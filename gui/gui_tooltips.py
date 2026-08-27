@@ -1621,34 +1621,42 @@ TOOLTIPS = {
     # THE BODY-FIRST SCREENS
     # =========================================================================
     "ui.body_button": (
-        "Choose the world you are modeling. The choice sets the orbit, the "
+        "Choose the body you are modeling. The choice sets the orbit, the "
         "spin, the surface properties, the ephemeris kernels and which "
         "physics options are even offered, so the rest of the setup is a "
         "handful of decisions rather than a form.\n"
+        "Moon has the fullest data support: an albedo map, a topography "
+        "catalog, the sub-facet roughness calibration and every worked "
+        "example. Europa adds the five Sutton elevation models and the "
+        "forty-five shipped site configurations. Mercury is runnable but "
+        "ships no map, no topography grid and no worked example. Asteroid and "
+        "Custom body both write a generic_body: section: use Asteroid when the "
+        "body is defined from an orbit, a spin pole and a shape model, and "
+        "Custom body when it is defined from its surface properties.\n"
         "Only bodies this engine actually implements appear here. A body it "
         "has no properties for is refused rather than run with another "
         "body's radius and no sunlight, so use Custom body for anything not "
         "shown."
     ),
     "ui.body_mode": (
-        "Whether to model the whole body as a sphere, or one piece of ground "
-        "from a terrain mesh you supply.\n"
-        "The whole body is right for diurnal and seasonal behavior and for "
-        "global maps. A place on it is right for craters, ridges and landing "
-        "sites, where local shadowing and infrared exchange between facets "
+        "Whether to model the whole body as a sphere, or one site from a "
+        "terrain mesh you supply.\n"
+        "Global is right for diurnal and seasonal behavior and for global "
+        "maps. Local mesh is right for craters, ridges and landing sites, "
+        "where local shadowing and infrared exchange between facets "
         "dominate.\n"
         "This is the engine's own distinction and it is the mesh file alone: "
         "supplying mesh.import_file makes it a local run."
     ),
     "ui.run_type": (
         "What the run should produce.\n"
-        "Temperature through time writes one field per output sample, so any "
-        "face can be plotted against time. Recommended for a first run and "
-        "for anything diurnal.\n"
-        "Summary maps only writes the minimum, mean and maximum over the "
+        "Time series writes one field per output sample, so any face can be "
+        "plotted against time. Recommended for a first run and for anything "
+        "diurnal.\n"
+        "Integrated statistics writes the minimum, mean and maximum over the "
         "window and skips every per-sample file -- the same physics, a "
         "fraction of the disk. Right for long or seasonal runs.\n"
-        "A grid of runs repeats the same setup once per point of a grid.\n"
+        "Parameter grid repeats the same setup once per point of a grid.\n"
         "Sets output.skip_time_series."
     ),
     "ui.all_settings": (
@@ -1676,8 +1684,9 @@ TOOLTIPS = {
         "applied, which announces what it changed."
     ),
     "ui.back_to_runtype": (
-        "Return to the run-type step, where the choice between the whole body "
-        "and a place on it also lives. The configuration is left as it is."
+        "Return to the run-type step, where the choice between the global "
+        "domain and a local mesh also lives. The configuration is left as it "
+        "is."
     ),
     "ui.landing_open": (
         "Open an existing configuration file. It must be YAML and it must "

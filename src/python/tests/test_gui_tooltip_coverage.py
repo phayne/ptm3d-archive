@@ -578,8 +578,17 @@ def _source_strings():
 
     from gui_core import body_cards as bc
     for button in bc.body_buttons():
-        out.append((f"body button {button.key}: subtitle", button.subtitle))
-        out.append((f"body button {button.key}: badge", button.maturity))
+        # A body button is its TITLE, full stop. It had a `maturity` badge and
+        # a `subtitle` until 2026-08-27 and a `note` before that; all three were
+        # removed from `BodyButton` itself, so harvesting any of them here would
+        # be an AttributeError rather than a quiet hole in the corpus.
+        #
+        # The Mercury data caveat that the badge used to carry is now the
+        # Mercury card's banner. It stays in this corpus through BOTH halves --
+        # the rendered sweep reads the live QLabel, and the source sweep reads
+        # its `setText` literal, which is why the card assigns the text rather
+        # than passing it to the QLabel constructor.
+        out.append((f"body button {button.key}: title", button.title))
     for mode in (bc.GLOBAL, bc.LOCAL):
         out.append((f"mode {mode.key}: title", mode.title))
         out.append((f"mode {mode.key}: summary", mode.summary))
@@ -674,7 +683,7 @@ def test_the_crew_idiom_check_actually_fires():
         assert hits, f"the wordlist did not fire on {text!r}"
     # ...and the positive control: ordinary user copy passes clean.
     clean = [
-        "Global and site-scale thermal models",
+        "Local mesh (Sutton DEM)",
         "The engine refuses 'Auto' at startup.",
         "Measured in diurnal skin depths.",
         "Hayne (2017): the lunar angular-albedo fit, and the default.",

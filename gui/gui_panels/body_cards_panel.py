@@ -2,8 +2,8 @@
 
 Three screens, in this order (DP-10):
 
-    which body?  ->  which kind of run?  ->  one card, for that body and that
-                                             kind of run
+    body  ->  model domain and run type  ->  one card, for that body and that
+                                             run type
 
 and, from every card, one control back to the eleven-section panel, which is
 unchanged and still the complete view of the configuration.
@@ -27,8 +27,13 @@ FOUR RULES, each of which a previous stage paid for:
 * **An automatic choice is announced and reversible.** Auto-albedo and the
   beaming facet-scale rule both narrate what they did and why.
 * **A control that cannot be honored is not offered.** The body buttons come
-  from the engine's own implemented-body table; "a grid of runs" appears only
-  where a grid is actually backed by shipped configurations.
+  from the engine's own implemented-body table; the parameter-grid run type
+  appears only where a grid is actually backed by shipped configurations.
+
+REGISTER. Section headers and control labels are technical terms, not
+questions: "Local mesh", not "Which piece of ground"; "Output", not "Where it
+goes". Explanatory prose belongs in the tooltips, which keep the plain-language
+what/recommended/when standard. `test_gui_body_first.py` holds that line.
 """
 
 import logging
@@ -188,14 +193,14 @@ class BodyCard(BaseConfigTab):
                     f"shown for it; edit the field to change it.")
         return f"ico{level} — {20 * (4 ** level):,} faces"
 
-    def time_group(self, title="When"):
+    def time_group(self, title="Time window"):
         """The three time controls every card carries."""
         group = QGroupBox(title)
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         self.add_string_field(grid, 0, "Start (UTC):", "simulation.start_time")
         spin = self.add_double_field(
-            grid, 1, "How long (days):", "simulation.duration_days",
+            grid, 1, "Duration (days):", "simulation.duration_days",
             0.001, 365000.0, decimals=6)
         spin.setSingleStep(1.0)
         self.add_int_field(grid, 2, "Output samples:", "simulation.timesteps",
@@ -203,24 +208,49 @@ class BodyCard(BaseConfigTab):
         group.setLayout(grid)
         return group
 
-    def output_group(self, title="Where it goes"):
+    def thermal_group(self, title="Thermal", integration_window=False):
+        """The thermal-solver controls, in one section.
+
+        THIS SECTION EXISTS BECAUSE ITS CONTROLS WERE FILED BY ACCIDENT.
+        ``thermal.use_gpu`` sat in the output section next to
+        ``output.directory``, where nothing about it belongs: it selects the
+        device the heat-equation solver runs on, not where the run's files
+        land. ``thermal.equilibration_orbits`` had a one-control section of its
+        own titled "How long to settle". Both are ``thermal.*`` solver
+        settings, and the split this draws -- solver here, destination in
+        Output -- is the one the All settings view already draws between its
+        Thermal and Output pages.
+
+        `integration_window` adds ``thermal.integration_days``, which was
+        likewise misfiled: it sat inside the Europa card's mesh-geometry
+        section, where it is neither geometry nor Europa-specific.
+        """
         group = QGroupBox(title)
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_directory_field(grid, 0, "Output folder:", "output.directory")
-        self.add_bool_field(grid, 1, "Run the thermal solver on the GPU",
+        row = 0
+        if integration_window:
+            self.add_double_field(grid, row, "Integration window (days):",
+                                  "thermal.integration_days", -1.0, 365000.0,
+                                  decimals=4)
+            row += 1
+        spin = self.add_double_field(
+            grid, row, "Spin-up (diurnal cycles):",
+            "thermal.equilibration_orbits", 0.0, 100000.0, decimals=2)
+        spin.setSingleStep(1.0)
+        row += 1
+        self.add_bool_field(grid, row, "Run the thermal solver on the GPU",
                             "thermal.use_gpu")
         group.setLayout(grid)
         return group
 
-    def settle_group(self):
-        group = QGroupBox("How long to settle")
+    def output_group(self, title="Output"):
+        """Where the run's files land, and nothing else."""
+        group = QGroupBox(title)
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        spin = self.add_double_field(
-            grid, 0, "Spin-up (day/night cycles):",
-            "thermal.equilibration_orbits", 0.0, 100000.0, decimals=2)
-        spin.setSingleStep(1.0)
+        self.add_directory_field(grid, 0, "Output directory:",
+                                 "output.directory")
         group.setLayout(grid)
         return group
 
@@ -307,14 +337,15 @@ class MoonCard(BodyCard):
 
         layout.addWidget(self.time_group())
 
-        # -- whole-Moon geometry --------------------------------------------
-        self.global_group = QGroupBox("Which sphere")
+        # -- global geometry --------------------------------------------------
+        self.global_group = QGroupBox("Global mesh")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_int_field(grid, 0, "Level of detail:", "mesh.resolution", 0, 9)
+        self.add_int_field(grid, 0, "Subdivision level:", "mesh.resolution",
+                           0, 9)
         self.face_count = _muted("")
         grid.addWidget(self.face_count, 1, 0, 1, 2)
-        self.add_bool_field(grid, 2, "Use real topography",
+        self.add_bool_field(grid, 2, "Apply topographic relief",
                             "mesh.use_topographic")
         self.topo_note = _muted("")
         grid.addWidget(self.topo_note, 3, 0, 1, 2)
@@ -325,13 +356,19 @@ class MoonCard(BodyCard):
         self.widgets["mesh.use_topographic"].toggled.connect(
             lambda _v: self._refresh_surface())
 
-        # -- a place on the Moon --------------------------------------------
-        self.local_group = QGroupBox("Which piece of ground")
+        # -- a site on the Moon ----------------------------------------------
+        self.local_group = QGroupBox("Local mesh")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         self.add_file_field(grid, 0, "Terrain mesh:", "mesh.import_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
-        self.add_file_field(grid, 1, "Shadow-only ring:", "mesh.occluder_file",
+        # The label argument is DEAD for this key: `_resolve_text` prefers
+        # `gui_tooltips.LABELS`, which spells it "Shadow-only surrounding
+        # mesh:". Kept identical to the rendered text so the call site cannot
+        # be read as a second, disagreeing answer (BUGS.md
+        # GUI-CARD-LABEL-LITERAL-DEAD).
+        self.add_file_field(grid, 1, "Shadow-only surrounding mesh:",
+                            "mesh.occluder_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
         self.add_double_field(grid, 2, "Latitude (deg):",
                               "mesh.latitude_override", -999.0, 90.0,
@@ -353,26 +390,28 @@ class MoonCard(BodyCard):
             ["builtin", "custom", "none"])
         self.albedo_note = _muted("")
         grid.addWidget(self.albedo_note, 1, 0, 1, 2)
-        self.add_bool_field(grid, 2, "Vary albedo with sun angle (Hapke)",
+        self.add_bool_field(grid, 2,
+                            "Directional-hemispheric albedo (Hapke)",
                             "thermophysical.incidence_angle_albedo")
-        self.add_bool_field(grid, 3, "Use the bundled per-face property map",
+        self.add_bool_field(grid, 3, "Bundled per-face property map",
                             "thermal.use_default_property_map")
         self.properties_note = _muted("")
         grid.addWidget(self.properties_note, 4, 0, 1, 2)
         surface.setLayout(grid)
         layout.addWidget(surface)
 
-        # -- self-heating (local only) ---------------------------------------
-        self.radiation_group = QGroupBox("Self-heating between facets")
+        # -- radiation exchange (local only) ----------------------------------
+        self.radiation_group = QGroupBox("Radiation exchange")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_bool_field(grid, 0, "Exchange infrared between facets",
+        self.add_bool_field(grid, 0, "Facet-to-facet infrared exchange",
                             "radiation.enabled")
+        # Label from `gui_tooltips.LABELS`, which wins over any literal here.
         self.add_bool_field(grid, 1, "Beam infrared from sub-facet roughness",
                             "radiation.beaming")
         self.beaming_note = _muted("")
         grid.addWidget(self.beaming_note, 2, 0, 1, 2)
-        self.add_file_field(grid, 3, "Reuse view factors:",
+        self.add_file_field(grid, 3, "View-factor cache:",
                             "radiation.view_factor_file",
                             "View factors (*.vf *.csr *.hmat);;All Files (*)")
         self.radiation_group.setLayout(grid)
@@ -380,7 +419,7 @@ class MoonCard(BodyCard):
         self.widgets["radiation.beaming"].toggled.connect(
             self._on_beaming_toggled)
 
-        layout.addWidget(self.settle_group())
+        layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
         layout.addStretch()
@@ -530,26 +569,27 @@ class EuropaCard(BodyCard):
 
         layout.addWidget(self.time_group())
 
-        # -- whole Europa ----------------------------------------------------
-        self.global_group = QGroupBox("Which sphere")
+        # -- global Europa ----------------------------------------------------
+        # `thermal.integration_days` used to sit here, in a mesh-geometry
+        # section. It is a solver setting, so it now lives in the Thermal
+        # section this card builds below.
+        self.global_group = QGroupBox("Global mesh")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_int_field(grid, 0, "Level of detail:", "mesh.resolution", 0, 9)
+        self.add_int_field(grid, 0, "Subdivision level:", "mesh.resolution",
+                           0, 9)
         self.add_combo_field(grid, 1, "Albedo source:",
                              "illumination.albedo_source",
                              ["builtin", "custom", "none"])
         self.albedo_note = _muted("")
         grid.addWidget(self.albedo_note, 2, 0, 1, 2)
-        self.add_double_field(grid, 3, "Integrate over (days):",
-                              "thermal.integration_days", -1.0, 365000.0,
-                              decimals=4)
         self.global_group.setLayout(grid)
         layout.addWidget(self.global_group)
         self.widgets["mesh.resolution"].valueChanged.connect(
             lambda _v: self._refresh())
 
         # -- a Sutton DEM site -----------------------------------------------
-        self.local_group = QGroupBox("Which terrain")
+        self.local_group = QGroupBox("Local mesh (Sutton DEM)")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
 
@@ -580,7 +620,7 @@ class EuropaCard(BodyCard):
         grid.addWidget(self.latitude_combo, 2, 1)
         self.widgets["mesh.latitude_override"] = self.latitude_combo
 
-        self.add_bool_field(grid, 3, "Exchange infrared between facets",
+        self.add_bool_field(grid, 3, "Facet-to-facet infrared exchange",
                             "radiation.enabled")
         self.vf_note = _muted("")
         grid.addWidget(self.vf_note, 4, 0, 1, 2)
@@ -588,12 +628,12 @@ class EuropaCard(BodyCard):
         layout.addWidget(self.local_group)
 
         # -- the grid (run type "sweep") --------------------------------------
-        self.sweep_group = QGroupBox("The whole grid")
+        self.sweep_group = QGroupBox("Parameter grid")
         sweep_layout = QVBoxLayout()
         self.sweep_summary = _muted("", color="#64b5f6", size=11)
         sweep_layout.addWidget(self.sweep_summary)
         row = QHBoxLayout()
-        self.sweep_button = QPushButton("Prepare the grid…")
+        self.sweep_button = QPushButton("Write grid configurations…")
         self.sweep_button.setToolTip(get_tooltip("ui.europa_sweep"))
         self.sweep_button.clicked.connect(self._on_prepare_sweep)
         row.addWidget(self.sweep_button)
@@ -612,7 +652,7 @@ class EuropaCard(BodyCard):
             "comparing against it.", color="#EF9A9A", size=10)
         layout.addWidget(caveat)
 
-        layout.addWidget(self.settle_group())
+        layout.addWidget(self.thermal_group(integration_window=True))
         layout.addWidget(self.output_group())
         self._make_report(layout)
         layout.addStretch()
@@ -790,13 +830,13 @@ class EuropaCard(BodyCard):
                 "list means an empty grid and not a wrong one.")
             return
         directory = QFileDialog.getExistingDirectory(
-            self, "Where should the grid's runs go?", "",
+            self, "Output directory for the grid", "",
             QFileDialog.Option.ShowDirsOnly)
         if not directory:
             return
         minutes = len(points) * _MINUTES_PER_RUN_GUESS
         answer = QMessageBox.question(
-            self, "Prepare the whole grid?",
+            self, "Write grid configurations?",
             f"This writes {len(points)} configurations under\n{directory}\n\n"
             f"Running them all takes roughly {minutes / 60.0:.0f} hours in "
             f"series on this machine — a rough estimate, not a measurement.\n\n"
@@ -850,8 +890,10 @@ class MercuryCard(BodyCard):
     the engine now forces at the 175.938 d SOLAR day rather than the 58.646 d
     sidereal rotation, and the 500 K ceiling written for icy bodies is gone
     from every path. What is still missing is a dataset -- no albedo map, no
-    topography, no worked example -- and the card says so rather than implying
-    the Moon's level of support.
+    topography, no worked example -- and `data_support_banner` is now the ONLY
+    place that is said. The landing screen carried a two-word "(limited data)"
+    badge until 2026-08-27; the button is the body's bare name now, so a
+    Mercury user meets this statement here or nowhere.
     """
 
     def init_ui(self):
@@ -861,21 +903,35 @@ class MercuryCard(BodyCard):
         layout.setSpacing(10)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        banner = _muted("", color="#FFCC80", size=11)
-        banner.setText(
-            "Mercury ships no albedo map, no topography grid and no worked "
-            "example, so every run here is a uniform-albedo icosphere at the "
-            "engine's built-in Mercury properties. The solver, the "
-            "illumination and the 175.938-day solar day are the same "
-            "machinery the Moon uses.")
-        layout.addWidget(banner)
+        # A BANNER, not a caption. It is the single surviving disclosure that
+        # this body ships no data, so it is bordered and sits above every
+        # control it constrains -- `test_gui_body_first.py` pins both the text
+        # and the fact that it is on this card.
+        # `setText`, NOT a QLabel(...) constructor argument: the voice gate's
+        # source-side harvest reads string constants handed to `setText` and
+        # friends, and moving this copy into the constructor would drop the one
+        # remaining Mercury disclosure out of that corpus silently.
+        self.data_support_banner = QLabel("")
+        self.data_support_banner.setText(
+            "Limited data: no albedo map, no topography grid and no worked "
+            "example ship for Mercury. Every run here is a uniform-albedo "
+            "icosphere at the engine's built-in Mercury properties. The "
+            "solver, the illumination and the 175.938-day solar day are the "
+            "same machinery the Moon uses.")
+        self.data_support_banner.setWordWrap(True)
+        self.data_support_banner.setTextFormat(Qt.TextFormat.PlainText)
+        self.data_support_banner.setStyleSheet(
+            "color: #FFCC80; font-size: 11px; padding: 6px; "
+            "border: 1px solid #FFCC80; border-radius: 4px;")
+        layout.addWidget(self.data_support_banner)
 
         layout.addWidget(self.time_group())
 
-        sphere = QGroupBox("Which sphere")
+        sphere = QGroupBox("Global mesh")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_int_field(grid, 0, "Level of detail:", "mesh.resolution", 0, 9)
+        self.add_int_field(grid, 0, "Subdivision level:", "mesh.resolution",
+                           0, 9)
         self.face_count = _muted("")
         grid.addWidget(self.face_count, 1, 0, 1, 2)
         sphere.setLayout(grid)
@@ -886,14 +942,15 @@ class MercuryCard(BodyCard):
         surface = QGroupBox("Surface")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_bool_field(grid, 0, "Vary albedo with sun angle (Hapke)",
+        self.add_bool_field(grid, 0,
+                            "Directional-hemispheric albedo (Hapke)",
                             "thermophysical.incidence_angle_albedo")
         self.properties_note = _muted("")
         grid.addWidget(self.properties_note, 1, 0, 1, 2)
         surface.setLayout(grid)
         layout.addWidget(surface)
 
-        layout.addWidget(self.settle_group())
+        layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
         layout.addStretch()
@@ -940,7 +997,7 @@ class GenericBodyCard(BodyCard):
         layout.setSpacing(10)
         layout.setContentsMargins(16, 16, 16, 16)
 
-        identity = QGroupBox("Which body")
+        identity = QGroupBox("Body identity")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         self.add_string_field(grid, 0, "Name:", "generic_body.name")
@@ -949,7 +1006,7 @@ class GenericBodyCard(BodyCard):
         layout.addWidget(identity)
 
         # -- ephemeris, with the coverage check the project never had ---------
-        ephemeris = QGroupBox("Where it is")
+        ephemeris = QGroupBox("Ephemeris")
         egrid = QGridLayout()
         egrid.setColumnStretch(1, 1)
         row = QWidget()
@@ -985,7 +1042,7 @@ class GenericBodyCard(BodyCard):
         layout.addWidget(ephemeris)
 
         # -- spin -------------------------------------------------------------
-        spin = QGroupBox("How it turns")
+        spin = QGroupBox("Spin state")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         self.add_double_field(grid, 0, "Rotation period (hours):",
@@ -1001,7 +1058,7 @@ class GenericBodyCard(BodyCard):
         layout.addWidget(spin)
 
         # -- shape -------------------------------------------------------------
-        shape = QGroupBox("What shape it is")
+        shape = QGroupBox("Shape")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         from gui_core.body_cards import GENERIC_SHAPE_TYPES
@@ -1029,7 +1086,7 @@ class GenericBodyCard(BodyCard):
             lambda _v: self._propagate_shape_mesh())
 
         # -- surface ------------------------------------------------------------
-        surface = QGroupBox("What the surface is like")
+        surface = QGroupBox("Surface properties")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         self.add_double_field(grid, 0, "Bond albedo:",
@@ -1065,8 +1122,8 @@ class GenericBodyCard(BodyCard):
             self.widgets[key].valueChanged.connect(
                 lambda _v: self._refresh_surface())
 
-        layout.addWidget(self.time_group("When to run it"))
-        layout.addWidget(self.settle_group())
+        layout.addWidget(self.time_group())
+        layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
         layout.addStretch()
@@ -1229,12 +1286,21 @@ class CustomBodyCard(GenericBodyCard):
 # ===========================================================================
 
 class _BigButton(QPushButton):
-    def __init__(self, title, subtitle, badge="", tooltip=""):
+    """A large button. `subtitle` is OPTIONAL and empty for a body button.
+
+    A body button carries the body's name and nothing else -- not even the
+    two-word maturity badge it briefly had, which is why there is no `badge`
+    parameter here any more: a body's caveats belong on that body's card, said
+    once. The run-type buttons still carry a summary line, because a run type
+    is a decision about what the run produces and the name alone does not
+    settle it.
+    """
+
+    def __init__(self, title, subtitle="", tooltip=""):
         super().__init__("")
         self.setMinimumHeight(96)
         self.setMinimumWidth(180)
-        text = title if not badge else f"{title}\n({badge})"
-        self.setText(f"{text}\n{subtitle}")
+        self.setText(f"{title}\n{subtitle}" if subtitle else title)
         self.setToolTip(tooltip)
         font = QFont()
         font.setPointSize(12)
@@ -1299,9 +1365,12 @@ class BodyFirstPanel(BaseConfigTab):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        heading = QLabel("What would you like to model?")
-        heading.setFont(QFont("Helvetica Neue", 15, QFont.Weight.Bold))
-        layout.addWidget(heading)
+        # Kept as an attribute so the register gate can read it by name rather
+        # than fishing for a bold QLabel among the muted notes.
+        self.landing_heading = QLabel("Select a body")
+        self.landing_heading.setFont(
+            QFont("Helvetica Neue", 15, QFont.Weight.Bold))
+        layout.addWidget(self.landing_heading)
 
         # Its OWN message line. The first draft put "no card describes this
         # file" into the baseline entry's report box, which is a different
@@ -1316,17 +1385,18 @@ class BodyFirstPanel(BaseConfigTab):
         self.landing_message.setVisible(False)
         layout.addWidget(self.landing_message)
 
-        # Buttons only. The grid used to carry a paragraph of prose under each
-        # one; the paragraphs read as commentary rather than as a choice, and a
-        # body with something to disclose now discloses it on its own card,
-        # where the controls it constrains are. `BodyButton` has no `note`
+        # The body's NAME, and nothing else. The grid carried a paragraph of
+        # prose under each button, then one functional line, then a two-word
+        # maturity badge on Mercury; each read as commentary rather than as a
+        # choice, and a body with something to disclose discloses it in the
+        # button's tooltip and on its own card, where the controls it
+        # constrains are. `BodyButton` has no `note`, `subtitle` or `maturity`
         # field any more, so this cannot regress by someone re-adding the text
         # to the table and finding it does not appear.
         grid = QGridLayout()
         grid.setSpacing(10)
         for index, button in enumerate(buttons):
-            widget = _BigButton(button.title, button.subtitle,
-                                badge=button.maturity,
+            widget = _BigButton(button.title,
                                 tooltip=get_tooltip("ui.body_button"))
             widget.clicked.connect(
                 lambda _c=False, k=button.key: self.choose_body(k))
@@ -1390,7 +1460,7 @@ class BodyFirstPanel(BaseConfigTab):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
-        back = QPushButton("← bodies")
+        back = QPushButton("← Bodies")
         back.setToolTip(get_tooltip("ui.back_to_bodies"))
         back.clicked.connect(lambda: self.stack.setCurrentIndex(self.LANDING))
         row = QHBoxLayout()
@@ -1403,13 +1473,13 @@ class BodyFirstPanel(BaseConfigTab):
             QFont("Helvetica Neue", 14, QFont.Weight.Bold))
         layout.addWidget(self.runtype_heading)
 
-        self.mode_group = QGroupBox("Which part of it")
+        self.mode_group = QGroupBox("Model domain")
         self.mode_layout = QVBoxLayout()
         self.mode_group.setLayout(self.mode_layout)
         layout.addWidget(self.mode_group)
         self._mode_radios = []
 
-        self.runtype_group = QGroupBox("What kind of run")
+        self.runtype_group = QGroupBox("Run type")
         self.runtype_layout = QVBoxLayout()
         self.runtype_group.setLayout(self.runtype_layout)
         layout.addWidget(self.runtype_group)
@@ -1427,7 +1497,7 @@ class BodyFirstPanel(BaseConfigTab):
         header = QWidget()
         layout = QHBoxLayout(header)
         layout.setContentsMargins(12, 8, 12, 4)
-        back = QPushButton("← run type")
+        back = QPushButton("← Run type")
         back.setToolTip(get_tooltip("ui.back_to_runtype"))
         back.clicked.connect(lambda: self.stack.setCurrentIndex(self.RUNTYPE))
         layout.addWidget(back)
@@ -1501,7 +1571,7 @@ class BodyFirstPanel(BaseConfigTab):
     def choose_body(self, body_key):
         from gui_core.body_cards import modes_for, run_types_for
         self._route = (body_key, None, self._route[2])
-        self.runtype_heading.setText(f"{body_key} — how should it be run?")
+        self.runtype_heading.setText(f"{body_key} — run configuration")
 
         for widget in self._mode_radios:
             widget.setParent(None)
