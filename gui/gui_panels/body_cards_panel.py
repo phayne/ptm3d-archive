@@ -1316,6 +1316,12 @@ class BodyFirstPanel(BaseConfigTab):
         self.landing_message.setVisible(False)
         layout.addWidget(self.landing_message)
 
+        # Buttons only. The grid used to carry a paragraph of prose under each
+        # one; the paragraphs read as commentary rather than as a choice, and a
+        # body with something to disclose now discloses it on its own card,
+        # where the controls it constrains are. `BodyButton` has no `note`
+        # field any more, so this cannot regress by someone re-adding the text
+        # to the table and finding it does not appear.
         grid = QGridLayout()
         grid.setSpacing(10)
         for index, button in enumerate(buttons):
@@ -1325,9 +1331,6 @@ class BodyFirstPanel(BaseConfigTab):
             widget.clicked.connect(
                 lambda _c=False, k=button.key: self.choose_body(k))
             grid.addWidget(widget, index // 3, index % 3)
-            if button.note:
-                note = _muted(button.note)
-                grid.addWidget(note, 2 + index // 3, index % 3)
         layout.addLayout(grid)
 
         rule = QFrame()
@@ -1345,20 +1348,29 @@ class BodyFirstPanel(BaseConfigTab):
         baseline_button.clicked.connect(self._on_choose_baseline)
         row.addWidget(baseline_button)
 
-        settings_button = QPushButton("All settings…")
+        # Clearly secondary, and labeled as what it is. The flow is the way
+        # through this application; the eleven-section view is the escape
+        # hatch for someone who already knows which key they want.
+        settings_button = QPushButton("All settings (advanced)…")
+        settings_button.setObjectName("AllSettingsButton")
         settings_button.setToolTip(get_tooltip("ui.all_settings"))
         settings_button.clicked.connect(self.all_settings_requested.emit)
         row.addWidget(settings_button)
         row.addStretch()
         layout.addLayout(row)
 
-        # The baseline entry keeps the task card's own report surface and its
-        # beaming line, because what it promises is unusual and specific: it
-        # overrides nothing the baseline recorded, including beaming.
-        from gui_core.presets import PRESETS_BY_KEY
-        baseline = PRESETS_BY_KEY["reproduce_baseline"]
-        layout.addWidget(_muted(baseline.summary))
-        layout.addWidget(_muted("Beaming: unchanged. " + baseline.beaming_note))
+        # The baseline entry keeps its own REPORT surface -- what it loaded,
+        # which engine build ran it, and whether the environment is knowable --
+        # because that is written after the user acts and is the whole point of
+        # the entry.
+        #
+        # What it no longer keeps is the two paragraphs of standing prose that
+        # sat here permanently: the preset's five-sentence summary and its
+        # beaming line, naming config_used.yaml, provenance.txt and
+        # engine_env:. On a landing screen whose job is "choose a body", that
+        # is a wall of text in front of a choice. Both are now in the button's
+        # own tooltip (`ui.landing_baseline`, which gained the environment
+        # caveat verbatim), where a user goes when they want the detail.
         report = QLabel("")
         report.setWordWrap(True)
         report.setTextFormat(Qt.TextFormat.PlainText)
@@ -1423,11 +1435,45 @@ class BodyFirstPanel(BaseConfigTab):
         self.card_title.setFont(QFont("Helvetica Neue", 13, QFont.Weight.Bold))
         layout.addWidget(self.card_title)
         layout.addStretch()
-        settings = QPushButton("All settings…")
+        settings = QPushButton("All settings (advanced)…")
+        settings.setObjectName("AllSettingsButton")
         settings.setToolTip(get_tooltip("ui.all_settings"))
         settings.clicked.connect(self.all_settings_requested.emit)
         layout.addWidget(settings)
         return header
+
+    # -- what the flow is currently on ----------------------------------------
+
+    def route(self):
+        """``(body_key, mode_key, run_type)`` -- may carry ``None`` for the
+        first two while the user is still on the landing screen."""
+        return self._route
+
+    def active_card(self):
+        """The card the flow is showing, or None if it is not on a card."""
+        if self.stack.currentIndex() != self.CARD:
+            return None
+        return self.card_stack.currentWidget()
+
+    def refresh_active_card(self):
+        """Re-read the configuration into whichever card is live.
+
+        Called when the user returns from All settings. A value edited on a
+        section page is in the configuration but not on the card's controls,
+        and `BaseConfigTab` writes a control's value back on the next widget
+        event -- so a card left showing a stale number would push that stale
+        number over the edit the moment anything else on the card was touched.
+
+        Goes through `BodyCard.load_from_config`, which is `_loading`-guarded,
+        so re-mirroring is not itself an edit: the same guard is what keeps
+        merely DISPLAYING a configuration from firing the `toggled` handler
+        that writes `radiation.rms_slope_deg`.
+        """
+        card = self.active_card()
+        if card is None:
+            return None
+        card.load_from_config()
+        return card
 
     def register_cards(self, cards):
         """Take the card widgets built by the ConfigurationPanel.
@@ -1542,8 +1588,10 @@ class BodyFirstPanel(BaseConfigTab):
             result.applied[key] = value
         if preset.needs_advanced:
             result.notes.append(
-                "'Advanced options' has been turned on and the sections "
-                "holding the fields above have been opened.")
+                "The fields listed above are not on this card. 'Advanced "
+                "options' has been turned on and the sections holding them "
+                "have been opened for you -- press 'All settings (advanced)' "
+                "at the top of this card to get to them.")
             self.advanced_requested.emit(preset.key)
         return result
 
@@ -1636,8 +1684,10 @@ class BodyFirstPanel(BaseConfigTab):
         lines = result.summary_lines()
         if preset.needs_advanced:
             lines.append(
-                "NOTE: 'Advanced options' has been turned on and the sections "
-                "holding the fields above have been opened.")
+                "NOTE: the fields listed above are not on this card. "
+                "'Advanced options' has been turned on and the sections "
+                "holding them have been opened for you -- press 'All settings "
+                "(advanced)' to get to them.")
             self.advanced_requested.emit(key)
         self._show(key, "\n".join(lines))
         self.preset_applied.emit(key)

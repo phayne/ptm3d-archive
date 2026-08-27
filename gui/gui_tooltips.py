@@ -1652,11 +1652,23 @@ TOOLTIPS = {
         "Sets output.skip_time_series."
     ),
     "ui.all_settings": (
-        "Open the full eleven-section configuration view. Everything a card "
-        "shows is there too, along with every option a card leaves at its "
-        "default.\n"
+        "Open the full eleven-section configuration view: Simulation, Mesh, "
+        "Properties, Thermal, Output, Illumination, Radiation, GPU and the "
+        "rest. Everything a card shows is there too, along with every option a "
+        "card leaves at its default.\n"
+        "You do not need it for an ordinary run -- the body cards cover that, "
+        "and this is here for when you already know which setting you want. "
+        "It stays out of the way until you ask for it.\n"
         "Nothing is lost by moving between the two: they edit the same "
-        "configuration, and an edit made in either is visible in the other."
+        "configuration, an edit made in either is visible in the other, and "
+        "the Back button returns you to the card you came from."
+    ),
+    "ui.close_all_settings": (
+        "Close the full settings view and go back to where you were in the "
+        "body-first flow -- the same body, the same run type, the same card.\n"
+        "Nothing is discarded. Anything you changed here is already in the "
+        "configuration, and the card re-reads it on the way back so the two "
+        "always show the same values."
     ),
     "ui.back_to_bodies": (
         "Return to the body chooser. The configuration is not reset -- "
@@ -1679,7 +1691,16 @@ TOOLTIPS = {
         "own config_used.yaml, and report the engine build it ran on.\n"
         "Use this to reproduce a published result: it reads the values rather "
         "than guessing them, and it says plainly whether your engine is the "
-        "same one."
+        "same one. Point it at the run's output directory.\n"
+        "Beaming: unchanged. Everything the baseline recorded is loaded as it "
+        "stands -- its spin-up seed, its coupling mode and its beaming setting "
+        "included -- and nothing here overrides any of it.\n"
+        "The engine environment is the one thing it may not be able to tell "
+        "you. A run's record does not list the PTM_* variables it used, so if "
+        "the loaded configuration carries no engine_env: section -- a run "
+        "started from the command line usually does not -- that part is "
+        "unknown and your current settings are used instead. It says which of "
+        "the two cases you are in after it loads."
     ),
     "ui.europa_terrain": (
         "Which Sutton digital elevation model to run. The list, the file "
@@ -1857,8 +1878,8 @@ TOOLTIPS = {
         "Heat flowing up from the interior, in watts per square meter. It sets "
         "the floor the deepest layer settles to, which matters only where the "
         "sun never reaches.\n"
-        "About 0.018 on the Moon. On a small body it is effectively zero, and "
-        "leaving it at zero is the honest choice unless you have a reason.\n"
+        "About 0.018 on the Moon. On a small body it is effectively zero, so "
+        "leave it at zero unless you have a value for this body.\n"
         "Sets generic_body.surface.Qb."
     ),
     "generic_body.surface.chi": (

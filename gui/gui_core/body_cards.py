@@ -107,32 +107,36 @@ LOCAL = _Mode("local", "A place on it",
 #: `IMPLEMENTED_BODIES`; `src/python/tests/test_gui_body_first.py` asserts that,
 #: so a body added to `planetary_properties.h` fails a test here instead of
 #: quietly missing its button.
+#:
+#: A `subtitle` is ONE short functional line naming what the button leads to.
+#: `note` is empty for every button and the landing screen renders no note
+#: paragraphs at all: a paragraph of prose under each of five large buttons is
+#: what the landing screen looked like before, and it read as commentary rather
+#: than as a choice. Anything a body genuinely has to disclose belongs on that
+#: body's card, in context and next to the controls it affects --
+#: `test_gui_body_first.py` holds that line for the one body that has such a
+#: disclosure, so removing the paragraph cannot quietly remove the warning.
 BODY_PRESENTATION = {
     "Moon": dict(
-        subtitle="global or a polar site",
+        subtitle="Global and site-scale thermal models",
         modes=("global", "local"),
         maturity="",
-        note="",
     ),
     "Europa": dict(
-        subtitle="global or a Sutton DEM",
+        subtitle="Global and Sutton DEM site models",
         modes=("global", "local"),
         maturity="",
-        note="",
     ),
     "Mercury": dict(
-        subtitle="global",
+        subtitle="Global thermal models",
         modes=("global",),
-        # Not a warning any more. The two defects that held this button back --
-        # a solar day recorded as the 58.646 d SIDEREAL rotation, and a 500 K
-        # ceiling written for icy bodies -- were fixed in the engine on
-        # 2026-08-26 (BUGS.md ENG-MERCURY-SOLAR-DAY, ENG-MERCURY-TEMP-CEILING).
-        # What remains is thin DATA, which is a different claim and is made
-        # honestly below.
-        maturity="young",
-        note=("Mercury ships no albedo map, no topography and no worked "
-              "example, so every Mercury run here is a uniform-albedo "
-              "icosphere. The physics is the same solver the Moon uses."),
+        # The two defects that held this button back -- a solar day recorded as
+        # the 58.646 d SIDEREAL rotation, and a 500 K ceiling written for icy
+        # bodies -- were fixed in the engine on 2026-08-26 (BUGS.md
+        # ENG-MERCURY-SOLAR-DAY, ENG-MERCURY-TEMP-CEILING). What remains is thin
+        # DATA. The badge says so in two words; the Mercury card says so in
+        # full, beside the controls it constrains.
+        maturity="limited data",
     ),
 }
 
@@ -144,35 +148,42 @@ BODY_PRESENTATION = {
 CUSTOM_ROUTES = {
     "asteroid": dict(
         title="Asteroid",
-        subtitle="a shape model or a sphere",
+        subtitle="Shape model or sphere, from an orbit and spin pole",
         modes=("body",),
         maturity="",
-        note="",
     ),
     "custom": dict(
         title="Custom body",
-        subtitle="anything else, by its properties",
+        subtitle="Any other world, from its own surface properties",
         modes=("body",),
         maturity="",
-        note=("The honest destination for a world the engine has no built-in "
-              "properties for. Naming such a body under simulation.body is "
-              "refused by the engine, because it would substitute Europa's "
-              "radius and produce an output directory with no sunlight in it."),
+        # What this route is FOR, and what happens if you try to reach it by
+        # typing a body name instead, is on the card itself -- see
+        # `_card_presets()`'s `custom` summary, which a user reads at the moment
+        # the choice is in front of them.
     ),
 }
 
 
 class BodyButton:
-    """One large button on the landing screen."""
+    """One large button on the landing screen.
 
-    def __init__(self, key, title, subtitle, modes, maturity="", note="",
+    There is deliberately NO `note` field. The landing screen carried a
+    paragraph under each button, and a body that has something to disclose now
+    discloses it on its own card instead. Keeping an unrendered `note=` here
+    would be worse than either choice: somebody would fill it in and it would
+    do nothing. Because `body_buttons()` splats the presentation table straight
+    into this constructor, a `note=` put back into either table is a TypeError
+    at import, not a silent drop.
+    """
+
+    def __init__(self, key, title, subtitle, modes, maturity="",
                  builtin=True):
         self.key = key
         self.title = title
         self.subtitle = subtitle
         self.modes = tuple(modes)
         self.maturity = maturity
-        self.note = note
         self.builtin = builtin
 
     def __repr__(self):                                   # pragma: no cover
@@ -652,9 +663,11 @@ def _card_presets():
         key="custom_body",
         title="A body you describe yourself",
         summary=("Any world the engine has no built-in properties for. "
-                 "Everything the run needs comes from the generic_body: "
-                 "block, which is the only route that is honored -- naming "
-                 "such a body under simulation.body is refused."),
+                 "Everything the run needs is described here and written to "
+                 "the configuration's generic_body: section. This is the only "
+                 "way to model such a body: typing its name under "
+                 "simulation.body instead will not start a run, because the "
+                 "engine has no radius, albedo or orbit to go with the name."),
         sets={
             "thermal.run_thermal_mesh": True,
             "radiation.enabled": False,
