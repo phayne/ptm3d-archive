@@ -27,11 +27,23 @@ local disk, not in a cloud-synced folder.
 ## Features
 
 ### 1. Simulation Configuration
-- **Start page**: five task cards — global lunar diurnal, lunar polar crater
-  with self-heating, Europa diurnal, asteroid or other custom body, and
-  "reproduce a published baseline". Each one states the exact keys it set and
-  any it refused, and nothing is applied until you press its button.
-- **Tabbed Interface**: the complete reference view — Simulation, Mesh,
+
+The GUI has **two levels**: a body card, and all settings. Every card carries
+one control to the second, and both edit the same configuration.
+
+- **Start page — which body?** Five large buttons: Moon, Europa, Mercury,
+  Asteroid, and Custom body. The three built-in bodies are exactly the ones the
+  engine implements; the list is generated from `planetary_properties.h`, so a
+  body it cannot run cannot have a button. "Open a configuration file" and
+  "Reproduce a published run" are the other two ways in.
+- **Then — what kind of run?** Whether to model the whole body or one piece of
+  ground, and whether to write a field per output sample, only the summary maps,
+  or (for the Europa terrain grid) a whole set of runs.
+- **Then — one card**, sized to that body and that kind of run: eleven controls
+  for a whole-Moon run, nine for a Europa terrain site, eight for Mercury. Each
+  card states the exact keys it set, announces every automatic choice, and lists
+  anything an opened file carries that the card does not show.
+- **All settings**: the complete reference view — Simulation, Mesh,
   Properties, Thermal, Output, Body, Illumination, Radiation, GPU and Engine
   Flags. Every tab is always visible; "Advanced options" reveals the expert
   groups *inside* each tab rather than hiding whole tabs.
@@ -43,10 +55,18 @@ local disk, not in a cloud-synced folder.
   Configuration*, which hands the config to `ptm_thermal_sim
   --validate-config` and reports the engine's own words.
 
-The presets were unreachable code for months — `ConfigManager.PRESETS` had no
-menu, no button and no dialog — and this list advertised them anyway. The old
-table was deleted rather than papered over; the Start page above is the
-replacement, designed in `docs/design/gui-update-plan.md` (items 2.2, 2.3).
+Why body-first: measured across the 78 configurations shipped in `configs/` and
+`examples/`, **115 of the engine's 184 keys never take a second value anywhere**,
+and the forty-five Europa terrain runs differ in exactly two scientific keys.
+The tabbed view showed 145 controls for decisions that are between two and
+seventeen keys wide. `scripts/gui_option_usage_audit.py` reproduces those
+numbers.
+
+Each card applies its defaults through the same mechanism the task cards used,
+so "a card reports exactly the keys it wrote" is one rule with one set of
+tests. Opening a file requires only that it be YAML and name a body under
+`simulation.body`; everything else in it is loaded unchanged, listed above the
+card, and editable under All settings.
 
 ### 2. 3D Visualization (PyVista)
 - Interactive 3D mesh rendering with zoom, pan, and rotate
