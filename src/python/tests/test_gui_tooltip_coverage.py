@@ -13,7 +13,16 @@ So this file is a ratchet on the help text itself, not just on its presence:
   * single source -- `gui_tooltips.py` is the only place the prose lives
   * substance     -- a tooltip may not simply restate its own label
   * plain language-- no ticket numbers and no internal shorthand
+  * VOICE         -- no user-visible string anywhere reads like a session note
   * enums         -- every choice a combo offers is explained by name
+
+The voice check is the newest and the widest: it reads every string on a live
+panel AND every literal handed to a user-visible Qt setter under `gui/`, not
+just the tooltip table. The text that prompted it was neither a tooltip nor a
+label -- it was a paragraph under a button on the landing screen. Its wordlist
+was measured against the existing corpus before it was switched on, and two of
+the requested terms were measured, found to be 97% and 100% false positives,
+and left out; the numbers and the reasoning are recorded beside the patterns.
 
 Run directly::
 
@@ -407,6 +416,301 @@ def test_the_help_text_carries_no_internal_shorthand():
 
 
 # --------------------------------------------------------------------------
+# 4b. PLAIN LANGUAGE, EVERYWHERE -- not just in tooltips
+# --------------------------------------------------------------------------
+#
+# The check above reads TOOLTIPS only. The text that prompted this one was not
+# a tooltip: it was a paragraph rendered under a button on the landing screen,
+# beginning "The honest destination for a world the engine has no built-in
+# properties for." That is the register of a session note, not of an
+# application, and no gate could see it.
+#
+# So the corpus below is BOTH halves, because either alone has a hole:
+#
+#   * RENDERED -- every text/title/tooltip/placeholder on a live offscreen
+#     ConfigurationPanel. Catches anything a future surface puts on screen
+#     without going through a table. Misses state-dependent strings: the
+#     Radiation page's coupling-mode note said "legacy re-introduces PTM-89"
+#     only while the combo sat on `legacy`, and the rendered sweep never saw it.
+#   * SOURCE -- every string constant handed to a user-visible Qt setter
+#     anywhere under gui/, plus the copy tables (TOOLTIPS, LABELS, the body
+#     buttons, the run types, the presets, the engine-environment notes).
+#     Catches the state-dependent ones. Misses text assembled at runtime.
+#
+# THE WORDLIST WAS MEASURED BEFORE IT WAS ENABLED, on the corpus of 2026-08-26
+# (1456 rendered strings, 876 source literals). Every term below scored ZERO
+# false positives; the hits it did score were real and are fixed:
+#
+#     term            hits  real  false  disposition
+#     honest*            3     3      0  ENABLED  (the landing paragraph, x2 --
+#                                                  one table entry rendered once
+#                                                  -- and one Qb tooltip)
+#     PTM-<n>            2     2      0  ENABLED  (a Radiation note, an
+#                                                  engine-environment banner)
+#     disclos*           0     -      0  ENABLED
+#     proven             0     -      0  ENABLED
+#     ledger             0     -      0  ENABLED
+#     crew names         0     -      0  ENABLED  (see the Hayne note below)
+#     byte-identical     0     -      0  ENABLED
+#     do-no-harm         0     -      0  ENABLED
+#     prepare-only       0     -      0  ENABLED
+#     DP-<n>, item n.n   0     -      0  ENABLED
+#     session notes      0     -      0  ENABLED
+#
+# TWO TERMS ON THE REQUESTED LIST ARE DELIBERATELY NOT ENABLED, because the
+# same measurement says enabling them would do harm, and dropping them quietly
+# would be the worse answer:
+#
+#     refus*            37     1     36  NOT ENABLED -- 97% false positive.
+#         "The engine refuses 'Auto' at startup", "beaming with a zero slope is
+#         refused", "a card with less headroom has its work separated or
+#         refused". This is the project's fail-loud vocabulary and it is
+#         exactly what a user needs to read. Enabling it would force 36 correct
+#         warnings to be reworded into vaguer ones. The single real hit was
+#         inside the landing paragraph and is gone with it.
+#     measur*           53     0     53  NOT ENABLED -- 100% false positive.
+#         "measured in diurnal skin depths", "measured 11.7 percent low on the
+#         shipped 80N crater", "a measured or assumed grain size". These are
+#         the numbers that make a tooltip worth reading.
+#
+# `test_the_rejected_terms_are_still_mostly_legitimate` keeps that decision
+# falsifiable rather than leaving it as a comment: if either term ever stops
+# having many legitimate uses, it fails and asks for a re-measurement.
+#
+# One narrowing worth naming: the crew-name pattern does NOT include "Hayne".
+# It appears six times in this corpus, every one of them an author-year
+# citation or an enum spelling ("Hayne (2017): the lunar angular-albedo fit",
+# "(Hayne = false, Hapke = true)") -- a literature reference and a YAML value,
+# not a person on a team.
+
+_CREW_IDIOM = [
+    (re.compile(r"\bhonest\w*\b", re.I),
+     "the register of a session note; say what it does instead"),
+    (re.compile(r"\bdisclos\w*\b", re.I),
+     "internal shorthand for 'says so'"),
+    (re.compile(r"\bproven\b", re.I), "internal shorthand"),
+    (re.compile(r"\bledger\b", re.I), "the internal bug ledger"),
+    (re.compile(r"\bPTM-\d+", re.I), "a ticket number"),
+    (re.compile(r"\bPR #?\d+", re.I), "a pull-request number"),
+    (re.compile(r"\b(Ada|Fermi|Sagan|Luna|Paul|the crew)\b"),
+     "a name from inside the project"),
+    (re.compile(r"\bbyte-identical\b", re.I), "internal shorthand"),
+    (re.compile(r"\bdo-no-harm\b", re.I), "internal shorthand"),
+    (re.compile(r"\bprepare-only\b", re.I), "internal shorthand"),
+    (re.compile(r"\b(DP-\d+|item \d+\.\d+)\b"),
+     "a reference to an internal design document"),
+    (re.compile(r"\b(session notes|BUGS\.md)\b", re.I),
+     "a file the user does not have"),
+    (re.compile(r"\b(the first draft|the previous stage)\b", re.I),
+     "self-referential process talk"),
+]
+
+#: Terms measured, found to be overwhelmingly legitimate, and left OUT of the
+#: gate above. Each carries the count it scored on the 2026-08-26 corpus.
+_REJECTED_AS_TOO_BROAD = [
+    (re.compile(r"\brefus\w*\b", re.I), "refus*", 37),
+    (re.compile(r"\bmeasur\w*\b", re.I), "measur*", 53),
+]
+
+#: Every Qt call that puts a string in front of a user.
+_USER_VISIBLE_SETTERS = {
+    "setText", "setToolTip", "setTitle", "setPlaceholderText",
+    "setWindowTitle", "setStatusTip", "setWhatsThis", "addItem",
+    "setInformativeText", "setDetailedText", "setLabelText",
+    "setSuffix", "setPrefix", "information", "warning", "critical", "question",
+}
+
+
+def _rendered_strings(panel):
+    """Every string a live offscreen panel is currently showing."""
+    from PyQt6.QtWidgets import QWidget
+    out, seen = [], set()
+    for tab_name, tab in panel.tabs.items():
+        for widget in tab.findChildren(QWidget):
+            for getter in ("text", "title", "toolTip", "placeholderText"):
+                fn = getattr(widget, getter, None)
+                if not callable(fn):
+                    continue
+                try:
+                    value = (fn() or "").strip()
+                except Exception:                            # noqa: BLE001
+                    continue
+                where = f"{tab_name}/{type(widget).__name__}.{getter}"
+                if value and (where, value) not in seen:
+                    seen.add((where, value))
+                    out.append((where, value))
+    return out
+
+
+def _source_strings():
+    """Every string constant handed to a user-visible setter under gui/, plus
+    the copy tables that feed the body-first surfaces."""
+    import ast
+    out = []
+    gui_root = REPO_ROOT / "gui"
+    files = sorted(gui_root.rglob("*.py"))
+    assert files, f"no GUI sources found under {gui_root}; this would pass empty"
+    for path in files:
+        try:
+            tree = ast.parse(path.read_text())
+        except (SyntaxError, UnicodeDecodeError):            # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+            if name not in _USER_VISIBLE_SETTERS:
+                continue
+            args = list(node.args) + [kw.value for kw in node.keywords]
+            for arg in args:
+                for sub in ast.walk(arg):
+                    if isinstance(sub, ast.Constant) \
+                            and isinstance(sub.value, str) \
+                            and sub.value.strip():
+                        out.append((f"{path.name}:{node.lineno}", sub.value))
+
+    from gui_tooltips import LABELS, TOOLTIPS
+    for key, value in TOOLTIPS.items():
+        out.append((f"TOOLTIPS[{key}]", value))
+    for key, value in LABELS.items():
+        out.append((f"LABELS[{key}]", value))
+
+    from gui_core import body_cards as bc
+    for button in bc.body_buttons():
+        out.append((f"body button {button.key}: subtitle", button.subtitle))
+        out.append((f"body button {button.key}: badge", button.maturity))
+    for mode in (bc.GLOBAL, bc.LOCAL):
+        out.append((f"mode {mode.key}: title", mode.title))
+        out.append((f"mode {mode.key}: summary", mode.summary))
+    for run_type in bc.RUN_TYPES:
+        for attr in ("title", "summary", "produces"):
+            out.append((f"run type {run_type.key}: {attr}",
+                        getattr(run_type, attr)))
+
+    from gui_core.presets import PRESETS_BY_KEY
+    presets = list(PRESETS_BY_KEY.items())
+    presets += [(f"card {route}/{mode}", preset)
+                for (route, mode), preset in bc.CARD_PRESETS().items()]
+    for key, preset in presets:
+        for attr in ("title", "summary", "beaming_note"):
+            out.append((f"preset {key}: {attr}", getattr(preset, attr, "") or ""))
+        for need in (getattr(preset, "needs", None) or ()):
+            out.append((f"preset {key}: needs", need))
+
+    from gui_core.preflight import (DELIBERATELY_NOT_INJECTED,
+                                    ENV_SET_CHANGED_PHYSICS)
+    for key, value in DELIBERATELY_NOT_INJECTED.items():
+        out.append((f"engine env, not injected: {key}", value))
+    out.append(("engine env banner", ENV_SET_CHANGED_PHYSICS))
+    return [(w, t) for w, t in out if (t or "").strip()]
+
+
+def _ui_corpus(panel):
+    return _rendered_strings(panel) + _source_strings()
+
+
+def _idiom_hits(corpus, patterns):
+    hits = []
+    for where, text in corpus:
+        for pattern, why in patterns:
+            match = pattern.search(text)
+            if match:
+                start = max(0, match.start() - 60)
+                hits.append(f"{where}: {match.group(0)!r} is {why}\n"
+                            f"        ...{text[start:match.end() + 60]}...")
+    return hits
+
+
+def test_no_user_visible_string_carries_crew_idiom():
+    """The gate the landing paragraph would have failed.
+
+    A user has no ticket tracker, no session notes and no colleagues named in
+    the source. Every string this application shows is read by someone who has
+    none of that context.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        corpus = _ui_corpus(panel)
+        assert len(corpus) > 500, (
+            f"the corpus is only {len(corpus)} strings -- the harvest is "
+            f"broken and this check would pass vacuously")
+        hits = _idiom_hits(corpus, _CREW_IDIOM)
+        assert not hits, "\n  ".join(
+            [f"crew idiom in {len(hits)} user-visible string(s) "
+             f"(corpus: {len(corpus)}):"] + hits)
+        print(f"    [voice] {len(corpus)} user-visible strings "
+              f"({len(_rendered_strings(panel))} rendered + "
+              f"{len(_source_strings())} source/table), 0 crew idiom")
+
+
+def test_the_crew_idiom_check_actually_fires():
+    """Its negative controls. A wordlist nobody proved can fire is decoration.
+
+    One arm per enabled pattern, injected into a string the harvest really
+    reads, so this proves the CORPUS reaches the text as well as proving the
+    regular expressions match.
+    """
+    samples = [
+        "The honest destination for a world with no built-in properties.",
+        "Everything the card hides is disclosed below.",
+        "This is a proven result.",
+        "See the ledger for the rest.",
+        "This is the PTM-89 fix and the engine default.",
+        "Merged in PR #135.",
+        "Paul's ruling, recorded here.",
+        "The two runs are byte-identical.",
+        "A do-no-harm check on the Moon.",
+        "The commit is prepare-only.",
+        "This is DP-7, and item 2.1 covers the rest.",
+        "The session notes explain why; see BUGS.md.",
+        "The first draft of this card offered two spellings.",
+    ]
+    assert len(samples) == len(_CREW_IDIOM), (
+        f"{len(_CREW_IDIOM)} patterns but {len(samples)} negative controls -- "
+        f"a pattern added without an arm is a pattern nobody proved fires")
+    for text in samples:
+        hits = _idiom_hits([("negative control", text)], _CREW_IDIOM)
+        assert hits, f"the wordlist did not fire on {text!r}"
+    # ...and the positive control: ordinary user copy passes clean.
+    clean = [
+        "Global and site-scale thermal models",
+        "The engine refuses 'Auto' at startup.",
+        "Measured in diurnal skin depths.",
+        "Hayne (2017): the lunar angular-albedo fit, and the default.",
+        "One temperature field per output sample.",
+    ]
+    for text in clean:
+        hits = _idiom_hits([("positive control", text)], _CREW_IDIOM)
+        assert not hits, f"the wordlist fired on ordinary user copy: {hits}"
+
+
+def test_the_rejected_terms_are_still_mostly_legitimate():
+    """Keeps a judgment call falsifiable instead of leaving it in a comment.
+
+    'refused' and 'measured' were on the requested wordlist and were left out
+    because 36 of 37 and 53 of 53 of their hits are correct user copy. If that
+    ever stops being true -- if the counts collapse toward zero -- the reason
+    for excluding them has gone and somebody should re-measure and enable them.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        corpus = _ui_corpus(panel)
+        report = []
+        for pattern, name, measured_2026_08_26 in _REJECTED_AS_TOO_BROAD:
+            count = sum(1 for _w, t in corpus if pattern.search(t))
+            report.append(f"{name}: {count} hit(s) "
+                          f"(was {measured_2026_08_26} on 2026-08-26)")
+            assert count >= 10, (
+                f"{name} now matches only {count} user-visible string(s). It "
+                f"was excluded from the crew-idiom gate because it matched "
+                f"{measured_2026_08_26}, nearly all of them legitimate. That "
+                f"reason no longer holds -- re-measure and either enable it or "
+                f"update this threshold.")
+        print("    [rejected terms] " + "; ".join(report))
+
+
+# --------------------------------------------------------------------------
 # 5. ENUMS
 # --------------------------------------------------------------------------
 
@@ -533,6 +837,9 @@ TESTS = [
     test_a_disabled_control_is_not_styled_as_an_enabled_one,
     test_no_tooltip_merely_restates_its_own_label,
     test_the_help_text_carries_no_internal_shorthand,
+    test_no_user_visible_string_carries_crew_idiom,
+    test_the_crew_idiom_check_actually_fires,
+    test_the_rejected_terms_are_still_mostly_legitimate,
     test_every_choice_a_policy_combo_offers_is_explained,
     test_every_relabeled_key_is_a_real_control,
     test_every_relabeled_control_shows_its_new_label,

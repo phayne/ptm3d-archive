@@ -1679,7 +1679,16 @@ TOOLTIPS = {
         "own config_used.yaml, and report the engine build it ran on.\n"
         "Use this to reproduce a published result: it reads the values rather "
         "than guessing them, and it says plainly whether your engine is the "
-        "same one."
+        "same one. Point it at the run's output directory.\n"
+        "Beaming: unchanged. Everything the baseline recorded is loaded as it "
+        "stands -- its spin-up seed, its coupling mode and its beaming setting "
+        "included -- and nothing here overrides any of it.\n"
+        "The engine environment is the one thing it may not be able to tell "
+        "you. A run's record does not list the PTM_* variables it used, so if "
+        "the loaded configuration carries no engine_env: section -- a run "
+        "started from the command line usually does not -- that part is "
+        "unknown and your current settings are used instead. It says which of "
+        "the two cases you are in after it loads."
     ),
     "ui.europa_terrain": (
         "Which Sutton digital elevation model to run. The list, the file "
@@ -1857,8 +1866,8 @@ TOOLTIPS = {
         "Heat flowing up from the interior, in watts per square meter. It sets "
         "the floor the deepest layer settles to, which matters only where the "
         "sun never reaches.\n"
-        "About 0.018 on the Moon. On a small body it is effectively zero, and "
-        "leaving it at zero is the honest choice unless you have a reason.\n"
+        "About 0.018 on the Moon. On a small body it is effectively zero, so "
+        "leave it at zero unless you have a value for this body.\n"
         "Sets generic_body.surface.Qb."
     ),
     "generic_body.surface.chi": (

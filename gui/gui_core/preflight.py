@@ -87,8 +87,9 @@ RECOMMENDED_ENGINE_ENV = {
 #: table that quietly fell behind the documentation.
 DELIBERATELY_NOT_INJECTED = {
     "PTM_EQ_PERFACE_FLUX":
-        "PTM-276: inert on CPU (the engine says so), and on GPU it overrides "
-        "an explicit thermal.spinup_seed: legacy. Ask for it per config.",
+        "Inert on the processor path (the engine says so), and on the graphics "
+        "cards it overrides an explicit thermal.spinup_seed: legacy. Add it "
+        "per configuration if you want it.",
 }
 
 #: One-line banner for the console: injecting the rise-epsilon gate changed the
@@ -99,7 +100,7 @@ ENV_SET_CHANGED_PHYSICS = (
     "fix APPLIES. Every GUI run before this date silently ran without it "
     "(PTM_ILLUM_RISE_HABS alone is inert). Illumination -- and therefore "
     "temperatures -- differ from earlier GUI runs of the same config. "
-    "PTM_EQ_PERFACE_FLUX is no longer injected (PTM-276)."
+    "PTM_EQ_PERFACE_FLUX is no longer injected."
 )
 
 CLOUD_PATH_MARKERS = ("/Library/CloudStorage/",)

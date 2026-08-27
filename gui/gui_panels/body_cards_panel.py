@@ -1316,6 +1316,12 @@ class BodyFirstPanel(BaseConfigTab):
         self.landing_message.setVisible(False)
         layout.addWidget(self.landing_message)
 
+        # Buttons only. The grid used to carry a paragraph of prose under each
+        # one; the paragraphs read as commentary rather than as a choice, and a
+        # body with something to disclose now discloses it on its own card,
+        # where the controls it constrains are. `BodyButton` has no `note`
+        # field any more, so this cannot regress by someone re-adding the text
+        # to the table and finding it does not appear.
         grid = QGridLayout()
         grid.setSpacing(10)
         for index, button in enumerate(buttons):
@@ -1325,9 +1331,6 @@ class BodyFirstPanel(BaseConfigTab):
             widget.clicked.connect(
                 lambda _c=False, k=button.key: self.choose_body(k))
             grid.addWidget(widget, index // 3, index % 3)
-            if button.note:
-                note = _muted(button.note)
-                grid.addWidget(note, 2 + index // 3, index % 3)
         layout.addLayout(grid)
 
         rule = QFrame()
@@ -1352,13 +1355,18 @@ class BodyFirstPanel(BaseConfigTab):
         row.addStretch()
         layout.addLayout(row)
 
-        # The baseline entry keeps the task card's own report surface and its
-        # beaming line, because what it promises is unusual and specific: it
-        # overrides nothing the baseline recorded, including beaming.
-        from gui_core.presets import PRESETS_BY_KEY
-        baseline = PRESETS_BY_KEY["reproduce_baseline"]
-        layout.addWidget(_muted(baseline.summary))
-        layout.addWidget(_muted("Beaming: unchanged. " + baseline.beaming_note))
+        # The baseline entry keeps its own REPORT surface -- what it loaded,
+        # which engine build ran it, and whether the environment is knowable --
+        # because that is written after the user acts and is the whole point of
+        # the entry.
+        #
+        # What it no longer keeps is the two paragraphs of standing prose that
+        # sat here permanently: the preset's five-sentence summary and its
+        # beaming line, naming config_used.yaml, provenance.txt and
+        # engine_env:. On a landing screen whose job is "choose a body", that
+        # is a wall of text in front of a choice. Both are now in the button's
+        # own tooltip (`ui.landing_baseline`, which gained the environment
+        # caveat verbatim), where a user goes when they want the detail.
         report = QLabel("")
         report.setWordWrap(True)
         report.setTextFormat(Qt.TextFormat.PlainText)

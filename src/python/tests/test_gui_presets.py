@@ -332,26 +332,57 @@ def test_a_card_that_names_advanced_fields_reveals_them():
         panel.advanced_toggle.setChecked(False)
 
 
-def test_the_baseline_card_does_not_advertise_beaming_off():
+def test_the_baseline_entry_does_not_advertise_beaming_off():
     """The display half of the "preserve" fix.
 
     The shared else-branch labeled every non-"on" preset "Beaming: off.",
     including the one whose note says nothing here overrides the baseline --
     self-contradictory, and wrong for a beaming baseline.
+
+    WHERE this is said moved on 2026-08-26 and the property did not. The
+    landing screen used to carry the baseline preset's summary and its beaming
+    line as two standing paragraphs under the button; a landing screen whose
+    job is "choose a body" should not open with a wall of prose, so both went
+    into the button's own tooltip. This check follows them there rather than
+    being dropped -- a user who wants to know what "reproduce a published run"
+    does to their beaming setting must still be told, before they press it.
+
+    The other half, the report written AFTER loading, is checked by
+    `test_reproduce_a_baseline_reads_the_runs_own_record`.
     """
     from gui_core.presets import PRESETS_BY_KEY
+    from gui_tooltips import TOOLTIPS
     assert PRESETS_BY_KEY["reproduce_baseline"].beaming == "preserve"
+
+    tip = TOOLTIPS["ui.landing_baseline"]
+    assert "Beaming: unchanged" in tip, (
+        f"the baseline button's tooltip no longer says its beaming is "
+        f"unchanged, and nothing on the landing screen says it either:\n{tip}")
+    assert "Beaming: off" not in tip, tip
+    assert "overrides" in tip, (
+        f"the tooltip says beaming is unchanged without saying that NOTHING "
+        f"here overrides the baseline, which is the actual promise:\n{tip}")
+
     with tempfile.TemporaryDirectory() as scratch:
         manager, panel = _panel(scratch)
-        from PyQt6.QtWidgets import QLabel
-        labels = [w.text() for w in panel.tabs["start"].findChildren(QLabel)]
-        beaming_labels = [t for t in labels if t.startswith("Beaming:")]
-        assert beaming_labels, "no beaming labels on the cards at all"
-        preserve = [t for t in beaming_labels if "unchanged" in t]
-        assert preserve, (
-            f"no card says its beaming is unchanged: {beaming_labels}")
-        for text in preserve:
-            assert "Beaming: off" not in text, text
+        from PyQt6.QtWidgets import QLabel, QPushButton
+        start = panel.tabs["start"]
+        # It has to be ON the button, not merely in the table.
+        buttons = [b for b in start.findChildren(QPushButton)
+                   if "published run" in b.text()]
+        assert buttons, "the 'Reproduce a published run' entry is gone"
+        assert any(b.toolTip() == tip for b in buttons), (
+            f"the baseline button shows help that is not "
+            f"TOOLTIPS['ui.landing_baseline']: "
+            f"{[b.toolTip()[:60] for b in buttons]}")
+        # ...and the negative control: no surface anywhere claims it turns
+        # beaming off, which is the defect this test was written for.
+        wrong = [t for t in
+                 [w.text() for w in start.findChildren(QLabel)]
+                 + [w.toolTip() for w in start.findChildren(QPushButton)]
+                 if "Beaming: off" in t]
+        assert not wrong, (
+            f"a surface says the baseline entry turns beaming off: {wrong}")
 
 
 def test_the_baseline_preset_overrides_nothing():
@@ -570,7 +601,7 @@ TESTS = [
     test_europa_and_generic_body_presets_never_ask_for_beaming,
     test_a_global_preset_clears_an_inherited_import_mesh,
     test_a_card_that_names_advanced_fields_reveals_them,
-    test_the_baseline_card_does_not_advertise_beaming_off,
+    test_the_baseline_entry_does_not_advertise_beaming_off,
     test_the_baseline_preset_overrides_nothing,
     test_compare_binary_does_not_treat_unknown_as_a_hash,
     test_every_preset_leaves_a_config_the_gui_accepts,

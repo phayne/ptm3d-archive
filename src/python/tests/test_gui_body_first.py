@@ -114,6 +114,106 @@ def test_the_landing_screen_offers_exactly_the_implemented_bodies():
     print(f"    [landing] {len(buttons)} buttons: {[b.key for b in buttons]}")
 
 
+def test_a_body_button_carries_one_short_functional_line_and_no_paragraph():
+    """The landing screen offers a choice; it does not comment on it.
+
+    It used to carry a paragraph of muted prose under each button. One of them
+    opened "The honest destination for a world the engine has no built-in
+    properties for" -- the register of a session note, in front of somebody who
+    has never read one. Two properties replace it:
+
+    * a button has ONE subtitle, one line, short enough to read at a glance;
+    * `BodyButton` has no `note` field at all, so the paragraph cannot be put
+      back in the table and quietly fail to appear.
+    """
+    from gui_core.body_cards import body_buttons
+
+    long_lines, multi_line = [], []
+    for button in body_buttons():
+        assert not hasattr(button, "note"), (
+            f"BodyButton grew a `note` field back ({button.key}). The landing "
+            f"screen does not render one, so it would be text nobody sees.")
+        assert button.subtitle.strip(), (
+            f"{button.key} has no subtitle; the button would read as a bare "
+            f"word with no idea what it leads to")
+        if "\n" in button.subtitle:
+            multi_line.append(button.key)
+        if len(button.subtitle) > 55:
+            long_lines.append(f"{button.key}: {len(button.subtitle)} chars -- "
+                              f"{button.subtitle!r}")
+    assert not multi_line, (
+        f"a body button's subtitle spans more than one line: {multi_line}")
+    assert not long_lines, "\n  ".join(
+        ["a body-button subtitle is a paragraph, not a functional line:"]
+        + long_lines)
+    print("    [landing copy] "
+          + "; ".join(f"{b.key}: {b.subtitle!r}" for b in body_buttons()))
+
+
+def test_removing_the_paragraphs_did_not_remove_a_disclosure():
+    """The half that makes the deletion above safe rather than merely tidy.
+
+    Mercury's paragraph was the only one carrying a claim a user needs: it
+    ships no albedo map, no topography and no worked example, so every Mercury
+    run is a uniform-albedo sphere. Deleting the paragraph without this check
+    would delete the warning with it. It now lives on the Mercury card -- where
+    the controls it constrains are -- plus a two-word badge on the button.
+
+    The custom-body paragraph is the same shape: what that route is for, and
+    what happens if you type the body's name under `simulation.body` instead,
+    is on the card.
+    """
+    from gui_core.body_cards import body_buttons, card_preset
+
+    mercury = [b for b in body_buttons() if b.key == "Mercury"]
+    assert mercury, "the Mercury button is gone"
+    assert mercury[0].maturity.strip(), (
+        "the Mercury button lost both its paragraph and its badge, so nothing "
+        "on the landing screen says this body is thin on data")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        from PyQt6.QtWidgets import QLabel
+        card = panel.tabs["card_mercury"]
+        text = "\n".join(w.text() for w in card.findChildren(QLabel))
+        for phrase in ("no albedo map", "no topography", "uniform-albedo"):
+            assert phrase in text, (
+                f"the Mercury card no longer says {phrase!r}, and the landing "
+                f"paragraph that used to say it has been removed:\n{text[:400]}")
+
+    custom = card_preset("custom", "body")
+    assert custom is not None, "the custom-body card lost its preset"
+    assert "simulation.body" in custom.summary, (
+        f"the custom-body card no longer explains that naming the body under "
+        f"simulation.body will not work, and the landing paragraph that used "
+        f"to say it has been removed:\n{custom.summary}")
+
+
+def test_the_landing_screen_is_buttons_not_prose():
+    """Measured on the rendered page, not on the tables.
+
+    A paragraph can come back through any widget, not only through
+    `BODY_PRESENTATION`. So this counts the standing prose actually on the
+    landing page: its heading, its (normally hidden) routing message and the
+    baseline entry's (normally hidden) report are the only long labels allowed.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        from PyQt6.QtWidgets import QLabel
+        start = panel.tabs["start"]
+        page = start.stack.widget(start.LANDING)
+        prose = []
+        for label in page.findChildren(QLabel):
+            text = (label.text() or "").strip()
+            if len(text) > 90 and label.isVisibleTo(page):
+                prose.append(f"{len(text)} chars: {text[:90]}...")
+        assert not prose, "\n  ".join(
+            ["the landing screen carries standing paragraphs again -- it is a "
+             "choice of body, and the detail belongs in the tooltips and on "
+             "the cards:"] + prose)
+        print("    [landing copy] no standing paragraph on the landing page")
+
+
 def test_a_body_the_presentation_table_forgets_is_loud():
     """A body implemented in C++ and missing here would have no way in."""
     from gui_core import body_cards
@@ -641,6 +741,9 @@ def test_a_generic_body_value_below_the_floor_blocks_the_launch():
 
 TESTS = [
     test_the_landing_screen_offers_exactly_the_implemented_bodies,
+    test_a_body_button_carries_one_short_functional_line_and_no_paragraph,
+    test_removing_the_paragraphs_did_not_remove_a_disclosure,
+    test_the_landing_screen_is_buttons_not_prose,
     test_a_body_the_presentation_table_forgets_is_loud,
     test_a_grid_is_offered_only_where_a_grid_exists,
     test_every_route_reaches_its_own_card,

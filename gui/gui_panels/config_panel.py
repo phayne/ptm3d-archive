@@ -2831,17 +2831,18 @@ class RadiationTab(BaseConfigTab):
             ff.setEnabled(legacy)
         if legacy:
             self.coupling_mode_note.setText(
-                "legacy re-introduces PTM-89: the face-fraction exit has no "
-                "error bound, so a coupled run's answer depends on how the "
-                "window was chunked. Use it to reproduce a published run.")
+                "legacy stops when a fraction of faces stops changing, which "
+                "puts no bound on the remaining error -- so a coupled run's "
+                "answer depends on how the window was chunked. Use it only to "
+                "reproduce a run published under that behavior.")
         elif mode == "fixed":
             self.coupling_mode_note.setText(
                 "fixed runs exactly Max Coupling Iterations passes; Face "
                 "Fraction is not read.")
         else:
             self.coupling_mode_note.setText(
-                "bounded is the PTM-89 fix and the engine default; Face "
-                "Fraction is not read.")
+                "bounded carries an error bound and is the engine default; "
+                "Face Fraction is not read.")
 
     def _update_vf_builder_gating(self, _value=None):
         """Warn on quadrature order 1, and gate the Monte Carlo ray count."""
