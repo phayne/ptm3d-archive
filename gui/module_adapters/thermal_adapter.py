@@ -115,8 +115,19 @@ class ThermalModule(AbstractModule):
         return self._cm
 
     def reload_config(self):
-        """Re-read the config manager into every tab (dashboard File > Open)."""
+        """Re-read the config manager into every tab (dashboard File > Open).
+
+        Also lands on the body card the loaded configuration belongs to, the
+        same as the main window's own Open, so the two doors behave alike.
+        """
         self._config_panel.load_from_config()
+        land = getattr(self._config_panel, "land_on_loaded_config", None)
+        if callable(land):
+            route = land()
+            if route is not None and not route.ok and self._console is not None:
+                self._console.append_warning(
+                    f"[THERMAL] No body card describes this configuration: "
+                    f"{route.refusal}")
 
     def set_input(self, input_type: str, value: str):
         if input_type == "mesh_file":

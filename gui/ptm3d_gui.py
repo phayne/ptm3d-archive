@@ -58,9 +58,11 @@ class PTM3DMainWindow(QMainWindow):
         self.apply_style()
         self.restore_window_state()
 
-        # On first launch, ask for the target body once the event loop is up so
-        # the default (Moon) is an explicit choice, not a silent one.
-        QTimer.singleShot(0, self._maybe_show_body_picker)
+        # The body is chosen on the body-first landing screen, which is the
+        # first thing this window shows. A modal asking the same question on
+        # first launch is now a second, worse copy of it -- it offered a list
+        # rather than the cards, and answering it skipped past the screen that
+        # exists to make the choice.
 
         # Give the docked console a comfortable default height once laid out
         # (first launch only; a saved window state wins).
@@ -160,36 +162,6 @@ class PTM3DMainWindow(QMainWindow):
             self.left_tabs.addTab(self.camera_panel, "Camera")
         elif not visible and idx >= 0:
             self.left_tabs.removeTab(idx)
-
-    def _maybe_show_body_picker(self):
-        """On first launch only, prompt for the target body so the default
-        (Moon) is an explicit choice rather than a silent one. Selecting the
-        body drives the Simulation-tab combo, which updates every body-aware
-        tab exactly as a manual selection would. Shown once, tracked in
-        QSettings; choosing Cancel keeps the current default."""
-        if self.settings.value("bodyPickerShown", False, type=bool):
-            return
-        from PyQt6.QtWidgets import QInputDialog
-        from gui_panels.config_panel import SimulationTab
-        bodies = list(SimulationTab.BUILTIN_BODIES)
-        current = self.config_manager.get_value("simulation.body", "Moon")
-        default_idx = bodies.index(current) if current in bodies else 0
-        body, ok = QInputDialog.getItem(
-            self, "Select target body",
-            "Choose the planetary body for this project.\n"
-            "You can change it any time on the Simulation tab.",
-            bodies, default_idx, False)
-        # Mark as shown regardless of choice so it never nags again.
-        self.settings.setValue("bodyPickerShown", True)
-        if ok and body:
-            combo = self.config_panel.tabs["simulation"].widgets.get(
-                "simulation.body")
-            if combo is not None:
-                # setCurrentText fires the normal change signals -> updates the
-                # config and every body-aware tab.
-                combo.setCurrentText(body)
-            else:
-                self.config_manager.set_value("simulation.body", body)
 
     def create_right_panel(self):
         """Create the right panel with visualization"""
@@ -450,6 +422,11 @@ class PTM3DMainWindow(QMainWindow):
         # Config panel signals
         self.config_panel.config_changed.connect(self.on_config_changed)
         self.config_panel.project_replaced.connect(self.on_project_replaced)
+        # "Open a configuration file…" on the landing screen goes through the
+        # window's own Open, so it gets the unsaved-changes check, the recent
+        # files list and the body-key requirement, rather than a second path
+        # that has none of them.
+        self.config_panel.open_requested.connect(self.open_project)
 
         # Results panel signals
         self.results_panel.results_selected.connect(self.on_results_selected)
@@ -525,17 +502,50 @@ class PTM3DMainWindow(QMainWindow):
             examples_dir = gui_dir / "examples"
             start_dir = str(examples_dir) if examples_dir.exists() else str(gui_dir)
 
+        # YAML only. The dialog used to offer "Legacy PTM3D Projects (*.ptm3d)"
+        # -- a format nothing in this project reads or writes -- and "All Files
+        # (*)", which invited a mesh or a binary into yaml.safe_load.
         filename, _ = QFileDialog.getOpenFileName(
             self, "Open Project",
             start_dir,
-            "YAML Files (*.yaml *.yml);;Legacy PTM3D Projects (*.ptm3d);;All Files (*)"
+            "PTM3D configuration (*.yaml *.yml)"
         )
 
         if filename:
             self.load_project(filename)
 
     def load_project(self, filename):
-        """Load a project file"""
+        """Load a project file and land on the body card that describes it.
+
+        Two requirements before anything is loaded (DP-7): the file is YAML,
+        and it names ``simulation.body``. Neither is a formality. The body key
+        is what decides which card describes the file, and there is no honest
+        default -- landing a Europa configuration on the Moon card would show
+        lunar defaults for properties the file never set, which is the
+        hide-a-live-setting class the correctness stage spent fourteen items
+        removing.
+
+        Refusing happens BEFORE the load, so a rejected file leaves the current
+        project untouched rather than half-replacing it.
+        """
+        import yaml
+
+        from gui_core.body_cards import open_refusal
+
+        try:
+            with open(filename) as handle:
+                probe = yaml.safe_load(handle)
+        except Exception as e:                               # noqa: BLE001
+            QMessageBox.critical(
+                self, "Error", f"Failed to read {Path(filename).name}:\n{e}")
+            return
+        refusal = open_refusal(filename, probe)
+        if refusal:
+            QMessageBox.warning(self, "This file cannot be opened", refusal)
+            self.console_panel.append_warning(f"Not opened: {refusal}")
+            self.status_label.setText("Not opened")
+            return
+
         try:
             self.config_manager.load_from_yaml(filename)
             self.config_panel.load_from_config()
@@ -545,7 +555,16 @@ class PTM3DMainWindow(QMainWindow):
             self.add_recent_file(filename)
             self.status_label.setText(f"Loaded: {Path(filename).name}")
             self.console_panel.append_info(f"Project loaded: {filename}")
-        except Exception as e:
+            # Land on the body card for this file, and say what it carries that
+            # the card does not show. Anything not shown is preserved by the
+            # comment-preserving writer and editable under All settings.
+            route = self.config_panel.land_on_loaded_config()
+            if route is not None and not route.ok:
+                self.console_panel.append_warning(
+                    f"No body card describes this file, so it stayed on the "
+                    f"body chooser: {route.refusal} Everything in the file is "
+                    f"loaded; use All settings to see and edit it.")
+        except Exception as e:                               # noqa: BLE001
             QMessageBox.critical(self, "Error", f"Failed to load project:\n{str(e)}")
 
     def save_project(self):
