@@ -172,10 +172,21 @@ def test_the_text_on_screen_is_the_text_in_gui_tooltips():
             + wrong)
 
 
+#: Every source file that builds user-visible controls. The body-first cards
+#: are a second such file, and the single-source rule applies to them for the
+#: same reason it applies to the first: two copies of a tooltip is two answers
+#: to the same question, and which one the user reads is decided by which file
+#: someone edited last.
+_PANEL_SOURCES = (
+    REPO_ROOT / "gui" / "gui_panels" / "config_panel.py",
+    REPO_ROOT / "gui" / "gui_panels" / "body_cards_panel.py",
+)
+
+
 def test_the_panel_authors_no_tooltip_prose_of_its_own():
     """The structural half of "single source", and the stronger half.
 
-    `config_panel.py` builds widgets. Every string it hands to setToolTip must
+    The panel files build widgets. Every string they hand to setToolTip must
     come from gui_tooltips -- a `get_tooltip(...)` call, possibly `.format(...)`
     for the two state-dependent ones, or a value carried in from the engine.
     A bare literal here is a second source by definition, whether or not it
@@ -183,51 +194,60 @@ def test_the_panel_authors_no_tooltip_prose_of_its_own():
     """
     import ast
     from gui_tooltips import TOOLTIPS
-    src = REPO_ROOT / "gui" / "gui_panels" / "config_panel.py"
-    tree = ast.parse(src.read_text())
 
     literals = []
-    for node in ast.walk(tree):
-        fn = getattr(node, "func", None)
-        if not isinstance(node, ast.Call) or not isinstance(fn, ast.Attribute) \
-                or fn.attr != "setToolTip":
-            continue
-        # Collect the string constants that are a get_tooltip() KEY; every
-        # other string constant under this call is prose.
-        keys = set()
-        for sub in ast.walk(node):
-            sub_fn = getattr(sub, "func", None)
-            name = getattr(sub_fn, "id", None) or getattr(sub_fn, "attr", None)
-            if isinstance(sub, ast.Call) and name == "get_tooltip":
-                for karg in sub.args:
-                    if isinstance(karg, ast.Constant):
-                        keys.add(id(karg))
-        for arg in node.args:
-            for sub in ast.walk(arg):
-                if isinstance(sub, ast.Constant) \
-                        and isinstance(sub.value, str) \
-                        and sub.value.strip() \
-                        and id(sub) not in keys:
-                    literals.append(
-                        f"config_panel.py:{node.lineno}: {sub.value[:70]!r}")
+    asked = set()
+    for src in _PANEL_SOURCES:
+        if not src.exists():
+            raise AssertionError(f"{src} is missing; this check would pass "
+                                 f"vacuously for the controls it builds")
+        tree = ast.parse(src.read_text())
+        for node in ast.walk(tree):
+            fn = getattr(node, "func", None)
+            if not isinstance(node, ast.Call) \
+                    or not isinstance(fn, ast.Attribute) \
+                    or fn.attr != "setToolTip":
+                continue
+            # Collect the string constants that are a get_tooltip() KEY; every
+            # other string constant under this call is prose.
+            keys = set()
+            for sub in ast.walk(node):
+                sub_fn = getattr(sub, "func", None)
+                name = (getattr(sub_fn, "id", None)
+                        or getattr(sub_fn, "attr", None))
+                if isinstance(sub, ast.Call) and name == "get_tooltip":
+                    for karg in sub.args:
+                        if isinstance(karg, ast.Constant):
+                            keys.add(id(karg))
+            for arg in node.args:
+                for sub in ast.walk(arg):
+                    if isinstance(sub, ast.Constant) \
+                            and isinstance(sub.value, str) \
+                            and sub.value.strip() \
+                            and id(sub) not in keys:
+                        literals.append(
+                            f"{src.name}:{node.lineno}: {sub.value[:70]!r}")
+
+        # ...and every key a panel asks for must actually exist, or the control
+        # silently ships bare -- which is what the coverage test then catches,
+        # but this names the typo directly.
+        for node in ast.walk(tree):
+            fn = getattr(node, "func", None)
+            name = getattr(fn, "id", None) or getattr(fn, "attr", None)
+            if isinstance(node, ast.Call) and name == "get_tooltip":
+                for karg in node.args:
+                    if isinstance(karg, ast.Constant) \
+                            and isinstance(karg.value, str):
+                        asked.add(karg.value)
 
     assert not literals, "\n  ".join(
-        ["tooltip prose authored inside the panel instead of gui_tooltips.py:"]
+        ["tooltip prose authored inside a panel instead of gui_tooltips.py:"]
         + sorted(set(literals)))
 
-    # ...and every key the panel asks for must actually exist, or the control
-    # silently ships bare -- which is what the coverage test then catches, but
-    # this names the typo directly.
-    asked = set()
-    for node in ast.walk(tree):
-        fn = getattr(node, "func", None)
-        name = getattr(fn, "id", None) or getattr(fn, "attr", None)
-        if isinstance(node, ast.Call) and name == "get_tooltip":
-            for karg in node.args:
-                if isinstance(karg, ast.Constant) and isinstance(karg.value, str):
-                    asked.add(karg.value)
     unknown = sorted(k for k in asked if k not in TOOLTIPS)
-    assert not unknown, f"the panel asks for tooltip key(s) that do not exist: {unknown}"
+    assert not unknown, f"a panel asks for tooltip key(s) that do not exist: {unknown}"
+    print(f"    [single source] {len(asked)} tooltip keys asked for across "
+          f"{len(_PANEL_SOURCES)} panel files, 0 authored in place")
 
 
 def test_no_info_key_names_a_tooltip_that_does_not_exist():
@@ -242,13 +262,16 @@ def test_no_info_key_names_a_tooltip_that_does_not_exist():
     import ast
     import re
     from gui_tooltips import TOOLTIPS
-    src = (REPO_ROOT / "gui" / "gui_panels" / "config_panel.py").read_text()
-    ast.parse(src)                       # cheap syntax guard on the same file
-    stale = sorted({m.group(1) for m in re.finditer(r'info_key="([^"]+)"', src)
-                    if m.group(1) not in TOOLTIPS})
+    stale = set()
+    for path in _PANEL_SOURCES:
+        src = path.read_text()
+        ast.parse(src)                   # cheap syntax guard on the same file
+        stale.update(m.group(1)
+                     for m in re.finditer(r'info_key="([^"]+)"', src)
+                     if m.group(1) not in TOOLTIPS)
     assert not stale, (
         f"info_key= names {len(stale)} tooltip key(s) that do not exist, so "
-        f"those labels silently lose their help: {stale}")
+        f"those labels silently lose their help: {sorted(stale)}")
 
 
 def test_a_disabled_control_is_not_styled_as_an_enabled_one():
@@ -291,33 +314,33 @@ def test_no_call_site_still_carries_a_superseded_tooltip():
         "add_directory_field": (3, 4), "add_device_ids_field": (3, 4),
         "add_property_with_default": (3, 8),
     }
-    src = REPO_ROOT / "gui" / "gui_panels" / "config_panel.py"
-    tree = ast.parse(src.read_text())
     dead = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        fn = node.func
-        if not isinstance(fn, ast.Attribute) or fn.attr not in sigs:
-            continue
-        ki, ti = sigs[fn.attr]
-        if len(node.args) <= ki:
-            continue
-        key_node = node.args[ki]
-        if not isinstance(key_node, ast.Constant) \
-                or not isinstance(key_node.value, str) \
-                or key_node.value not in TOOLTIPS:
-            continue
-        literal = (len(node.args) > ti
-                   and isinstance(node.args[ti], ast.Constant)
-                   and isinstance(node.args[ti].value, str)
-                   and node.args[ti].value)
-        for kw in node.keywords:
-            if kw.arg == "tooltip" and isinstance(kw.value, ast.Constant) \
-                    and kw.value.value:
-                literal = kw.value.value
-        if literal:
-            dead.append(f"config_panel.py:{node.lineno} {key_node.value}")
+    for src in _PANEL_SOURCES:
+        tree = ast.parse(src.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not isinstance(fn, ast.Attribute) or fn.attr not in sigs:
+                continue
+            ki, ti = sigs[fn.attr]
+            if len(node.args) <= ki:
+                continue
+            key_node = node.args[ki]
+            if not isinstance(key_node, ast.Constant) \
+                    or not isinstance(key_node.value, str) \
+                    or key_node.value not in TOOLTIPS:
+                continue
+            literal = (len(node.args) > ti
+                       and isinstance(node.args[ti], ast.Constant)
+                       and isinstance(node.args[ti].value, str)
+                       and node.args[ti].value)
+            for kw in node.keywords:
+                if kw.arg == "tooltip" and isinstance(kw.value, ast.Constant) \
+                        and kw.value.value:
+                    literal = kw.value.value
+            if literal:
+                dead.append(f"{src.name}:{node.lineno} {key_node.value}")
     assert not dead, "\n  ".join(
         ["these tooltip literals are dead -- gui_tooltips.py supersedes them:"]
         + dead)

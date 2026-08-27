@@ -175,7 +175,85 @@ def test_no_scalar_spelling_can_abort_the_gui():
             f"message:\n  " + "\n  ".join(failures[:15]))
 
 
-TESTS = [test_no_scalar_spelling_can_abort_the_gui]
+def test_no_scalar_spelling_can_abort_a_body_card():
+    """The same sweep, over the body-first cards.
+
+    The cards are a SECOND set of widgets bound to the same configuration keys,
+    with their own loaders and their own refresh functions -- the auto-albedo
+    narration, the beaming facet-scale gate, the terrain registry mirror, the
+    thermal-inertia readout. Every one of those reads a value straight out of
+    the configuration, where ``yaml.safe_load`` may have left a string, a None
+    or a NaN, and every one runs from a Qt slot where an escaping exception is
+    a process abort rather than a message.
+
+    The sweep above cannot reach them: a card mirrors the configuration only
+    while it is the ACTIVE route, which is deliberate (five cards bind
+    ``simulation.start_time``, and an inactive one loading would let whichever
+    ran last decide the stored precision). So this drives each card through
+    ``activate()`` for every mode it offers, over its OWN bound keys -- which
+    is complete for the cards rather than a sample of them.
+    """
+    import yaml
+
+    with tempfile.TemporaryDirectory() as scratch:
+        ConfigManager, ConfigurationPanel = _panel_stack(scratch)
+        from gui_core.body_cards import modes_for
+
+        path = Path(scratch) / "card_spelling.yaml"
+        manager = ConfigManager()
+        panel = ConfigurationPanel(manager)
+        start = panel.tabs["start"]
+
+        routes = []
+        for name, card in sorted(panel.tabs.items()):
+            if not name.startswith("card_"):
+                continue
+            for mode in modes_for(card.route):
+                routes.append((card, mode.key, sorted(card.widgets)))
+        assert routes, "no body cards were found; this sweep checks nothing"
+        assert sum(len(keys) for _c, _m, keys in routes) > 40, (
+            "the cards bind fewer than forty keys in total; the derivation is "
+            "broken and this test would pass vacuously")
+
+        failures = []
+        checked = 0
+        for card, mode, keys in routes:
+            for spelling in SPELLINGS:
+                parsed = yaml.safe_load(spelling)
+                for dotted in keys:
+                    doc = {"simulation": {"body": "Moon"},
+                           "radiation": {"enabled": True, "beaming": True}}
+                    node = doc
+                    parts = dotted.split(".")
+                    for part in parts[:-1]:
+                        node = node.setdefault(part, {})
+                    node[parts[-1]] = parsed
+                    path.write_text(yaml.dump(doc, default_flow_style=False))
+                    checked += 1
+                    try:
+                        manager.load_from_yaml(str(path))
+                        # activate() is the real entry point: it applies the
+                        # mode, shows or hides groups, and mirrors the config.
+                        # One run type is enough -- the run type decides which
+                        # groups are VISIBLE and nothing about what is read --
+                        # and two doubled a gate that already runs for minutes.
+                        card.activate(mode, "time_series")
+                        start.route_for_config()
+                    except Exception as exc:               # noqa: BLE001
+                        failures.append(
+                            f"{card.route}/{mode}: {dotted} = {spelling}: "
+                            f"{type(exc).__name__}: {exc}")
+
+        print(f"    swept {checked} card x key x spelling combinations across "
+              f"{len(routes)} card modes, {len(failures)} raised")
+        assert not failures, (
+            f"{len(failures)} of {checked} card loads raised. Each one is an "
+            f"application abort (PyQt6 qFatal, exit 134), not an error "
+            f"message:\n  " + "\n  ".join(failures[:15]))
+
+
+TESTS = [test_no_scalar_spelling_can_abort_the_gui,
+         test_no_scalar_spelling_can_abort_a_body_card]
 
 
 def main():

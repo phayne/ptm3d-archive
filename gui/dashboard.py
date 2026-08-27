@@ -336,12 +336,33 @@ class UnifiedDashboard(QMainWindow):
                 self.console_panel.append_info("Configuration reset to defaults")
 
     def _on_open_project(self):
+        # THE OTHER DOOR. This is a second entry point into the same
+        # ConfigManager, and it has been missed twice before -- once for the
+        # save-mode disclosure, once because it never reloaded the panel. The
+        # body-key requirement (DP-7) applies here for the same reason it
+        # applies in the main window: a configuration with no simulation.body
+        # cannot be described by any card and cannot be run by the engine.
+        import yaml
+
+        from gui_core.body_cards import open_refusal
+
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Open Configuration",
             str(Path.home()),
-            "YAML Files (*.yaml *.yml);;All Files (*)"
+            "PTM3D configuration (*.yaml *.yml)"
         )
         if filepath:
+            try:
+                with open(filepath) as handle:
+                    probe = yaml.safe_load(handle)
+            except Exception as exc:                         # noqa: BLE001
+                self.console_panel.append_error(
+                    f"Could not read {Path(filepath).name}: {exc}")
+                return
+            refusal = open_refusal(filepath, probe)
+            if refusal:
+                self.console_panel.append_warning(f"Not opened: {refusal}")
+                return
             modules = self.registry.modules()
             idx = self._active_module_index
             if idx < len(modules):
