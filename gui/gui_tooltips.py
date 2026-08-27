@@ -1764,6 +1764,76 @@ TOOLTIPS = {
         "brings a SPICE kernel its coverage is compared with this run's dates "
         "straight away."
     ),
+    "ui.fetch_spk": (
+        "Ask JPL HORIZONS to build a SPICE kernel for this body over this "
+        "run's dates, and store it under data/horizons_cache so later runs "
+        "need no network.\n"
+        "The request reaches a year past each end of the run, including the "
+        "spin-up that happens before the start date, because a kernel costs "
+        "the same whether it spans a month or a decade and a short one fails "
+        "invisibly.\n"
+        "What arrives is read back and compared with the run before anything "
+        "is changed. If it does not span the whole window, the ephemeris "
+        "source is left as it was and the reason is printed: for an epoch "
+        "outside a kernel the engine substitutes orbital elements and logs "
+        "nothing, so a kernel that was never checked is a run that was never "
+        "checked.\n"
+        "Nothing is downloaded until you press this."
+    ),
+    "ui.fetch_sbdb": (
+        "Fill in radius, Bond albedo, rotation period and spin pole from "
+        "JPL's Small-Body Database.\n"
+        "Two of those are converted rather than copied, because the database "
+        "and the model do not use the same definitions. The database "
+        "publishes a diameter and a GEOMETRIC albedo p_V; this model takes a "
+        "radius and a BOND albedo, and it publishes the spin pole in ecliptic "
+        "coordinates while this model takes right ascension and declination. "
+        "The line under each field shows the conversion.\n"
+        "Thermal inertia is not filled in: no database publishes it the way "
+        "this one publishes a diameter, so the conductivity, density and heat "
+        "capacity below stay yours to set.\n"
+        "Everything filled in stays editable, and a failure changes nothing."
+    ),
+    "ui.fetch_damit_shape": (
+        "Look this body up in DAMIT, the database of asteroid shape models "
+        "derived from lightcurves, and use its model if one exists.\n"
+        "Most asteroids have no model, and the answer says so rather than "
+        "substituting a near miss: a different asteroid number is a different "
+        "body.\n"
+        "A model brings its own spin pole and rotation period, and they are "
+        "offered with it. They belong together -- the shape is described in "
+        "the frame its own pole and period define, so keeping the shape while "
+        "using a pole from elsewhere points the body in the wrong direction. "
+        "If the two disagree, the card says so instead of choosing.\n"
+        "The model fixes the body's shape but not its size, so it is scaled "
+        "to the radius on this card as it is stored."
+    ),
+    "ui.shape_provenance": (
+        "Where the shape file came from, and how to get it again.\n"
+        "Downloaded shape models are stored beside a small text record of "
+        "their source, database id and checksum. The models themselves are "
+        "excluded from this project's version control by a rule written for "
+        "compiler output, so a model exists in one copy on this machine and "
+        "the record is what makes it recoverable."
+    ),
+    "ui.spin_provenance": (
+        "Where each spin value came from: a database, a shape model, or you.\n"
+        "Worth reading before a long run. A pole from a lightcurve inversion "
+        "is a fit with an uncertainty of a few degrees and sometimes a mirror "
+        "solution; a pole nobody has measured is whatever was left in the "
+        "field. Neither is marked in the output, and both run to completion."
+    ),
+    "ui.thermal_inertia_manual": (
+        "Thermal inertia is not filled in from any database, and this says "
+        "what published values look like so the fields below can be set by "
+        "hand.\n"
+        "The values that exist come from individual thermophysical fits to "
+        "individual infrared data sets, each with its own roughness and shape "
+        "assumptions, so one lifted into a different model is not a "
+        "measurement. Fine regolith on a large main-belt asteroid runs low, "
+        "tens of units; a kilometre-scale near-Earth rubble pile runs in the "
+        "hundreds; bare rock runs over a thousand."
+    ),
     "ui.orbit_on_body_page": (
         "Open the Body page, where the six orbital elements and their epoch "
         "live.\n"
@@ -1835,6 +1905,15 @@ TOOLTIPS = {
         "here.\n"
         "Typical values: about 0.04 for a dark carbonaceous asteroid, 0.2 for "
         "a stony one, 0.5 or more for fresh ice.\n"
+        "NOT the geometric albedo p_V that catalogs publish. The two differ by "
+        "the phase integral q, and the conversion is A = p_V x q with "
+        "q = 0.290 + 0.684 G, where G is the slope parameter of the H, G "
+        "magnitude system (0.15 when none is published). Typing a published "
+        "p_V straight in reflects far too much sunlight and runs the body "
+        "cold: for a bright asteroid with p_V 0.42 and G 0.32 the Bond albedo "
+        "is 0.21, and using 0.42 instead absorbs a quarter less sunlight. "
+        "Filling this in from the Small-Body Database applies the conversion "
+        "and shows it under the field.\n"
         "Sets generic_body.surface.albedo."
     ),
     "generic_body.surface.emissivity": (
