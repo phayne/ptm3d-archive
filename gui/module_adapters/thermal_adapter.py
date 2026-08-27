@@ -161,7 +161,8 @@ class ThermalModule(AbstractModule):
 
         # Pre-flight (paths, dataless cloud files, disk, VF guard, exe)
         config_dict = self._cm.get_config()
-        report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
+        report = run_preflight(config_dict, SimulationRunner.find_ptm_executable,
+                               config_manager=self._cm)
         for line in report.summary_lines():
             # Route by the severity tag summary_lines() already applies. The
             # main window was fixed the same way, and this shares the same

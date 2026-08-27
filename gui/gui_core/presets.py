@@ -29,17 +29,141 @@ from dataclasses import dataclass, field
 LUNAR_RMS_SLOPE_DEG = 32.5
 
 
+#: What a BUILT-IN body's card clears: the whole `generic_body:` section.
+#:
+#: The engine reads `generic_body:` first and never consults `simulation.body`
+#: when one is configured -- `isConfigured()` is `!name.empty() || ...`
+#: (config_parser.h:717), tested at ptm_thermal_sim.cpp:14626. So a single
+#: leftover name under `generic_body:` does not merely add a stray key; it
+#: decides which body runs. Measured 2026-08-27: a name typed on the Asteroid
+#: card, then the Europa Global card, then Run, produced a configuration
+#: reading `simulation.body: Europa` whose run recorded `body=bennu`,
+#: `generic_body=true` and a 99.99 km median radius.
+#:
+#: Clearing it also restores the `thermophysical:` cleanup, which
+#: `_config_for_yaml` gates on the same "is a generic body active" question --
+#: that is why the same run also emitted the dead 19-key thermophysical block
+#: (PTM-67) instead of the `*_override` keys.
+#:
+#: `illumination.include_primary_reflection` is here for the mirror-image
+#: reason. The generic-body cards set it FALSE, which is right for a
+#: heliocentric asteroid and wrong for a moon: Europa's night side is lit by
+#: Jupiter, and leaving the switch off carried that straight into the next
+#: Europa run. It is a body-dependent default, so a body card must state it
+#: rather than inherit it.
+BUILTIN_BODY_CLEARS = (
+    "generic_body",
+    "illumination.include_primary_reflection",
+)
+
+#: What a GENERIC body's card clears: another body's mesh placement.
+#:
+#: The mirror of the above, and the same engine rule underneath -- the solver
+#: takes `mesh.import_file` whenever it is non-empty and reaches the icosphere
+#: branch only when it is empty (ptm_thermal_sim.cpp:15087). A lunar crater
+#: core mesh left behind by the Moon card would therefore become the asteroid's
+#: shape, at a latitude and longitude that mean nothing on it, against a
+#: view-factor matrix built for a different mesh entirely.
+#:
+#: The `generic_body:` section is NOT cleared here: it is what these cards are
+#: for. Nor is `mesh.resolution`, which the generic cards use for their own
+#: procedural sphere.
+#:
+#: `mesh.import_file` and `mesh.scale_factor` ARE cleared, and then
+#: :func:`mirror_shape_mesh` puts this body's OWN shape model back. Clearing
+#: without that step would delete a `custom_mesh` asteroid's DAMIT model:
+#: `mesh.import_file` is a MIRROR of `generic_body.shape.mesh_file` (the solver
+#: reads the top-level path, the generic-body one is metadata), and the card's
+#: `_propagate_shape_mesh` early-returns while a card is loading, so nothing
+#: would re-establish it. The run would then use the procedural sphere from
+#: `mesh.resolution` with the shape model unread on disk -- silently.
+GENERIC_BODY_CLEARS = (
+    "mesh.import_file",
+    "mesh.scale_factor",
+    "mesh.occluder_file",
+    "mesh.latitude_override",
+    "mesh.longitude_override",
+    "radiation.view_factor_file",
+)
+
+#: The mesh keys that describe WHERE ON WHICH BODY a local run sits, cleared
+#: when the user changes body.
+#:
+#: NOT part of any preset's `clears`. The global cards already reset these
+#: through their `sets` (a global run has no imported mesh), and a local-mesh
+#: card must NOT reset them just because it was opened: the lunar crater card
+#: is about an imported mesh, and clearing it on every open would leave the
+#: beaming facet-scale rule with nothing to measure on a mesh the user had
+#: already chosen.
+#:
+#: The rule is about the BODY changing, so it is applied where the body change
+#: is known -- `BodyFirstPanel._apply_route_defaults`. The lunar crater card
+#: and the Europa Sutton-DEM card both write `mesh.import_file`,
+#: `mesh.latitude_override` and `radiation.view_factor_file`, and going from
+#: one to the other used to carry the crater mesh, its lunar latitude and a
+#: view-factor matrix built for a different mesh into a Europa run.
+FOREIGN_MESH_CLEARS = (
+    "mesh.import_file",
+    "mesh.occluder_file",
+    "mesh.latitude_override",
+    "mesh.longitude_override",
+    "radiation.view_factor_file",
+)
+
+#: The shape spelling the engine branches on for a mesh-shaped generic body
+#: (`ptm_thermal_sim.cpp:14707`). Duplicated from `body_cards.GENERIC_MESH_SHAPE`
+#: only in the sense that both are pinned to the C++ literal by
+#: `test_gui_body_first.py`; imported rather than retyped below.
+def mirror_shape_mesh(config_manager):
+    """Point `mesh.import_file` at this generic body's own shape model.
+
+    ONE rule, in one place. `GenericBodyCard._propagate_shape_mesh` applies the
+    same rule when the user picks a shape file, and this applies it when a card
+    has just cleared the mesh keys. Two copies of "which key the solver reads"
+    is how the mirror came to be missing on one of the two paths.
+
+    Returns ``{dotted key: value}`` for what it wrote, or ``{}``.
+    """
+    shape_type = str(config_manager.get_value(
+        "generic_body.shape.type", "") or "").strip()
+    from gui_core.body_cards import GENERIC_MESH_SHAPE
+    if shape_type != GENERIC_MESH_SHAPE:
+        return {}
+    mesh_file = str(config_manager.get_value(
+        "generic_body.shape.mesh_file", "") or "").strip()
+    if not mesh_file:
+        return {}
+    scale = config_manager.get_value("generic_body.shape.mesh_scale", 1.0)
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError):
+        scale = 1.0
+    written = {"mesh.import_file": mesh_file, "mesh.scale_factor": scale}
+    for key, value in written.items():
+        config_manager.set_value(key, value)
+    return written
+
+
 @dataclass
 class PresetResult:
     """What applying a preset actually did."""
     applied: dict = field(default_factory=dict)   # dotted key -> value written
     refused: list = field(default_factory=list)   # (dotted key, reason)
     notes: list = field(default_factory=list)     # things the user must supply
+    #: dotted key -> the value that was there, for each key a `clears` section
+    #: reset. Reported, because a section quietly reset is the same defect as a
+    #: section quietly kept.
+    cleared: dict = field(default_factory=dict)
 
     def summary_lines(self):
         out = [f"Set {len(self.applied)} key(s):"]
         for key in sorted(self.applied):
             out.append(f"    {key} = {self.applied[key]!r}")
+        if self.cleared:
+            out.append(f"Cleared {len(self.cleared)} key(s) left by another "
+                       f"body's card:")
+            for key in sorted(self.cleared):
+                out.append(f"    {key} was {self.cleared[key]!r}")
         for key, reason in self.refused:
             out.append(f"REFUSED {key}: {reason}")
         for note in self.notes:
@@ -54,6 +178,18 @@ class Preset:
     summary: str
     #: Dotted key -> value, applied in order.
     sets: dict = field(default_factory=dict)
+    #: Whole top-level SECTIONS this preset resets to the engine default,
+    #: because carrying them under this body would describe a different body.
+    #:
+    #: `sets` cannot do this job. It writes the keys a card shows, and the
+    #: defect it left open is exactly the one measured on 2026-08-27: a name
+    #: typed on the Asteroid card survived the trip back to the landing screen,
+    #: the Europa card wrote `simulation.body: Europa` over the top of it, and
+    #: the engine -- which reads `generic_body:` FIRST and never looks at
+    #: `simulation.body` when one is present (`ptm_thermal_sim.cpp:14626`) --
+    #: ran a 100 km sphere at 1 AU. Clearing by SECTION rather than by key list
+    #: means a key added to `generic_body:` later is cleared too.
+    clears: tuple = ()
     #: "on" (subject to the scale rule), "off", or "n/a" (radiation is off).
     beaming: str = "off"
     #: Fields the user still has to fill in for this to be a runnable config.
@@ -90,6 +226,7 @@ PRESETS = [
             "radiation.enabled": False,
             "illumination.albedo_source": "builtin",
         },
+        clears=BUILTIN_BODY_CLEARS,
         beaming="n/a",
         beaming_note=(
             "Radiation exchange is off, and the engine reads radiation.beaming "
@@ -111,6 +248,11 @@ PRESETS = [
             "radiation.nearfield_quadrature_order": 3,
             "illumination.albedo_source": "builtin",
         },
+        # The mesh keys are NOT cleared here: this card is about an imported
+        # mesh, and the beaming rule below has to be able to measure one the
+        # user has already chosen. A DIFFERENT body's terrain is cleared by
+        # FOREIGN_MESH_CLEARS, on the body change, where that is knowable.
+        clears=BUILTIN_BODY_CLEARS,
         beaming="on",
         needs_advanced=True,
         needs=(
@@ -148,6 +290,7 @@ PRESETS = [
             "radiation.enabled": False,
             "illumination.albedo_source": "builtin",
         },
+        clears=BUILTIN_BODY_CLEARS,
         beaming="off",
         beaming_note=(
             "The Smith roughness parameterization is calibrated on LUNAR "
@@ -163,6 +306,13 @@ PRESETS = [
             "the HORIZONS page to fetch one, then this preset to set the rest "
             "of the run up around it."),
         sets={
+            # A placeholder, immediately overwritten by the card's own mirror
+            # of generic_body.name (GenericBodyCard._mirror_body_name) whenever
+            # there is a name to mirror. It is here so that the route defaults
+            # alone never leave the PREVIOUS card's body name in place: opening
+            # Mercury and then this card used to emit
+            # `simulation.body: Mercury` beside a generic_body: section.
+            "simulation.body": "Custom",
             "thermal.run_thermal_mesh": True,
             "radiation.enabled": False,
             "illumination.albedo_source": "none",
@@ -174,6 +324,7 @@ PRESETS = [
             # a claim about a key that would be silently dropped, which breaks
             # this module's first rule.
         },
+        clears=GENERIC_BODY_CLEARS,
         beaming="off",
         # NOT needs_advanced: nothing this card names sits behind an Advanced
         # SECTION. generic_body.* lives on the Body page, which is gated on a
@@ -237,6 +388,22 @@ def apply_preset(config_manager, preset, project_root=None):
     that direction, which is the safe one.
     """
     result = PresetResult()
+    # CLEAR BEFORE SET. A cleared section is reset from DEFAULT_CONFIG, so
+    # clearing after `sets` would wipe any key this preset had just written
+    # into that section.
+    for path in preset.clears:
+        removed = config_manager.reset_to_default(path)
+        if removed:
+            result.cleared.update(removed)
+    # A generic body's own shape model goes back immediately. See
+    # GENERIC_BODY_CLEARS: the clear above removed the PREVIOUS body's mesh,
+    # and this puts THIS body's back, so the two together mean "the mesh is
+    # whatever generic_body.shape says" rather than "no mesh".
+    if "mesh.import_file" in preset.clears:
+        restored = mirror_shape_mesh(config_manager)
+        for key, value in restored.items():
+            result.applied[key] = value
+            result.cleared.pop(key, None)
     for key, value in preset.sets.items():
         config_manager.set_value(key, value)
         result.applied[key] = value

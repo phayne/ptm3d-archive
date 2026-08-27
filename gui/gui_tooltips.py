@@ -1751,6 +1751,19 @@ TOOLTIPS = {
         "check that the kernel covers the whole window -- including the "
         "spin-up, which runs before the start date."
     ),
+    "ui.body_lookup": (
+        "Look the name in the Name field up and fill in what is known about "
+        "that body: NAIF id, radius, spin period, pole and orbital "
+        "elements.\n"
+        "Recommended before typing any of those by hand -- a mistyped "
+        "semi-major axis is a value nothing downstream can range-check.\n"
+        "The local cache under data/horizons_cache is searched first and "
+        "needs no network; JPL HORIZONS is asked only if the cache has no "
+        "match. If neither answers, nothing is changed and the message says "
+        "which happened. Everything filled in stays editable, and if the body "
+        "brings a SPICE kernel its coverage is compared with this run's dates "
+        "straight away."
+    ),
     "ui.orbit_on_body_page": (
         "Open the Body page, where the six orbital elements and their epoch "
         "live.\n"

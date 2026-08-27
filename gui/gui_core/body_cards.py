@@ -98,7 +98,7 @@ class _Mode:
 
 
 GLOBAL = _Mode("global", "Global",
-               "Procedural icosphere at a chosen subdivision level.")
+               "Icosphere at a chosen subdivision level.")
 LOCAL = _Mode("local", "Local mesh",
               "Imported terrain mesh, placed at a latitude and longitude.")
 
@@ -241,36 +241,41 @@ class RunType:
         self.produces = produces
 
 
+#: A run type's `summary` is drawn INSIDE its button, which is 180 px wide at
+#: its narrowest. Keep these short: the fuller wording belongs in the button's
+#: tooltip and in the "Produces:" line under it, both of which have room.
+#: `test_gui_button_text_fits.py` measures each one against the button's own
+#: font metrics at the button's minimum size and fails if it no longer fits.
 RUN_TYPES = (
     RunType(
         key="time_series",
         title="Time series",
-        summary=("One temperature field per output sample, resolving the "
-                 "diurnal or seasonal cycle and letting any face be plotted "
-                 "against time."),
+        summary="One temperature field per output sample.",
         sets={"output.skip_time_series": False,
               "thermal.compute_statistics": True},
-        produces=("a per-sample binary file per field, plus the summary maps"),
+        produces=("a per-sample binary file per field, plus the summary maps. "
+                  "Resolves the diurnal or seasonal cycle, so any face can be "
+                  "plotted against time"),
     ),
     RunType(
         key="integrated",
         title="Integrated statistics",
-        summary=("The same simulation, but only the minimum, mean and maximum "
-                 "over the whole window are written. Every per-sample file is "
-                 "skipped, which is most of the disk a long run uses."),
+        summary="Minimum, mean and maximum only.",
         sets={"output.skip_time_series": True,
               "thermal.compute_statistics": True},
-        produces="the summary maps in statistics/, and no per-sample files",
+        produces=("the summary maps in statistics/, and no per-sample files. "
+                  "The same simulation as a time series, without the files "
+                  "that are most of the disk a long run uses"),
     ),
     RunType(
         key="sweep",
         title="Parameter grid",
-        summary=("The same configuration run once per point of a grid -- for "
-                 "Europa, every Sutton terrain crossed with every latitude the "
-                 "shipped configurations use."),
+        summary="One run per point of a grid.",
         sets={"output.skip_time_series": False,
               "thermal.compute_statistics": True},
-        produces="one output directory per grid point, under a common root",
+        produces=("one output directory per grid point, under a common root. "
+                  "For Europa the grid is every Sutton terrain crossed with "
+                  "every latitude the shipped configurations use"),
     ),
 )
 
@@ -604,7 +609,8 @@ def _card_presets():
     and one set of tests. The three new ones fill the routes the task cards
     never covered.
     """
-    from gui_core.presets import PRESETS_BY_KEY, Preset
+    from gui_core.presets import (BUILTIN_BODY_CLEARS, GENERIC_BODY_CLEARS,
+                                  PRESETS_BY_KEY, Preset)
 
     europa_site = Preset(
         key="europa_dem_site",
@@ -621,6 +627,10 @@ def _card_presets():
             "radiation.enabled": True,
             "illumination.albedo_source": "none",
         },
+        # The mesh keys are NOT cleared here; see the lunar crater preset. A
+        # DIFFERENT body's terrain is cleared on the body change, by
+        # BodyFirstPanel._apply_route_defaults.
+        clears=BUILTIN_BODY_CLEARS,
         beaming="off",
         needs=("mesh.import_file -- pick a terrain, which also fills in its "
                "view-factor cache path",),
@@ -649,6 +659,7 @@ def _card_presets():
             "radiation.enabled": False,
             "illumination.albedo_source": "none",
         },
+        clears=BUILTIN_BODY_CLEARS,
         beaming="n/a",
         beaming_note=(
             "Radiation exchange is off, and the sub-facet roughness slope is "
@@ -664,11 +675,17 @@ def _card_presets():
                  "simulation.body instead will not start a run, because the "
                  "engine has no radius, albedo or orbit to go with the name."),
         sets={
+            # See the `generic_body` preset in gui_core/presets.py: a
+            # placeholder the card's own mirror of generic_body.name replaces,
+            # here so the route defaults never leave the previous card's body
+            # name under a generic_body: section.
+            "simulation.body": "Custom",
             "thermal.run_thermal_mesh": True,
             "radiation.enabled": False,
             "illumination.albedo_source": "none",
             "illumination.include_primary_reflection": False,
         },
+        clears=GENERIC_BODY_CLEARS,
         beaming="off",
         needs=("generic_body.name -- what the body is called",
                "generic_body.shape -- a radius, semi-axes, or a shape mesh",

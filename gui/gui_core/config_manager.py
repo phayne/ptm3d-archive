@@ -40,6 +40,40 @@ def _collect_section_keys(node, prefix=""):
             _collect_section_keys(value, f"{prefix}{key}.")
 
 
+def _flatten_leaves(node, prefix=""):
+    """``{dotted key: leaf value}`` for a (possibly nested) section."""
+    out = {}
+    if not isinstance(node, dict):
+        return out
+    for key, value in node.items():
+        dotted = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            out.update(_flatten_leaves(value, dotted))
+        else:
+            out[dotted] = value
+    return out
+
+
+#: The bodies the ENGINE has built-in properties for, lower-cased for matching.
+#: Generated from ``planetary_properties.h`` -- not retyped, so a body added or
+#: removed in C++ moves this set rather than needing somebody to remember.
+#:
+#: This is the discriminator for the emission rule below. It is imported
+#: defensively because `ptm.body_table` is generated, and a GUI that cannot
+#: import it must still start -- it just cannot make the check, and says so.
+try:
+    from ptm.body_table import IMPLEMENTED_BODIES as _IMPLEMENTED_BODIES
+    BUILTIN_BODY_NAMES = frozenset(str(b).strip().lower()
+                                   for b in _IMPLEMENTED_BODIES)
+except Exception:                                            # pragma: no cover
+    logger.warning(
+        "[config] ptm.body_table is unavailable, so a configuration that names "
+        "a built-in body AND carries a generic_body: section cannot be "
+        "detected here; the engine will run the generic body and ignore "
+        "simulation.body.")
+    BUILTIN_BODY_NAMES = frozenset()
+
+
 def _sync_with_engine_defaults(shape, overrides, prefix=""):
     """Replace every value in `shape` that is an engine key with the engine's own.
 
@@ -572,6 +606,28 @@ class ConfigManager:
         #: preserve comments (ruamel.yaml missing). The GUI shows it once as a
         #: dialog and every time in the console; it is never silent.
         self.comment_loss_disclosed = False
+        #: What the LAST `_config_for_yaml()` had to correct so the emitted
+        #: configuration named one body rather than two, or "". Same lifetime
+        #: as `last_save_layout_changes`: set on every emission. Read by
+        #: `gui_core.preflight.run_preflight`, which puts it in front of the
+        #: user before a run starts, and by the body cards' own report.
+        self.last_body_identity_conflict = ""
+        #: True once `simulation.body` is an explicit statement -- a file that
+        #: sets it, or a control that wrote it -- rather than DEFAULT_CONFIG's
+        #: 'Moon' showing through.
+        #:
+        #: The identity rule below MUST NOT fire on the default. A generic-body
+        #: configuration may legitimately omit `simulation.body` (the engine
+        #: ignores that key entirely when a generic body is configured, and all
+        #: seven cached `body_config.yaml` files are written that way), and the
+        #: merge with DEFAULT_CONFIG then supplies 'Moon'. Treating that as
+        #: "the user named the Moon" would delete the whole `generic_body:`
+        #: section of a perfectly good asteroid file and emit a Moon run
+        #: instead -- the opposite of the defect this rule exists to fix, and
+        #: with the same silence. Same shape of problem, and the same remedy,
+        #: as `legacy_implicit_beaming`: "the file did not mention it" is
+        #: information only the loader has.
+        self.body_is_explicit = False
 
     def reset_to_defaults(self):
         """Reset configuration to defaults"""
@@ -579,6 +635,8 @@ class ConfigManager:
         self.legacy_implicit_beaming = None
         self._source_doc = None
         self._loaded_engine_view = None
+        self.last_body_identity_conflict = ""
+        self.body_is_explicit = False
 
     def generic_body_active(self):
         """True when the config carries real generic-body data (the engine
@@ -605,6 +663,10 @@ class ConfigManager:
             current = current[k]
 
         current[keys[-1]] = value
+        if key == "simulation.body":
+            # Somebody chose this: a control, a preset, or a card's mirror of
+            # the generic body's name. See `body_is_explicit`.
+            self.body_is_explicit = bool(str(value or "").strip())
 
     def get_value(self, key, default=None):
         """Get a configuration value using dot notation"""
@@ -617,6 +679,52 @@ class ConfigManager:
             return current
         except (KeyError, TypeError):
             return default
+
+    def reset_to_default(self, path):
+        """Reset one section or one key to its default, reporting what moved.
+
+        `path` is a top-level section name (``"generic_body"``) or a dotted key
+        (``"mesh.import_file"``). Returns ``{dotted key: previous value}`` for
+        every leaf that actually changed -- empty when it was already at its
+        default. The return value exists so a caller can SAY what it cleared; a
+        setting silently reset is the same defect as a setting silently kept.
+
+        This is what makes a card able to clear another card's residue.
+        ``set_value`` cannot do it at section granularity: it writes one leaf,
+        so clearing ``generic_body`` with it means enumerating twenty keys and
+        remembering to extend the list when the schema grows. Resetting from
+        ``DEFAULT_CONFIG`` instead makes the schema the single source of what
+        "cleared" means.
+        """
+        parts = str(path).split(".")
+        default_node = self.DEFAULT_CONFIG
+        for part in parts:
+            if not isinstance(default_node, dict) or part not in default_node:
+                # Never silent: a `clears` entry naming a key this schema does
+                # not have would otherwise clear nothing and report nothing.
+                raise KeyError(
+                    f"{path!r} is not a key or section of DEFAULT_CONFIG, so "
+                    f"there is no default to reset it to.")
+            default_node = default_node[part]
+        default = deepcopy(default_node)
+
+        current_parent = self.config
+        for part in parts[:-1]:
+            node = current_parent.get(part)
+            if not isinstance(node, dict):
+                node = {}
+                current_parent[part] = node
+            current_parent = node
+        leaf = parts[-1]
+
+        before = _flatten_leaves(current_parent.get(leaf), path) \
+            if isinstance(current_parent.get(leaf), dict) \
+            else {path: current_parent.get(leaf)}
+        after = _flatten_leaves(default, path) if isinstance(default, dict) \
+            else {path: default}
+        current_parent[leaf] = default
+        return {key: value for key, value in before.items()
+                if key not in after or after[key] != value}
 
     def load_from_yaml(self, filename):
         """Load configuration from YAML file"""
@@ -693,6 +801,16 @@ class ConfigManager:
             loaded_slope
             if "beaming" not in loaded_rad and loaded_slope > 0.0
             else None)
+
+        # Did the FILE name a body? Only the loader can answer that: the merge
+        # below supplies DEFAULT_CONFIG's 'Moon' either way, and the identity
+        # rule must not read that default as a statement about the body. See
+        # `body_is_explicit`.
+        loaded_sim = ((loaded or {}).get("simulation", {}) or {}) \
+            if isinstance(loaded, dict) else {}
+        self.body_is_explicit = bool(
+            str((loaded_sim or {}).get("body", "") or "").strip()
+            if isinstance(loaded_sim, dict) else False)
 
         self.config = self._deep_merge(deepcopy(self.DEFAULT_CONFIG), loaded or {})
         if self.legacy_implicit_beaming is not None:
@@ -1065,6 +1183,64 @@ class ConfigManager:
                 result[k] = v
         return result
 
+    def body_identity_conflict(self):
+        """The one-line reason this configuration names two different bodies.
+
+        Empty string when it does not. A configuration that sets
+        ``simulation.body`` to a body the engine implements AND carries a
+        ``generic_body:`` section names two bodies, and the engine resolves
+        that in a way nothing in this application used to say out loud::
+
+            ConfigParser::GenericBodyParams::isConfigured()   config_parser.h:717
+                return !config_file.empty() || !name.empty()
+                       || hasOrbitalElements() || hasSpinState();
+
+            if (sim_config.generic_body.isConfigured()) {     ptm_thermal_sim.cpp:14626
+                ...                                          // simulation.body
+                planet = thermal::Planet(generic_body.name,   // is NEVER read
+                                         generic_body.thermo);
+
+        A single leftover ``generic_body.name`` therefore wins outright:
+        ``simulation.body`` is not consulted, ``target_body_name`` is never set
+        (it is assigned only on the built-in branch, ``:14127``), and so the
+        albedo-map loader at ``:7660`` reports "No body name in config" and
+        falls back to a uniform albedo. Measured on 2026-08-27: a Europa Global
+        card run emitted ``simulation.body: Europa`` beside
+        ``generic_body: {name: bennu}`` and the engine's own provenance.txt
+        recorded ``body=bennu``, ``generic_body=true``,
+        ``mesh_median_radius=99.99`` km -- a 100 km sphere at 1 AU where a
+        1561 km moon at 5.2 AU was asked for.
+
+        Every shipped configuration that carries a ``generic_body:`` block sets
+        ``simulation.body`` to that same body's name (25 of 25, measured), so
+        this combination is never a legitimate configuration -- it is always
+        one card's leftovers under another card's body.
+        """
+        if not self.body_is_explicit:
+            # DEFAULT_CONFIG's 'Moon' showing through, not a choice. See
+            # `body_is_explicit`: firing here would delete the generic_body:
+            # section of every asteroid configuration that omits the key.
+            return ""
+        body = str((self.config.get("simulation") or {}).get("body", "") or "")
+        body = body.strip()
+        if body.startswith("[H] "):
+            return ""            # an explicit HORIZONS body: the generic route
+        if body.lower() not in BUILTIN_BODY_NAMES:
+            return ""
+        if not self.generic_body_active():
+            return ""
+        gb = self.config.get("generic_body") or {}
+        named = (gb.get("name") or gb.get("config_file")
+                 or f"semi_major_axis_au "
+                    f"{(gb.get('orbit') or {}).get('semi_major_axis_au')}")
+        return (
+            f"simulation.body is {body!r}, but the configuration also carries a "
+            f"generic_body: section ({named!r}). The engine reads the "
+            f"generic body and ignores simulation.body entirely, so this would "
+            f"run {named!r} -- with its radius, orbit, spin and albedo -- under "
+            f"the name {body!r}. The generic_body: section is left out of the "
+            f"configuration written for the run.")
+
     def _config_for_yaml(self):
         """Return config dict suitable for YAML output.
 
@@ -1077,9 +1253,29 @@ class ConfigManager:
         - Sentinel values (-1.0, empty strings) are stripped for clean YAML
         - Semi-axes a/b/c are converted to a ``semi_axes_km`` YAML sequence
           as expected by the C++ parser (config_parser.cpp:133)
+
+        A ``generic_body:`` section that contradicts a built-in
+        ``simulation.body`` is DROPPED here and recorded in
+        ``last_body_identity_conflict`` -- see :meth:`body_identity_conflict`
+        for why that combination can only ever be another card's residue, and
+        what the engine does with it if it is emitted. This is the last point
+        before the engine, so it holds whether the residue arrived from a card,
+        from the full settings view, or from a file somebody hand-edited.
         """
         from copy import deepcopy as _dc
-        generic_active = self.generic_body_active()
+        # Reset per call, like last_save_layout_changes: this records what THIS
+        # emission did, and _config_for_yaml is called on every preview, every
+        # save and twice per round-trip plan.
+        self.last_body_identity_conflict = self.body_identity_conflict()
+        if self.last_body_identity_conflict:
+            logger.warning("[config] %s", self.last_body_identity_conflict)
+        # ONE decision, used by both the generic_body: branch and the
+        # thermophysical: branch below. They used to read
+        # `generic_body_active()` separately, which is how a single stale
+        # `generic_body.name` also suppressed the thermophysical cleanup and
+        # put the whole dead 19-key block back into the file (PTM-67).
+        generic_active = (self.generic_body_active()
+                          and not self.last_body_identity_conflict)
         out = {}
         for k, v in self.config.items():
             if k == "gpu":
@@ -1153,9 +1349,13 @@ class ConfigManager:
                 out[k] = cleaned
                 continue
             if k == "generic_body":
-                # Include generic_body when it carries real data
+                # Include generic_body when it carries real data AND does not
+                # contradict a built-in simulation.body. `generic_active` is
+                # the single decision computed at the top of this method, so
+                # this branch and the thermophysical: branch above can no
+                # longer disagree about whether a generic body is in play.
                 gb = v if isinstance(v, dict) else {}
-                has_data = (
+                has_data = generic_active and (
                     gb.get("config_file") or gb.get("name")
                     or self._as_number(
                 (gb.get("orbit") or {}).get("semi_major_axis_au", -1.0), -1.0) > 0

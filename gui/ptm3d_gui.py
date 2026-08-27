@@ -841,7 +841,8 @@ class PTM3DMainWindow(QMainWindow):
         # face-count guard, executable fingerprint. A config that fails
         # pre-flight would previously hang or crash mid-run with no
         # diagnosis (e.g. an OneDrive topo_directory of evicted files).
-        report = run_preflight(config_dict, SimulationRunner.find_ptm_executable)
+        report = run_preflight(config_dict, SimulationRunner.find_ptm_executable,
+                               config_manager=self.config_manager)
         for line in report.summary_lines():
             # summary_lines() already tags severity; route it so a warning is
             # colored as one. Everything went through append_info before, which
