@@ -166,12 +166,38 @@ def topo_status(body, resolution, project_root, env=None, manifest=None):
         f"not on disk (dataset '{dataset or 'unknown'}')", dataset)
 
 
-def albedo_status(body, resolution, project_root, env=None, manifest=None):
-    """Status of the built-in albedo map for (body, resolution).
+#: The latitude/longitude maps the engine interpolates onto an ARBITRARY mesh,
+#: in the order AlbedoManager::tryLoadBestMap tries them. Imported from the
+#: generated engine table rather than retyped, so a change to the engine's
+#: naming shows up here.
+try:
+    from ptm.body_table import ALBEDO_FITS_PATTERNS
+except ImportError:                                   # pragma: no cover
+    ALBEDO_FITS_PATTERNS = ("{Body}-0.5deg-BondAlbedo.fits",)
+
+
+def albedo_status(body, resolution, project_root, env=None, manifest=None,
+                  import_file=None):
+    """Status of the built-in albedo map for (body, resolution, mesh).
 
     Mirrors the engine: prefers <Body>_Albedo_res<meshres>.bin, but the
     engine will fall back to the highest available res 8 -> 3, so any
-    resolution present counts as available (with a note)."""
+    resolution present counts as available (with a note).
+
+    ``import_file`` is the mesh, and it changes the answer. The engine picks
+    the albedo branch on ``is_custom_mesh``, which is the mesh file alone
+    (``ptm_thermal_sim.cpp:17036``), and the per-face binary is matched to its
+    icosphere BY FACE COUNT -- the load is refused outright on a size mismatch
+    (``:2471``). So on an imported mesh the per-face map cannot apply at all,
+    and what does apply is a latitude/longitude FITS map, which the engine
+    interpolates onto any mesh (``:2329``).
+
+    Ignoring the mesh is why this function used to promise a per-face map for a
+    lunar crater configuration that the engine would then reject, falling back
+    to a single albedo and saying so only on stdout (BUGS.md
+    GUI-ALBEDO-STATUS-IGNORES-MESH). Callers that genuinely have no mesh in
+    hand may still omit the argument; callers that do have one must pass it.
+    """
     body_lc = str(body).strip().lower()
     if body_lc not in ALBEDO_BODIES:
         return DatasetStatus(
@@ -180,6 +206,35 @@ def albedo_status(body, resolution, project_root, env=None, manifest=None):
             "(Moon and Europa ship albedo maps today)")
     root_dir = resolve_data_reference(ALBEDO_CONFIG_VALUE, project_root, env)
     proper = _proper(body)
+
+    if str(import_file or "").strip():
+        manifest = manifest if manifest is not None else read_manifest(
+            project_root, env)
+        for pattern in ALBEDO_FITS_PATTERNS:
+            candidate = root_dir / pattern.format(Body=proper)
+            state = _classify(candidate)
+            dataset = dataset_for_data_path(
+                manifest, f"{ALBEDO_CONFIG_VALUE}/{candidate.name}")
+            if state == STATE_OK:
+                return DatasetStatus(
+                    STATE_OK, candidate,
+                    "a latitude/longitude map, interpolated onto the imported "
+                    "mesh (the per-face map is matched by face count and "
+                    "cannot apply to an imported mesh)", dataset)
+            if state == STATE_DATALESS:
+                return DatasetStatus(
+                    STATE_DATALESS, candidate,
+                    "present but DATALESS (cloud placeholder) -- hydrate or "
+                    "re-fetch", dataset)
+        first = root_dir / ALBEDO_FITS_PATTERNS[0].format(Body=proper)
+        return DatasetStatus(
+            STATE_MISSING, first,
+            "this run uses an imported mesh, so the per-face albedo map "
+            "cannot apply -- it is matched to a procedural sphere by face "
+            "count. A latitude/longitude map would apply and is not on disk, "
+            "so every face takes the single Bond albedo from Properties.",
+            dataset_for_data_path(manifest,
+                                  f"{ALBEDO_CONFIG_VALUE}/{first.name}"))
     exact = root_dir / f"{proper}_Albedo_res{int(resolution)}.bin"
     manifest = manifest if manifest is not None else read_manifest(project_root, env)
     dataset = dataset_for_data_path(

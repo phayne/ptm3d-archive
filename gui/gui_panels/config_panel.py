@@ -697,8 +697,20 @@ class SimulationTab(BaseConfigTab):
     CUSTOM_BODY = "Custom Body..."
     BROWSE_HORIZONS = "Browse HORIZONS..."
 
-    # Standard built-in bodies (Moon first: the default and best-validated body)
-    BUILTIN_BODIES = ["Moon", "Europa", "Mercury", "Enceladus", "Titan", "Mars", "Ceres"]
+    # The bodies the ENGINE implements, in its own order, taken from the
+    # generated table rather than retyped.
+    #
+    # This list used to carry Enceladus, Titan, Mars and Ceres as well. The
+    # engine implements three bodies and resolved every other name to EUROPA:
+    # selecting Mars produced a run that exited 0, wrote all sixteen statistics
+    # binaries, and was entirely fictitious -- Europa's radius, Europa's
+    # metakernel, Europa's albedo, and 0.000000000 W/m^2 of solar flux on every
+    # face at every timestep, with one `Note:` line on stderr
+    # (BUGS.md ENG-BODY-UNBACKED-RUN / GUI-BODY-DROPDOWN-UNBACKED). The engine
+    # now refuses those names outright; offering them here would be offering a
+    # choice that cannot start. Anything not in this list is a Custom Body.
+    from ptm.body_table import IMPLEMENTED_BODIES as _IMPLEMENTED
+    BUILTIN_BODIES = list(_IMPLEMENTED)
 
     def init_ui(self):
         self._syncing = False
@@ -3817,8 +3829,13 @@ class ThermophysicalTab(BaseConfigTab):
 class BodyDefinitionTab(BaseConfigTab):
     """Body definition parameters: shape, orbit, spin, ephemeris source."""
 
-    # Built-in bodies that use SPICE (fields should be informational only)
-    BUILTIN_BODIES = {"Europa", "Moon", "Mercury", "Enceladus", "Titan", "Mars", "Ceres"}
+    # Built-in bodies that use SPICE (fields should be informational only).
+    # The same generated list the Simulation page uses: this set decides
+    # whether the generic-body fields are DISABLED, so carrying four extra
+    # names here disabled the one route that would have made Mars real while
+    # the panel showed Mars-specific property values for it.
+    from ptm.body_table import IMPLEMENTED_BODIES as _IMPLEMENTED
+    BUILTIN_BODIES = set(_IMPLEMENTED)
 
     def init_ui(self):
         content = QWidget()
@@ -4549,7 +4566,14 @@ class IlluminationTab(BaseConfigTab):
         res = int(ConfigManager._as_number(
             self.config_manager.get_value("mesh.resolution", 5), 5))
         root = self._project_root()
-        status = datasets.albedo_status(body, res, root)
+        # The MESH decides which albedo branch the engine takes, so it is part
+        # of the question. Without it this display promised a per-face map for
+        # every imported-mesh configuration, and the engine rejected it on a
+        # size mismatch and fell back to a single value, on stdout
+        # (GUI-ALBEDO-STATUS-IGNORES-MESH).
+        status = datasets.albedo_status(
+            body, res, root,
+            import_file=self.config_manager.get_value("mesh.import_file", ""))
         supported = status.state != datasets.STATE_UNSUPPORTED
 
         self.albedo_builtin_radio.setEnabled(supported)
@@ -5392,6 +5416,10 @@ class ConfigurationPanel(QWidget):
     #: card). Carries that file's path. The main window must forget which
     #: project file it was editing.
     project_replaced = pyqtSignal(str)
+    #: "Open a configuration file…" on the body-first landing screen. Re-emitted
+    #: rather than opening a dialog here, because the window owns the
+    #: unsaved-changes check, the recent-files list and the project file.
+    open_requested = pyqtSignal()
 
     def __init__(self, config_manager):
         super().__init__()
@@ -5406,8 +5434,32 @@ class ConfigurationPanel(QWidget):
         # Create splitter for tabs and preview
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Create and add tabs
-        self.tabs["start"] = TaskCardsTab(self.config_manager)
+        # Create and add tabs.
+        #
+        # The Start page is the BODY-FIRST flow (landing -> run type -> one
+        # card), which REPLACES the task-card landing screen: four of those
+        # five cards were body cards under other names, and the fifth
+        # ("reproduce a published baseline") is not a body at all and is now an
+        # entry mode on the landing screen.
+        #
+        # The body cards are built HERE, not inside the flow, so each one is
+        # registered in self.tabs and therefore inside the tooltip-coverage,
+        # scalar-spelling and tier gates. A card those gates cannot see is a
+        # card that can ship with a bare control or abort the window on a
+        # quoted number.
+        from gui_panels.body_cards_panel import (
+            AsteroidCard, BodyFirstPanel, CustomBodyCard, EuropaCard,
+            MercuryCard, MoonCard)
+        self.tabs["start"] = BodyFirstPanel(self.config_manager)
+        body_cards = {}
+        for route, factory in (("Moon", MoonCard), ("Europa", EuropaCard),
+                               ("Mercury", MercuryCard),
+                               ("asteroid", AsteroidCard),
+                               ("custom", CustomBodyCard)):
+            card = factory(self.config_manager, route, self.tabs["start"])
+            body_cards[route] = card
+            self.tabs[f"card_{route.lower()}"] = card
+        self.tabs["start"].register_cards(body_cards)
         self.tabs["simulation"] = SimulationTab(self.config_manager)
         self.tabs["mesh"] = MeshTab(self.config_manager)
         self.tabs["thermal"] = ThermalTab(self.config_manager)
@@ -5471,6 +5523,12 @@ class ConfigurationPanel(QWidget):
             self.stacked_widget.addWidget(self.tabs[key])
             self._nav_keys.append(key)
 
+        # The five body cards live INSIDE the Start page's own stack, not in
+        # the nav rail: the whole point of the two levels is that a card is
+        # reached by choosing a body, and everything else is one control away
+        # under "All settings".
+        self._card_keys = [k for k in self.tabs if k.startswith("card_")]
+
         if self._horizons_panel:
             self.nav_rail.addItem("HORIZONS")
             self.stacked_widget.addWidget(self._horizons_panel)
@@ -5516,11 +5574,22 @@ class ConfigurationPanel(QWidget):
         self.tabs["start"].preset_applied.connect(
             lambda _key: self.load_from_config())
         # Re-emitted so the main window can detach its project file; see
-        # TaskCardsTab.project_replaced.
+        # BodyFirstPanel.project_replaced.
         self.tabs["start"].project_replaced.connect(self.project_replaced)
         # A card that asks for expert fields reveals them, rather than naming
         # controls the current tier hides.
         self.tabs["start"].advanced_requested.connect(self._reveal_advanced)
+        # "All settings…" is the second of the two levels. It lands on
+        # Simulation rather than wherever the rail happened to be, so the move
+        # from a card to the full view is somewhere recognizable.
+        self.tabs["start"].all_settings_requested.connect(self.show_all_settings)
+        self.tabs["start"].open_requested.connect(self.open_requested)
+        # Choosing a body writes a group of keys, and every section tab has to
+        # re-read afterward or the next widget event writes a stale value back.
+        # That is `preset_applied`, connected above -- it fires exactly when a
+        # card APPLIED its defaults. `route_changed` also fires when a card is
+        # merely shown (opening a file), where the configuration did not
+        # change, so connecting it too would reload eleven tabs for nothing.
 
         # Connect body selection to thermophysical and body definition tabs
         if "simulation.body" in self.tabs["simulation"].widgets:
@@ -5694,6 +5763,29 @@ class ConfigurationPanel(QWidget):
         """Update YAML preview"""
         yaml_content = self.config_manager.generate_yaml()
         self.preview_text.setText(yaml_content)
+
+    def show_all_settings(self):
+        """The second level: the eleven-section view, landing on Simulation."""
+        idx = self.stacked_widget.indexOf(self.tabs["simulation"])
+        if idx >= 0:
+            self.stacked_widget.setCurrentIndex(idx)
+            self.nav_rail.setCurrentRow(idx)
+
+    def show_body_first(self):
+        """The first level: the body-first Start page."""
+        idx = self.stacked_widget.indexOf(self.tabs["start"])
+        if idx >= 0:
+            self.stacked_widget.setCurrentIndex(idx)
+            self.nav_rail.setCurrentRow(idx)
+
+    def land_on_loaded_config(self):
+        """After an open: land on the loaded configuration's own body card.
+
+        Returns the `BodyRoute`, whose `refusal` is non-empty when the file
+        could not be routed -- which is REPORTED, never guessed past.
+        """
+        self.show_body_first()
+        return self.tabs["start"].land_on_current_config()
 
     def switch_to_horizons_tab(self):
         """Switch to the HORIZONS search tab."""

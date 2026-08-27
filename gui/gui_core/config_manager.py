@@ -1702,6 +1702,27 @@ class ConfigManager:
                 f"one of {', '.join(valid_vtk_modes)}. The engine writes no "
                 f"VTK for anything else and does not say so.")
 
+        # A custom body's surface value too small to survive the trip into the
+        # solver. The engine forwards it through std::to_string -- six decimal
+        # places -- so anything under 5e-7 arrives as "0.000000", fails the
+        # receiving positive-value check, and the run silently keeps a
+        # PLACEHOLDER property instead (BUGS.md PTM-201; measured, ks = kd =
+        # 4e-7 and ks = 0.0096, kd = 0.05 give byte-identical statistics -- a
+        # 24000-fold conductivity error with nothing said).
+        #
+        # An ERROR, not a warning: the run would complete, look complete, and
+        # be wrong. ks below 5e-7 W/m/K is not exotic -- it is the porous end
+        # of the cometary and trans-Neptunian regolith literature, which is
+        # exactly where someone modeling an insulating lag would go.
+        try:
+            from gui_core.body_cards import tiny_surface_refusals
+            errors.extend(tiny_surface_refusals(self.config))
+        except ImportError:                              # pragma: no cover
+            warnings.append(
+                "Warning: the custom-body surface round-trip check could not "
+                "be loaded, so a conductivity or density too small to reach "
+                "the solver would not be caught here.")
+
         # GPU warnings
         thermal = self.config.get("thermal", {})
         gpu_requested = thermal.get("use_gpu") or rad.get("use_gpu")

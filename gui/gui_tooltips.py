@@ -1616,6 +1616,258 @@ TOOLTIPS = {
         "Aim for at least about 48 frames per diurnal cycle: the surface "
         "temperature peak is sharp, and a coarser cadence clips it."
     ),
+
+    # =========================================================================
+    # THE BODY-FIRST SCREENS
+    # =========================================================================
+    "ui.body_button": (
+        "Choose the world you are modeling. The choice sets the orbit, the "
+        "spin, the surface properties, the ephemeris kernels and which "
+        "physics options are even offered, so the rest of the setup is a "
+        "handful of decisions rather than a form.\n"
+        "Only bodies this engine actually implements appear here. A body it "
+        "has no properties for is refused rather than run with another "
+        "body's radius and no sunlight, so use Custom body for anything not "
+        "shown."
+    ),
+    "ui.body_mode": (
+        "Whether to model the whole body as a sphere, or one piece of ground "
+        "from a terrain mesh you supply.\n"
+        "The whole body is right for diurnal and seasonal behavior and for "
+        "global maps. A place on it is right for craters, ridges and landing "
+        "sites, where local shadowing and infrared exchange between facets "
+        "dominate.\n"
+        "This is the engine's own distinction and it is the mesh file alone: "
+        "supplying mesh.import_file makes it a local run."
+    ),
+    "ui.run_type": (
+        "What the run should produce.\n"
+        "Temperature through time writes one field per output sample, so any "
+        "face can be plotted against time. Recommended for a first run and "
+        "for anything diurnal.\n"
+        "Summary maps only writes the minimum, mean and maximum over the "
+        "window and skips every per-sample file -- the same physics, a "
+        "fraction of the disk. Right for long or seasonal runs.\n"
+        "A grid of runs repeats the same setup once per point of a grid.\n"
+        "Sets output.skip_time_series."
+    ),
+    "ui.all_settings": (
+        "Open the full eleven-section configuration view. Everything a card "
+        "shows is there too, along with every option a card leaves at its "
+        "default.\n"
+        "Nothing is lost by moving between the two: they edit the same "
+        "configuration, and an edit made in either is visible in the other."
+    ),
+    "ui.back_to_bodies": (
+        "Return to the body chooser. The configuration is not reset -- "
+        "everything set so far stays set until another body's card is "
+        "applied, which announces what it changed."
+    ),
+    "ui.back_to_runtype": (
+        "Return to the run-type step, where the choice between the whole body "
+        "and a place on it also lives. The configuration is left as it is."
+    ),
+    "ui.landing_open": (
+        "Open an existing configuration file. It must be YAML and it must "
+        "name a body under simulation.body, because that is what decides "
+        "which card describes it.\n"
+        "Anything the card does not show is kept exactly as the file had it, "
+        "listed above the card, and editable under All settings."
+    ),
+    "ui.landing_baseline": (
+        "Load the configuration a finished run actually used, from that run's "
+        "own config_used.yaml, and report the engine build it ran on.\n"
+        "Use this to reproduce a published result: it reads the values rather "
+        "than guessing them, and it says plainly whether your engine is the "
+        "same one."
+    ),
+    "ui.europa_terrain": (
+        "Which Sutton digital elevation model to run. The list, the file "
+        "paths and the latitudes each terrain offers are read out of the "
+        "configurations shipped with PTM3D, so they cannot drift from them.\n"
+        "Choosing one fills in both the terrain mesh and the matching "
+        "view-factor cache path. These elevation models are not distributed "
+        "with PTM3D; the line below says whether the file is on disk.\n"
+        "Sets mesh.import_file and radiation.view_factor_file."
+    ),
+    "ui.europa_sweep": (
+        "Write one configuration per point of the terrain-by-latitude grid -- "
+        "the same set of runs the shipped Europa configurations describe, "
+        "derived from the choices on this card.\n"
+        "They are written, not launched. A grid of this size runs for hours, "
+        "and a long run belongs in a detached process that survives closing "
+        "this window."
+    ),
+    "ui.ephemeris_keplerian": (
+        "Compute the body's position from orbital elements rather than from a "
+        "SPICE kernel. A deliberate choice, recorded in the configuration.\n"
+        "Right when no kernel covers your dates, or when you are varying the "
+        "orbit yourself. Accurate for a short window near the elements' own "
+        "epoch and progressively less so away from it."
+    ),
+    "ui.ephemeris_spice": (
+        "Compute the body's position from a SPICE kernel. The accurate "
+        "choice, when the kernel covers every epoch the run needs.\n"
+        "Check the coverage before trusting it: for an epoch the kernel does "
+        "not cover, the engine falls back to orbital elements for that epoch "
+        "and says nothing, so a run can be entirely element-based while its "
+        "record says SPICE."
+    ),
+    "ui.spk_coverage": (
+        "Read the chosen kernel's own coverage window and compare it with "
+        "this run.\n"
+        "Worth doing every time: the fallback to orbital elements happens per "
+        "epoch, silently, and the only way to know it did not happen is to "
+        "check that the kernel covers the whole window -- including the "
+        "spin-up, which runs before the start date."
+    ),
+    "ui.orbit_on_body_page": (
+        "Open the Body page, where the six orbital elements and their epoch "
+        "live.\n"
+        "They are not repeated here on purpose: one value edited in two "
+        "places is a value whose stored form depends on which page was "
+        "displayed last."
+    ),
+
+    # =========================================================================
+    # KEYS THE CARDS EXPOSE THAT THE SECTION TABS REACH ANOTHER WAY
+    # =========================================================================
+    "illumination.albedo_source": (
+        "Where the per-face Bond albedo comes from.\n"
+        "Built-in map uses the albedo map shipped for this body, which is "
+        "recommended for lunar and Europan work because real albedo contrast "
+        "changes absorbed sunlight and therefore temperature.\n"
+        "Custom uses a map of your own.\n"
+        "None gives every face the single albedo from the Properties page, "
+        "which is right for an idealized or comparative run.\n"
+        "A built-in per-face map is matched to the procedural sphere it was "
+        "built for by face count, so it cannot apply to an imported terrain "
+        "mesh; the line beneath says what will actually be loaded."
+    ),
+    "thermal.use_default_property_map": (
+        "Give each face its own H parameter from the map bundled for this "
+        "body and sphere resolution, instead of one value everywhere.\n"
+        "Recommended on the Moon, where the bundled map carries the measured "
+        "regolith variation. It applies only to the procedural sphere it was "
+        "built for; an imported terrain mesh uses the single value from the "
+        "Properties page.\n"
+        "Sets thermal.use_default_property_map."
+    ),
+    "output.skip_time_series": (
+        "Skip the per-sample field files and keep only the summary maps "
+        "(minimum, mean and maximum over the window).\n"
+        "The physics is identical either way; this decides only what is "
+        "written. Turn it on for long or seasonal runs, where the per-sample "
+        "files are most of the disk used and the summary is what gets "
+        "analyzed.\n"
+        "Sets output.skip_time_series."
+    ),
+    "generic_body.name": (
+        "What to call this body. It names the run in logs and provenance and "
+        "is what a fetched HORIZONS record fills in.\n"
+        "It is not looked up anywhere: the physics comes from the orbit, spin, "
+        "shape and surface values below, not from the name.\n"
+        "Sets generic_body.name."
+    ),
+
+    # =========================================================================
+    # A CUSTOM BODY'S SURFACE
+    # -------------------------------------------------------------------------
+    # These are a DIFFERENT set of keys from the Properties page's, and they
+    # behave differently: on a built-in body most of the plainly-named
+    # properties are read by nothing, while on a custom body this whole block
+    # is honored. They are described here rather than pointed at the other
+    # entries so that neither description has to hedge about the other case.
+    #
+    # Every one of them carries the same floor. A value below 0.0000005 is
+    # written to the solver with six decimal places, arrives as 0.000000, fails
+    # the engine's positive-value check, and is silently replaced by a
+    # placeholder property -- so the card refuses those rather than letting the
+    # run use a number nobody chose.
+    # =========================================================================
+    "generic_body.surface.albedo": (
+        "The fraction of sunlight this surface reflects across all "
+        "wavelengths (the Bond albedo). It sets how much sunlight is absorbed, "
+        "so it drives the temperature more directly than any other property "
+        "here.\n"
+        "Typical values: about 0.04 for a dark carbonaceous asteroid, 0.2 for "
+        "a stony one, 0.5 or more for fresh ice.\n"
+        "Sets generic_body.surface.albedo."
+    ),
+    "generic_body.surface.emissivity": (
+        "How efficiently the surface radiates heat away in the infrared, as a "
+        "fraction of a perfect blackbody.\n"
+        "Recommended 0.9 to 0.95 for any natural regolith; the value is "
+        "poorly constrained for most small bodies and the results are not very "
+        "sensitive to it.\n"
+        "Sets generic_body.surface.emissivity."
+    ),
+    "generic_body.surface.ks": (
+        "Thermal conductivity of the topmost, most porous layer, in watts per "
+        "meter per kelvin. With density and heat capacity it sets the thermal "
+        "inertia, which is what controls how far the daily heat wave "
+        "penetrates and how much the surface cools at night.\n"
+        "Typical regolith values are 0.001 to 0.01; solid rock is near 2.\n"
+        "Must be at least 0.0000005: below that the value does not survive "
+        "the trip into the solver and a placeholder is used instead.\n"
+        "Sets generic_body.surface.ks."
+    ),
+    "generic_body.surface.kd": (
+        "Thermal conductivity of the deeper, compacted material, in watts per "
+        "meter per kelvin. The model blends from the surface value to this one "
+        "over the depth scale H.\n"
+        "Usually several times larger than the surface value, because "
+        "compaction closes the pore space that insulates the top layer.\n"
+        "Must be at least 0.0000005, for the same reason as the surface "
+        "value.\n"
+        "Sets generic_body.surface.kd."
+    ),
+    "generic_body.surface.rhos": (
+        "Bulk density of the topmost layer, in kilograms per cubic meter. "
+        "Part of the thermal inertia, and of how much heat the near-surface "
+        "can store.\n"
+        "Typical loose regolith is 1000 to 1500; ice-rich material is lower.\n"
+        "Sets generic_body.surface.rhos."
+    ),
+    "generic_body.surface.rhod": (
+        "Bulk density of the deeper material, in kilograms per cubic meter, "
+        "blended from the surface value over the depth scale H.\n"
+        "Typically 1.5 to 2 times the surface value on a regolith-covered "
+        "body.\n"
+        "Sets generic_body.surface.rhod."
+    ),
+    "generic_body.surface.cp0": (
+        "Specific heat capacity, in joules per kilogram per kelvin -- how much "
+        "energy it takes to warm the material by one degree. The third factor "
+        "in the thermal inertia.\n"
+        "Around 800 for silicate regolith at room temperature; it falls "
+        "steeply at the low temperatures of the outer solar system, which is "
+        "what the temperature-dependent form on the Properties page is for.\n"
+        "Sets generic_body.surface.cp0."
+    ),
+    "generic_body.surface.H": (
+        "The depth over which the surface properties blend into the deep ones, "
+        "in meters. Small H means the transition happens right at the top and "
+        "the insulating layer is thin.\n"
+        "Around 0.06 m on the Moon; there is no measured value for most small "
+        "bodies, so it is usually left at a lunar-like scale.\n"
+        "Sets generic_body.surface.H."
+    ),
+    "generic_body.surface.Qb": (
+        "Heat flowing up from the interior, in watts per square meter. It sets "
+        "the floor the deepest layer settles to, which matters only where the "
+        "sun never reaches.\n"
+        "About 0.018 on the Moon. On a small body it is effectively zero, and "
+        "leaving it at zero is the honest choice unless you have a reason.\n"
+        "Sets generic_body.surface.Qb."
+    ),
+    "generic_body.surface.chi": (
+        "How strongly radiation through the pore space adds to conduction as "
+        "the material warms -- the coefficient on the cubic temperature term.\n"
+        "Around 2.7 for lunar regolith. Set it to zero to model conduction "
+        "alone, which is what a constant thermal inertia means.\n"
+        "Sets generic_body.surface.chi."
+    ),
 }
 
 

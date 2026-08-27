@@ -20,14 +20,17 @@ Six things are asserted, in the order they would break:
    engine -- ``gui_tooltips.BODY_SYNODIC_PERIODS``,
    ``gui_tooltips.BODY_DEFAULTS``, ``gui_core.facet_scale._BODY_RADII_M``
    and ``ptm.results.BODY_RADII``;
-5. the GUI's built-in body dropdown offers no body the engine cannot run,
-   except the four that are explicitly pinned here as known-unbacked;
+5. the GUI's built-in body list is DERIVED from the generated table rather
+   than written out, so it cannot grow a body the engine refuses;
 6. the engine really does refuse an unbacked name -- asserted against the
    header text, so it holds without a build.
 
-Checks 4 and 5 need the GUI sources on ``sys.path``; they do NOT need PyQt6,
-because ``gui_tooltips`` and ``gui_core.facet_scale`` are deliberately Qt-free.
-A genuinely missing module is a failure, not a skip.
+Check 4 needs the GUI sources on ``sys.path``; it does NOT need PyQt6, because
+``gui_tooltips`` and ``gui_core.facet_scale`` are deliberately Qt-free. A
+genuinely missing module is a failure, not a skip. Check 5 is structural for
+the same reason, with an additional runtime assertion that runs only where the
+panel stack (PyQt6 and PyVista) imports; when it cannot, it says so on stdout
+rather than passing quietly.
 
 Run directly (no pytest needed)::
 
@@ -36,6 +39,7 @@ Run directly (no pytest needed)::
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -61,7 +65,7 @@ REQUIRED_FIELDS = (
 #: added to the dropdown unnoticed, and so that removing them from the GUI
 #: (Phase B of the body-first work) fails this test until the pin is updated
 #: too. Do not add to this list to make the test pass.
-GUI_UNBACKED_BODIES = ("Enceladus", "Titan", "Mars", "Ceres")
+GUI_UNBACKED_BODIES = ()
 
 #: Non-body entries in the same dropdown: separators and actions, not names the
 #: engine ever sees.
@@ -189,29 +193,59 @@ def test_every_other_copy_of_these_numbers_agrees():
 
 
 def test_gui_offers_no_unpinned_unbacked_body():
-    """The dropdown may not grow a body the engine refuses, unnoticed."""
-    source = (REPO_ROOT / "gui" / "gui_panels" / "config_panel.py").read_text()
-    marker = "BUILTIN_BODIES = ["
-    start = source.index(marker) + len(marker)
-    listed = [item.strip().strip("\"'")
-              for item in source[start:source.index("]", start)].split(",")
-              if item.strip()]
-    assert listed, "could not read BUILTIN_BODIES out of config_panel.py"
+    """The dropdown may not grow a body the engine refuses, unnoticed.
 
-    offered = [b for b in listed if b not in GUI_DROPDOWN_NON_BODIES]
-    unbacked = tuple(b for b in offered if not is_implemented(b))
-    assert unbacked == GUI_UNBACKED_BODIES, (
-        "the set of built-in bodies the GUI offers but the engine cannot run "
-        "changed.\n"
-        f"  now:      {list(unbacked)}\n"
+    It used to be a hand-written list, and this test's job was to PIN the four
+    names on it that the engine refuses so none could be added quietly. Phase B
+    of the body-first work removed those four and replaced the list with
+    ``list(IMPLEMENTED_BODIES)``, which is the generated table -- so the
+    property is now structural: there is no literal for anyone to extend.
+
+    That is a stronger guarantee than the pin, and this test now checks THAT,
+    plus the runtime value where the GUI stack is importable. A future edit
+    that reintroduces a literal list fails here on the day it is made.
+    """
+    source = (REPO_ROOT / "gui" / "gui_panels" / "config_panel.py").read_text()
+    literals = re.findall(r"BUILTIN_BODIES\s*=\s*[\[{]([^\]}]*)[\]}]", source)
+    offenders = []
+    for block in literals:
+        names = [item.strip().strip("\"'") for item in block.split(",")
+                 if item.strip()]
+        offenders.extend(n for n in names
+                         if n not in GUI_DROPDOWN_NON_BODIES
+                         and not is_implemented(n))
+    assert tuple(offenders) == GUI_UNBACKED_BODIES, (
+        "config_panel.py names built-in bodies the engine cannot run.\n"
+        f"  now:      {offenders}\n"
         f"  expected: {list(GUI_UNBACKED_BODIES)}\n"
-        "Every name here produces a FATAL at config parse. If one was removed "
-        "from the GUI, delete it from GUI_UNBACKED_BODIES too; if one was "
-        "added, do not add it here -- implement it or take it out of the "
-        "dropdown.")
-    for body in IMPLEMENTED_BODIES:
-        assert body in offered, (
-            f"the GUI no longer offers {body}, which the engine implements")
+        "Every name here produces a FATAL at config parse. Derive the list "
+        "from ptm.body_table.IMPLEMENTED_BODIES instead of writing one.")
+
+    assert "BUILTIN_BODIES = list(_IMPLEMENTED)" in source \
+        and "BUILTIN_BODIES = set(_IMPLEMENTED)" in source, (
+        "the two BUILTIN_BODIES lists in config_panel.py (the Simulation "
+        "dropdown and the Body page's is-this-built-in set) are no longer "
+        "derived from the generated implemented-body table, so they can drift "
+        "from the engine again")
+
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "gui"))
+        from gui_panels.config_panel import BodyDefinitionTab, SimulationTab
+    except Exception as exc:                                 # noqa: BLE001
+        print(f"    [gui] not importable here ({type(exc).__name__}); the "
+              f"structural check above still ran")
+        return
+    for owner in (SimulationTab, BodyDefinitionTab):
+        offered = [b for b in owner.BUILTIN_BODIES
+                   if b not in GUI_DROPDOWN_NON_BODIES]
+        unbacked = [b for b in offered if not is_implemented(b)]
+        assert not unbacked, (
+            f"{owner.__name__}.BUILTIN_BODIES offers {unbacked}, which the "
+            f"engine refuses at config parse")
+        for body in IMPLEMENTED_BODIES:
+            assert body in offered, (
+                f"{owner.__name__} no longer offers {body}, which the engine "
+                f"implements")
 
 
 def test_the_engine_refuses_unbacked_names():
