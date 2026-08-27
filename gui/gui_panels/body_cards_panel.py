@@ -39,7 +39,7 @@ what/recommended/when standard. `test_gui_body_first.py` holds that line.
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
@@ -299,6 +299,32 @@ class BodyCard(BaseConfigTab):
     def custom_loaded_keys(self):
         return set()
 
+    @staticmethod
+    def _clear_widget(widget):
+        """Put a control back to 'nothing set', without writing the config.
+
+        Signals are blocked throughout: these handlers write derived keys, and
+        showing a configuration must not edit it.
+        """
+        blocked = widget.signalsBlocked()
+        widget.blockSignals(True)
+        try:
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(False)
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                # The smallest value the control allows, which for every
+                # generic-body surface field is 0.0 -- and 0.0 is already how
+                # this card reads "not set" (`_number(key, 0.0)`, and
+                # `tiny_surface_refusals` skips zero deliberately).
+                widget.setValue(widget.minimum())
+            elif isinstance(widget, QComboBox):
+                if widget.count():
+                    widget.setCurrentIndex(0)
+            elif isinstance(widget, QLineEdit):
+                widget.setText("")
+        finally:
+            widget.blockSignals(blocked)
+
     def load_card(self):
         """Mirror the configuration into this card's controls."""
         skip = self.custom_loaded_keys()
@@ -307,6 +333,19 @@ class BodyCard(BaseConfigTab):
                 continue
             value = self.config_manager.get_value(key, None)
             if value is None:
+                # ABSENT from the configuration, which is not the same as
+                # "leave the control alone". Leaving it alone is a control
+                # showing a setting the run does not have -- the same defect
+                # COMBO_VALUES above exists to close for combo boxes.
+                #
+                # It became reachable when the body cards started clearing
+                # another card's section: `generic_body.surface.*` has no entry
+                # in DEFAULT_CONFIG (the keys are created on demand), so after
+                # a clear the spin boxes went on showing the previous body's
+                # albedo and conductivity while the configuration carried
+                # neither. Every other key a card shows is in DEFAULT_CONFIG and
+                # so is never None here.
+                self._clear_widget(widget)
                 continue
             if isinstance(widget, QCheckBox):
                 self.set_bool(key, value)
@@ -642,16 +681,12 @@ class EuropaCard(BodyCard):
         self.sweep_group.setLayout(sweep_layout)
         layout.addWidget(self.sweep_group)
 
-        # -- the standing caveat ----------------------------------------------
-        caveat = _muted(
-            "Europa's night side never sits at zero absorbed flux: Jupiter "
-            "shines on it. Archived Europa results produced before the "
-            "2026-08 surface-solver fix can be wrong by up to 12 K at "
-            "mid-latitudes with no out-of-range value to notice, so check the "
-            "engine build recorded beside any archived output before "
-            "comparing against it.", color="#EF9A9A", size=10)
-        layout.addWidget(caveat)
-
+        # No standing caveat on this card. It used to carry one about archived
+        # Europa results predating a 2026-08 solver fix; that is a statement
+        # about other people's older output rather than about the run this card
+        # is setting up, and the number it quoted holds only for the
+        # Jupiter-facing hemisphere. A card describes the run in front of the
+        # user.
         layout.addWidget(self.thermal_group(integration_window=True))
         layout.addWidget(self.output_group())
         self._make_report(layout)
@@ -976,6 +1011,40 @@ class MercuryCard(BodyCard):
 # Generic bodies: asteroid, and anything else
 # ===========================================================================
 
+class _LookupWorker(QThread):
+    """One HORIZONS request, off the GUI thread.
+
+    Emits exactly once, always. `lookup_body` does not raise -- but if it ever
+    did, the exception would cross a thread boundary into nothing and the card
+    would sit on "Asking HORIZONS..." forever, so it is caught here too and
+    turned into a result the card can show.
+
+    ``route`` is carried through untouched so the card can check, when the
+    answer arrives up to ``ONLINE_TIMEOUT_S`` later, that it is still the card
+    the answer was asked for.
+    """
+
+    done = pyqtSignal(object, object)
+
+    def __init__(self, query, project_root, route):
+        super().__init__()
+        self._query = query
+        self._project_root = project_root
+        self.route = route
+
+    def run(self):
+        from gui_core.body_lookup import BodyLookupResult, lookup_body
+        try:
+            result = lookup_body(self._query, self._project_root,
+                                 allow_online=True)
+        except Exception as exc:                             # noqa: BLE001
+            result = BodyLookupResult(
+                message=(f"The lookup failed unexpectedly "
+                         f"({type(exc).__name__}: {exc}). Nothing has been "
+                         f"changed."))
+        self.done.emit(result, self.route)
+
+
 class GenericBodyCard(BodyCard):
     """The `generic_body:` route -- the only way to model a body the engine has
     no built-in properties for.
@@ -1002,8 +1071,37 @@ class GenericBodyCard(BodyCard):
         grid.setColumnStretch(1, 1)
         self.add_string_field(grid, 0, "Name:", "generic_body.name")
         self.add_string_field(grid, 1, "NAIF id:", "generic_body.naif_id")
+
+        # -- the lookup (item 3) ---------------------------------------------
+        # A BUTTON, deliberately, not a textChanged handler. The name field
+        # already carries one lesson about per-keystroke work: `beaming_policy`
+        # ran from `mesh.import_file`'s textChanged and opened a 100 MB mesh on
+        # the GUI thread while the user typed. A network request per keystroke
+        # would be that, over the internet, and it would fire on every prefix
+        # of the name the user is halfway through typing.
+        self.lookup_button = QPushButton("Look up")
+        self.lookup_button.setToolTip(get_tooltip("ui.body_lookup"))
+        self.lookup_button.clicked.connect(self._on_lookup)
+        grid.addWidget(self.lookup_button, 0, 2)
+        #: The in-flight HORIZONS request, or None. Held so the QThread is not
+        #: garbage-collected while it is still running.
+        self._lookup_worker = None
+
+        self.provenance_note = _muted("Parameters entered by hand.", size=10)
+        grid.addWidget(self.provenance_note, 2, 0, 1, 3)
+        self.lookup_note = _muted("", color="#64b5f6", size=10)
+        grid.addWidget(self.lookup_note, 3, 0, 1, 3)
+
         identity.setLayout(grid)
         layout.addWidget(identity)
+        # The name is this card's answer to "which body is this run about", so
+        # it owns `simulation.body` as well. Without the mirror the key kept
+        # whatever the LAST card wrote -- and every shipped configuration with
+        # a `generic_body:` block sets `simulation.body` to that same body's
+        # name (25 of 25), so the mirror is the corpus's own convention rather
+        # than a new one. See `_mirror_body_name`.
+        self.widgets["generic_body.name"].textChanged.connect(
+            self._mirror_body_name)
 
         # -- ephemeris, with the coverage check the project never had ---------
         ephemeris = QGroupBox("Ephemeris")
@@ -1129,8 +1227,84 @@ class GenericBodyCard(BodyCard):
         layout.addStretch()
         self.create_scroll_area(content)
 
+    #: What `simulation.body` says while this card has no name in it yet.
+    #: `examples/justitia_generic-test.yaml` ships exactly this pair
+    #: (`simulation.body: Custom` beside `generic_body.name: Custom`), and
+    #: `ConfigurationPanel._on_body_combo_changed` already writes it for the
+    #: custom-body route, so this is the spelling the project uses.
+    UNNAMED_BODY = "Custom"
+
+    def _mirror_body_name(self, text=None):
+        """Keep `simulation.body` on the body this card is describing.
+
+        Not cosmetic. `simulation.body` is the ONLY thing that says which card
+        a configuration belongs to -- `body_cards.detect_route` reads it, the
+        pre-flight body-identity check reads it, and `_config_for_yaml` uses it
+        to decide whether a `generic_body:` section is this run's body or the
+        previous card's leftovers. Left unwritten, a generic-body card
+        inherited `Mercury` (or `Moon`, or `Europa`) from whichever card ran
+        before it, and the configuration then named two different bodies.
+
+        TWO things it must not do, both reproduced before they were guarded:
+
+        * **Write while the card is only being displayed.** `load_card` runs
+          under `_loading`, and `set_text` does not block `textChanged`, so
+          this fired on every open. Showing a configuration is not editing it
+          (`load_from_config`'s own docstring, and
+          `test_showing_a_card_does_not_rewrite_the_configuration`).
+        * **Strip the `[H] ` prefix.** That prefix is load-bearing GUI state:
+          `ConfigurationPanel._on_body_combo_changed` branches on it,
+          `add_horizons_body` inserts the combo entry under the prefixed
+          spelling, and `ConfigManager.body_identity_conflict` exempts it. It
+          is removed from the engine-facing YAML by `_config_for_yaml`, which
+          is the right place for it to go. A HORIZONS body already names
+          itself, so there is nothing here to mirror.
+        """
+        if self._loading:
+            return
+        self._write_body_name(text)
+
+    def _write_body_name(self, text=None):
+        current = str(self.config_manager.get_value(
+            "simulation.body", "") or "").strip()
+        if current.startswith("[H] "):
+            return
+        if text is None:
+            text = self.config_manager.get_value("generic_body.name", "")
+        name = str(text or "").strip()
+        wanted = name or self.UNNAMED_BODY
+        if current == wanted:
+            return
+        self.config_manager.set_value("simulation.body", wanted)
+
+    def _repair_body_name(self):
+        """Fix `simulation.body` when it names a body this card is not.
+
+        Runs from `load_card`, so it is deliberately narrow: it writes ONLY
+        when the stored body is a body the engine has built-in properties for,
+        or the unnamed placeholder while a real name exists. Both are
+        configurations that would run as something other than what they say --
+        a built-in name beside a `generic_body:` section is the contradiction
+        `ConfigManager.body_identity_conflict` reports, and letting a card
+        display it unchanged would hand the user a run that silently drops
+        either the body or its definition.
+
+        Anything else the user or their file chose is left exactly as it is.
+        """
+        from gui_core.config_manager import BUILTIN_BODY_NAMES
+        current = str(self.config_manager.get_value(
+            "simulation.body", "") or "").strip()
+        name = str(self.config_manager.get_value(
+            "generic_body.name", "") or "").strip()
+        contradicts = current.lower() in BUILTIN_BODY_NAMES
+        placeholder = (current == self.UNNAMED_BODY and bool(name))
+        if not (contradicts or placeholder):
+            return
+        self._write_body_name(name)
+
     def load_card(self):
         super().load_card()
+        self._repair_body_name()
         source = str(self.config_manager.get_value(
             "generic_body.ephemeris_source", "auto") or "auto").lower()
         self.spice_radio.blockSignals(True)
@@ -1141,6 +1315,107 @@ class GenericBodyCard(BodyCard):
         self.kepler_radio.blockSignals(False)
         self._refresh_shape()
         self._refresh_surface()
+
+    # -- name -> parameters (item 3) ------------------------------------------
+
+    def _on_lookup(self):
+        """Resolve the name in the field, cache first, HORIZONS second.
+
+        The cache is on disk and answers instantly, so it runs here. HORIZONS
+        is a network request with a timeout, so it runs on a worker thread --
+        a blocking request on the GUI thread is a frozen window, and "never a
+        hang" is the requirement this control was asked for.
+
+        Nothing is applied until a lookup SUCCEEDS, and every field it writes
+        stays editable afterwards. A failure changes nothing at all and says
+        which kind of failure it was.
+        """
+        from gui_core.body_lookup import lookup_body
+
+        query = str(self.config_manager.get_value(
+            "generic_body.name", "") or "").strip()
+        if not query:
+            self.lookup_note.setText(
+                "Type a name, a number or a designation in the Name field "
+                "first, then press Look up.")
+            return
+
+        result = lookup_body(query, self._project_root(), allow_online=False)
+        if result.found:
+            self._apply_lookup(result)
+            return
+
+        if result.ambiguous:
+            # More than one cached body matches. Stop here rather than let
+            # HORIZONS turn an ambiguous question into one confident answer.
+            self.lookup_note.setText(result.message)
+            return
+
+        # A request is already in flight. Starting a second one would rebind
+        # `self._lookup_worker` and drop the last reference to a QThread that
+        # has not finished, which Qt answers with "QThread: Destroyed while
+        # thread is still running" and std::terminate -- taking any unsaved
+        # edits with it.
+        if self._lookup_worker is not None and self._lookup_worker.isRunning():
+            self.lookup_note.setText(
+                "A lookup is already running. Wait for it to finish.")
+            return
+
+        # Cache miss. Say so, then ask HORIZONS off the GUI thread.
+        self.lookup_note.setText(f"{result.message} Asking HORIZONS...")
+        self.lookup_button.setEnabled(False)
+        worker = _LookupWorker(query, self._project_root(), self.route)
+        worker.done.connect(self._on_lookup_done)
+        # Keep it referenced until Qt itself says the thread has ended, then
+        # let Qt delete it. `done` is emitted as the last statement of run(),
+        # so the slot can arrive BEFORE run() has returned; `finished` cannot.
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_lookup_thread_finished)
+        self._lookup_worker = worker
+        worker.start()
+
+    def _on_lookup_thread_finished(self):
+        self._lookup_worker = None
+
+    def _on_lookup_done(self, result, route):
+        self.lookup_button.setEnabled(True)
+        if route != self.route or not self._active:
+            # The user moved on while HORIZONS was answering. Applying now
+            # would write this body's generic_body.* into whatever
+            # configuration is on screen -- which, if they went to a built-in
+            # body card, is exactly the cross-card residue this branch exists
+            # to remove.
+            logger.info("[body-lookup] discarding a result for %s; the "
+                        "active route is now %s", route, self.route)
+            return
+        if result.found:
+            self._apply_lookup(result)
+        else:
+            self.lookup_note.setText(result.message)
+
+    def _apply_lookup(self, result):
+        """Write what the lookup found, and report every key of it."""
+        for key, value in result.values.items():
+            self.config_manager.set_value(key, value)
+        self.provenance_note.setText(result.provenance())
+        lines = [result.message]
+
+        # PTM-145. A kernel that does not span the run is not an error the
+        # engine reports: it substitutes Keplerian elements for the epochs
+        # outside coverage and logs NOTHING, which is how fourteen of fifteen
+        # Justitia configurations "passed". If this body brought a kernel, its
+        # coverage is checked HERE rather than waiting for the user to press
+        # the separate button.
+        if result.kernel:
+            self.config_manager.set_value(
+                "generic_body.spice_metakernel", result.kernel)
+            lines.append(f"Kernel: {result.kernel}")
+
+        self.lookup_note.setText("\n".join(lines))
+        self.load_from_config()
+        if result.kernel:
+            self._check_coverage()
+        self.value_changed.emit()
 
     def _on_ephemeris_changed(self, _checked):
         source = "keplerian" if self.kepler_radio.isChecked() else "spice"
@@ -1294,18 +1569,91 @@ class _BigButton(QPushButton):
     once. The run-type buttons still carry a summary line, because a run type
     is a decision about what the run produces and the name alone does not
     settle it.
+
+    **The summary is a child label, not a second line of `setText`.** A
+    QPushButton does not wrap its own text: it draws each newline-separated
+    line on one line and ELIDES what does not fit. Measured on 2026-08-27 at
+    this button's own minimum width, in this button's own font, the three
+    run-type summaries wanted 962, 1348 and 1122 px against 156 px of room --
+    so all three were cut off, and the reader saw a fragment ending in an
+    ellipsis. A wrapping QLabel makes the button grow downward instead, and
+    `sizeHint` then reports the height the text really needs.
+
+    `text()` still returns the TITLE. The Qt text is emptied so the button does
+    not paint it underneath the labels, and this override keeps `.text()`
+    meaningful for the callers and gates that read it.
     """
+
+    #: Chrome between the button's edge and its text, both axes. Qt's own
+    #: default QPushButton content margins are smaller than this on macOS; the
+    #: extra is what stops the text touching the frame.
+    TEXT_PADDING_PX = 24
+    TITLE_POINT_SIZE = 12
+    #: Smaller and not bold. The summary is a sentence, not a heading, and at
+    #: 12 pt bold it needed six lines of a four-line button.
+    SUBTITLE_POINT_SIZE = 10
 
     def __init__(self, title, subtitle="", tooltip=""):
         super().__init__("")
+        self._title = title
         self.setMinimumHeight(96)
         self.setMinimumWidth(180)
-        self.setText(f"{title}\n{subtitle}" if subtitle else title)
         self.setToolTip(tooltip)
         font = QFont()
-        font.setPointSize(12)
+        font.setPointSize(self.TITLE_POINT_SIZE)
         font.setBold(True)
         self.setFont(font)
+
+        # Both are assigned on BOTH branches, so `button.title_label` is not an
+        # AttributeError on a body button while `button.subtitle_label` is a
+        # clean None.
+        self.title_label = None
+        self.subtitle_label = None
+        if not subtitle:
+            # No summary: let the button draw its own text, exactly as before.
+            # A body button is a name in the middle of a large button and
+            # nothing about that needed changing.
+            self.setText(title)
+            return
+
+        half = self.TEXT_PADDING_PX // 2
+        box = QVBoxLayout(self)
+        box.setContentsMargins(half, half, half, half)
+        box.setSpacing(4)
+        self.title_label = QLabel(title)
+        self.title_label.setFont(font)
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft
+                                      | Qt.AlignmentFlag.AlignTop)
+        self.subtitle_label = QLabel(subtitle)
+        self.subtitle_label.setFont(self.subtitle_font())
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignLeft
+                                         | Qt.AlignmentFlag.AlignTop)
+        for label in (self.title_label, self.subtitle_label):
+            # Without this the labels swallow the press and the button never
+            # emits clicked() -- the flow stops dead at the run-type screen.
+            label.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            label.setStyleSheet("background: transparent; border: none;")
+            box.addWidget(label)
+        box.addStretch()
+
+    def subtitle_font(self):
+        """The font the summary line is drawn in."""
+        font = QFont()
+        font.setPointSize(self.SUBTITLE_POINT_SIZE)
+        font.setBold(False)
+        return font
+
+    def text(self):
+        """The button's TITLE.
+
+        Qt's own text is empty on a button that has a summary, because the
+        child labels do the drawing. Callers -- including
+        `test_gui_body_first.py`, which reads this to check which run types are
+        offered -- get the title either way.
+        """
+        return self._title
 
 
 class BodyFirstPanel(BaseConfigTab):
@@ -1336,6 +1684,10 @@ class BodyFirstPanel(BaseConfigTab):
 
         self._reports = {}
         self._route = (None, None, "time_series")
+        #: The body of the last card actually opened, or None. Distinct from
+        #: `_route[0]`, which `choose_body` moves to the DESTINATION while the
+        #: user is still on the landing screen. See `open_card`.
+        self._card_body = None
         self.cards = {}
 
         outer = QVBoxLayout(self)
@@ -1627,12 +1979,21 @@ class BodyFirstPanel(BaseConfigTab):
         for other in self.cards.values():
             if other is not card:
                 other.deactivate()
+        # Which body we are coming FROM is the only thing that distinguishes
+        # "this card's own terrain" from "another body's terrain".
+        #
+        # It CANNOT be read from `self._route`: `choose_body` writes the new
+        # body into `_route` on the landing screen, before this method is ever
+        # called, so by now `_route[0]` is already the destination and every
+        # transition would look like a same-body one. `_card_body` is the body
+        # of the last card actually OPENED, which is the question being asked.
+        previous_body = self._card_body
         self._route = (body_key, mode_key, run_type_key)
 
         result = None
         if apply_defaults:
             result = self._apply_route_defaults(body_key, mode_key,
-                                                run_type_key)
+                                                run_type_key, previous_body)
         card.activate(mode_key, run_type_key)
         self.card_stack.setCurrentWidget(card)
         run_type = RUN_TYPES_BY_KEY[run_type_key]
@@ -1642,17 +2003,41 @@ class BodyFirstPanel(BaseConfigTab):
         if result is not None and preset is not None:
             card.show_report("\n".join(result.summary_lines()))
             self.preset_applied.emit(preset.key)
+        self._card_body = body_key
         self.route_changed.emit(body_key, mode_key or "", run_type_key)
         self.value_changed.emit()
         return card
 
-    def _apply_route_defaults(self, body_key, mode_key, run_type_key):
+    def _apply_route_defaults(self, body_key, mode_key, run_type_key,
+                              previous_body=None):
         from gui_core.body_cards import RUN_TYPES_BY_KEY, card_preset
-        from gui_core.presets import apply_preset
+        from gui_core.presets import (FOREIGN_MESH_CLEARS, apply_preset,
+                                      mirror_shape_mesh)
         preset = card_preset(body_key, mode_key)
         if preset is None:
             return None
+
+        # -- another body's terrain, cleared on the body change ---------------
+        # BEFORE the preset, so the preset's beaming rule measures what is
+        # actually going to be used. Scoped to a CHANGE of body on purpose:
+        # the lunar crater card and the Europa Sutton-DEM card both write
+        # mesh.import_file, mesh.latitude_override and
+        # radiation.view_factor_file, so going from one to the other carried a
+        # crater mesh, a lunar latitude and a view-factor matrix built for a
+        # different mesh into the other body's run -- while re-opening the SAME
+        # card must leave the mesh the user already chose alone.
+        cleared = {}
+        if previous_body is not None and previous_body != body_key:
+            for path in FOREIGN_MESH_CLEARS:
+                cleared.update(self.config_manager.reset_to_default(path))
+            # A generic body's own shape model is not "another body's
+            # terrain"; put it straight back. Same rule, same function, as the
+            # one apply_preset uses.
+            for key, value in mirror_shape_mesh(self.config_manager).items():
+                cleared.pop(key, None)
+
         result = apply_preset(self.config_manager, preset, self._project_root())
+        result.cleared.update(cleared)
         for key, value in RUN_TYPES_BY_KEY[run_type_key].sets.items():
             self.config_manager.set_value(key, value)
             result.applied[key] = value

@@ -955,12 +955,37 @@ def engine_validate_config(config, executable, project_root=None, env=None):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def run_preflight(config, find_executable, project_root=None):
+def run_preflight(config, find_executable, project_root=None,
+                  config_manager=None):
     """Run all pre-flight checks. `find_executable` is a callable returning
     the engine binary path or None (SimulationRunner.find_ptm_executable).
     Returns a PreflightReport; launch only if report.ok and the user
-    accepted any cloud-path / VF-rebuild overrides."""
+    accepted any cloud-path / VF-rebuild overrides.
+
+    `config_manager` is optional and is used for the one check that cannot be
+    made from the configuration dictionary alone -- see the body-identity
+    check below, which needs to know whether `simulation.body` was chosen or
+    is DEFAULT_CONFIG showing through.
+    """
     report = PreflightReport()
+
+    # -- Two bodies in one configuration ------------------------------------
+    # Said HERE because this is the screen the user reads before a run starts.
+    # The correction itself happens in ConfigManager._config_for_yaml, which
+    # leaves the contradicting `generic_body:` section out of the file the
+    # engine is handed; without this line the only trace would be a log
+    # warning, and a run that quietly drops a body definition is the same
+    # class of silence as a run that quietly uses one.
+    if config_manager is not None:
+        try:
+            conflict = config_manager.body_identity_conflict()
+        except Exception as exc:                             # noqa: BLE001
+            conflict = ""
+            report.warnings.append(
+                f"could not check whether this configuration names one body "
+                f"or two: {exc}")
+        if conflict:
+            report.warnings.append("body identity: " + conflict)
 
     # -- Executable ---------------------------------------------------------
     exe = find_executable() if callable(find_executable) else find_executable

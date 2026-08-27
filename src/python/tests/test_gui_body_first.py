@@ -1218,6 +1218,21 @@ def _engine():
 def test_every_card_emits_a_configuration_the_engine_accepts():
     """Every body x mode x run type, handed to the engine's own checker.
 
+    WHAT THIS DOES NOT CHECK: which body the configuration describes.
+    ``--validate-config`` answers "can the engine parse and run this file" --
+    it is a SYNTAX and reachability check and has no opinion about identity.
+    On 2026-08-27 the Europa Global card emitted ``simulation.body: Europa``
+    beside ``generic_body: {name: bennu}`` and ran a 100 km sphere at 1 AU;
+    that file is a perfectly valid asteroid run, so this arm passed it and
+    would pass it again. Worse, the loop below does not reset between routes,
+    so on its own ordering the asteroid route's ``generic_body`` reached the
+    ``custom`` route and Mercury's ``simulation.body`` reached the asteroid
+    route -- and every arm was green.
+
+    Identity is a separate property and has its own file:
+    ``test_gui_card_body_identity.py``, which asserts on the configuration the
+    RUN writes and needs no engine at all.
+
     The configuration is reset first, deliberately. This measures what a CARD
     produces, not what a card produces on top of whatever the previous check in
     this process left behind -- and the difference is real: an earlier check

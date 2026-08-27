@@ -41,7 +41,7 @@ configuration.
   whose data support is thin says so on its own card — Mercury opens with a
   banner naming the datasets it does not ship. "Open a configuration file" and
   "Reproduce a published run" are the other two ways in.
-- **Then — model domain and run type.** Global (a procedural icosphere) or
+- **Then — model domain and run type.** Global (an icosphere) or
   Local mesh (a terrain mesh you supply), and then Time series, Integrated
   statistics, or — for the Europa terrain grid — Parameter grid.
 - **Then — one card**, sized to that body and that run type: eleven controls

@@ -223,7 +223,19 @@ def test_gui_written_yaml_uses_only_engine_keys():
 
     # Again with the generic-body branch populated, which is where the
     # semi_axis_a/b/c -> semi_axes_km translation lives.
+    #
+    # `simulation.body` is set to the generic body's own name, which is the
+    # convention every shipped configuration with a `generic_body:` section
+    # follows (25 of 25) and what the body cards now write. It matters here:
+    # leaving it at DEFAULT_CONFIG's "Moon" describes a configuration naming
+    # TWO bodies, and the engine resolves that by reading the generic body and
+    # ignoring `simulation.body` entirely (`isConfigured()`,
+    # config_parser.h:717, tested at ptm_thermal_sim.cpp:14626) -- so
+    # `_config_for_yaml` now leaves the section out rather than emit a file
+    # whose stated body is not the body that would run. The probe was
+    # describing a configuration that could not do what it said.
     manager = ConfigManager()
+    manager.set_value("simulation.body", "parity-probe")
     body = manager.config["generic_body"]
     body["name"] = "parity-probe"
     body["orbit"]["semi_major_axis_au"] = 2.5
