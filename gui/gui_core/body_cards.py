@@ -79,7 +79,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 class _Mode:
-    """One shape of run on one body -- 'the whole body' or 'a place on it'.
+    """One model domain on one body -- 'Global' or 'Local mesh'.
 
     The split is the ENGINE's, and it is the mesh file alone::
 
@@ -97,10 +97,10 @@ class _Mode:
         self.summary = summary
 
 
-GLOBAL = _Mode("global", "The whole body",
-               "A procedural icosphere at a chosen level of detail.")
-LOCAL = _Mode("local", "A place on it",
-              "A terrain mesh you supply, placed at a latitude and longitude.")
+GLOBAL = _Mode("global", "Global",
+               "Procedural icosphere at a chosen subdivision level.")
+LOCAL = _Mode("local", "Local mesh",
+              "Imported terrain mesh, placed at a latitude and longitude.")
 
 
 #: How each ENGINE-IMPLEMENTED body is presented. Keys must be exactly
@@ -108,35 +108,31 @@ LOCAL = _Mode("local", "A place on it",
 #: so a body added to `planetary_properties.h` fails a test here instead of
 #: quietly missing its button.
 #:
-#: A `subtitle` is ONE short functional line naming what the button leads to.
-#: `note` is empty for every button and the landing screen renders no note
-#: paragraphs at all: a paragraph of prose under each of five large buttons is
-#: what the landing screen looked like before, and it read as commentary rather
-#: than as a choice. Anything a body genuinely has to disclose belongs on that
-#: body's card, in context and next to the controls it affects --
-#: `test_gui_body_first.py` holds that line for the one body that has such a
-#: disclosure, so removing the paragraph cannot quietly remove the warning.
+#: A button carries the BODY NAME and NOTHING ELSE. There is no `subtitle`, no
+#: `note` and no `maturity` badge: all three were tried, and any second line
+#: under each of five large buttons reads as commentary rather than as a
+#: choice. What a button leads to is in its tooltip; anything a body genuinely
+#: has to disclose is on that body's card, in context and next to the controls
+#: it affects -- `test_gui_body_first.py` holds that line for the one body that
+#: has such a disclosure, so removing the button copy cannot quietly remove the
+#: warning.
 BODY_PRESENTATION = {
     "Moon": dict(
-        subtitle="Global and site-scale thermal models",
         modes=("global", "local"),
-        maturity="",
     ),
     "Europa": dict(
-        subtitle="Global and Sutton DEM site models",
         modes=("global", "local"),
-        maturity="",
     ),
     "Mercury": dict(
-        subtitle="Global thermal models",
         modes=("global",),
         # The two defects that held this button back -- a solar day recorded as
         # the 58.646 d SIDEREAL rotation, and a 500 K ceiling written for icy
         # bodies -- were fixed in the engine on 2026-08-26 (BUGS.md
-        # ENG-MERCURY-SOLAR-DAY, ENG-MERCURY-TEMP-CEILING). What remains is thin
-        # DATA. The badge says so in two words; the Mercury card says so in
-        # full, beside the controls it constrains.
-        maturity="limited data",
+        # ENG-MERCURY-SOLAR-DAY, ENG-MERCURY-TEMP-CEILING). What remains is
+        # thin DATA, and the Mercury CARD says so in a banner at the top,
+        # beside the controls it constrains. It used to say so twice, once as a
+        # two-word badge on the button; the badge is gone and the banner is the
+        # single place that statement lives.
     ),
 }
 
@@ -148,15 +144,11 @@ BODY_PRESENTATION = {
 CUSTOM_ROUTES = {
     "asteroid": dict(
         title="Asteroid",
-        subtitle="Shape model or sphere, from an orbit and spin pole",
         modes=("body",),
-        maturity="",
     ),
     "custom": dict(
         title="Custom body",
-        subtitle="Any other world, from its own surface properties",
         modes=("body",),
-        maturity="",
         # What this route is FOR, and what happens if you try to reach it by
         # typing a body name instead, is on the card itself -- see
         # `_card_presets()`'s `custom` summary, which a user reads at the moment
@@ -166,24 +158,24 @@ CUSTOM_ROUTES = {
 
 
 class BodyButton:
-    """One large button on the landing screen.
+    """One large button on the landing screen: the body's name, and only that.
 
-    There is deliberately NO `note` field. The landing screen carried a
-    paragraph under each button, and a body that has something to disclose now
-    discloses it on its own card instead. Keeping an unrendered `note=` here
-    would be worse than either choice: somebody would fill it in and it would
-    do nothing. Because `body_buttons()` splats the presentation table straight
-    into this constructor, a `note=` put back into either table is a TypeError
-    at import, not a silent drop.
+    There is deliberately NO `note`, NO `subtitle` and NO `maturity` field. The
+    landing screen carried a paragraph under each button, then one functional
+    line, then a two-word badge on the one body that needed a caveat -- each
+    read as commentary in front of a choice that is five words wide. A body
+    that has something to say says it in the button's tooltip and on its own
+    card. Keeping any of the three here unrendered would be worse than either
+    choice: somebody would fill it in and it would do nothing. Because
+    `body_buttons()` splats the presentation table straight into this
+    constructor, any of them put back into either table is a TypeError at
+    import, not a silent drop.
     """
 
-    def __init__(self, key, title, subtitle, modes, maturity="",
-                 builtin=True):
+    def __init__(self, key, title, modes, builtin=True):
         self.key = key
         self.title = title
-        self.subtitle = subtitle
         self.modes = tuple(modes)
-        self.maturity = maturity
         self.builtin = builtin
 
     def __repr__(self):                                   # pragma: no cover
@@ -206,20 +198,22 @@ def body_buttons():
                 f"{name} is implemented by the engine but BODY_PRESENTATION "
                 f"has no entry for it, so the body-first screen would offer no "
                 f"way to reach it. Add one in gui_core/body_cards.py.")
-        out.append(BodyButton(name, name.upper(), builtin=True,
-                              **presentation))
+        # The body's own name, in its own capitalization -- not upper-cased.
+        # Five shouted words is the register the sweep of 2026-08-27 removed.
+        out.append(BodyButton(name, name, builtin=True, **presentation))
     for key, presentation in CUSTOM_ROUTES.items():
         fields = dict(presentation)
-        out.append(BodyButton(key, fields.pop("title").upper(), builtin=False,
+        out.append(BodyButton(key, fields.pop("title"), builtin=False,
                               **fields))
     return out
 
 
 def modes_for(body_key):
-    """The modes a body offers, as `_Mode` objects."""
+    """The model domains a body offers, as `_Mode` objects."""
     lookup = {"global": GLOBAL, "local": LOCAL,
-              "body": _Mode("body", "Define the body",
-                            "A body you describe yourself.")}
+              "body": _Mode("body", "Body definition",
+                            "Properties supplied in the generic_body: "
+                            "section.")}
     for button in body_buttons():
         if button.key == body_key:
             return tuple(lookup[m] for m in button.modes)
@@ -250,16 +244,17 @@ class RunType:
 RUN_TYPES = (
     RunType(
         key="time_series",
-        title="Temperature through time",
-        summary=("One temperature field per output sample, so you can watch a "
-                 "diurnal or seasonal cycle and plot any face against time."),
+        title="Time series",
+        summary=("One temperature field per output sample, resolving the "
+                 "diurnal or seasonal cycle and letting any face be plotted "
+                 "against time."),
         sets={"output.skip_time_series": False,
               "thermal.compute_statistics": True},
         produces=("a per-sample binary file per field, plus the summary maps"),
     ),
     RunType(
         key="integrated",
-        title="Summary maps only",
+        title="Integrated statistics",
         summary=("The same simulation, but only the minimum, mean and maximum "
                  "over the whole window are written. Every per-sample file is "
                  "skipped, which is most of the disk a long run uses."),
@@ -269,7 +264,7 @@ RUN_TYPES = (
     ),
     RunType(
         key="sweep",
-        title="A grid of runs",
+        title="Parameter grid",
         summary=("The same configuration run once per point of a grid -- for "
                  "Europa, every Sutton terrain crossed with every latitude the "
                  "shipped configurations use."),
@@ -287,8 +282,8 @@ def run_types_for(body_key, mode_key):
 
     `sweep` is offered ONLY where a grid is actually backed by something: today
     that is the Europa Sutton-DEM product, the one Cartesian product the
-    shipped corpus contains (5 terrains x 9 latitudes). Offering "a grid of
-    runs" on a body with no grid behind it would be a button the project cannot
+    shipped corpus contains (5 terrains x 9 latitudes). Offering a parameter
+    grid on a body with no grid behind it would be a button the project cannot
     honor, which is the defect this whole screen exists to close.
     """
     keys = ["time_series", "integrated"]
@@ -540,7 +535,7 @@ def detect_route(config):
                 # global card over a config with a mesh in it.
                 return BodyRoute(refusal=(
                     f"This file is a {name} run on an imported mesh, and the "
-                    f"{name} card only covers whole-body runs. Everything in "
+                    f"{name} card only covers the global domain. Everything in "
                     f"the file is loaded; open All settings to see it."))
             return BodyRoute(body_key=name, mode_key=mode,
                              run_type=run_type_of(config))
@@ -613,7 +608,7 @@ def _card_presets():
 
     europa_site = Preset(
         key="europa_dem_site",
-        title="A Sutton DEM site on Europa",
+        title="Europa Sutton DEM site",
         summary=("One of the five Sutton terrains, placed at one of the "
                  "latitudes the shipped configurations use, with radiation "
                  "exchange between facets on."),
@@ -636,7 +631,7 @@ def _card_presets():
     )
     mercury = Preset(
         key="mercury_global",
-        title="Whole Mercury",
+        title="Mercury global",
         summary=("Mercury over one solar day. The engine forces at the "
                  "175.938-day solar day, which is three sidereal rotations "
                  "per two orbits, and no temperature ceiling is applied."),
@@ -661,7 +656,7 @@ def _card_presets():
     )
     custom = Preset(
         key="custom_body",
-        title="A body you describe yourself",
+        title="Generic body",
         summary=("Any world the engine has no built-in properties for. "
                  "Everything the run needs is described here and written to "
                  "the configuration's generic_body: section. This is the only "

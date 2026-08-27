@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """The body-first surface: the flow, the routing, and what each card emits.
 
-Five properties, in the order they would break:
+Seven properties, in the order they would break:
 
 1. **The buttons are the engine's.** The landing screen offers exactly the
    bodies ``planetary_properties.h`` implements, plus the two generic-body
    routes. A body added or removed in C++ changes this screen through the
    generated table, not through somebody remembering.
+1b. **A header names a thing; it does not ask a question.** Section headers and
+   control labels on these screens are technical terms -- "Local mesh", not
+   "Which piece of ground". Tooltips are deliberately exempt: explanatory prose
+   is where a question is the right shape.
+1c. **A control is filed under what it does.** ``thermal.use_gpu`` selects the
+   solver's device, so it is in the Thermal section, not beside
+   ``output.directory``.
 2. **The flow is a state machine and it terminates.** Every
    body x mode x run-type combination reaches a card, and the card that comes
    up is the one that was asked for.
@@ -30,6 +37,7 @@ Run directly::
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -114,50 +122,107 @@ def test_the_landing_screen_offers_exactly_the_implemented_bodies():
     print(f"    [landing] {len(buttons)} buttons: {[b.key for b in buttons]}")
 
 
-def test_a_body_button_carries_one_short_functional_line_and_no_paragraph():
+def test_a_body_button_is_the_body_name_and_nothing_else():
     """The landing screen offers a choice; it does not comment on it.
 
-    It used to carry a paragraph of muted prose under each button. One of them
-    opened "The honest destination for a world the engine has no built-in
-    properties for" -- the register of a session note, in front of somebody who
-    has never read one. Two properties replace it:
+    Three rounds of copy came off these buttons. First a paragraph of muted
+    prose under each -- one opened "The honest destination for a world the
+    engine has no built-in properties for", the register of a session note in
+    front of somebody who has never read one. Then, on 2026-08-27, the one-line
+    subtitle that replaced it. Then, the same day, Mercury's two-word "(limited
+    data)" badge, which was the last thing making one button taller than the
+    other four. What is left is the body's name, on every one of the five.
 
-    * a button has ONE subtitle, one line, short enough to read at a glance;
-    * `BodyButton` has no `note` field at all, so the paragraph cannot be put
-      back in the table and quietly fail to appear.
+    Three properties, and the third is the one that makes the first two hold:
+
+    * the TABLE carries the name and no prose -- `BodyButton` has no `note`,
+      `subtitle` or `maturity` field, so any of the three put back into
+      `BODY_PRESENTATION` or `CUSTOM_ROUTES` is a TypeError at import rather
+      than text nobody sees;
+    * the name is the body's OWN capitalization, not shouted;
+    * the RENDERED button carries EXACTLY ONE line -- Mercury included, which
+      is the arm this round added. Measured on the landing page, because copy
+      can reach a button from somewhere other than the table.
+
+    The disclosure the badge used to carry has NOT gone: see
+    `test_the_mercury_data_caveat_lives_on_the_mercury_card`, which fails if it
+    vanishes from the card.
     """
     from gui_core.body_cards import body_buttons
 
-    long_lines, multi_line = [], []
+    expected = {"Moon": "Moon", "Europa": "Europa", "Mercury": "Mercury",
+                "asteroid": "Asteroid", "custom": "Custom body"}
     for button in body_buttons():
-        assert not hasattr(button, "note"), (
-            f"BodyButton grew a `note` field back ({button.key}). The landing "
-            f"screen does not render one, so it would be text nobody sees.")
-        assert button.subtitle.strip(), (
-            f"{button.key} has no subtitle; the button would read as a bare "
-            f"word with no idea what it leads to")
-        if "\n" in button.subtitle:
-            multi_line.append(button.key)
-        if len(button.subtitle) > 55:
-            long_lines.append(f"{button.key}: {len(button.subtitle)} chars -- "
-                              f"{button.subtitle!r}")
-    assert not multi_line, (
-        f"a body button's subtitle spans more than one line: {multi_line}")
-    assert not long_lines, "\n  ".join(
-        ["a body-button subtitle is a paragraph, not a functional line:"]
-        + long_lines)
-    print("    [landing copy] "
-          + "; ".join(f"{b.key}: {b.subtitle!r}" for b in body_buttons()))
+        for gone in ("note", "subtitle", "maturity"):
+            assert not hasattr(button, gone), (
+                f"BodyButton grew a `{gone}` field back ({button.key}). The "
+                f"landing screen does not render one, so it would be text "
+                f"nobody sees.")
+        assert button.title == expected[button.key], (
+            f"the {button.key} button says {button.title!r}; the landing "
+            f"screen shows the body's name as {expected[button.key]!r}")
+
+    # ...and on the rendered page, where a second line could come from any
+    # widget rather than from the table.
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        from PyQt6.QtWidgets import QPushButton
+        start = panel.tabs["start"]
+        page = start.stack.widget(start.LANDING)
+        titles = set(expected.values())
+        found, wordy = {}, []
+        for widget in page.findChildren(QPushButton):
+            lines = [ln for ln in widget.text().split("\n") if ln.strip()]
+            if not lines or lines[0] not in titles:
+                continue
+            found[lines[0]] = lines
+            # EXACTLY one line. No badge exception any more: that exception is
+            # what let "Mercury\n(limited data)" through, and Mercury is a bare
+            # name now like the other four.
+            if len(lines) != 1:
+                wordy.append(f"{lines[0]}: {widget.text()!r}")
+        assert not wordy, "\n  ".join(
+            ["a body button carries copy under its name again:"] + wordy)
+        assert set(found) == titles, (
+            f"the landing page renders buttons for {sorted(found)}; the table "
+            f"offers {sorted(titles)}")
+        print("    [landing copy] "
+              + "; ".join(f"{k}: {v}" for k, v in sorted(found.items())))
 
 
-def test_removing_the_paragraphs_did_not_remove_a_disclosure():
-    """The half that makes the deletion above safe rather than merely tidy.
+#: What the Mercury data caveat has to say, in whatever words it says it. Three
+#: claims, because a user who reads only two of them still comes away thinking
+#: this body is supported the way the Moon is.
+_MERCURY_CAVEAT = ("no albedo map", "no topography", "uniform-albedo")
 
-    Mercury's paragraph was the only one carrying a claim a user needs: it
-    ships no albedo map, no topography and no worked example, so every Mercury
-    run is a uniform-albedo sphere. Deleting the paragraph without this check
-    would delete the warning with it. It now lives on the Mercury card -- where
-    the controls it constrains are -- plus a two-word badge on the button.
+
+def _mercury_caveat_missing(card):
+    """Which parts of the data caveat this card does not say. [] means all
+    three are on it, on a widget that is not hidden."""
+    from PyQt6.QtWidgets import QLabel
+    # `isHidden()`, NOT `isVisible()`: offscreen, `isVisible()` is False for
+    # every widget whose ancestors were never shown, so a visibility check
+    # written that way passes vacuously on this machine.
+    text = "\n".join(w.text() for w in card.findChildren(QLabel)
+                     if not w.isHidden())
+    return [phrase for phrase in _MERCURY_CAVEAT if phrase not in text]
+
+
+def test_the_mercury_data_caveat_lives_on_the_mercury_card():
+    """The half that makes the button sweep safe rather than merely tidy.
+
+    Mercury's landing-screen copy was the only one carrying a claim a user
+    needs: it ships no albedo map, no topography and no worked example, so
+    every Mercury run is a uniform-albedo sphere. That claim has now been
+    displaced twice -- out of the paragraph under the button, then out of the
+    two-word "(limited data)" badge that replaced the paragraph. The button is
+    a bare name, so THE CARD IS THE ONLY PLACE LEFT, and this is the check that
+    makes each of those deletions a move rather than a loss.
+
+    The negative control is the point of the exercise: the caveat is blanked on
+    the live card and the same predicate must complain. Without it this is an
+    assertion that a string is present in a haystack of every label on the
+    card, which is exactly the shape that passes for the wrong reason.
 
     The custom-body paragraph is the same shape: what that route is for, and
     what happens if you type the body's name under `simulation.body` instead,
@@ -167,19 +232,42 @@ def test_removing_the_paragraphs_did_not_remove_a_disclosure():
 
     mercury = [b for b in body_buttons() if b.key == "Mercury"]
     assert mercury, "the Mercury button is gone"
-    assert mercury[0].maturity.strip(), (
-        "the Mercury button lost both its paragraph and its badge, so nothing "
-        "on the landing screen says this body is thin on data")
 
     with tempfile.TemporaryDirectory() as scratch:
         _, panel = _panel(scratch)
-        from PyQt6.QtWidgets import QLabel
         card = panel.tabs["card_mercury"]
-        text = "\n".join(w.text() for w in card.findChildren(QLabel))
-        for phrase in ("no albedo map", "no topography", "uniform-albedo"):
-            assert phrase in text, (
-                f"the Mercury card no longer says {phrase!r}, and the landing "
-                f"paragraph that used to say it has been removed:\n{text[:400]}")
+        banner = getattr(card, "data_support_banner", None)
+        assert banner is not None, (
+            "the Mercury card has no `data_support_banner`. The landing screen "
+            "no longer carries a badge or a paragraph for this body, so there "
+            "is now nowhere at all that says it ships no data.")
+        assert not banner.isHidden(), (
+            "the Mercury data-support banner is hidden, which is the same as "
+            "not being there")
+
+        missing = _mercury_caveat_missing(card)
+        assert not missing, (
+            f"the Mercury card no longer says {missing}, and neither the "
+            f"landing paragraph nor the badge that used to say it still "
+            f"exists:\n{banner.text()[:400]}")
+
+        # ...the negative control. Blank the banner and the predicate must
+        # complain about all three claims; then put it back.
+        original = banner.text()
+        try:
+            banner.setText("")
+            blanked = _mercury_caveat_missing(card)
+            assert blanked == list(_MERCURY_CAVEAT), (
+                f"with the banner blanked the check still reports only "
+                f"{blanked} missing -- something else on the card is "
+                f"satisfying it, so this check does not measure the banner")
+        finally:
+            banner.setText(original)
+        assert _mercury_caveat_missing(card) == [], (
+            "the negative control did not restore the banner")
+        print(f"    [disclosure] Mercury caveat on card_mercury, "
+              f"{len(original)} chars, all of {list(_MERCURY_CAVEAT)} present; "
+              f"blanking it fails the check")
 
     custom = card_preset("custom", "body")
     assert custom is not None, "the custom-body card lost its preset"
@@ -212,6 +300,241 @@ def test_the_landing_screen_is_buttons_not_prose():
              "choice of body, and the detail belongs in the tooltips and on "
              "the cards:"] + prose)
         print("    [landing copy] no standing paragraph on the landing page")
+
+
+# --------------------------------------------------------------------------
+# 1b. REGISTER -- a header names a thing, it does not ask a question
+# --------------------------------------------------------------------------
+#
+# Paul, click-testing the merged body-first GUI: "we don't need to use informal
+# language like 'which piece of ground' (users are planetary scientists) so
+# change these to be more technically accurate and concise, e.g., 'Local mesh'."
+#
+# Every section header on these screens was phrased as a question -- "Which
+# sphere", "Which piece of ground", "Where it goes", "How long to settle",
+# "What kind of run". A question is the register of a wizard walking somebody
+# through a form; a planetary scientist reading a section header wants the name
+# of the thing.
+#
+# SCOPE, deliberately narrow, and each exclusion is a measurement rather than a
+# convenience:
+#
+#   * covered -- QGroupBox titles, checkbox, radio and PUSH-BUTTON labels,
+#     field labels and the flow's own headings, on the Start page and the five
+#     body cards. Push buttons are in on purpose: the sweep renamed "Prepare
+#     the grid..." and both Back controls, and a gate blind to buttons would
+#     let "Where should the grid go?" back in green.
+#   * NOT covered -- TOOLTIPS. The plain-language what/recommended/when
+#     standard stays exactly as it is: explanatory prose is where a question is
+#     the right shape ("Whether to model the whole body as a sphere, or one
+#     site from a terrain mesh you supply"). This gate would have 46 hits on
+#     the tooltip table and every one of them would be a wrong fix.
+#   * NOT covered -- the muted notes under controls, which are prose for the
+#     same reason, and modal dialog titles, where "Write grid configurations?"
+#     is a real question being asked of the user.
+#   * NOT covered -- the eleven All settings section pages. Measured on the
+#     2026-08-27 corpus: 31 group titles, 0 hits. They were already technical
+#     ("Time Parameters", "Output Destination", "Thermal GPU Dispatch"), which
+#     is why the complaint was about the cards.
+
+_INTERROGATIVE = re.compile(r"^(Which|What|Where|When|How|Why|Who)\b", re.I)
+
+
+def _register_corpus(panel):
+    """(where, text) for every header and label on the body-first surface."""
+    from PyQt6.QtWidgets import (QCheckBox, QGroupBox, QLabel, QPushButton,
+                                 QRadioButton)
+    out = []
+    surfaces = {name: tab for name, tab in panel.tabs.items()
+                if name == "start" or name.startswith("card_")}
+    assert surfaces, "no body-first surfaces found -- the probe is broken"
+    for name, tab in surfaces.items():
+        for widget in tab.findChildren(QGroupBox):
+            if widget.title().strip():
+                out.append((f"{name}/section", widget.title()))
+        for widget in tab.findChildren((QCheckBox, QRadioButton)):
+            if widget.text().strip():
+                out.append((f"{name}/control", widget.text()))
+        for widget in tab.findChildren(QPushButton):
+            # The FIRST line only. A run-type button carries its summary on the
+            # lines below, and a summary is prose, checked nowhere here.
+            text = (widget.text() or "").split("\n")[0].strip()
+            if text:
+                out.append((f"{name}/button", text))
+        for widget in tab.findChildren(QLabel):
+            text = (widget.text() or "").strip()
+            # Field labels only. The muted note paragraphs are prose and are
+            # excluded by construction, not by a wordlist.
+            if text.endswith(":"):
+                out.append((f"{name}/label", text))
+    start = panel.tabs["start"]
+    for attr in ("landing_heading", "runtype_heading", "card_title"):
+        widget = getattr(start, attr, None)
+        text = (widget.text() or "").strip() if widget is not None else ""
+        if text:
+            out.append((f"start/{attr}", text))
+    return out
+
+
+def test_no_header_or_label_on_a_card_is_phrased_as_a_question():
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        # Drive the flow so the run-type step's own headers are built and the
+        # card header carries a title: an unvisited screen would pass empty.
+        start = panel.tabs["start"]
+        start.choose_body("Moon")
+        start._choose_mode("local")
+        start.open_card("Moon", "local", "time_series", apply_defaults=False)
+
+        corpus = _register_corpus(panel)
+        assert len(corpus) > 60, (
+            f"the register corpus is only {len(corpus)} strings -- the "
+            f"harvest is broken and this check would pass vacuously")
+        hits = [f"{where}: {text!r}" for where, text in corpus
+                if _INTERROGATIVE.match(text) or text.rstrip().endswith("?")]
+        assert not hits, "\n  ".join(
+            [f"a section header or label on the body-first surface is phrased "
+             f"as a question ({len(hits)} of {len(corpus)}); name the thing "
+             f"instead -- 'Local mesh', not 'Which piece of ground':"] + hits)
+        print(f"    [register] {len(corpus)} headers and labels across the "
+              f"Start page and five cards, 0 phrased as questions")
+        start.stack.setCurrentIndex(start.LANDING)
+
+
+def test_the_register_check_actually_fires():
+    """Its negative controls -- the exact strings this sweep replaced.
+
+    A pattern nobody proved can fire is decoration. Each of these was a real
+    section header on the merged body-first GUI on 2026-08-27.
+    """
+    was_real = ["Which sphere", "Which piece of ground", "Which terrain",
+                "Where it goes", "How long to settle", "What kind of run",
+                "Which part of it", "Where it is", "How it turns",
+                "What shape it is", "What the surface is like", "Which body",
+                "When", "When to run it", "What would you like to model?"]
+    for text in was_real:
+        assert (_INTERROGATIVE.match(text)
+                or text.rstrip().endswith("?")), (
+            f"the register check does not fire on {text!r}, which was a real "
+            f"header before this sweep")
+    # ...and the positive control: the replacements pass clean.
+    replacements = ["Global mesh", "Local mesh", "Local mesh (Sutton DEM)",
+                    "Output", "Thermal", "Run type", "Model domain",
+                    "Ephemeris", "Spin state", "Shape", "Surface properties",
+                    "Body identity", "Time window", "Select a body",
+                    "Parameter grid", "Radiation exchange",
+                    "Subdivision level:", "Duration (days):",
+                    "Output directory:", "Integration window (days):"]
+    for text in replacements:
+        assert not (_INTERROGATIVE.match(text)
+                    or text.rstrip().endswith("?")), (
+            f"the register check fires on {text!r}, which is the replacement")
+
+
+# --------------------------------------------------------------------------
+# 1c. A control is filed under what it does, not under what it sits beside
+# --------------------------------------------------------------------------
+
+def _owning_section(widget):
+    """The QGroupBox title a control is inside, or ""."""
+    from PyQt6.QtWidgets import QGroupBox
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QGroupBox):
+            return parent.title()
+        parent = parent.parentWidget()
+    return ""
+
+
+def _misfiled(key, section):
+    """A solver setting sitting under a destination or a mesh, or ""."""
+    if not key.startswith("thermal."):
+        return ""
+    if section == "Output":
+        return f"{key} is in the Output section"
+    # Any mesh section, global OR local. `thermal.integration_days` would land
+    # in the LOCAL group if it were re-added to the Europa card, and matching
+    # only "Global mesh" would miss it.
+    if "mesh" in section.lower():
+        return f"{key} is in the {section!r} section"
+    return ""
+
+
+def test_the_misfiled_control_check_actually_fires():
+    """Its negative controls. Two of the three arms below cannot fire on the
+    current GUI, because the current GUI is correct -- so they are exercised
+    against the predicate directly rather than shipped unproven.
+    """
+    fires = [("thermal.use_gpu", "Output"),                 # the real defect
+             ("thermal.integration_days", "Global mesh"),   # where it was
+             ("thermal.integration_days", "Local mesh (Sutton DEM)"),
+             ("thermal.equilibration_orbits", "Local mesh")]
+    for key, section in fires:
+        assert _misfiled(key, section), (
+            f"the misfiled check does not fire on {key} in {section!r}")
+    clean = [("thermal.use_gpu", "Thermal"),
+             ("thermal.equilibration_orbits", "Thermal"),
+             ("thermal.integration_days", "Thermal"),
+             ("output.directory", "Output"),
+             ("mesh.resolution", "Global mesh"),
+             ("mesh.import_file", "Local mesh"),
+             ("radiation.enabled", "Radiation exchange")]
+    for key, section in clean:
+        assert not _misfiled(key, section), (
+            f"the misfiled check fires on {key} in {section!r}, which is "
+            f"where it belongs")
+
+
+def test_the_thermal_solver_controls_are_in_the_thermal_section():
+    """`thermal.use_gpu` sat in the output section, beside output.directory.
+
+    It selects the device the heat-equation solver runs on. Nothing about it is
+    a destination, and a user looking for it under Output found it only by
+    accident. Two properties, and the second is the one that would have failed
+    before this change:
+
+    * every card has a Thermal section, and both solver settings are in it;
+    * NO `thermal.*` control is inside the Output section -- which is where
+      `thermal.use_gpu` was, on every one of the five cards.
+
+    Also pinned: `output.directory` stays in Output. Moving the GPU switch out
+    must not take the destination with it.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        cards = {n: t for n, t in panel.tabs.items() if n.startswith("card_")}
+        assert len(cards) == 5, f"expected five cards, found {sorted(cards)}"
+        misfiled, missing = [], []
+        for name, card in cards.items():
+            sections = {key: _owning_section(w)
+                        for key, w in card.widgets.items()}
+            for key in ("thermal.use_gpu", "thermal.equilibration_orbits"):
+                if sections.get(key) != "Thermal":
+                    missing.append(f"{name}: {key} is in "
+                                   f"{sections.get(key)!r}, not 'Thermal'")
+            if sections.get("output.directory") != "Output":
+                missing.append(f"{name}: output.directory is in "
+                               f"{sections.get('output.directory')!r}, not "
+                               f"'Output'")
+            for key, section in sections.items():
+                complaint = _misfiled(key, section)
+                if complaint:
+                    misfiled.append(f"{name}: {complaint}")
+        assert not missing, "\n  ".join(
+            ["a solver or destination control is not in its own section:"]
+            + missing)
+        assert not misfiled, "\n  ".join(
+            ["a thermal-solver control is filed under where the run's files "
+             "go, or under the mesh geometry:"] + misfiled)
+        # Europa's integration window moved out of the mesh section too.
+        europa = panel.tabs["card_europa"]
+        assert _owning_section(
+            europa.widgets["thermal.integration_days"]) == "Thermal", (
+            "thermal.integration_days is still filed under the Europa card's "
+            "mesh section")
+        print(f"    [sections] {len(cards)} cards: thermal.use_gpu, "
+              f"thermal.equilibration_orbits in Thermal; output.directory in "
+              f"Output; 0 thermal keys under Output")
 
 
 def test_a_body_the_presentation_table_forgets_is_loud():
@@ -1159,9 +1482,13 @@ def test_a_generic_body_value_below_the_floor_blocks_the_launch():
 
 TESTS = [
     test_the_landing_screen_offers_exactly_the_implemented_bodies,
-    test_a_body_button_carries_one_short_functional_line_and_no_paragraph,
-    test_removing_the_paragraphs_did_not_remove_a_disclosure,
+    test_a_body_button_is_the_body_name_and_nothing_else,
+    test_the_mercury_data_caveat_lives_on_the_mercury_card,
     test_the_landing_screen_is_buttons_not_prose,
+    test_no_header_or_label_on_a_card_is_phrased_as_a_question,
+    test_the_register_check_actually_fires,
+    test_the_misfiled_control_check_actually_fires,
+    test_the_thermal_solver_controls_are_in_the_thermal_section,
     test_a_body_the_presentation_table_forgets_is_loud,
     test_a_grid_is_offered_only_where_a_grid_exists,
     test_every_route_reaches_its_own_card,

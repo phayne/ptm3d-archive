@@ -29,22 +29,28 @@ local disk, not in a cloud-synced folder.
 ### 1. Simulation Configuration
 
 The GUI has **two levels**, and only the first is navigation. Clicking through
-— body, kind of run, card, run — is how you get anywhere; the section list on
+— body, run type, card, run — is how you get anywhere; the section list on
 the left is **hidden until you ask for it**. Both levels edit the same
 configuration.
 
-- **Start page — which body?** Five large buttons: Moon, Europa, Mercury,
-  Asteroid, and Custom body. The three built-in bodies are exactly the ones the
-  engine implements; the list is generated from `planetary_properties.h`, so a
-  body it cannot run cannot have a button. "Open a configuration file" and
+- **Start page — select a body.** Five large buttons carrying the body's name
+  and no other copy at all: Moon, Europa, Mercury, Asteroid, and Custom body.
+  The three built-in bodies are exactly the ones the engine implements; the
+  list is generated from `planetary_properties.h`, so a body it cannot run
+  cannot have a button. What each one leads to is in its tooltip, and a body
+  whose data support is thin says so on its own card — Mercury opens with a
+  banner naming the datasets it does not ship. "Open a configuration file" and
   "Reproduce a published run" are the other two ways in.
-- **Then — what kind of run?** Whether to model the whole body or one piece of
-  ground, and whether to write a field per output sample, only the summary maps,
-  or (for the Europa terrain grid) a whole set of runs.
-- **Then — one card**, sized to that body and that kind of run: eleven controls
-  for a whole-Moon run, nine for a Europa terrain site, eight for Mercury. Each
-  card states the exact keys it set, announces every automatic choice, and lists
-  anything an opened file carries that the card does not show.
+- **Then — model domain and run type.** Global (a procedural icosphere) or
+  Local mesh (a terrain mesh you supply), and then Time series, Integrated
+  statistics, or — for the Europa terrain grid — Parameter grid.
+- **Then — one card**, sized to that body and that run type: eleven controls
+  for a global Moon run, nine for a Europa terrain site, eight for Mercury.
+  Its sections are Time window, the mesh, the surface, Radiation exchange,
+  Thermal and Output — the solver's own settings, `thermal.use_gpu` among them,
+  are in Thermal, and Output holds only where the files land. Each card states
+  the exact keys it set, announces every automatic choice, and lists anything
+  an opened file carries that the card does not show.
 - **All settings (advanced)**: the complete reference view — Simulation, Mesh,
   Properties, Thermal, Output, Body, Illumination, Radiation, GPU and Engine
   Flags. It is **not** the primary navigation and it is not on screen by
