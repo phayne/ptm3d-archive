@@ -12,6 +12,32 @@ import sys
 import os
 from pathlib import Path
 
+
+def _setup_qt_plugin_path():
+    """Point Qt at the PyQt6 wheel's own plugins before any Qt import.
+
+    In a conda environment that also ships its own Qt, a qt.conf beside the
+    python binary redirects the plugin search away from the PyQt6 wheel and a
+    direct launch of this module dies with: Could not find the Qt platform
+    plugin "cocoa" in "". gui/run_gui.py has always compensated; launching
+    this module directly must work the same way. setdefault so an
+    intentionally set environment (run_gui.py, offscreen test harnesses)
+    is never overridden.
+    """
+    try:
+        import PyQt6
+        plugin_path = os.path.join(os.path.dirname(PyQt6.__file__), 'Qt6', 'plugins')
+        if os.path.exists(plugin_path):
+            os.environ.setdefault('QT_PLUGIN_PATH', plugin_path)
+            platforms_path = os.path.join(plugin_path, 'platforms')
+            if os.path.exists(platforms_path):
+                os.environ.setdefault('QT_QPA_PLATFORM_PLUGIN_PATH', platforms_path)
+    except ImportError:
+        pass
+
+
+_setup_qt_plugin_path()
+
 # PyQt6 imports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
