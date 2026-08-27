@@ -1831,7 +1831,7 @@ TOOLTIPS = {
         "individual infrared data sets, each with its own roughness and shape "
         "assumptions, so one lifted into a different model is not a "
         "measurement. Fine regolith on a large main-belt asteroid runs low, "
-        "tens of units; a kilometre-scale near-Earth rubble pile runs in the "
+        "tens of units; a kilometer-scale near-Earth rubble pile runs in the "
         "hundreds; bare rock runs over a thousand."
     ),
     "ui.orbit_on_body_page": (
