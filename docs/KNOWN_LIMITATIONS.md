@@ -472,6 +472,75 @@ that the value you set is the value that was echoed.
 
 ## Configuration gotchas
 
+- **`simulation.body` accepts three names, and every other name is now refused.** The engine
+  implements `Moon`, `Europa` and `Mercury`. Until 2026-08-26 any other name resolved to **Europa's**
+  property set inside `PlanetaryData::getPropertiesByName`, so a config saying `body: Mars` ran to
+  completion with `rc 0`, Europa's 1560.8 km radius, Europa's `europa.tm` metakernel, a
+  `Synodic day 3.55 Earth days` banner, `Default albedo 0.5`, sixteen statistics binaries, an
+  all-`NaN` `effective_albedo.bin` — and average **and** maximum total flux of `0.000000000 W/m²`
+  on every face. The only warning was one `Note:` line on stderr. Measured on all four bodies the
+  GUI offered and the engine did not implement (Mars, Ceres, Titan, Enceladus). Such a config is
+  now `FATAL` at config parse, with a message naming the implemented set and pointing at the
+  generic-body route. A body name outside the three that **is** backed by a `generic_body:` block —
+  every asteroid config in `examples/` — is unaffected: `generic_body:` supplies the properties, and
+  that is the supported route.
+
+- **Mercury's `day` was the sidereal rotation, not the solar day, and this is a physics change.**
+  `props.day` is the period the thermal model is forced at: it sets the hour angle, the diurnal
+  skin depth and hence the depth grid, the timestep, the equilibration block length and the output
+  cadence. Mercury's entry carried the **sidereal** 58.646 d while the banner printed it as
+  `Synodic day (solar day)`. Mercury is in a 3:2 spin-orbit resonance, so its solar day is
+  `1/|1/P_sid − 1/P_orb|` = **175.938 d**, three times longer. Every derived quantity was therefore
+  a third of its true length — `thermal.equilibration_orbits: N` bought N sidereal rotations of
+  spin-up, and the diurnal skin depth was √3 = 1.73× too shallow. Fixed 2026-08-26. Measured on an
+  ico2 4-step probe: banner and `Total equilibration period` 58.65 d → 175.94 d; `temperature_max`
+  mean 283.80 K → 324.46 K and minimum 24.82 K → 133.40 K on the CPU SIMD batch path. **A Mercury
+  run on this binary is not comparable with one from before.** No shipped configuration, tutorial
+  or dataset selects Mercury (0 of 78 run configs; the albedo and topography datasets cover Moon and
+  Europa only), so the blast radius is the tutorial and testing surface. Moon and Europa are
+  untouched and byte-identical.
+
+- **There is no upper temperature clamp, on any path — and there used to be one, on one path.**
+  `MAX_PHYSICAL_TEMP_K = 500.0` was applied by the **CPU scalar** solver only
+  (`Profile::update_T`, `outputSurfaceTemp`); the CPU SIMD batch path and the GPU persistent kernel
+  never had it. On the same Keplerian generic-body config at 0.25 AU the two CPU paths therefore
+  disagreed by **210 K** in mean `temperature_max` (SIMD 686.09 K, scalar 475.84 K with its maximum
+  sitting at exactly 500.000000 K), and a Mercury run reported `T_max` = 606.71 K on the default
+  path while the engine warned that a 500 K clamp would truncate it. The constant and all four of
+  its clamp sites were removed 2026-08-26 on Paul's ruling ("remove the temperature ceiling for all
+  bodies — no clamps, only physics"); the three paths now agree to 0.19 K on that config. **The
+  `T_geo` floor is a different object and stays** — it is per-face physics, see section 2 above —
+  as do the NaN/Inf guards. Two upper bounds survive, both inside the **legacy** initial condition
+  (`thermal.spinup_seed: legacy`, which no shipped config selects): a 400 K cap on the seed's
+  radiative-equilibrium temperature and a 50 K cap on its geothermal rise. They are kept because
+  that path's whole contract is to reproduce the pre-2026-08-11 seed exactly, and an initial
+  condition is not a solution bound — but each now prints a one-shot note when it binds instead of
+  substituting silently.
+
+- **The Python and GUI layers no longer keep their own copy of the body list.**
+  `src/python/ptm/body_capabilities.py` exposes the implemented bodies and their engine
+  properties, generated from `planetary_properties.h` by
+  `python3 -m ptm.body_capabilities --regenerate` on the `ptm.engine_config` precedent.
+  `src/python/tests/test_body_capabilities.py` re-derives it on every run and fails if the
+  committed table, `gui_tooltips.BODY_SYNODIC_PERIODS`, `gui_tooltips.BODY_DEFAULTS`,
+  `gui_core.facet_scale._BODY_RADII_M` or `ptm.results.BODY_RADII` disagrees with the engine --
+  four hand-maintained duplicates that nothing checked before, and that is how
+  `BODY_SYNODIC_PERIODS` came to carry 175.942 d for Mercury under a comment claiming it
+  matched `thermo.day` while the engine carried 58.646 d.
+
+- **`radiation.beaming: true` is refused on a mesh whose facets are at the roughness scale.** The
+  Smith sub-facet roughness model double-counts on facets that already resolve the roughness
+  geometrically. The engine measures the mesh's facet scale at load (5th percentile of face area,
+  in meters, using the same inferred length unit as the PTM-37 check) and refuses below **0.05 m**,
+  warns loudly between 0.05 m and 1 m, and is silent at or above 1 m. Same rule and same thresholds
+  as the GUI's `gui_core/facet_scale.py`, and the two agree to every reported digit on the meshes
+  this project runs (`sunlit_radcore_r50` 236.648 m / 169.386 m; `lunar_crater_80N` 17.947 m /
+  17.678 m). The gate is the **fine end**, not the mean, because `sqrt(mean area)` is dominated by
+  the largest facets: a mesh that is 99 % millimeter-scale with a coarse minority reports 70.7 cm
+  and would sail through a rule written to refuse millimeter facets. The 509,337-face moon3d mesh
+  measures 1.89 mm mean / 0.45 mm at the fine end and is refused. Nothing is checked, and no mesh is
+  traversed, when `beaming` is off.
+
 - **Most of the `thermophysical:` block is not read, and the run now says so.** On a *built-in*
   body (Moon/Europa/Mercury) the parser consumes only `use_default_albedo`,
   `constant_thermal_inertia`, `albedo_override`, `emissivity_override`, `ks_override`,

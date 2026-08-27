@@ -1959,23 +1959,27 @@ public:
 static constexpr int kCpuAnalyticSeedYears = 2;
 
 // Length of the CPU paths' analytic clear-sky pre-conditioner, in diurnal
-// cycles, for a body with a real seasonal year (Moon 24, Europa 2, Mercury 4).
+// cycles, for a body with a real seasonal year (Moon 24, Europa 2, Mercury 2).
 // SINGLE SOURCE: the SIMD equilibrator sizes its seed with this and the
 // pre-flight banner reports it with this, so the reported length cannot drift
 // away from the integrated one. Generic bodies do NOT use it on the SIMD path
 // (an asteroid's year is ~10^4 rotations); see the "using_generic_body" branch
 // in runThermalModelsForAllFacesBatchSoA.
+//
+// Must stay identical to thermal::analyticSeedCycles (eq_seed.cpp), including
+// the floor below.
 static double cpuAnalyticSeedCycles(const thermal::Planet& planet, int nyearseq) {
     if (!(planet.day > 0.0)) return 0.0;
-    return static_cast<double>(nyearseq) * std::round(planet.year / planet.day);
+    return thermal::analyticSeedCyclesFromPeriods(planet.day, planet.year, nyearseq);
 }
 
 double getSynodicDayFromPlanet(const thermal::Planet& planet) {
-    // The planet object stores the rotational period in seconds in the 'day' field
-    double rotation_period_seconds = planet.day;
-    double rotation_period_days = rotation_period_seconds / (24.0 * 3600.0);
-    
-    return rotation_period_days;
+    // planet.day is the SOLAR (synodic) day in seconds -- see the field comment
+    // in planetary_properties.h. This is the one place the banner and the
+    // equilibration window get their "Earth days per diurnal cycle" from, so
+    // reading it as anything else (a sidereal rotation, say) propagates
+    // everywhere at once.
+    return planet.day / (24.0 * 3600.0);
 }
 
 std::vector<double> importAlbedoMapFromFile(const std::string& filename) {
@@ -3006,11 +3010,12 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double Qb_override = -1.0,
     double H_override  = -1.0,
     // Global face index for the cross-path seed dump (PTM_DUMP_SEED) and the
-    // seed guards. -1 = not a mesh face (point mode / standalone), record
-    // nothing. `seed_flags` accumulates {floor_hits, above_500K_hits}.
+    // seed guard. -1 = not a mesh face (point mode / standalone), record
+    // nothing. `seed_floor_faces` accumulates the ABSOLUTE_ZERO_K hits; the
+    // companion "seed above the CPU clamp" counter is gone with the clamp
+    // itself (thermal_model.h, 2026-08-26).
     long long seed_record_face = -1,
     std::atomic<size_t>* seed_floor_faces = nullptr,
-    std::atomic<size_t>* seed_hot_faces   = nullptr,
     SeedAnchorCensus*    anchor_census    = nullptr,
     // Warm start / final-state capture. Null = neither, and this function is
     // then bit-identical to what it was before PTM-76.
@@ -3117,7 +3122,6 @@ std::vector<double> runThermalModelWithMatchedTimes(
         // guards so they can be reported instead of swallowed.
         if (model.seed_applied && !warm_started_face) {
             if (model.seed_result.clamped_low && seed_floor_faces) ++(*seed_floor_faces);
-            if (model.seed_result.above_500K  && seed_hot_faces)   ++(*seed_hot_faces);
             if (anchor_census) anchor_census->add(model.seed_result);
             if (seed_record_face >= 0) {
                 thermal::EqSeedInput rec;
@@ -3986,7 +3990,6 @@ bool runThermalModelsForAllFacesStreamed(
     // elsewhere implies -- so it gets the same shared seed through
     // runThermalModelWithMatchedTimes.
     std::atomic<size_t> seed_floor_faces{0};
-    std::atomic<size_t> seed_hot_faces{0};
     SeedAnchorCensus anchor_census;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
@@ -4098,7 +4101,7 @@ bool runThermalModelsForAllFacesStreamed(
             std::vector<double> temps = runThermalModelWithMatchedTimes(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
                 face_qb, face_H, static_cast<long long>(f),
-                &seed_floor_faces, &seed_hot_faces, &anchor_census, st_ptr);
+                &seed_floor_faces, &anchor_census, st_ptr);
 
             if (ckpt.want_out && st.out_column) ckpt.scatterOut(f, st_out.data());
 
@@ -4124,11 +4127,6 @@ bool runThermalModelsForAllFacesStreamed(
         std::cerr << "[Streamed] WARNING: " << seed_floor_faces.load() << " of "
                   << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor (Qb <= 0 AND zero mean absorbed flux).\n";
-    }
-    if (seed_hot_faces.load() > 0) {
-        std::cerr << "[Streamed] WARNING: " << seed_hot_faces.load() << " of "
-                  << n_faces << " faces seed above " << thermal::MAX_PHYSICAL_TEMP_K
-                  << " K, the CPU solver's hard clamp.\n";
     }
     anchor_census.report("cpu-streamed", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-streamed");
@@ -4274,7 +4272,6 @@ bool runThermalModelsForAllFaces(
     // latitude-blind -- and then integrate 24 lunations of analytic clear-sky
     // forcing on top. Both are gone under spinup_seed: physical.
     std::atomic<size_t> seed_floor_faces{0};
-    std::atomic<size_t> seed_hot_faces{0};
     SeedAnchorCensus anchor_census;
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
@@ -4405,7 +4402,6 @@ bool runThermalModelsForAllFaces(
                     face_H,
                     static_cast<long long>(f),
                     &seed_floor_faces,
-                    &seed_hot_faces,
                     &anchor_census,
                     st_ptr
                 );
@@ -4509,12 +4505,6 @@ bool runThermalModelsForAllFaces(
                   << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor (Qb <= 0 AND zero mean absorbed flux)."
                   << std::endl;
-    }
-    if (seed_hot_faces.load() > 0) {
-        std::cerr << "WARNING: " << seed_hot_faces.load() << " of " << n_faces
-                  << " faces have a cycle-mean radiative-equilibrium seed above "
-                  << thermal::MAX_PHYSICAL_TEMP_K << " K, the CPU solver's hard "
-                     "clamp; the solution WILL be truncated there." << std::endl;
     }
     anchor_census.report("cpu-scalar", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-scalar");
@@ -4627,7 +4617,7 @@ struct GpuSharedSeedContext {
 
 static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                               std::vector<float>& T_initial,
-                              size_t& floor_faces, size_t& hot_faces) {
+                              size_t& floor_faces) {
     std::vector<double> z_col(c.n_layers), kc_col(c.n_layers),
                         rho_col(c.n_layers), T_col(c.n_layers);
     std::vector<double> series;
@@ -4712,7 +4702,6 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
         const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
         if (res.clamped_low) ++floor_faces;
-        if (res.above_500K)  ++hot_faces;
         if (c.census) c.census->add(res);
         thermal::EqSeedRecorder::instance().record(global_f, in, res);
 
@@ -5017,14 +5006,13 @@ bool runThermalModelsForAllFacesBatchSoA(
     // non-finite Qb is substituted with 0 in the seed, and counted, so the
     // substitution is reported instead of silently swallowed.
     std::atomic<size_t> bad_qb_faces{0};
-    // Seed guards, reported after the loop (never silent):
+    // Seed guard, reported after the loop (never silent):
     //   seed_floor_faces -- columns pinned at ABSOLUTE_ZERO_K (Qb <= 0 AND no
-    //                       absorbed flux; cp(T) is undefined below that);
-    //   seed_hot_faces   -- columns whose radiative-equilibrium seed exceeds
-    //                       the CPU solver's own MAX_PHYSICAL_TEMP_K clamp, so
-    //                       the run WILL be truncated by that clamp (Mercury).
+    //                       absorbed flux; cp(T) is undefined below that).
+    // There is no companion "too hot" guard any more: it existed only to warn
+    // that the CPU scalar path's 500 K ceiling would truncate the run, and that
+    // ceiling was removed 2026-08-26 (thermal_model.h).
     std::atomic<size_t> seed_floor_faces{0};
-    std::atomic<size_t> seed_hot_faces{0};
     auto start_time = std::chrono::high_resolution_clock::now();
 
     const thermal::EqSeedMode seed_mode = config.spinup_seed;
@@ -5541,7 +5529,6 @@ bool runThermalModelsForAllFacesBatchSoA(
                     const thermal::EqSeedResult sres =
                         thermal::eqSeedColumn(sin_, T_col);
                     if (sres.clamped_low) ++seed_floor_faces;
-                    if (sres.above_500K)  ++seed_hot_faces;
                     simd_anchor_census.add(sres);
                     thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
 
@@ -5577,9 +5564,35 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // No validated arm reaches the bound (minimum seed in the
                 // PTM-46 validation set is 24.04 K = Moon T_geo), so this is a
                 // guard, not a behavior change -- verified byte-identical.
+                //
+                // ⚠️ The 400 K UPPER bound is a LEGACY-SEED artifact, kept for
+                // the same reason as Profile::init_T's 50 K cap and stated in
+                // the same terms: this branch runs only under
+                // `thermal.spinup_seed: legacy`, whose contract is to reproduce
+                // the pre-2026-08-11 initial condition exactly. It is an
+                // INITIAL CONDITION, not a bound on the solution -- the solver
+                // itself has had no upper temperature bound since 2026-08-26
+                // (thermal_model.h). It binds on Mercury (subsolar cycle mean
+                // ~468 K), which is precisely where the seed is worst, so it
+                // now says so instead of substituting quietly. Zero shipped
+                // configs select the legacy seed. BUGS.md ENG-LEGACY-SEED-CAPS.
+                const double T_rad_eq = std::sqrt(std::sqrt(ratio));
+                if (T_rad_eq > 400.0) {
+                    static std::atomic<bool> announced{false};
+                    if (!announced.exchange(true)) {
+                        std::cerr << "[eq-seed] NOTE: legacy seed "
+                                     "(thermal.spinup_seed: legacy): a face's "
+                                     "radiative-equilibrium seed is "
+                                  << T_rad_eq << " K and is CAPPED at 400 K in "
+                                     "the initial condition. Historical seed "
+                                     "reproduced exactly; the solver has no "
+                                     "upper temperature bound. Use the default "
+                                     "thermal.spinup_seed: physical to avoid it."
+                                  << std::endl;
+                    }
+                }
                 double T_surf_est = std::min(400.0,
-                        std::max(thermal::ABSOLUTE_ZERO_K,
-                                 std::sqrt(std::sqrt(ratio))));
+                        std::max(thermal::ABSOLUTE_ZERO_K, T_rad_eq));
 
                 // Deep temperature: geothermal gradient on top of surface avg,
                 // capped to prevent runaway (same formula as Profile::init_T).
@@ -6135,16 +6148,6 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "cp(T) is not defined below that."
                   << std::endl;
     }
-    if (seed_hot_faces.load() > 0) {
-        std::cerr << "WARNING: " << seed_hot_faces.load() << " of " << n_faces
-                  << " faces have a cycle-mean radiative-equilibrium seed above "
-                  << thermal::MAX_PHYSICAL_TEMP_K
-                  << " K, which is the CPU solver's own hard temperature clamp. "
-                     "The seed is physical (Mercury's subsolar cycle mean is "
-                     "~468 K); the CLAMP will truncate the solution. Results on "
-                     "those faces are not trustworthy."
-                  << std::endl;
-    }
     simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
     thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
 
@@ -6318,7 +6321,8 @@ bool addThermalDataToVTK(
 // clear-sky pre-conditioner before the real forcing — Model::fastEquilibrate
 // (scalar) and its mirror in the SIMD batch path — of
 // `NYEARSEQ * round(planet.year / planet.day)` diurnal cycles: 24 on the Moon,
-// 2 on Europa, 4 on Mercury, with NYEARSEQ hard-wired to 2 in main(). It is
+// 2 on Europa, 2 on Mercury (see analyticSeedCyclesFromPeriods for the floor
+// that keeps it from being 0 there), with NYEARSEQ hard-wired to 2 in main(). It is
 // not user-configurable, it is not counted by equilibration_orbits, and the
 // GPU path has no equivalent. So "configured == integrated" is exact on the
 // GPU and is "configured == integrated real-forcing spin-up, plus a fixed
@@ -7256,7 +7260,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const size_t n_layers = z_grid.size();
 
     // Shared-seed guards, reported after the batch loop (never silent).
-    size_t gpu_seed_floor_faces = 0, gpu_seed_hot_faces = 0;
+    size_t gpu_seed_floor_faces = 0;
     SeedAnchorCensus gpu_anchor_census;
     const double gpu_seed_dt_s =
         (total_time_steps > 1 && times.size() > 1) ? (times[1] - times[0])
@@ -7947,13 +7951,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // -- with quadrature -- for a run that was seeded by nothing
             // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
-            size_t warm_seed_floor_sink = 0, warm_seed_hot_sink = 0;
+            size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
             gpuFillSharedSeed(sc, T_initial,
                               warm_start_run ? warm_seed_floor_sink
-                                             : gpu_seed_floor_faces,
-                              warm_start_run ? warm_seed_hot_sink
-                                             : gpu_seed_hot_faces);
+                                             : gpu_seed_floor_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -8639,13 +8641,11 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // -- with quadrature -- for a run that was seeded by nothing
             // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
-            size_t warm_seed_floor_sink = 0, warm_seed_hot_sink = 0;
+            size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
             gpuFillSharedSeed(sc, T_initial,
                               warm_start_run ? warm_seed_floor_sink
-                                             : gpu_seed_floor_faces,
-                              warm_start_run ? warm_seed_hot_sink
-                                             : gpu_seed_hot_faces);
+                                             : gpu_seed_floor_faces);
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -9160,13 +9160,6 @@ post_batch_loop:
                   << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor -- Qb <= 0 AND zero mean absorbed flux, so "
                      "the steady-state balance has no positive root.\n";
-    }
-    if (gpu_seed_hot_faces > 0) {
-        std::cerr << "[GPU Thermal] WARNING: " << gpu_seed_hot_faces << " of "
-                  << n_faces << " faces have a cycle-mean radiative-equilibrium "
-                     "seed above " << thermal::MAX_PHYSICAL_TEMP_K
-                  << " K, the CPU solver's hard clamp. The seed is physical; a "
-                     "CPU run of the same case would be truncated there.\n";
     }
     gpu_anchor_census.report("gpu-persistent", warm_start_run);
     thermal::EqSeedRecorder::instance().write("gpu-persistent");
@@ -10536,7 +10529,6 @@ std::vector<double> runThermalModelWithMatchedTimes(
     double H_override,
     long long seed_record_face,
     std::atomic<size_t>* seed_floor_faces,
-    std::atomic<size_t>* seed_hot_faces,
     SeedAnchorCensus*    anchor_census,
     FaceStateIO* state);
 
@@ -10934,6 +10926,105 @@ struct MeshUnitReport {
     double lo = 0.0, hi = 0.0;
     std::string message;         // reason, when fatal
 };
+
+// ---------------------------------------------------------------------------
+// FACET SCALE, and the beaming rule that depends on it (BUGS.md ENG-BEAM-SCALE-1).
+//
+// `radiation.beaming` turns on the Smith (1967) sub-facet roughness treatment.
+// Until now the engine enforced exactly one thing about it -- beaming: true
+// requires rms_slope_deg > 0 -- and NOTHING about the scale of the mesh it was
+// applied to. A mesh whose facets are already AT the roughness scale resolves
+// that roughness GEOMETRICALLY, and a sub-facet model on top counts it twice.
+// docs/radiation-exchange.md section 8.4 gives the criterion as a length
+// comparison: facet scale against the thermal-isolation scale, roughly a
+// millimeter to a centimeter.
+//
+// The GUI has carried this rule since 2026-08-25 (gui/gui_core/facet_scale.py,
+// approved as that plan's DP-4) and a CLI user had nothing. Same thresholds,
+// same gate quantity, so the two cannot give different answers about the same
+// mesh:
+//
+//     p05 facet scale < 0.05 m   REFUSE  (one decade above the top of the
+//                                        millimeter-to-centimeter band, so the
+//                                        1.96 mm moon3d 509k mesh is refused
+//                                        with margin)
+//     0.05 m .. 1 m              LOUD WARNING
+//     >= 1 m                     allow   (the 3.46 m A3GT core passes cleanly)
+//
+// THE GATE IS THE FINE END, NOT THE MEAN, for the reason facet_scale.py gives:
+// sqrt(mean area) is dominated by the LARGEST facets, so a mesh that is 99%
+// millimeter-scale with a coarse minority reports 70.7 cm and sails through a
+// rule written to refuse millimeter facets. Beaming double-counts on the facets
+// that already resolve the roughness, so what matters is whether a meaningful
+// fraction of the mesh sits at that scale. Measured, sqrt(mean) vs
+// sqrt(5th percentile): sunlit_radcore_r50 234 m / 169 m; A3GT A03MP026 core
+// 3.47 m / 0.708 m; A3GT ring 146 m / 25.1 m.
+//
+// UNITS come from inspectMeshLengthUnit's verdict, not from an assumption --
+// asteroid .obj are in kilometers and lunar/Europa DEM meshes in meters, and a
+// frame slip is 10^6 in AREA. facet_scale.py has to assume meters; this does
+// not, and says which it used.
+struct FacetScaleReport {
+    bool   measured = false;
+    double mean_m = 0.0;      ///< sqrt(mean face area), the number 8.4 tabulates
+    double p05_m  = 0.0;      ///< sqrt(5th-percentile face area), the gate
+    size_t n_faces = 0;
+    size_t n_sampled = 0;
+};
+
+// Above this face count, sample rather than sum every triangle. Same numbers as
+// facet_scale.py: summing all 2,397,890 faces of the A3GT core took 9.9 s in
+// the GUI's Python reader, and 5,000 evenly spaced faces reproduce its
+// documented 3.46 m. Here it is C++ and one pass, but the sampling is kept so
+// the two implementations answer identically on the same mesh.
+constexpr size_t kFacetScaleSampleAbove = 200000;
+constexpr size_t kFacetScaleSampleCount = 5000;
+
+FacetScaleReport measureFacetScale(const std::shared_ptr<ptm::Mesh>& mesh,
+                                   bool mesh_in_meters) {
+    FacetScaleReport r;
+    if (!mesh || mesh->faces.empty() || mesh->vertices.empty()) return r;
+    r.n_faces = mesh->faces.size();
+    const size_t stride = (r.n_faces > kFacetScaleSampleAbove)
+                            ? std::max<size_t>(1, r.n_faces / kFacetScaleSampleCount)
+                            : 1;
+    // Areas are in the mesh's own SQUARED length unit; convert to m^2 once.
+    const double to_m2 = mesh_in_meters ? 1.0 : 1.0e6;
+
+    std::vector<double> areas;
+    areas.reserve(r.n_faces / stride + 1);
+    for (size_t f = 0; f < r.n_faces; f += stride) {
+        const auto& tri = mesh->faces[f];
+        if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0) continue;
+        const size_t i0 = static_cast<size_t>(tri[0]);
+        const size_t i1 = static_cast<size_t>(tri[1]);
+        const size_t i2 = static_cast<size_t>(tri[2]);
+        if (i0 >= mesh->vertices.size() || i1 >= mesh->vertices.size() ||
+            i2 >= mesh->vertices.size()) continue;
+        const auto& a = mesh->vertices[i0];
+        const auto& b = mesh->vertices[i1];
+        const auto& c = mesh->vertices[i2];
+        const double ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+        const double vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+        const double cx = uy*vz - uz*vy;
+        const double cy = uz*vx - ux*vz;
+        const double cz = ux*vy - uy*vx;
+        const double area = 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz) * to_m2;
+        if (std::isfinite(area) && area > 0.0) areas.push_back(area);
+    }
+    if (areas.empty()) return r;
+
+    r.n_sampled = areas.size();
+    double sum = 0.0;
+    for (double a : areas) sum += a;
+    r.mean_m = std::sqrt(sum / static_cast<double>(areas.size()));
+    // Nearest-rank 5th percentile, the same rule facet_scale.py::_percentile uses.
+    const size_t k = static_cast<size_t>(0.05 * (areas.size() - 1));
+    std::nth_element(areas.begin(), areas.begin() + k, areas.end());
+    r.p05_m = std::sqrt(areas[k]);
+    r.measured = true;
+    return r;
+}
 
 MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
                                      double body_radius_km) {
@@ -13326,6 +13417,60 @@ int main(int argc, char** argv) {
         }
     }
 
+    // simulation.body must name a body this engine implements, unless the
+    // config also carries a `generic_body:` block that supplies the properties
+    // itself. BUGS.md ENG-BODY-UNBACKED-RUN.
+    //
+    // WHAT THIS REPLACES. `PlanetaryData::getPropertiesByName` resolves any
+    // unrecognized name to EUROPA. So `body: Mars` used to run to COMPLETION
+    // with exit 0 -- Europa's 1560.8 km radius, Europa's europa.tm metakernel,
+    // a "Synodic day 3.55 Earth days" banner, `Default albedo 0.5`, and
+    // average AND maximum total flux of 0.000000000 W/m^2 on every face,
+    // writing sixteen statistics binaries and an all-NaN effective_albedo.bin.
+    // Measured 2026-08-26 on four arms (Mars, Ceres, Titan, Enceladus). The
+    // only warning was one `Note:` line on stderr, which no wrapper reads and
+    // which a scrolling log buries. A body name is not a knob with a
+    // forgiving default: it selects the ephemeris, the radius, the rotation
+    // period and the whole thermophysical parameter set at once.
+    //
+    // The generic-body exemption is not a loophole, it is the supported route:
+    // `examples/quickstart_asteroid_bennu.yaml` names
+    // `101955 Bennu (1999 RQ36)` and supplies every property under
+    // `generic_body:`. isConfigured() is the same predicate the generic-body
+    // construction below uses, so the two cannot disagree about which runs
+    // take that path.
+    if (!sim_config.generic_body.isConfigured()) {
+        std::string canonical_body;
+        if (!thermal::isImplementedBody(sim_config.time.body, &canonical_body)) {
+            std::cerr << "FATAL: simulation.body = '" << sim_config.time.body
+                      << "' is not a body this engine implements.\n"
+                      << "  Implemented bodies (thermophysical properties, radius, "
+                         "rotation period and SPICE metakernel all present): "
+                      << thermal::implementedBodiesList() << ".\n"
+                      << "  For anything else -- an asteroid, a comet, a moon this "
+                         "engine has no properties for -- use the generic-body "
+                         "route:\n"
+                         "    add a `generic_body:` block naming the shape, orbit, "
+                         "spin and surface properties\n"
+                         "    (see examples/quickstart_asteroid_diurnal.yaml for "
+                         "Keplerian, examples/quickstart_asteroid_bennu.yaml for "
+                         "SPICE).\n"
+                      << "  Refusing to run. Continuing would silently substitute "
+                         "Europa's radius, metakernel and thermophysical "
+                         "properties for the body you named, and produce a "
+                         "complete-looking output directory with zero absorbed "
+                         "flux on every face (BUGS.md ENG-BODY-UNBACKED-RUN)."
+                      << std::endl;
+            return 1;
+        }
+        if (canonical_body != sim_config.time.body) {
+            std::cout << "[config] simulation.body '" << sim_config.time.body
+                      << "' resolved to the built-in body '" << canonical_body
+                      << "' (body names are matched case-insensitively)."
+                      << std::endl;
+        }
+    }
+
     // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
     // knob is first-class, but true per-output-step full-mesh checkpointing is
     // architecturally incompatible with the batch-outer/time-inner GPU
@@ -15213,6 +15358,73 @@ int main(int argc, char** argv) {
                       << "  See docs/KNOWN_LIMITATIONS.md (PTM-37, PTM-36, PTM-65)."
                       << std::endl;
             return 1;
+        }
+    }
+
+    // radiation.beaming vs the scale of the mesh it would be applied to.
+    // See measureFacetScale above for the rule and where its thresholds come
+    // from. Checked HERE because this is the first point where both the mesh
+    // and its length unit are known, and before any expensive work.
+    //
+    // Costs nothing on a run that does not ask for beaming: the whole block is
+    // behind `rad_beaming`, so no mesh is traversed and no output changes for
+    // every config that leaves the switch off (which is all of them today).
+    if (rad_beaming) {
+        const FacetScaleReport fs = measureFacetScale(mesh, mesh_length_unit == "meters");
+        if (!fs.measured) {
+            // NOT a refusal, and not silence either. "This mesh is at the
+            // roughness scale" and "I could not measure this mesh" are
+            // different statements; conflating them would refuse beaming for a
+            // reason about this code rather than about the mesh.
+            std::cerr << "[beaming] WARNING: could not measure the facet scale of "
+                         "this mesh (" << mesh->faces.size() << " faces, "
+                      << mesh->vertices.size() << " vertices), so the "
+                         "sub-facet-roughness scale check did NOT run. Confirm "
+                         "yourself that these facets are far larger than the "
+                         "roughness scale (millimeters to centimeters) before "
+                         "trusting a beaming result from this run." << std::endl;
+        } else {
+            std::ostringstream scale_line;
+            scale_line << "[beaming] facet scale: sqrt(mean area) = " << fs.mean_m
+                       << " m, finest 5% = " << fs.p05_m << " m ("
+                       << fs.n_faces << " faces";
+            if (fs.n_sampled < fs.n_faces)
+                scale_line << ", " << fs.n_sampled << " sampled";
+            scale_line << ", mesh read as " << mesh_length_unit << ")";
+            std::cout << scale_line.str() << std::endl;
+
+            constexpr double kBeamRefuseBelowM = 0.05;
+            constexpr double kBeamWarnBelowM   = 1.0;
+            if (fs.p05_m < kBeamRefuseBelowM) {
+                std::cerr << "\n[beaming] FATAL: radiation.beaming = true on a mesh "
+                             "whose finest facets are " << fs.p05_m << " m.\n"
+                          << "  " << scale_line.str() << "\n"
+                          << "  At or near the roughness scale itself this mesh "
+                             "ALREADY resolves the roughness geometrically, so the "
+                             "Smith sub-facet model would count it a second time. "
+                             "The limit is " << kBeamRefuseBelowM << " m -- one "
+                             "decade above the top of the millimeter-to-centimeter "
+                             "thermal-isolation band of "
+                             "docs/radiation-exchange.md section 8.4.\n"
+                          << "  Remove 'beaming: true' (the mesh resolves the "
+                             "roughness on its own), or run beaming on a mesh whose "
+                             "facets are meters across.\n"
+                          << "  Refusing rather than returning a doubly-counted "
+                             "roughness that looks like a result "
+                             "(BUGS.md ENG-BEAM-SCALE-1)." << std::endl;
+                return 1;
+            }
+            if (fs.p05_m < kBeamWarnBelowM || fs.mean_m < kBeamWarnBelowM) {
+                std::cerr << "[beaming] WARNING: this mesh is close enough to the "
+                             "roughness scale that SOME of the roughness may "
+                             "already be resolved geometrically, in which case "
+                             "beaming counts it twice there. Between "
+                          << kBeamRefuseBelowM << " m and " << kBeamWarnBelowM
+                          << " m the engine runs but does not vouch for the "
+                             "result: confirm this mesh does not resolve "
+                             "sub-facet slopes before quoting it. "
+                             "(BUGS.md ENG-BEAM-SCALE-1)" << std::endl;
+            }
         }
     }
 

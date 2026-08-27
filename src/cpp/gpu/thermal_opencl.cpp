@@ -952,7 +952,8 @@ __kernel void persistentThermalKernel(
             }
 
             // Geothermal-equilibrium floor (physics-based, NOT an arbitrary
-            // [3,500] K clamp). The substep dt is fixed from the initial
+            // upper clamp; there is none anywhere in the engine as of
+            // 2026-08-26). The substep dt is fixed from the initial
             // column and capped at N_SUBSTEPS_MAX for the GPU watchdog, so it
             // under-resolves the ~minute surface skin response. At a sharp
             // sunlit->shadow flux drop on a low-inertia face the upper column

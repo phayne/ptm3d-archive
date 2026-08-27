@@ -673,8 +673,11 @@ configured.
 
 (Separately, and not covered by that guarantee: a `simulation.body` name other
 than `Moon`, `Mercury` or `Europa` that is *not* backed by a `generic_body:`
-block falls through to Europa's built-in property set and Europa's metakernel.
-Use `generic_body:` for anything outside the three built-ins.)
+block is **refused at config parse**, with `rc 1` and a message naming the three
+implemented bodies and the generic-body route. Until 2026-08-26 such a name fell
+through to Europa's property set and Europa's metakernel instead, and the run
+completed with `rc 0` and zero absorbed flux on every face. Use `generic_body:`
+for anything outside the three built-ins.)
 
 Paths **inside** the metakernel (`PATH_VALUES`) are resolved by CSPICE itself,
 relative to the working directory, and are independent of the rule above. The

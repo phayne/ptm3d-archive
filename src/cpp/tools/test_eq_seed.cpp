@@ -172,20 +172,26 @@ int main() {
     }
 
     // -----------------------------------------------------------------------
-    // 5. NO 400 K clamp. Mercury's subsolar cycle mean absorbed flux is
-    //    ~2557 W/m^2, i.e. ~468 K -- the old seeds clamped that to 400 K
-    //    silently. Above the CPU solver's own MAX_PHYSICAL_TEMP_K the seed
-    //    must say so, because THAT clamp will truncate the run.
+    // 5. NO UPPER CLAMP ANYWHERE. Mercury's subsolar cycle mean absorbed flux
+    //    is ~2557 W/m^2, i.e. ~468 K -- the old seeds clamped that to 400 K
+    //    silently, and the CPU scalar solver then clamped the RUN at 500 K.
+    //    Both are gone (thermal_model.h, 2026-08-26), so the seed must track
+    //    the radiative-equilibrium temperature at any magnitude. 6000 W/m^2
+    //    is above the old 500 K ceiling; it must come back as physics.
     // -----------------------------------------------------------------------
     {
         const auto m = thermal::eqSeedColumn(moonInput(col, 2557.0), nullptr);
         check(m.T_surface > 400.0,
               "Mercury-scale mean flux is not clamped to 400 K",
               "T_surf = " + std::to_string(m.T_surface) + " K");
-        check(!m.above_500K, "468 K does not trip the MAX_PHYSICAL_TEMP_K flag");
         const auto h = thermal::eqSeedColumn(moonInput(col, 6000.0), nullptr);
-        check(h.above_500K, "a seed above 500 K trips the flag",
-              "T_surf = " + std::to_string(h.T_surface) + " K");
+        // eps*sigma*T^4 = F + Qb, eps = 0.95, F = 6000 -> T = 583.4 K.
+        const double expect =
+            std::pow((6000.0 + 0.018) / (0.95 * thermal::SIGMA_SB), 0.25);
+        check(h.T_surface > 500.0 && std::fabs(h.T_surface - expect) < 1e-6,
+              "a seed above the retired 500 K ceiling is returned unclamped",
+              "T_surf = " + std::to_string(h.T_surface) + " K, expected "
+              + std::to_string(expect) + " K");
     }
 
     // -----------------------------------------------------------------------

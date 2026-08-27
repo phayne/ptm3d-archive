@@ -207,8 +207,16 @@ double newton_eqfix(double Qs_d, double k0_d, double dz0_d, double T1_d,
 // ce4f617^). Reproduced here, and nowhere else, so the before/after numbers in
 // this program are measured rather than quoted. Five fixed iterations, no
 // convergence test, seed = the PREVIOUS surface temperature, no step limiter,
-// and a hard [ABSOLUTE_ZERO_K, MAX_PHYSICAL_TEMP_K] clamp INSIDE the loop.
+// and a hard [ABSOLUTE_ZERO_K, 500 K] clamp INSIDE the loop.
+//
+// The 500 K is written as a literal on purpose: it is the historical
+// MAX_PHYSICAL_TEMP_K, which no longer exists in the engine (removed
+// 2026-08-26, thermal_model.h). This function must keep reproducing what the
+// old code DID, so it keeps the old bound; it must not track a constant that
+// has been deleted, or the "before" arm would silently stop being the before.
 // ---------------------------------------------------------------------------
+namespace { constexpr double kHistoricalMaxTempK = 500.0; }
+
 double simd_batch_prefix(double Qs, double k0, double dz0, double T1,
                          double T0_prev, double eps, double sigma)
 {
@@ -219,7 +227,7 @@ double simd_batch_prefix(double Qs, double k0, double dz0, double T1,
         const double df = -k0 / dz0 - 4.0 * eps * sigma * T3;
         T -= 0.8 * f / df;
         T = std::max(thermal::ABSOLUTE_ZERO_K,
-                     std::min(thermal::MAX_PHYSICAL_TEMP_K, T));
+                     std::min(kHistoricalMaxTempK, T));
     }
     return T;
 }
