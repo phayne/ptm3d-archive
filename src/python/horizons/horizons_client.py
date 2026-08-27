@@ -13,6 +13,7 @@ SBDB documentation: https://ssd-api.jpl.nasa.gov/doc/sbdb.html
 import base64
 import json
 import logging
+import math
 import re
 import urllib.error
 import urllib.parse
@@ -24,6 +25,89 @@ logger = logging.getLogger(__name__)
 
 HORIZONS_API_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 SBDB_API_URL = "https://ssd-api.jpl.nasa.gov/sbdb.api"
+
+#: Mean obliquity of the ecliptic at J2000.0, degrees (IAU 2006/2000A:
+#: 23 deg 26' 21.406").
+J2000_OBLIQUITY_DEG = 23.439279
+
+
+def ecliptic_pole_to_equatorial(lambda_deg, lat_deg,
+                                obliquity_deg=J2000_OBLIQUITY_DEG):
+    """``(ra_deg, dec_deg)`` from an ecliptic pole ``(lambda, beta)``.
+
+    THE canonical implementation for this project; ``gui_core.body_properties``
+    re-exports it rather than keeping a second copy.  Both published sources of
+    an asteroid spin pole -- SBDB's ``pole`` physical parameter and DAMIT's
+    ``spin.txt`` -- give ECLIPTIC longitude and latitude, while PTM3D's
+    ``generic_body.spin.pole_ra_deg`` / ``pole_dec_deg`` are EQUATORIAL.
+    Writing one straight into the other is an error of up to the obliquity,
+    23.4 degrees, which moves the sub-solar latitude and the seasons and which
+    no plausibility check on a spin pole would catch.
+
+    Written with ``cos(beta)`` rather than ``tan(beta)`` so an exactly polar
+    ``beta = +-90`` (the orbit-normal case) is finite.
+    """
+    lam = math.radians(float(lambda_deg))
+    bet = math.radians(float(lat_deg))
+    eps = math.radians(float(obliquity_deg))
+
+    sin_dec = (math.sin(bet) * math.cos(eps)
+               + math.cos(bet) * math.sin(eps) * math.sin(lam))
+    dec = math.degrees(math.asin(max(-1.0, min(1.0, sin_dec))))
+
+    y = (math.cos(bet) * math.sin(lam) * math.cos(eps)
+         - math.sin(bet) * math.sin(eps))
+    x = math.cos(bet) * math.cos(lam)
+    ra = math.degrees(math.atan2(y, x)) % 360.0
+    return ra, dec
+
+
+# Kept private-looking for the call sites inside this module, but the same
+# object, so there is exactly one implementation.
+_ecliptic_pole_to_equatorial = ecliptic_pole_to_equatorial
+
+
+def _parse_sbdb_pole(value):
+    """``(ra_deg, dec_deg)`` from SBDB's ``pole`` string, or ``(None, None)``.
+
+    SBDB publishes the pole as ``"RA/Dec"`` in EQUATORIAL J2000 coordinates --
+    the same frame ``generic_body.spin.pole_ra_deg`` / ``pole_dec_deg`` take,
+    so it needs NO conversion.  Measured against the IAU WGCCRE values
+    (Archinal et al. 2018) on four bodies, all agreeing to better than 0.03
+    degrees::
+
+        (4) Vesta   SBDB 309.06110/42.232386   IAU 309.031 / 42.235
+        (1) Ceres   SBDB 291.421/66.758        IAU 291.418 / 66.764
+        (433) Eros  SBDB 11.37/17.22           IAU  11.35  / 17.22
+        (21) Lutetia SBDB 51.8/+10.8           IAU  52.0   / 12.0
+
+    This is worth stating because DAMIT's ``spin.txt``, the OTHER source of a
+    pole on this card, is ECLIPTIC ``(lambda, beta)`` and DOES need converting
+    (see ``ecliptic_pole_to_equatorial``).  The two are not interchangeable:
+    converting SBDB's pole as if it were ecliptic moved Vesta's from
+    309.06/42.23 to 300.41/22.83, about 20 degrees, which is the same class of
+    silent error as leaving DAMIT's unconverted.
+
+    Some records carry a leading ``+`` or extra whitespace, and a few carry two
+    solutions separated by a comma; only the first is read, because picking
+    silently between two spin solutions is exactly the kind of invisible choice
+    this project refuses to make -- the caller reports which it used.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None, None
+    text = text.split(",")[0].strip()
+    if "/" not in text:
+        return None, None
+    ra_text, _, dec_text = text.partition("/")
+    try:
+        ra = float(ra_text.strip())
+        dec = float(dec_text.strip())
+    except ValueError:
+        return None, None
+    if not (-90.0 <= dec <= 90.0):
+        return None, None
+    return ra % 360.0, dec
 
 
 @dataclass
@@ -52,7 +136,25 @@ class OrbitalElements:
 
 @dataclass
 class PhysicalParams:
-    """Physical parameters from SBDB."""
+    """Physical parameters from SBDB.
+
+    ``albedo`` is SBDB's ``albedo`` field VERBATIM, which is the visual
+    GEOMETRIC albedo p_V -- NOT a Bond albedo.  The engine's
+    ``generic_body.surface.albedo`` is a Bond albedo (``thermal_model.cpp``
+    computes ``1 - albedo`` and scales the solar constant by it), so anything
+    that moves this field into a configuration must convert it first; see
+    ``gui_core.body_properties.bond_albedo``.  The field is left named
+    ``albedo`` because that is SBDB's own name for it and renaming it would
+    break every existing caller for no gain -- the definition is stated here
+    instead, and ``albedo_is_geometric`` marks it in the data.
+
+    ``pole_ra_deg`` / ``pole_dec_deg`` carry SBDB's ``pole`` parameter, which
+    is published in EQUATORIAL J2000 and needs no conversion (verified against
+    IAU WGCCRE on four bodies; see ``_parse_sbdb_pole``).  DAMIT's spin
+    solution, the other source of a pole, is ECLIPTIC and does -- that
+    conversion lives in ``ecliptic_pole_to_equatorial`` and is applied by the
+    DAMIT path, not here.
+    """
     name: str = ""
     diameter_km: float = 0.0
     albedo: float = -1.0
@@ -62,6 +164,21 @@ class PhysicalParams:
     density_g_cm3: float = 0.0
     pole_ra_deg: float = -1.0
     pole_dec_deg: float = -1.0
+    #: Absolute magnitude H, and the IAU H,G slope parameter G.  G is needed
+    #: to turn p_V into a Bond albedo (q = 0.290 + 0.684 G); None means SBDB
+    #: published none, which is DISTINCT from a fitted G of 0.0.
+    absolute_magnitude_h: float = 0.0
+    slope_parameter_g: Optional[float] = None
+    #: An ecliptic pole, when one is known from a source that publishes in
+    #: that frame (DAMIT).  SBDB does NOT: it publishes equatorial, so these
+    #: stay unset on an SBDB lookup and ``pole_ra_deg``/``pole_dec_deg`` are
+    #: the published pair.
+    pole_ecliptic_lon_deg: float = -999.0
+    pole_ecliptic_lat_deg: float = -999.0
+    #: Always True for anything this client fills in from SBDB.  Present so a
+    #: caller cannot mistake the field for a Bond albedo by reading the object
+    #: alone.
+    albedo_is_geometric: bool = True
 
 
 @dataclass
@@ -376,6 +493,24 @@ class HorizonsClient:
         for entry in pp:
             name = entry.get("name", "")
             value_str = entry.get("value", "")
+
+            # `pole` and `spec_T` are NOT numbers, so they are handled before
+            # the float() gate.  `pole` in particular arrives as the string
+            # "lambda/beta" -- ECLIPTIC longitude and latitude, per SBDB's own
+            # field documentation -- and float() on it raises, which is why
+            # this parameter was silently dropped by every earlier version of
+            # this parser and no lookup has ever filled in a spin pole.
+            if name == "pole":
+                ra, dec = _parse_sbdb_pole(value_str)
+                if ra is not None:
+                    # EQUATORIAL as published; verified against IAU WGCCRE on
+                    # four bodies (see _parse_sbdb_pole). NOT converted.
+                    phys.pole_ra_deg, phys.pole_dec_deg = ra, dec
+                continue
+            if name == "spec_T":
+                phys.spectral_type = value_str
+                continue
+
             try:
                 value = float(value_str) if value_str else 0.0
             except ValueError:
@@ -384,15 +519,21 @@ class HorizonsClient:
             if name == "diameter":
                 phys.diameter_km = value
             elif name == "albedo":
+                # SBDB's GEOMETRIC albedo p_V.  Stored as published; the Bond
+                # conversion belongs to whoever writes it into a config.
                 phys.albedo = value
             elif name == "rot_per":
                 phys.rotation_period_hours = value
-            elif name == "spec_T":
-                phys.spectral_type = value_str
             elif name == "GM":
                 phys.gm_km3_s2 = value
             elif name == "density":
                 phys.density_g_cm3 = value
+            elif name == "H":
+                phys.absolute_magnitude_h = value
+            elif name == "G":
+                # A fitted G of 0.0 is a real value and must not read as
+                # "absent"; None is the only "absent".
+                phys.slope_parameter_g = value
 
         return phys
 

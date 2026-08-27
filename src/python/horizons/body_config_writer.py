@@ -162,14 +162,46 @@ class BodyConfigWriter:
         return output_path
 
     def _default_surface(self, physical: "PhysicalParams") -> dict:
-        """Estimate default thermophysical properties from physical params."""
+        """Estimate default thermophysical properties from physical params.
+
+        WARNING, and it is emitted at runtime rather than only written here:
+        ``physical.albedo`` is SBDB's GEOMETRIC albedo p_V, and
+        ``generic_body.surface.albedo`` is a BOND albedo -- the engine computes
+        ``1 - albedo`` and scales the solar constant by it
+        (``thermal_model.cpp:2906``).  The two differ by the phase integral
+        ``q = 0.290 + 0.684 G``: for a bright body (p_V 0.42, G 0.32) the Bond
+        albedo is 0.214, and writing 0.42 instead absorbs 26 percent less
+        sunlight and runs about 7 percent cold, with nothing downstream to
+        catch it.
+
+        This is NOT silently converted here, because every ``body_config.yaml``
+        already in ``data/horizons_cache`` was written by this code path and
+        converting now would change what those cached bodies mean without
+        rewriting them.  It warns instead, and the GUI's Asteroid card does the
+        conversion at the point where it can label it
+        (``gui_core.body_properties.bond_albedo``).  Converting here, and
+        rewriting the cached configurations that were written before it, is
+        owed as its own change.
+        """
         surface = {}
 
         # Albedo from SBDB if available
         if physical.albedo > 0:
             surface["albedo"] = round(physical.albedo, 3)
+            logger.warning(
+                "generic_body.surface.albedo is being written as %.3f, which "
+                "is SBDB's GEOMETRIC albedo p_V, into a field the engine reads "
+                "as a BOND albedo. They are not the same: A_B = p_V x "
+                "(0.290 + 0.684 G). This body will absorb too little sunlight "
+                "and run cold -- by 26%% in flux for a bright object. Convert "
+                "it, or set the albedo by hand.",
+                physical.albedo)
         else:
             surface["albedo"] = 0.1  # Default for rocky asteroid
+            logger.warning(
+                "No albedo was published for this body, so "
+                "generic_body.surface.albedo is a PLACEHOLDER of 0.1, not a "
+                "measurement. Set it before trusting a temperature.")
 
         surface["emissivity"] = 0.95
 

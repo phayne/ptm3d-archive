@@ -1045,6 +1045,41 @@ class _LookupWorker(QThread):
         self.done.emit(result, self.route)
 
 
+class _FetchWorker(QThread):
+    """One network fetch, off the GUI thread, emitting exactly once.
+
+    The same contract as `_LookupWorker` and for the same reasons: a blocking
+    request on the GUI thread is a frozen window, and an exception crossing a
+    thread boundary into nothing leaves the card on "Fetching..." forever, so
+    it is caught here and turned into a result the card can show.
+
+    `route` is carried through untouched so the card can check, when the answer
+    arrives up to a minute and a half later, that it is still the card the
+    answer was asked for. Without that check a kernel fetched for an asteroid
+    would be written into whatever configuration is on screen when it lands.
+    """
+
+    done = pyqtSignal(object, object)
+
+    def __init__(self, call, route, kind):
+        super().__init__()
+        self._call = call
+        self.route = route
+        self.kind = kind
+
+    def run(self):
+        from gui_core.body_fetch import FetchResult
+        try:
+            result = self._call()
+        except Exception as exc:                             # noqa: BLE001
+            result = FetchResult(
+                kind=self.kind,
+                message=(f"The fetch failed unexpectedly "
+                         f"({type(exc).__name__}: {exc}). Nothing has been "
+                         f"changed."))
+        self.done.emit(result, self.route)
+
+
 class GenericBodyCard(BodyCard):
     """The `generic_body:` route -- the only way to model a body the engine has
     no built-in properties for.
@@ -1087,6 +1122,14 @@ class GenericBodyCard(BodyCard):
         #: garbage-collected while it is still running.
         self._lookup_worker = None
 
+        # Physical properties, from SBDB, on their own button. Separate from
+        # Look up because it is a separate question with a separate answer:
+        # Look up says WHICH body this is, this says what is known about it.
+        self.sbdb_button = QPushButton("Fill in properties (SBDB)")
+        self.sbdb_button.setToolTip(get_tooltip("ui.fetch_sbdb"))
+        self.sbdb_button.clicked.connect(self._on_fetch_sbdb)
+        grid.addWidget(self.sbdb_button, 1, 2)
+
         self.provenance_note = _muted("Parameters entered by hand.", size=10)
         grid.addWidget(self.provenance_note, 2, 0, 1, 3)
         self.lookup_note = _muted("", color="#64b5f6", size=10)
@@ -1123,19 +1166,26 @@ class GenericBodyCard(BodyCard):
         egrid.addWidget(source_label, 0, 0)
         egrid.addWidget(row, 0, 1)
         self.kepler_radio.toggled.connect(self._on_ephemeris_changed)
-        self.add_file_field(egrid, 1, "SPICE metakernel:",
+        # The kernel can be FETCHED as well as picked. Both stay: a fetch
+        # covers the ordinary case and needs a network, a file picker covers a
+        # kernel somebody already has and needs none.
+        self.spk_fetch_button = QPushButton("Fetch kernel from HORIZONS")
+        self.spk_fetch_button.setToolTip(get_tooltip("ui.fetch_spk"))
+        self.spk_fetch_button.clicked.connect(self._on_fetch_spk)
+        egrid.addWidget(self.spk_fetch_button, 1, 0, 1, 2)
+        self.add_file_field(egrid, 2, "SPICE metakernel:",
                             "generic_body.spice_metakernel",
                             "Metakernels (*.tm);;Kernels (*.bsp);;All Files (*)")
         self.coverage_note = _muted("", color="#EF9A9A", size=10)
-        egrid.addWidget(self.coverage_note, 2, 0, 1, 2)
+        egrid.addWidget(self.coverage_note, 3, 0, 1, 2)
         check = QPushButton("Check SPK coverage")
         check.setToolTip(get_tooltip("ui.spk_coverage"))
         check.clicked.connect(self._check_coverage)
-        egrid.addWidget(check, 3, 1)
+        egrid.addWidget(check, 4, 1)
         orbit_button = QPushButton("Orbital elements on the Body page…")
         orbit_button.setToolTip(get_tooltip("ui.orbit_on_body_page"))
         orbit_button.clicked.connect(self._open_body_page)
-        egrid.addWidget(orbit_button, 4, 1)
+        egrid.addWidget(orbit_button, 5, 1)
         ephemeris.setLayout(egrid)
         layout.addWidget(ephemeris)
 
@@ -1152,6 +1202,12 @@ class GenericBodyCard(BodyCard):
         self.add_double_field(grid, 2, "Spin pole declination (deg):",
                               "generic_body.spin.pole_dec_deg", -90.0, 90.0,
                               decimals=3)
+        # Per FIELD, not per card. A period from SBDB beside a pole from a
+        # lightcurve inversion is the ordinary case, and the two are not the
+        # same kind of number.
+        self.spin_provenance = _muted("", size=10)
+        self.spin_provenance.setToolTip(get_tooltip("ui.spin_provenance"))
+        grid.addWidget(self.spin_provenance, 3, 0, 1, 2)
         spin.setLayout(grid)
         layout.addWidget(spin)
 
@@ -1174,8 +1230,19 @@ class GenericBodyCard(BodyCard):
         self.add_double_field(grid, 3, "Shape model scale:",
                               "generic_body.shape.mesh_scale", 0.0, 100000.0,
                               decimals=6)
+        self.damit_button = QPushButton("DAMIT shape model…")
+        self.damit_button.setToolTip(get_tooltip("ui.fetch_damit_shape"))
+        self.damit_button.clicked.connect(self._on_fetch_damit)
+        grid.addWidget(self.damit_button, 4, 1)
         self.shape_note = _muted("")
-        grid.addWidget(self.shape_note, 4, 0, 1, 2)
+        grid.addWidget(self.shape_note, 5, 0, 1, 2)
+        self.shape_provenance = _muted("", size=10)
+        self.shape_provenance.setToolTip(get_tooltip("ui.shape_provenance"))
+        grid.addWidget(self.shape_provenance, 6, 0, 1, 2)
+        #: Non-empty when the configured spin and the shape model's own spin
+        #: describe different bodies. Red, because it is not advice.
+        self.spin_shape_flag = _muted("", color="#EF9A9A", size=10)
+        grid.addWidget(self.spin_shape_flag, 7, 0, 1, 2)
         shape.setLayout(grid)
         layout.addWidget(shape)
         self.widgets["generic_body.shape.mesh_file"].textChanged.connect(
@@ -1187,9 +1254,18 @@ class GenericBodyCard(BodyCard):
         surface = QGroupBox("Surface properties")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_double_field(grid, 0, "Bond albedo:",
-                              "generic_body.surface.albedo", 0.0, 1.0,
-                              decimals=4)
+        # The LABEL is rewritten by `_show_albedo_provenance` when the value
+        # came from SBDB, to carry the p_V and G it was computed from. A
+        # converted number with no visible conversion is indistinguishable
+        # from an unconverted one, and that distinction is the whole point.
+        self.albedo_label = self.add_double_field(
+            grid, 0, "Bond albedo:", "generic_body.surface.albedo", 0.0, 1.0,
+            decimals=4)
+        self.albedo_provenance = _muted("", size=10)
+        grid.addWidget(self.albedo_provenance, 9, 0, 1, 2)
+        #: The grid cell the albedo's own QLabel sits in, so the label can
+        #: carry the p_V and G a fetched value was computed from.
+        self._albedo_label_cell = (grid, 0)
         self.add_double_field(grid, 1, "Emissivity:",
                               "generic_body.surface.emissivity", 0.0, 1.0,
                               decimals=4)
@@ -1209,6 +1285,7 @@ class GenericBodyCard(BodyCard):
                               "generic_body.surface.cp0", 0.0, 10000.0,
                               decimals=3)
         self.ti_note = _muted("")
+        self.ti_note.setToolTip(get_tooltip("ui.thermal_inertia_manual"))
         grid.addWidget(self.ti_note, 7, 0, 1, 2)
         self.surface_refusal = _muted("", color="#EF9A9A", size=10)
         grid.addWidget(self.surface_refusal, 8, 0, 1, 2)
@@ -1315,6 +1392,7 @@ class GenericBodyCard(BodyCard):
         self.kepler_radio.blockSignals(False)
         self._refresh_shape()
         self._refresh_surface()
+        self._refresh_provenance()
 
     # -- name -> parameters (item 3) ------------------------------------------
 
@@ -1397,6 +1475,14 @@ class GenericBodyCard(BodyCard):
         """Write what the lookup found, and report every key of it."""
         for key, value in result.values.items():
             self.config_manager.set_value(key, value)
+        # One source label per field, so the per-field lines say where these
+        # came from too and are not blank until somebody presses a second
+        # button. The cache and HORIZONS are different sources and are named
+        # differently: a cached body_config.yaml is whatever was written into
+        # it, which is not the same claim as "SBDB says so today".
+        source = ("the local cache" if result.source == "cache"
+                  else "HORIZONS")
+        self._provenance().update({key: source for key in result.values})
         self.provenance_note.setText(result.provenance())
         lines = [result.message]
 
@@ -1413,9 +1499,206 @@ class GenericBodyCard(BodyCard):
 
         self.lookup_note.setText("\n".join(lines))
         self.load_from_config()
+        self._refresh_provenance()
         if result.kernel:
             self._check_coverage()
         self.value_changed.emit()
+
+    # -- the three fetches (items 1, 2, 3 and 4) -------------------------------
+
+    #: Where each field's value came from, ``{dotted key: short label}``.
+    #: Rebuilt from what a fetch reports, and DROPPED for any key the user
+    #: subsequently edits -- a provenance line that survives a hand edit is a
+    #: label claiming a source for a number that no longer came from it.
+    def _provenance(self):
+        if not hasattr(self, "_field_provenance"):
+            self._field_provenance = {}
+            self._provenance_body = self._current_body_name()
+        # Provenance belongs to ONE body. Left alone it would survive the name
+        # changing and go on saying "SBDB" over a different asteroid's numbers
+        # -- the same residue, one field narrower, that
+        # `_repair_body_name` removes from `simulation.body`.
+        current = self._current_body_name()
+        if current != getattr(self, "_provenance_body", current):
+            self._field_provenance = {}
+            self._provenance_body = current
+        return self._field_provenance
+
+    def _current_body_name(self):
+        return str(self.config_manager.get_value(
+            "generic_body.name", "") or "").strip().lower()
+
+    def _start_fetch(self, kind, call, button, note):
+        """Run `call` on a worker thread, with the one-at-a-time guard.
+
+        Starting a second fetch of the same kind would rebind the attribute
+        holding the running QThread and drop the last reference to it, which
+        Qt answers with "QThread: Destroyed while thread is still running" and
+        std::terminate -- taking any unsaved edits with it. The same lesson
+        `_on_lookup` already carries.
+        """
+        attribute = f"_fetch_worker_{kind}"
+        running = getattr(self, attribute, None)
+        if running is not None and running.isRunning():
+            note.setText(f"A {kind} fetch is already running. Wait for it to "
+                         f"finish.")
+            return
+        button.setEnabled(False)
+        worker = _FetchWorker(call, self.route, kind)
+        worker.done.connect(self._on_fetch_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(
+            lambda: setattr(self, attribute, None))
+        setattr(self, attribute, worker)
+        worker.start()
+
+    #: Which button and which note belong to each fetch kind.
+    def _fetch_controls(self, kind):
+        return {
+            "spk": (self.spk_fetch_button, self.coverage_note),
+            "damit_shape": (self.damit_button, self.shape_provenance),
+            "sbdb": (self.sbdb_button, self.lookup_note),
+        }[kind]
+
+    def _on_fetch_done(self, result, route):
+        button, note = self._fetch_controls(result.kind)
+        button.setEnabled(True)
+        if route != self.route or not self._active:
+            # The user moved on while the service was answering. Applying now
+            # would write this body's generic_body.* into whatever
+            # configuration is on screen -- the cross-card residue the
+            # body-identity gate exists to catch. The FILES are still on disk
+            # and still correct; only the write into a live card is dropped.
+            logger.info("[body-fetch] discarding a %s result for %s; the "
+                        "active route is now %s", result.kind, route,
+                        self.route)
+            return
+        self._apply_fetch(result, note)
+
+    def _apply_fetch(self, result, note):
+        """Write what a fetch returned, and report every key of it.
+
+        A refusal writes NOTHING. That is the whole of PTM-145 in one branch:
+        the kernel is on disk and is a perfectly good kernel, it simply does
+        not cover this run, and the engine would serve the uncovered epochs
+        from orbital elements without a word.
+        """
+        from gui_core.body_fetch import spin_consistency
+
+        if result.ok and result.values:
+            if result.kind == "damit_shape":
+                self.spin_shape_flag.setText(
+                    spin_consistency(self.config_manager.get_config(),
+                                     result.values))
+            for key, value in result.values.items():
+                self.config_manager.set_value(key, value)
+            self._provenance().update(result.provenance)
+            self.load_from_config()
+
+        note.setText("\n".join(result.lines()))
+        self._refresh_provenance()
+        self._refresh_shape()
+        self._refresh_surface()
+        if result.ok and result.values:
+            self.value_changed.emit()
+
+    def _on_fetch_spk(self):
+        """Fetch a kernel spanning this run, with a year of margin each end."""
+        from gui_core.body_fetch import fetch_spk
+
+        name = str(self.config_manager.get_value(
+            "generic_body.name", "") or "").strip()
+        naif_id = str(self.config_manager.get_value(
+            "generic_body.naif_id", "") or "").strip()
+        config = self.config_manager.get_config()
+        project_root = self._project_root()
+        self.coverage_note.setText(
+            f"Asking HORIZONS for a kernel covering this run, with a year of "
+            f"margin at each end. Nothing is changed unless what arrives is "
+            f"read back and shown to span the window.")
+        self._start_fetch(
+            "spk",
+            lambda: fetch_spk(config, project_root, name=name,
+                              naif_id=naif_id),
+            self.spk_fetch_button, self.coverage_note)
+
+    def _on_fetch_damit(self):
+        """Fetch this body's DAMIT shape model, and the spin that goes with it."""
+        from gui_core.body_fetch import fetch_damit_shape
+
+        name = str(self.config_manager.get_value(
+            "generic_body.name", "") or "").strip()
+        naif_id = str(self.config_manager.get_value(
+            "generic_body.naif_id", "") or "").strip()
+        radius_km = self._number("generic_body.shape.radius_km", 0.0)
+        project_root = self._project_root()
+        self.shape_provenance.setText(
+            "Asking DAMIT for a shape model. Most asteroids do not have one.")
+        self._start_fetch(
+            "damit_shape",
+            lambda: fetch_damit_shape(project_root, name=name,
+                                      naif_id=naif_id, radius_km=radius_km),
+            self.damit_button, self.shape_provenance)
+
+    def _on_fetch_sbdb(self):
+        """Fill in the physical properties, converting the two that need it."""
+        from gui_core.body_fetch import fetch_sbdb_properties
+
+        query = str(self.config_manager.get_value(
+            "generic_body.name", "") or "").strip()
+        if not query:
+            self.lookup_note.setText(
+                "Type a name, a number or a designation in the Name field "
+                "first, then press Fill in properties.")
+            return
+        self.lookup_note.setText(
+            f"Asking the Small-Body Database about {query}...")
+        self._start_fetch(
+            "sbdb",
+            lambda: fetch_sbdb_properties(query),
+            self.sbdb_button, self.lookup_note)
+
+    def on_widget_changed(self, key, value):
+        """A hand edit drops that field's provenance.
+
+        A source line that survives an edit is a label claiming a database
+        computed a number the user has since replaced -- and the Bond-albedo
+        label is the worst case, because it would go on naming the p_V and G
+        the value is no longer derived from. `_loading` is exempt: showing a
+        card is not editing it.
+        """
+        if not self._loading:
+            self._provenance().pop(key, None)
+            if hasattr(self, "spin_provenance"):
+                self._refresh_provenance()
+        super().on_widget_changed(key, value)
+
+    def _refresh_provenance(self):
+        """Redraw the per-field source lines from what the fetches reported."""
+        sources = self._provenance()
+
+        spin_lines = []
+        for key, label in (("generic_body.spin.period_hours",
+                            "Rotation period"),
+                           ("generic_body.spin.pole_ra_deg", "Spin pole")):
+            source = sources.get(key)
+            spin_lines.append(f"{label}: {source or 'manual'}")
+        self.spin_provenance.setText("Source — " + ", ".join(spin_lines) + ".")
+
+        albedo_source = sources.get("generic_body.surface.albedo")
+        label_widget = self._grid_label(*self._albedo_label_cell)
+        if albedo_source and label_widget is not None:
+            label_widget.setText(f"Bond albedo (from {albedo_source}):")
+        elif label_widget is not None:
+            label_widget.setText("Bond albedo:")
+        self.albedo_provenance.setText(
+            f"Source — {albedo_source or 'manual'}.")
+
+    @staticmethod
+    def _grid_label(grid, row):
+        item = grid.itemAtPosition(row, 0)
+        widget = item.widget() if item is not None else None
+        return widget if isinstance(widget, QLabel) else None
 
     def _on_ephemeris_changed(self, _checked):
         source = "keplerian" if self.kepler_radio.isChecked() else "spice"
