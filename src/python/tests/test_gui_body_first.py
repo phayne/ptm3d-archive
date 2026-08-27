@@ -411,6 +411,424 @@ def test_loading_a_config_lands_on_its_own_card():
 
 
 # --------------------------------------------------------------------------
+# 3b. The click-through flow IS the navigation; the rail is a second level
+# --------------------------------------------------------------------------
+#
+# Paul, on the merged body-first GUI: "the tabs ('Simulation', 'Mesh',
+# 'Properties', etc) on the lefthand side are somewhat obsolete and confusing.
+# The GUI should embrace the click-through structure, and only offer these
+# other features as advanced options."
+#
+# Four properties, in the order they would break:
+#
+#   1. the rail is not on screen at launch;
+#   2. an explicit, clearly-secondary control brings it up, and it exists in
+#      more than one place -- the card, the landing screen and the View menu;
+#   3. leaving it returns to WHERE THE FLOW WAS, not to the top of it;
+#   4. the round trip does not lose or corrupt state in either direction.
+#
+# (4) is the one worth writing carefully. A value edited on a section page is
+# in the configuration but not on the card's controls, and `BaseConfigTab`
+# writes a control's value back on the next widget event -- so a card left
+# showing a stale number would push it over the edit the moment anything else
+# on the card was touched. That is the failure this arm measures directly.
+
+def test_the_section_rail_is_not_the_primary_navigation():
+    """It is hidden at launch, and the flow is what is on screen instead."""
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        panel.show_body_first()
+        assert not panel.all_settings_visible(), (
+            "the eleven-section rail is on screen at launch; the click-through "
+            "flow is supposed to be the only primary navigation")
+        assert panel.nav_column.isHidden(), (
+            "nav_column is not hidden, so the Simulation/Mesh/Properties list "
+            "is still the first thing a user sees")
+        assert panel.stacked_widget.currentWidget() is panel.tabs["start"], (
+            "the panel does not open on the body-first Start page")
+        # Hidden, NOT removed: every section still exists, still loads and
+        # still saves, so no written configuration depends on this.
+        for key in ("simulation", "mesh", "thermophysical", "radiation",
+                    "illumination", "output", "gpu", "engine_flags"):
+            assert key in panel.tabs, f"the {key} page was deleted, not hidden"
+            assert panel.stacked_widget.indexOf(panel.tabs[key]) >= 0, (
+                f"the {key} page is no longer in the stack")
+        print(f"    [nav] rail hidden at launch; "
+              f"{len(panel._nav_keys)} sections still present and loadable")
+
+
+def test_all_settings_is_reachable_and_clearly_secondary():
+    """From the card, from the landing screen, and from the View menu.
+
+    A single entry point would be one misclick from a user who cannot find
+    the settings they know exist -- which is the complaint the rail was hiding
+    in the first place, inverted.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        _, panel = _panel(scratch)
+        from PyQt6.QtWidgets import QPushButton
+        start = panel.tabs["start"]
+
+        buttons = [b for b in start.findChildren(QPushButton)
+                   if b.objectName() == "AllSettingsButton"]
+        assert len(buttons) >= 2, (
+            f"only {len(buttons)} 'All settings' control(s) on the Start page; "
+            f"the card header and the landing screen must each carry one")
+        for button in buttons:
+            assert "advanced" in button.text().lower(), (
+                f"the control says {button.text()!r}, which does not say it is "
+                f"the advanced view")
+            assert button.toolTip(), "the All settings control ships bare"
+
+        # It opens the second level, and lands somewhere recognizable.
+        panel.show_body_first()
+        assert not panel.all_settings_visible()
+        panel.show_all_settings()
+        assert panel.all_settings_visible(), (
+            "'All settings' did not reveal the section rail")
+        assert panel.stacked_widget.currentWidget() is panel.tabs["simulation"], (
+            "All settings did not land on Simulation")
+        # ...and the way back exists, is labeled, and closes it again.
+        assert not panel.close_all_settings_button.isHidden(), (
+            "there is no visible control to leave All settings")
+        assert panel.close_all_settings_button.toolTip(), (
+            "the way out of All settings ships bare")
+        panel.close_all_settings_button.click()
+        assert not panel.all_settings_visible(), (
+            "the Back control did not close the section rail")
+
+
+def test_the_rails_own_start_row_leaves_the_rail():
+    """There must not be two navigations on screen at the same time.
+
+    The section list still carries a "Start" row -- it has to, because a row's
+    index IS its page's index in the stack and dropping the row would shift
+    every section below it. Selecting it used to show the click-through flow
+    with the section list still up, which is precisely the "obsolete and
+    confusing" arrangement this change removes. It now does what Back does.
+
+    Also the negative control on the recursion guard: `show_body_first` sets
+    the rail's row back to Start, which re-enters the same handler.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        start.open_card("Moon", "global", "time_series", apply_defaults=True)
+        panel.show_all_settings()
+        assert panel.all_settings_visible()
+        assert panel.stacked_widget.currentWidget() is panel.tabs["simulation"]
+
+        start_row = panel._nav_keys.index("start")
+        panel.nav_rail.setCurrentRow(start_row)
+        assert not panel.all_settings_visible(), (
+            "selecting 'Start' in the section list showed the flow with the "
+            "section list still on screen")
+        assert panel.stacked_widget.currentWidget() is panel.tabs["start"]
+        assert start.stack.currentIndex() == start.CARD, (
+            "leaving through the rail's Start row did not return to the card")
+
+        # ...and every OTHER row still just switches the page.
+        panel.show_all_settings()
+        for key in ("mesh", "thermophysical", "radiation"):
+            row = panel._nav_keys.index(key)
+            panel.nav_rail.setCurrentRow(row)
+            assert panel.stacked_widget.currentWidget() is panel.tabs[key], (
+                f"selecting {key!r} in the section list did not show it")
+            assert panel.all_settings_visible(), (
+                f"selecting {key!r} closed the section list")
+        panel.show_body_first()
+
+
+def test_a_hidden_section_does_not_eject_the_user_from_all_settings():
+    """`_apply_tab_visibility` hides the Body page when no generic body is
+    active, and then jumps off it. Jumping to "Start" would close All settings
+    out from under a user who only changed a body.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        manager.set_value("generic_body.name", "probe")
+        panel.load_from_config()
+        panel.show_all_settings()
+        assert manager.generic_body_active(), "the fixture has no generic body"
+        row = panel._nav_keys.index("body_definition")
+        panel.nav_rail.setCurrentRow(row)
+        assert panel.stacked_widget.currentWidget() is panel.tabs["body_definition"]
+
+        # Take the generic body away: the Body page becomes irrelevant.
+        manager.set_value("generic_body.name", "")
+        manager.set_value("generic_body.config_file", "")
+        manager.set_value("generic_body.orbit.semi_major_axis_au", 0.0)
+        panel._apply_tab_visibility()
+        assert panel.all_settings_visible(), (
+            "hiding the Body page closed All settings; the user asked to "
+            "change a body, not to leave the settings view")
+        assert panel.stacked_widget.currentWidget() is not panel.tabs["start"], (
+            "hiding the Body page fell back to the click-through flow instead "
+            "of to another section")
+        panel.show_body_first()
+
+
+def test_leaving_all_settings_returns_to_the_same_card():
+    """Not to the top of the flow. Returning to the landing screen would throw
+    away the body and run type the user had already chosen."""
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        for body, mode, run_type in (("Moon", "local", "time_series"),
+                                     ("Europa", "global", "integrated"),
+                                     ("asteroid", "body", "time_series")):
+            start.choose_body(body)
+            start._choose_mode(mode)
+            card = start.open_card(body, mode, run_type, apply_defaults=True)
+            panel.show_all_settings()
+            assert panel.all_settings_visible()
+            # The label names where it goes back to, so it is not a mystery.
+            assert body in panel.close_all_settings_button.text(), (
+                f"the Back control says "
+                f"{panel.close_all_settings_button.text()!r} while the flow is "
+                f"on {body}")
+            panel.show_body_first()
+            assert start.stack.currentIndex() == start.CARD, (
+                f"returning from All settings left the {body} flow on step "
+                f"{start.stack.currentIndex()}, not on its card")
+            assert start.card_stack.currentWidget() is card, (
+                f"returning from All settings showed a different card than the "
+                f"{body} one the user left")
+            assert start.route() == (body, mode, run_type), (
+                f"the flow's route changed across the round trip: "
+                f"{start.route()} != {(body, mode, run_type)}")
+
+
+def test_an_edit_in_all_settings_reaches_the_card_and_survives_the_return():
+    """The state half of the round trip.
+
+    A number typed on the Simulation page must be showing on the card when the
+    user comes back. Without `refresh_active_card()` in `show_body_first` this
+    arm fails with "the card came back showing 29.530588 for a duration the
+    user changed to 12.75" -- measured, by disabling the call.
+
+    THE BLAST RADIUS OF A STALE CARD WAS MEASURED, and it is smaller than it
+    first looks. The obvious worry is that touching an unrelated control on a
+    stale card writes its stale siblings back over the edit. It does not: with
+    the re-mirror disabled, editing `simulation.timesteps` on a card still
+    showing 29.530588 left `simulation.duration_days` at 12.75, because Qt
+    wires each control to its own key and `on_widget_changed` writes only the
+    one that fired. So the third arm below is a NEGATIVE CONTROL on that --
+    stated as one, not dressed up as a corruption guard it cannot be. What a
+    stale card actually costs is a user reading a wrong number and acting on
+    it, which is what the second arm holds.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        card = start.open_card("Moon", "global", "time_series",
+                               apply_defaults=True)
+
+        # --- card -> All settings: the section page shows what the card set.
+        #
+        # Compared to the PAGE'S OWN display precision, deliberately, and this
+        # is not a loosened assertion -- it is a measured pre-existing gap that
+        # this branch did not introduce and does not fix. The Simulation page's
+        # duration box carries four decimals (config_panel.py, setDecimals(4),
+        # unchanged since 815c6ad) while the value and the body cards carry
+        # six, so a lunation reads 29.5306 on the page and 29.530588 in the
+        # configuration. Measured consequence, filed rather than fixed here:
+        # stepping that box up and then back down writes 29.5306 to the
+        # configuration -- a silent 4.5-second change to the run. Touching an
+        # unrelated control does NOT do it, which is the property the arm below
+        # measures and which does hold.
+        panel.show_all_settings()
+        sim = panel.tabs["simulation"]
+        shown = sim.widgets["simulation.duration_days"].value()
+        stored = manager.get_value("simulation.duration_days")
+        places = sim.widgets["simulation.duration_days"].decimals()
+        assert round(stored, places) == round(shown, places), (
+            f"the Simulation page shows {shown} for a configuration that says "
+            f"{stored} -- not a rounding difference at {places} decimals")
+
+        # --- edit in All settings, on a key the card also shows.
+        edited = 12.75
+        sim.widgets["simulation.duration_days"].setValue(edited)
+        assert manager.get_value("simulation.duration_days") == edited
+
+        # --- and back into the flow.
+        panel.show_body_first()
+        assert start.card_stack.currentWidget() is card
+        assert card.widgets["simulation.duration_days"].value() == edited, (
+            f"the card came back showing "
+            f"{card.widgets['simulation.duration_days'].value()} for a "
+            f"duration the user changed to {edited} in All settings")
+
+        # --- negative control: a card writes ONLY the control that fired.
+        #     Measured to hold even with the re-mirror disabled, so this is not
+        #     evidence for the re-mirror -- it is the guard that stops someone
+        #     "fixing" a future mirror by writing every key on every change,
+        #     which WOULD make a stale card destructive.
+        card.widgets["simulation.timesteps"].setValue(96)
+        assert manager.get_value("simulation.duration_days") == edited, (
+            f"editing one control on a card wrote a sibling's value too "
+            f"({manager.get_value('simulation.duration_days')} != {edited}); "
+            f"a card must write only the key whose control the user touched")
+        assert manager.get_value("simulation.timesteps") == 96
+
+        # --- and the negative control: the mirror is not itself an edit. A
+        #     second round trip with nothing typed changes nothing at all.
+        import copy
+        before = copy.deepcopy(manager._config_for_yaml())
+        panel.show_all_settings()
+        panel.show_body_first()
+        after = manager._config_for_yaml()
+        assert after == before, (
+            "an empty card -> All settings -> card round trip changed the "
+            "configuration. Differences:\n  " + "\n  ".join(
+                f"{k}: {before.get(k)!r} -> {after.get(k)!r}"
+                for k in sorted(set(before) | set(after))
+                if before.get(k) != after.get(k)))
+        print(f"    [round trip] duration {edited} survived "
+              f"card -> All settings -> card, and an empty round trip is inert")
+
+
+def test_opening_a_file_leaves_all_settings_and_lands_on_the_card():
+    """Paul's DP-7 ruling, held across the new second level.
+
+    Open lands on the body card. Landing on the card with the section rail
+    still up would be landing in the advanced view, which is not the ruling.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        path = REPO_ROOT / "examples" / "quickstart_moon_diurnal.yaml"
+        if not path.exists():
+            raise Skip("quickstart_moon_diurnal.yaml is not in this checkout")
+        panel.show_all_settings()
+        assert panel.all_settings_visible(), "the fixture did not open the rail"
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        route = panel.land_on_loaded_config()
+        assert route.ok, route.refusal
+        assert not panel.all_settings_visible(), (
+            "opening a file left the user in the eleven-section view instead "
+            "of landing on the body card")
+        start = panel.tabs["start"]
+        assert start.stack.currentIndex() == start.CARD
+        assert start.card_stack.currentWidget() is start.cards["Moon"]
+
+
+def test_the_main_window_menu_offers_both_levels():
+    """Checked from the AST, because the window cannot be built here.
+
+    ``PTM3DMainWindow`` constructs a ``VisualizationPanel``, which segfaults at
+    the pyvistaqt/VTK import headless, so no probe can press this menu. The
+    same limitation is why ``test_gui_run_is_read_only`` parses the source, and
+    this follows it: the wiring is pinned structurally rather than claimed.
+
+    It matters more now than it did. With the section rail hidden by default, a
+    user who has never found the card's "All settings (advanced)" button has
+    only the menu, and a menu item wired to nothing would be a dead end with no
+    error -- the failure mode this whole restructure has to avoid.
+
+    NOT COVERED: that the menu items are enabled, that the shortcuts do not
+    collide with another action's, or that anything appears on screen. Those
+    need a window.
+    """
+    import ast
+    source = (REPO_ROOT / "gui" / "ptm3d_gui.py").read_text()
+    tree = ast.parse(source)
+
+    methods = {node.name for node in ast.walk(tree)
+               if isinstance(node, ast.FunctionDef)}
+    for name in ("show_all_settings", "show_body_first"):
+        assert name in methods, (
+            f"PTM3DMainWindow has no {name}(), so the View menu cannot reach "
+            f"the two levels")
+
+    # Every QAction built with its label and its connected handler.
+    actions = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            fn = node.value.func
+            if (getattr(fn, "id", None) or getattr(fn, "attr", None)) != "QAction":
+                continue
+            args = node.value.args
+            if args and isinstance(args[0], ast.Constant):
+                target = node.targets[0]
+                key = getattr(target, "attr", None) or getattr(target, "id", None)
+                actions[key] = args[0].value
+    connected = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if getattr(fn, "attr", None) != "connect" or not node.args:
+            continue
+        handler = getattr(node.args[0], "attr", None)
+        owner = getattr(fn.value, "value", None)
+        signal = getattr(fn.value, "attr", None)
+        if signal == "triggered" and handler:
+            connected.add((getattr(owner, "attr", None)
+                           or getattr(owner, "id", None), handler))
+
+    wanted = (("all settings", "show_all_settings"),
+              ("body cards", "show_body_first"))
+    for phrase, handler in wanted:
+        named = [key for key, label in actions.items()
+                 if phrase in (label or "").replace("&", "").lower()]
+        assert named, (
+            f"no menu action is labeled with {phrase!r}; the two levels are "
+            f"reachable only from the Start page")
+        assert any((key, handler) in connected for key in named), (
+            f"the {phrase!r} menu action exists but is not connected to "
+            f"{handler}(): {sorted(connected)}")
+
+    # ...and the window's own methods delegate rather than reaching into the
+    # panel's widgets, so there is one implementation of "which level am I in".
+    for name in ("show_all_settings", "show_body_first"):
+        body = [n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == name][0]
+        calls = {getattr(c.func, "attr", None) for c in ast.walk(body)
+                 if isinstance(c, ast.Call)}
+        assert name in calls, (
+            f"PTM3DMainWindow.{name}() does not call config_panel.{name}(); it "
+            f"is a second implementation of the level switch")
+    print("    [nav] View menu wires both levels to the panel's own switch")
+
+
+def test_a_card_that_names_off_card_fields_says_how_to_reach_them():
+    """The instruction has to be followable now that the rail starts hidden.
+
+    The crater card's "Still needed" list names mesh.occluder_file and three
+    others, none of which are on the card. Before the rail was hidden, "the
+    sections holding the fields above have been opened" was enough. With the
+    rail hidden it names a place the user cannot see, which is precisely the
+    class of quiet dead end this restructure must not introduce.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        start.choose_body("Moon")
+        start._choose_mode("local")
+        card = start.open_card("Moon", "local", "time_series",
+                               apply_defaults=True)
+        report = card.report_text()
+        assert "Advanced options" in report, (
+            f"the crater card no longer says the tier was turned on:\n{report}")
+        assert "All settings" in report, (
+            f"the card tells the user to fill in fields that are not on it "
+            f"without naming the control that gets them there, and the "
+            f"section rail is hidden by default:\n{report}")
+        assert panel.advanced_toggle.isChecked(), (
+            "the crater card did not turn Advanced on")
+
+
+# --------------------------------------------------------------------------
 # 4. What the card hides, it lists
 # --------------------------------------------------------------------------
 
@@ -754,6 +1172,15 @@ TESTS = [
     test_open_accepts_every_shipped_run_configuration,
     test_every_shipped_configuration_routes_to_a_card_or_says_why,
     test_loading_a_config_lands_on_its_own_card,
+    test_the_section_rail_is_not_the_primary_navigation,
+    test_all_settings_is_reachable_and_clearly_secondary,
+    test_the_rails_own_start_row_leaves_the_rail,
+    test_a_hidden_section_does_not_eject_the_user_from_all_settings,
+    test_leaving_all_settings_returns_to_the_same_card,
+    test_an_edit_in_all_settings_reaches_the_card_and_survives_the_return,
+    test_opening_a_file_leaves_all_settings_and_lands_on_the_card,
+    test_the_main_window_menu_offers_both_levels,
+    test_a_card_that_names_off_card_fields_says_how_to_reach_them,
     test_an_opened_file_lists_what_the_card_does_not_show,
     test_a_cards_exposed_keys_are_keys_the_engine_reads,
     test_every_card_emits_a_configuration_the_engine_accepts,

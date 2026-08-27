@@ -1652,11 +1652,23 @@ TOOLTIPS = {
         "Sets output.skip_time_series."
     ),
     "ui.all_settings": (
-        "Open the full eleven-section configuration view. Everything a card "
-        "shows is there too, along with every option a card leaves at its "
-        "default.\n"
+        "Open the full eleven-section configuration view: Simulation, Mesh, "
+        "Properties, Thermal, Output, Illumination, Radiation, GPU and the "
+        "rest. Everything a card shows is there too, along with every option a "
+        "card leaves at its default.\n"
+        "You do not need it for an ordinary run -- the body cards cover that, "
+        "and this is here for when you already know which setting you want. "
+        "It stays out of the way until you ask for it.\n"
         "Nothing is lost by moving between the two: they edit the same "
-        "configuration, and an edit made in either is visible in the other."
+        "configuration, an edit made in either is visible in the other, and "
+        "the Back button returns you to the card you came from."
+    ),
+    "ui.close_all_settings": (
+        "Close the full settings view and go back to where you were in the "
+        "body-first flow -- the same body, the same run type, the same card.\n"
+        "Nothing is discarded. Anything you changed here is already in the "
+        "configuration, and the card re-reads it on the way back so the two "
+        "always show the same values."
     ),
     "ui.back_to_bodies": (
         "Return to the body chooser. The configuration is not reset -- "

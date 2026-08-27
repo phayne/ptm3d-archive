@@ -1348,7 +1348,11 @@ class BodyFirstPanel(BaseConfigTab):
         baseline_button.clicked.connect(self._on_choose_baseline)
         row.addWidget(baseline_button)
 
-        settings_button = QPushButton("All settings…")
+        # Clearly secondary, and labeled as what it is. The flow is the way
+        # through this application; the eleven-section view is the escape
+        # hatch for someone who already knows which key they want.
+        settings_button = QPushButton("All settings (advanced)…")
+        settings_button.setObjectName("AllSettingsButton")
         settings_button.setToolTip(get_tooltip("ui.all_settings"))
         settings_button.clicked.connect(self.all_settings_requested.emit)
         row.addWidget(settings_button)
@@ -1431,11 +1435,45 @@ class BodyFirstPanel(BaseConfigTab):
         self.card_title.setFont(QFont("Helvetica Neue", 13, QFont.Weight.Bold))
         layout.addWidget(self.card_title)
         layout.addStretch()
-        settings = QPushButton("All settings…")
+        settings = QPushButton("All settings (advanced)…")
+        settings.setObjectName("AllSettingsButton")
         settings.setToolTip(get_tooltip("ui.all_settings"))
         settings.clicked.connect(self.all_settings_requested.emit)
         layout.addWidget(settings)
         return header
+
+    # -- what the flow is currently on ----------------------------------------
+
+    def route(self):
+        """``(body_key, mode_key, run_type)`` -- may carry ``None`` for the
+        first two while the user is still on the landing screen."""
+        return self._route
+
+    def active_card(self):
+        """The card the flow is showing, or None if it is not on a card."""
+        if self.stack.currentIndex() != self.CARD:
+            return None
+        return self.card_stack.currentWidget()
+
+    def refresh_active_card(self):
+        """Re-read the configuration into whichever card is live.
+
+        Called when the user returns from All settings. A value edited on a
+        section page is in the configuration but not on the card's controls,
+        and `BaseConfigTab` writes a control's value back on the next widget
+        event -- so a card left showing a stale number would push that stale
+        number over the edit the moment anything else on the card was touched.
+
+        Goes through `BodyCard.load_from_config`, which is `_loading`-guarded,
+        so re-mirroring is not itself an edit: the same guard is what keeps
+        merely DISPLAYING a configuration from firing the `toggled` handler
+        that writes `radiation.rms_slope_deg`.
+        """
+        card = self.active_card()
+        if card is None:
+            return None
+        card.load_from_config()
+        return card
 
     def register_cards(self, cards):
         """Take the card widgets built by the ConfigurationPanel.
@@ -1550,8 +1588,10 @@ class BodyFirstPanel(BaseConfigTab):
             result.applied[key] = value
         if preset.needs_advanced:
             result.notes.append(
-                "'Advanced options' has been turned on and the sections "
-                "holding the fields above have been opened.")
+                "The fields listed above are not on this card. 'Advanced "
+                "options' has been turned on and the sections holding them "
+                "have been opened for you -- press 'All settings (advanced)' "
+                "at the top of this card to get to them.")
             self.advanced_requested.emit(preset.key)
         return result
 
@@ -1644,8 +1684,10 @@ class BodyFirstPanel(BaseConfigTab):
         lines = result.summary_lines()
         if preset.needs_advanced:
             lines.append(
-                "NOTE: 'Advanced options' has been turned on and the sections "
-                "holding the fields above have been opened.")
+                "NOTE: the fields listed above are not on this card. "
+                "'Advanced options' has been turned on and the sections "
+                "holding them have been opened for you -- press 'All settings "
+                "(advanced)' to get to them.")
             self.advanced_requested.emit(key)
         self._show(key, "\n".join(lines))
         self.preset_applied.emit(key)

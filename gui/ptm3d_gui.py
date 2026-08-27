@@ -273,6 +273,23 @@ class PTM3DMainWindow(QMainWindow):
 
         view_menu.addSeparator()
 
+        # The two levels. The click-through flow is the primary navigation and
+        # the eleven-section rail is hidden until it is asked for, so the menu
+        # carries the same two controls the card and the landing screen do --
+        # a user who has hidden the rail must have a way back to it that does
+        # not depend on remembering which button revealed it.
+        self.all_settings_action = QAction("&All Settings (Advanced)", self)
+        self.all_settings_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.all_settings_action.triggered.connect(self.show_all_settings)
+        view_menu.addAction(self.all_settings_action)
+
+        self.body_first_action = QAction("&Back to the Body Cards", self)
+        self.body_first_action.setShortcut(QKeySequence("Ctrl+Shift+B"))
+        self.body_first_action.triggered.connect(self.show_body_first)
+        view_menu.addAction(self.body_first_action)
+
+        view_menu.addSeparator()
+
         # Advanced tools: the Camera simulator tab is hidden by default.
         self.show_camera_action = QAction("Show &Camera Tool", self)
         self.show_camera_action.setCheckable(True)
@@ -1054,6 +1071,27 @@ class PTM3DMainWindow(QMainWindow):
             QMessageBox.information(self, "Check Configuration", body)
 
     # === View Operations ===
+
+    def show_all_settings(self):
+        """View > All Settings (Advanced). The window's half of the two levels.
+
+        The configuration panel owns the switch; this exists so the menu and
+        any future toolbar button go through one path rather than reaching into
+        the panel's widgets. It also makes sure the left column is showing the
+        configuration and not the Results Browser, which would otherwise leave
+        the menu item looking like it did nothing.
+        """
+        self.left_tabs.setCurrentWidget(self.config_panel)
+        self.config_panel.show_all_settings()
+
+    def show_body_first(self):
+        """View > Back to the Body Cards. Returns into the click-through flow.
+
+        Nothing is discarded: the panel re-mirrors the live card from the
+        configuration on the way back, so the card and the section pages agree.
+        """
+        self.left_tabs.setCurrentWidget(self.config_panel)
+        self.config_panel.show_body_first()
 
     def toggle_console(self):
         """Toggle console dock visibility"""

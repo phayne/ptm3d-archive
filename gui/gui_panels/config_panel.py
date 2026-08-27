@@ -5535,7 +5535,14 @@ class ConfigurationPanel(QWidget):
             self.stacked_widget.addWidget(self._horizons_panel)
             self._nav_keys.append("__horizons__")
 
-        self.nav_rail.currentRowChanged.connect(self.stacked_widget.setCurrentIndex)
+        # NOT wired straight to `setCurrentIndex`. The rail still carries a
+        # "Start" row -- it has to, because the row index and the stack index
+        # are the same number and dropping the row would shift every one below
+        # it -- and selecting it used to show the click-through flow WITH the
+        # section list still up. Two navigations on screen at once is the exact
+        # confusion this change exists to remove, so that row now does what the
+        # Back button does: it leaves the second level.
+        self.nav_rail.currentRowChanged.connect(self._on_nav_row_changed)
         self.nav_rail.setCurrentRow(0)
 
         # Basic / Advanced disclosure toggle above the nav rail. It now reveals
@@ -5545,21 +5552,49 @@ class ConfigurationPanel(QWidget):
         self.advanced_toggle.setToolTip(get_tooltip("ui.advanced_options"))
         self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
 
+        # The way BACK. The rail is not primary navigation any more, so leaving
+        # it needs a control of its own -- otherwise the only route out of the
+        # eleven sections is to click "Start" in the rail, which is the rail
+        # being primary navigation again.
+        self.close_all_settings_button = QPushButton("← Back")
+        self.close_all_settings_button.setToolTip(
+            get_tooltip("ui.close_all_settings"))
+        self.close_all_settings_button.clicked.connect(self.show_body_first)
+
         # Container for nav rail + content
         nav_container = QWidget()
         nav_layout = QHBoxLayout(nav_container)
         nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(0)
 
-        nav_column = QWidget()
-        nav_col_layout = QVBoxLayout(nav_column)
+        self.nav_column = QWidget()
+        nav_col_layout = QVBoxLayout(self.nav_column)
         nav_col_layout.setContentsMargins(0, 0, 0, 0)
         nav_col_layout.setSpacing(4)
+        nav_col_layout.addWidget(self.close_all_settings_button)
         nav_col_layout.addWidget(self.advanced_toggle)
         nav_col_layout.addWidget(self.nav_rail, stretch=1)
 
-        nav_layout.addWidget(nav_column)
+        nav_layout.addWidget(self.nav_column)
         nav_layout.addWidget(self.stacked_widget, stretch=1)
+
+        # THE RAIL IS HIDDEN UNTIL IT IS ASKED FOR.
+        #
+        # Paul, on the merged body-first GUI: "the tabs ('Simulation', 'Mesh',
+        # 'Properties', etc) on the lefthand side are somewhat obsolete and
+        # confusing. The GUI should embrace the click-through structure, and
+        # only offer these other features as advanced options."
+        #
+        # So the click-through flow -- landing, run type, card, run -- is the
+        # only primary navigation, and the eleven-section view is a second
+        # level reached from an explicit "All settings (advanced)" control on
+        # the card, on the landing screen, and in the View menu. Hiding the
+        # COLUMN rather than removing the rail matters: every section widget
+        # still exists, still loads and still saves, so nothing about a written
+        # configuration depends on whether the rail happens to be on screen.
+        # That is the same property the Basic/Advanced tier already had, and it
+        # is what makes this a navigation change rather than a behavior change.
+        self.nav_column.setVisible(False)
 
         # Apply the initial Basic/Advanced visibility (Basic by default).
         self._apply_tab_visibility()
@@ -5750,11 +5785,18 @@ class ConfigurationPanel(QWidget):
             else:
                 hidden = False
             item.setHidden(hidden)
-        # If the current selection just got hidden, jump to the first visible.
+        # If the current selection just got hidden, jump to the first visible
+        # SECTION -- not to "Start", which is no longer a section but the way
+        # out of this view entirely. Falling back to it would eject a user from
+        # All settings the moment their configuration stopped having a generic
+        # body in it, which is not something they asked for.
         cur = self.nav_rail.currentRow()
         cur_item = self.nav_rail.item(cur) if cur >= 0 else None
         if cur_item is None or cur_item.isHidden():
             for row in range(self.nav_rail.count()):
+                key = self._nav_keys[row] if row < len(self._nav_keys) else None
+                if key == "start" and self.all_settings_visible():
+                    continue
                 it = self.nav_rail.item(row)
                 if it is not None and not it.isHidden():
                     self.nav_rail.setCurrentRow(row)
@@ -5765,42 +5807,137 @@ class ConfigurationPanel(QWidget):
         yaml_content = self.config_manager.generate_yaml()
         self.preview_text.setText(yaml_content)
 
+    # -- the two levels -------------------------------------------------------
+    #
+    # Level one is the click-through flow and it is the only primary
+    # navigation. Level two is the eleven-section view, and it is reached and
+    # left through these two methods and nothing else -- the nav rail's own
+    # `currentRowChanged` still switches PAGES within level two, but it is not
+    # visible outside it.
+
+    def _on_nav_row_changed(self, row):
+        """A row in the section list was selected.
+
+        Every row but one simply switches the page. "Start" is the exception:
+        it is the click-through flow, which is the FIRST level, so selecting it
+        closes the second one instead of showing the flow underneath a section
+        list that is still on screen.
+
+        `_leaving_rail` is a recursion guard, not decoration: `show_body_first`
+        sets the rail's current row back to Start, which re-enters here.
+        """
+        if getattr(self, "_leaving_rail", False):
+            return
+        key = self._nav_keys[row] if 0 <= row < len(self._nav_keys) else None
+        if key == "start" and self.all_settings_visible():
+            self._leaving_rail = True
+            try:
+                self.show_body_first()
+            finally:
+                self._leaving_rail = False
+            return
+        self.stacked_widget.setCurrentIndex(row)
+
+    def all_settings_visible(self):
+        """True while the eleven-section view is showing.
+
+        Reads the widget's own HIDE flag, not `isVisible()`. `isVisible()` is
+        true only when every ancestor is shown as well, so on an offscreen
+        panel that was never `show()`n it is False for everything -- which
+        would make this report "the rail is closed" whether it was open or not,
+        and every headless probe of the two levels would pass vacuously. The
+        hide flag is the state this panel actually sets.
+
+        Answers False before `nav_column` exists. `init_ui` calls
+        `nav_rail.setCurrentRow(0)` -- which fires `_on_nav_row_changed` on the
+        "start" row -- several statements BEFORE it builds the column, so
+        without this the panel raises AttributeError during construction and
+        the window never opens.
+        """
+        column = getattr(self, "nav_column", None)
+        return column is not None and not column.isHidden()
+
     def show_all_settings(self):
-        """The second level: the eleven-section view, landing on Simulation."""
+        """The second level: reveal the rail and land on Simulation.
+
+        It lands on Simulation rather than wherever the rail was left, so the
+        move from a card into the full view arrives somewhere recognizable.
+        """
+        self.nav_column.setVisible(True)
+        self.close_all_settings_button.setText(self._back_label())
         idx = self.stacked_widget.indexOf(self.tabs["simulation"])
         if idx >= 0:
             self.stacked_widget.setCurrentIndex(idx)
             self.nav_rail.setCurrentRow(idx)
 
     def show_body_first(self):
-        """The first level: the body-first Start page."""
+        """The first level: hide the rail and return into the flow.
+
+        RETURNS TO WHERE THE FLOW WAS, not to the top of it. The Start page
+        keeps its own step (landing / run type / card), so a user who opened
+        All settings from the Moon card comes back to the Moon card. Coming
+        back to the landing screen instead would silently discard the body and
+        run type they had already chosen.
+
+        The card is RE-MIRRORED on the way back. That is the whole round trip:
+        a value edited on the Simulation page is in the configuration but not
+        yet on the card's controls, and `BaseConfigTab` writes a control's
+        value back on the next widget event -- so a card showing a stale number
+        would overwrite the edit as soon as anything else on it was touched.
+        `BodyFirstPanel.refresh_active_card()` re-reads the configuration into
+        whichever card is live, through the same `_loading`-guarded path that
+        opening a file uses, so returning is not itself an edit.
+        """
+        self.nav_column.setVisible(False)
         idx = self.stacked_widget.indexOf(self.tabs["start"])
         if idx >= 0:
             self.stacked_widget.setCurrentIndex(idx)
             self.nav_rail.setCurrentRow(idx)
+        self.tabs["start"].refresh_active_card()
+
+    def _back_label(self):
+        """What the way out of All settings says it returns to."""
+        body, _mode, _run_type = self.tabs["start"].route()
+        return f"← Back to {body}" if body else "← Back"
 
     def land_on_loaded_config(self):
         """After an open: land on the loaded configuration's own body card.
 
         Returns the `BodyRoute`, whose `refusal` is non-empty when the file
         could not be routed -- which is REPORTED, never guessed past.
+
+        Opening a file leaves the eleven-section view if it was open. Paul's
+        DP-7 ruling is that Open lands on the body card; landing on the card
+        with the rail still up would be landing in level two.
         """
-        self.show_body_first()
+        self.nav_column.setVisible(False)
+        idx = self.stacked_widget.indexOf(self.tabs["start"])
+        if idx >= 0:
+            self.stacked_widget.setCurrentIndex(idx)
+            self.nav_rail.setCurrentRow(idx)
         return self.tabs["start"].land_on_current_config()
 
     def switch_to_horizons_tab(self):
-        """Switch to the HORIZONS search tab."""
+        """Switch to the HORIZONS search page.
+
+        HORIZONS lives in the second level, so getting there OPENS the second
+        level. Switching the stacked widget without revealing the rail would
+        drop the user on a page with no visible way back -- the flow's own
+        controls are on the Start page, which is no longer on screen.
+        """
         if self._horizons_panel:
             idx = self.stacked_widget.indexOf(self._horizons_panel)
             if idx >= 0:
+                self.show_all_settings()
                 self.stacked_widget.setCurrentIndex(idx)
                 self.nav_rail.setCurrentRow(idx)
 
     def switch_to_body_definition_tab(self):
-        """Switch to the Body Definition tab."""
+        """Switch to the Body Definition page (second level; see above)."""
         if "body_definition" in self.tabs:
             idx = self.stacked_widget.indexOf(self.tabs["body_definition"])
             if idx >= 0:
+                self.show_all_settings()
                 self.stacked_widget.setCurrentIndex(idx)
                 self.nav_rail.setCurrentRow(idx)
 
@@ -5838,14 +5975,12 @@ class ConfigurationPanel(QWidget):
             self.config_manager.set_value("illumination.albedo_maps_directory", "")
 
         # A generic body is now active — refresh nav visibility so the Body
-        # tab can appear (when Advanced is on).
+        # page can appear.
         self._apply_tab_visibility()
 
-        # Switch back to simulation tab
-        sim_idx = self.stacked_widget.indexOf(self.tabs["simulation"])
-        if sim_idx >= 0:
-            self.stacked_widget.setCurrentIndex(sim_idx)
-            self.nav_rail.setCurrentRow(sim_idx)
+        # Back to Simulation. The user reached HORIZONS from the second level
+        # and stays in it; show_all_settings lands there and keeps the rail up.
+        self.show_all_settings()
 
         self.on_value_changed()
 

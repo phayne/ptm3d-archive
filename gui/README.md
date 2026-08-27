@@ -28,8 +28,10 @@ local disk, not in a cloud-synced folder.
 
 ### 1. Simulation Configuration
 
-The GUI has **two levels**: a body card, and all settings. Every card carries
-one control to the second, and both edit the same configuration.
+The GUI has **two levels**, and only the first is navigation. Clicking through
+— body, kind of run, card, run — is how you get anywhere; the section list on
+the left is **hidden until you ask for it**. Both levels edit the same
+configuration.
 
 - **Start page — which body?** Five large buttons: Moon, Europa, Mercury,
   Asteroid, and Custom body. The three built-in bodies are exactly the ones the
@@ -43,10 +45,21 @@ one control to the second, and both edit the same configuration.
   for a whole-Moon run, nine for a Europa terrain site, eight for Mercury. Each
   card states the exact keys it set, announces every automatic choice, and lists
   anything an opened file carries that the card does not show.
-- **All settings**: the complete reference view — Simulation, Mesh,
+- **All settings (advanced)**: the complete reference view — Simulation, Mesh,
   Properties, Thermal, Output, Body, Illumination, Radiation, GPU and Engine
-  Flags. Every tab is always visible; "Advanced options" reveals the expert
-  groups *inside* each tab rather than hiding whole tabs.
+  Flags. It is **not** the primary navigation and it is not on screen by
+  default. Open it from the button on any card, from the landing screen, or
+  from *View → All Settings (Advanced)* (Ctrl+Shift+A); leave it with the
+  **Back** button above the section list, or *View → Back to the Body Cards*
+  (Ctrl+Shift+B). Leaving it returns you to the card you came from, not to the
+  top of the flow, and the card re-reads the configuration on the way back so
+  the two never disagree. Inside it, every section is always listed and
+  "Advanced options" reveals the expert groups *inside* each section rather
+  than hiding whole sections.
+
+  Nothing about a saved configuration depends on whether this view is open:
+  every section widget exists, loads and saves either way. Hiding it is a
+  navigation change, not a behavior change.
 - **YAML Preview**: the engine-facing configuration a run writes. Save does
   not write this: it edits your project file in place, changing only the keys
   you changed and preserving its comments (needs `ruamel.yaml`, which
@@ -66,7 +79,18 @@ Each card applies its defaults through the same mechanism the task cards used,
 so "a card reports exactly the keys it wrote" is one rule with one set of
 tests. Opening a file requires only that it be YAML and name a body under
 `simulation.body`; everything else in it is loaded unchanged, listed above the
-card, and editable under All settings.
+card, and editable under All settings. *File → Open* always lands on that
+file's own body card, closing All settings if it was open.
+
+The copy follows the same rule as the structure: a button says what it leads
+to in one short line, and the detail is in its tooltip. The landing screen used
+to carry a paragraph under each body button and two more under the baseline
+entry; they are gone, and anything among them that was a genuine disclosure —
+Mercury ships no albedo map, no topography and no worked example — now sits on
+that body's own card, next to the controls it constrains.
+`src/python/tests/test_gui_tooltip_coverage.py` reads every string the
+application shows, on screen and in the source, and fails on internal
+shorthand.
 
 ### 2. 3D Visualization (PyVista)
 - Interactive 3D mesh rendering with zoom, pan, and rotate
