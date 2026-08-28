@@ -451,6 +451,10 @@ def test_the_help_text_carries_no_internal_shorthand():
 #     proven             0     -      0  ENABLED
 #     ledger             0     -      0  ENABLED
 #     crew names         0     -      0  ENABLED  (see the Hayne note below)
+#                                                  RE-MEASURED 2026-08-28 with
+#                                                  "Sutton" added: 13 hits on a
+#                                                  corpus of 2189, all 13 real
+#                                                  and all 13 now fixed.
 #     byte-identical     0     -      0  ENABLED
 #     do-no-harm         0     -      0  ENABLED
 #     prepare-only       0     -      0  ENABLED
@@ -482,6 +486,18 @@ def test_the_help_text_carries_no_internal_shorthand():
 # citation or an enum spelling ("Hayne (2017): the lunar angular-albedo fit",
 # "(Hayne = false, Hapke = true)") -- a literature reference and a YAML value,
 # not a person on a team.
+#
+# "Sutton" is the opposite case, and it is why the pattern gained an arm on
+# 2026-08-28. It was never a citation: the five Europa elevation models were
+# forwarded by a colleague of that name, and the GUI labeled the product after
+# her -- "Local mesh (Sutton DEM)", "Europa Sutton DEM site", "the Europa SOCET
+# regional terrain set (Sutton et al.)". The models are Bland, Michael (2022),
+# figshare doi:10.6084/m9.figshare.16904632, CC BY 4.0, from the USGS
+# Astrogeology Science Center. A dataset is credited by its citation; the
+# person who passed it along is not an author, and "Sutton et al." named a
+# paper that does not exist. The DIRECTORY `data/external/sutton_DEMs/` keeps
+# its name -- 45 shipped configurations reference that path -- so this pattern
+# is deliberately case-sensitive and matches the label, not the path.
 
 _CREW_IDIOM = [
     (re.compile(r"\bhonest\w*\b", re.I),
@@ -492,8 +508,9 @@ _CREW_IDIOM = [
     (re.compile(r"\bledger\b", re.I), "the internal bug ledger"),
     (re.compile(r"\bPTM-\d+", re.I), "a ticket number"),
     (re.compile(r"\bPR #?\d+", re.I), "a pull-request number"),
-    (re.compile(r"\b(Ada|Fermi|Sagan|Luna|Paul|the crew)\b"),
-     "a name from inside the project"),
+    (re.compile(r"\b(Ada|Fermi|Sagan|Luna|Paul|Sutton|the crew)\b"),
+     "a personal name from inside the project or its collaborators; credit a "
+     "dataset by its citation, not by whoever passed it along"),
     (re.compile(r"\bbyte-identical\b", re.I), "internal shorthand"),
     (re.compile(r"\bdo-no-harm\b", re.I), "internal shorthand"),
     (re.compile(r"\bprepare-only\b", re.I), "internal shorthand"),
@@ -608,10 +625,18 @@ def _source_strings():
             out.append((f"preset {key}: needs", need))
 
     from gui_core.preflight import (DELIBERATELY_NOT_INJECTED,
-                                    ENV_SET_CHANGED_PHYSICS)
+                                    ENV_SET_CHANGED_PHYSICS,
+                                    _EXTERNAL_DATA_SOURCES)
     for key, value in DELIBERATELY_NOT_INJECTED.items():
         out.append((f"engine env, not injected: {key}", value))
     out.append(("engine env banner", ENV_SET_CHANGED_PHYSICS))
+    # The pre-flight's refusal text for a dataset PTM3D does not distribute.
+    # It reaches the user through `missing_external_data_hint`, a dialog like
+    # any other, and it was the one place in this GUI that credited a dataset
+    # to the person who forwarded it rather than to the people who made it.
+    # Harvested for the same reason the two tables above are.
+    for key, (what, _candidates) in _EXTERNAL_DATA_SOURCES.items():
+        out.append((f"external data source: {key}", what))
     return [(w, t) for w, t in out if (t or "").strip()]
 
 
@@ -681,13 +706,29 @@ def test_the_crew_idiom_check_actually_fires():
     for text in samples:
         hits = _idiom_hits([("negative control", text)], _CREW_IDIOM)
         assert hits, f"the wordlist did not fire on {text!r}"
+
+    # The personal-name pattern is an alternation, and one arm per PATTERN
+    # leaves every alternative after the first unproven. "Sutton" was added on
+    # 2026-08-28 and scored 13 real hits on a corpus of 2189 -- a section
+    # title, two tooltips, a run-type summary, a preset title and summary and
+    # the pre-flight's third-party-data entry all named the person who
+    # forwarded the Europa elevation models rather than the people who made
+    # them. So every alternative gets its own arm.
+    for name in ("Ada", "Fermi", "Sagan", "Luna", "Paul", "Sutton",
+                 "the crew"):
+        text = f"Ask {name} about the terrain."
+        assert _idiom_hits([("negative control", text)], _CREW_IDIOM), (
+            f"the personal-name pattern does not fire on {name!r}, so that "
+            f"alternative is decoration")
+
     # ...and the positive control: ordinary user copy passes clean.
     clean = [
-        "Local mesh (Sutton DEM)",
+        "Local mesh (DEM)",
         "The engine refuses 'Auto' at startup.",
         "Measured in diurnal skin depths.",
         "Hayne (2017): the lunar angular-albedo fit, and the default.",
         "One temperature field per output sample.",
+        "Bland, Michael (2022), figshare, doi:10.6084/m9.figshare.16904632.",
     ]
     for text in clean:
         hits = _idiom_hits([("positive control", text)], _CREW_IDIOM)

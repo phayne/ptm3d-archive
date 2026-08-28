@@ -374,7 +374,7 @@ def test_every_route_emits_its_own_body_after_every_other_route():
                         # This arm used to assert the -999.0 "not placed"
                         # sentinel, which forbade the one card whose subject IS
                         # a placed terrain from placing it: the Europa
-                        # Sutton-DEM card must fill the latitude in, and the
+                        # DEM card must fill the latitude in, and the
                         # positive claim for it is immediately below. Checked
                         # against the poisoned values, which is the question
                         # actually being asked.
@@ -581,7 +581,7 @@ def test_europa_terrain_card_emits_the_terrain_it_shows():
        terrain combo and showed 0 over a configuration that carried -999.
 
     Whether that file is ON DISK is checked too, and its absence is a SKIP with
-    the source named: the Sutton DEMs are collaborator data that PTM3D does not
+    the source named: the Europa DEMs are third-party data that PTM3D does not
     distribute, so a clean checkout must not show a red gate for not having
     them. The REFUSAL for that case is the next check.
     """
@@ -633,8 +633,8 @@ def test_europa_terrain_card_emits_the_terrain_it_shows():
             resolved = REPO_ROOT / resolved
         if not resolved.exists():
             raise Skip(
-                f"{resolved} is not on this disk (the Sutton DEMs are "
-                f"collaborator data, see data/external/README.md). The "
+                f"{resolved} is not on this disk (the Europa DEMs are "
+                f"third-party data, see data/external/README.md). The "
                 f"emission was checked; the file was not.")
         print(f"    [terrain] Europa Local emits {Path(got).name} at "
               f"latitude {latitude}, and the file is on disk")
@@ -717,7 +717,7 @@ def test_a_terrain_whose_file_is_absent_is_refused_and_says_where_to_get_it():
         }
         report = run_preflight(config, lambda: str(exe), project_root=root)
         assert not report.ok, (
-            "a configuration naming a Sutton DEM that is not on disk passed "
+            "a configuration naming a Europa DEM that is not on disk passed "
             "pre-flight")
         blocking = "\n".join(report.errors)
         assert entry.import_file.split("/")[-1] in blocking, (
@@ -751,12 +751,14 @@ def test_a_missing_view_factor_cache_offers_the_choice_not_a_refusal():
     """The SECOND missing artifact, hit the same afternoon as the first.
 
     The card wires ``radiation.view_factor_file`` to
-    ``data/external/sutton_DEMs/<DEM>.vf``, which is a collaborator cache and
-    is not in any checkout. The pre-flight used to make that a hard ERROR --
-    which blocked all 45 shipped ``configs/europa_lat*_*.yaml`` on any machine
-    that had not built the caches, while the command line ran them happily,
-    because the engine's behavior for a named cache that does not exist is to
-    BUILD it and SAVE it there (``ptm_thermal_sim.cpp:15716-15734``).
+    ``data/external/sutton_DEMs/<DEM>.vf``, which is not in any checkout --
+    PTM3D builds that matrix itself, so it is neither shipped nor obtainable
+    with the elevation models beside it. The pre-flight used to make that a
+    hard ERROR -- which blocked all 45 shipped ``configs/europa_lat*_*.yaml``
+    on any machine that had not built the caches, while the command line ran
+    them happily, because the engine's behavior for a named cache that does
+    not exist is to BUILD it and SAVE it there
+    (``ptm_thermal_sim.cpp:15716-15734``).
 
     So it is a CHOICE -- point at an existing matrix, or let this run build one
     -- and the message has to say so. It is still gated: the PTM-19 override

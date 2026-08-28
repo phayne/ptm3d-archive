@@ -123,6 +123,13 @@ def test_the_fit_check_fails_on_text_that_does_not_fit():
     are the three summaries as they were written on 2026-08-27, and every one
     of them must be reported as not fitting -- otherwise this file would go on
     passing after somebody put a paragraph back.
+
+    They are VERBATIM historical quotations, kept for their LENGTH. The third
+    still reads "every Sutton terrain" because that is what the summary said on
+    2026-08-27, before the label sweep of 2026-08-28 -- it is not a label this
+    GUI shows anywhere, it is the measured text. Do not rewrite it to match the
+    current wording: the replacement is shorter, and shortening the strings a
+    negative control is built on is how the control quietly stops controlling.
     """
     _qt()
     from gui_panels.body_cards_panel import _BigButton
