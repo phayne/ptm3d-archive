@@ -94,6 +94,23 @@
           "unpack_to": "data/meshes/"
         }
       ]
+    },
+    "bennu-shape-hires": {
+      "description": "Bennu OSIRIS-REx OLA v21 global shape model at 3.25 m sampling (196,608 facets) -- the optional higher-resolution companion to the 6.37 m model tracked in data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/. Volume is already converged at 6.37 m (R_vol moves 0.007%); surface area is NOT (+4.1%), so fetch this for roughness, beaming or self-heating work and not for bulk quantities.",
+      "tier": "optional",
+      "attribution": "Barnouin, O.; Daly, M.; Espiritu, R.; OSIRIS-REx Altimetry Working Group (2026), PDS Small Bodies Node, urn:nasa:pds:orex.altimetry; NASA PDS public domain",
+      "license": "CC-BY-4.0",
+      "comment": "Served straight from the PDS archive via the per-file 'url' override (scripts/fetch_data.py:80) rather than from the Zenodo deposit: this is somebody else's primary product, and re-hosting it would put a second copy of an archive file behind a checksum we control. The sha256 below was measured on the downloaded bytes, 2026-08-28.",
+      "files": [
+        {
+          "name": "g_03250mm_alt_obj_0000n00000_v021.obj",
+          "url": "https://sbnarchive.psi.edu/pds4/orex/orex.altimetry/data_derived_altimetry_lidar_global_models/global_digital_terrain_models/OLAv21/g_03250mm_alt_obj_0000n00000_v021.obj",
+          "sha256": "14f715f67b662f1830f8cc713108d364acc9367cd986cc735e5fcb37cda63746",
+          "size": 14851156,
+          "archive": false,
+          "unpack_to": "data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/"
+        }
+      ]
     }
   },
   "planned_optional_datasets": {

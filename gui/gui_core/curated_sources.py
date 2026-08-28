@@ -14,9 +14,10 @@ answers::
 
 -- correctly, and unhelpfully: Bennu's HORIZONS record is ``*SPECIAL*``, served
 from ``ORX_merged``. Asked for a shape, DAMIT has nothing, because Bennu's
-shape is not a lightcurve inversion; it is Nolan et al.'s radar model and,
-later, OLA. Both refusals are true, both are dead ends, and a user who does not
-already know where the OSIRIS-REx archive is has nowhere to go from either.
+shape is not a lightcurve inversion; it was Nolan et al.'s radar model, and
+since the encounter it is OLA's. Both refusals are true, both are dead ends,
+and a user who does not already know where the OSIRIS-REx archive is has
+nowhere to go from either.
 
 What this module adds is a THIRD TIER, consulted first for the bodies it
 covers::
@@ -162,11 +163,15 @@ class CuratedShape:
     through the same ``PTM_DATA_ROOT`` contract as ``mesh.import_file``.
 
     ``tracked`` records whether the file is in git. It matters and it is not
-    obvious: ``.gitignore`` line 14 is ``*.obj``, a rule written for C object
-    files that matches every asteroid shape model here (PTM-303). Bennu's is
-    tracked ANYWAY -- it was force-added -- so it ships; a future entry whose
-    shape is not tracked would exist in one copy on one machine, and the card
-    has to be able to say which case it is.
+    obvious: ``.gitignore`` carries ``*.obj``, a rule written for C object
+    files that matches every asteroid shape model here (PTM-303). The curated
+    body cache is excepted from it by name
+    (``!data/horizons_cache/bodies/**/*.obj``), so Bennu's shape ships by RULE
+    rather than by the ``git add -f`` it originally needed -- a force-add is
+    invisible to the next person, and a shape that quietly stopped being
+    tracked would leave this card offering a file a fresh checkout does not
+    contain. A future entry whose shape is not tracked would exist in one copy
+    on one machine, and the card has to be able to say which case it is.
     """
 
     def __init__(self, relpath, description, archive, radius_km, mesh_scale,
@@ -255,9 +260,11 @@ CURATED_BODIES = (
             "available for pre-computed objects in the major body index' "
             "(measured 2026-08-27 against four designation forms and the POST "
             "file endpoint). DAMIT has no Bennu either: DAMIT publishes "
-            "lightcurve inversions, and Bennu's shape is a radar model. Both "
-            "refusals are correct and permanent, so this body is served from "
-            "the mission products instead of from either service."),
+            "lightcurve inversions, and Bennu's shape is not one -- it is a "
+            "spacecraft product, measured by the OSIRIS-REx laser altimeter "
+            "and archived at the PDS Small Bodies Node. Both refusals are "
+            "correct and permanent, so this body is served from the mission "
+            "products instead of from either service."),
         ephemeris=CuratedEphemeris(
             fetch_bodies="bennu",
             metakernel="bennu.tm",
@@ -274,14 +281,28 @@ CURATED_BODIES = (
         ),
         shape=CuratedShape(
             relpath=("data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/"
-                     "bennu_radar_shape.obj"),
-            description="Nolan et al. (2013) radar + lightcurve shape model",
-            archive="PDS Small Bodies Node, "
-                    "urn:nasa:pds:ast-bennu.radar.shape-model::1.1",
-            radius_km=0.2447,
+                     "g_06370mm_alt_obj_0000n00000_v021.obj"),
+            description=("OSIRIS-REx OLA v21 global shape model, 6.37 m "
+                         "ground sample distance"),
+            archive="PDS Small Bodies Node, urn:nasa:pds:orex.altimetry:"
+                    "data_derived_altimetry_lidar_global_models:"
+                    "g_06370mm_alt_obj_0000n00000_v021.obj",
+            # Mean |vertex| over the 24,578 REFERENCED vertices, 0.243722 km.
+            # Not decoration: `BodyShape::meanRadiusKm` returns this verbatim
+            # for a CUSTOM_MESH (`src/cpp/orbital/body_shape.h:41`), so it is
+            # the R_body the engine's PTM-37 unit guard cross-checks the mesh
+            # against and the radius `setBodyRadius` receives.
+            radius_km=0.2437,
             mesh_scale=1.0,
-            vertices=1348,
-            faces=2692,
+            # The file's counts as the PDS4 label states them. 772 of the
+            # vertices appear in no facet -- duplicates the producer flags in
+            # the model's own header -- so V - E + F is 774 rather than 2 while
+            # the surface is still closed (0 boundary edges, measured with
+            # `scripts/validate_shape_model.py`). The archive product ships
+            # BYTE FOR BYTE, orphans included, because a checksum that matches
+            # the archive is worth more than a tidier vertex list.
+            vertices=25350,
+            faces=49152,
             units="km",
             tracked=True,
             # Hergenrother et al. (2013), the same PDS archive as the shape;
