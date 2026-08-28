@@ -269,6 +269,69 @@ def is_cloud_path(path):
     return any(marker in p for marker in CLOUD_PATH_MARKERS)
 
 
+#: Collaborator datasets that `configs/` references under `data/external/` and
+#: that PTM3D does NOT distribute (`data/external/README.md`). Keyed by the
+#: directory name inside `data/external/`; the value is what the dataset is and
+#: the candidate source directories to look in ON THIS MACHINE.
+#:
+#: The candidates are PROBED, never asserted: a path appears in the refusal only
+#: when the file is really sitting there. A hard-coded "get it from <path>" that
+#: is wrong on the reader's machine is worse than no hint, and this table ships
+#: to every checkout.
+_EXTERNAL_DATA_SOURCES = {
+    "sutton_DEMs": (
+        "the Europa SOCET regional terrain set (Sutton et al.) and its "
+        "view-factor caches. PTM3D does not distribute collaborator data -- "
+        "see data/external/README.md",
+        (
+            "~/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/"
+            "sutton_WorkMORE",
+        ),
+    ),
+}
+
+
+def missing_external_data_hint(missing_path):
+    """Where to get a `data/external/...` file that is not on disk.
+
+    Returns "" for any path that is not under `data/external/<known set>/`, so
+    an unrelated missing file gets the plain message it always got.
+
+    The point is the 2026-08-28 Europa terrain run: the five Sutton DEMs were
+    absent from the checkout, the card dropped `mesh.import_file` instead of
+    saying so, and the engine ran a global icosphere. A refusal that names the
+    path is half the answer; the other half is where the file comes from.
+    """
+    parts = Path(str(missing_path)).parts
+    try:
+        i = len(parts) - 1 - parts[::-1].index("external")
+    except ValueError:
+        return ""
+    if i == 0 or parts[i - 1] != "data" or i + 1 >= len(parts):
+        return ""
+    dataset = parts[i + 1]
+    entry = _EXTERNAL_DATA_SOURCES.get(dataset)
+    if entry is None:
+        return (f"{dataset} is a collaborator dataset under data/external/, "
+                f"which PTM3D does not distribute (data/external/README.md). "
+                f"Obtain it from its source and place it at the path above, or "
+                f"point the configuration at your own copy.")
+    what, candidates = entry
+    name = Path(str(missing_path)).name
+    for candidate in candidates:
+        source = Path(candidate).expanduser() / name
+        try:
+            present = source.exists()
+        except OSError:                                      # pragma: no cover
+            present = False
+        if present:
+            return (f"This is {what}. On this machine the file is at "
+                    f"{source} -- copy it to the path above, or point the "
+                    f"configuration at that copy.")
+    return (f"This is {what}. Obtain it from its source and place it at the "
+            f"path above, or point the configuration at your own copy.")
+
+
 def scan_dir_for_dataless(directory, max_entries=_SCAN_MAX_ENTRIES,
                           max_seconds=_SCAN_MAX_SECONDS):
     """Walk `directory` (stat-only) and return (dataless_files, truncated)."""
@@ -476,6 +539,81 @@ def expected_face_count(config):
     if 0 <= res <= 12:
         return 20 * (4 ** res)
     return None
+
+
+def _perface_albedo_header_count(path):
+    """Face count in a per-face albedo binary, or None.
+
+    Format from the engine's own reader (``ptm_thermal_sim.cpp:1985``): an
+    8-byte ``size_t`` count followed by that many doubles, and the reader
+    REFUSES the file unless ``8 + 8*n`` is exactly the file size. Both
+    conditions are reproduced here so this cannot claim a map the engine would
+    reject.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if len(head) < 8:
+        return None
+    n = struct.unpack("<Q", head)[0]
+    if 8 + 8 * n != size:
+        return None
+    return n
+
+
+def radiation_coupling_albedo_map(config, illum, project_root):
+    """The per-face albedo map the RADIATION COUPLING will load, if any.
+
+    Returns ``(Path, face_count)`` or ``(None, None)``.
+
+    This load (``ptm_thermal_sim.cpp:18086-18130``) is a SECOND, independent
+    read of the albedo map, and it does not honor ``illumination.use_albedo_map``
+    -- the engine says so itself in the warning at ``:18180``. It also does not
+    honor ``illumination.albedo_maps_directory`` being cleared: an empty
+    directory falls back to the literal ``data/albedo_maps`` (``:18110``). So
+    there is NO configuration key that turns it off, and the only things that
+    stop it are a missing file, a face-count mismatch, or a generic body.
+
+    Reproduced here so the GUI can say which file that is before the run, not
+    after. Search order and the acceptance test (``loaded.size() == num_faces``)
+    are transcribed from that block.
+    """
+    # A generic body never gets a `target_body_name`, so this load cannot
+    # resolve a file name at all. The test is whether one is CONFIGURED, not
+    # whether the section exists: DEFAULT_CONFIG always carries a `generic_body`
+    # scaffold of empty keys, and reading its truthiness made this whole check
+    # dead on every Moon and Europa run (measured 2026-08-28).
+    from gui_core.config_manager import generic_body_is_configured
+    if generic_body_is_configured(config):
+        return None, None
+    body = str((config.get("simulation") or {}).get("body", "") or "").strip()
+    if body.startswith("[H] ") or not body:
+        return None, None
+    body = body[:1].upper() + body[1:].lower()
+    n_faces = expected_face_count(config)
+    if n_faces is None:
+        return None, None
+    try:
+        res = int((config.get("mesh") or {}).get("resolution", 5))
+    except (TypeError, ValueError):
+        res = 5
+    filename = f"{body}_Albedo_res{res}.bin"
+    albedo_dir = str(illum.get("albedo_maps_directory", "") or "")
+    if not albedo_dir:
+        albedo_dir = "data/albedo_maps"
+    for candidate in (f"{albedo_dir.rstrip('/')}/{filename}",
+                      f"../data/albedo_maps/{filename}",
+                      f"data/albedo_maps/{filename}"):
+        p = resolve_data_path(candidate, project_root)
+        if not p.exists() or is_dataless(p):
+            continue
+        n = _perface_albedo_header_count(p)
+        if n is not None and n == n_faces:
+            return p, n
+    return None, None
 
 
 def _ply_face_count(ply_path):
@@ -1125,7 +1263,10 @@ def run_preflight(config, find_executable, project_root=None,
                         else resolve_path)
             p = resolver(val, project_root)
             if not p.exists():
-                report.errors.append(f"{dotted}: file not found: {p}")
+                hint = missing_external_data_hint(p)
+                report.errors.append(
+                    f"{dotted}: file not found: {p}"
+                    + (f". {hint}" if hint else ""))
                 continue
         if not os.access(p, os.R_OK):
             report.errors.append(f"{dotted}: file not readable: {p}")
@@ -1141,10 +1282,21 @@ def run_preflight(config, find_executable, project_root=None,
     # the property-map directory NEVER hard-fails (the engine falls back to
     # uniform body defaults).
     mesh = config.get("mesh", {})
-    illum = config.get("illumination", {})
+    # The illumination section AS THE ENGINE WILL SEE IT. run_preflight is
+    # handed `get_config()`, the raw GUI dictionary, whose `use_albedo_map` is
+    # a stale leftover that no longer moves when the albedo source does; the
+    # engine is handed `_config_for_yaml()`, where the source is translated.
+    # Checking the raw key meant the gate below could skip (or demand) an
+    # albedo directory the run would not (or would) use.
+    from gui_core.config_manager import illumination_for_engine
+    illum = illumination_for_engine(config.get("illumination", {}))
     therm = config.get("thermal", {})
     for dotted in _DATA_DIR_FIELDS:
-        val = get_config_value(config, dotted)
+        # Same reason as `illum` above: for the albedo directory the emitted
+        # value is the one the engine opens, not the raw one.
+        val = (illum.get("albedo_maps_directory")
+               if dotted == "illumination.albedo_maps_directory"
+               else get_config_value(config, dotted))
         if not val:
             continue
         # topo dir only matters if topographic meshes are enabled
@@ -1223,8 +1375,43 @@ def run_preflight(config, find_executable, project_root=None,
         else:
             vf_path = resolve_path(vf_val, project_root)
             if not vf_path.exists():
-                report.errors.append(
-                    f"radiation.view_factor_file: not found: {vf_path}")
+                # NOT an error. The engine's documented behavior for a named
+                # view-factor file that does not exist is to BUILD the matrix
+                # and SAVE it there (ptm_thermal_sim.cpp:15716-15734, "Saved
+                # view factors to: ..."), which is how every cache in the
+                # project came to exist in the first place. Refusing here
+                # blocked all 45 shipped `configs/europa_lat*_*.yaml` on a
+                # checkout that had not built their caches yet -- measured
+                # 2026-08-28 on europa_lat00_pwyll.yaml -- so the GUI could not
+                # run a configuration the command line runs happily.
+                #
+                # It still goes through the PTM-19 gate (an explicit override
+                # checkbox plus the cost estimate below), because an accidental
+                # multi-GB rebuild is the thing that guard exists to prevent.
+                # What changes is that it is a decision the user makes rather
+                # than a dead end.
+                #
+                # The message names BOTH choices explicitly, and where the
+                # cache can be had when it is a collaborator one: a run that
+                # rebuilds a matrix somebody already built and verified is not
+                # the same run, and "not found" is not a choice.
+                hint = missing_external_data_hint(vf_path)
+                report.vf_rebuild_warning = (
+                    f"Radiation exchange is on and the view-factor file "
+                    f"{vf_path} does not exist yet. Two ways forward, and this "
+                    f"is a choice, not an error.\n"
+                    f"(1) POINT radiation.view_factor_file at a matrix already "
+                    f"built for this exact mesh -- the face count is checked "
+                    f"against the mesh before the run starts."
+                    + (f" {hint}" if hint else "") + "\n"
+                    f"(2) PROCEED, and PTM3D builds the matrix (which facets "
+                    f"see which, for facet-to-facet radiation) from the "
+                    f"current mesh before the run starts and SAVES it to that "
+                    f"path, so later runs of the same mesh load it instead of "
+                    f"rebuilding. For large meshes that build can take a long "
+                    f"time and a lot of disk space -- see the estimate below.\n"
+                    f"(3) Or clear radiation.view_factor_file, which builds "
+                    f"the same matrix and keeps nothing.")
             elif is_dataless(vf_path):
                 report.dataless.append(("radiation.view_factor_file", str(vf_path)))
             else:
@@ -1246,6 +1433,70 @@ def run_preflight(config, find_executable, project_root=None,
                         report.info.append(
                             f"view factors: {vf_path.name} ({fmt}, {n_vf} faces"
                             + ("" if n_mesh is None else ", matches mesh") + ")")
+
+    # -- Radiation exchange on a convex mesh (a no-op that costs GB) ---------
+    # A smooth global icosphere is CONVEX: no facet sees any other facet, so
+    # every view factor is zero and the whole radiation package -- H-matrix
+    # build, radiosity solve, coupling iterations -- computes nothing. That is
+    # not a hypothetical: the 2026-08-28 Europa run built a 1.13M-block
+    # H-matrix in which every block was Zero, every row sum 0.0, and every
+    # indirect flux 0, in about two minutes and 18 GB.
+    #
+    # It WARNS and does not turn anything off. A global icosphere with
+    # `use_topographic: true` carries real relief and real self-heating, and an
+    # imported mesh obviously does; the switch is only inert for the smooth
+    # procedural sphere, and deciding that for the user is the silent
+    # substitution this project does not do.
+    #
+    # `mesh.occluder_file` deliberately does NOT rescue the surface. The engine
+    # says so in as many words at ptm_thermal_sim.cpp:16405-16410: the occluder
+    # ring is "added to the shadow-ray BVH ... NOT thermally solved /
+    # radiosity-coupled / output -- the sim still runs entirely on `mesh` (the
+    # core)". A smooth icosphere plus a LOLA ring is still a convex radiation
+    # problem, and treating the ring as terrain would silence this warning on
+    # exactly the configurations most likely to carry it.
+    smooth_global_sphere = (
+        not str(mesh.get("import_file", "") or "").strip()
+        and not mesh.get("use_topographic", False))
+    if rad.get("enabled", False) and smooth_global_sphere:
+        n_ico = expected_face_count(config)
+        report.warnings.append(
+            "radiation.enabled is ON with a smooth global icosphere"
+            + (f" ({n_ico} faces)" if n_ico else "")
+            + " and no topography and no imported mesh (an occluder ring is "
+            "shadow-only and is not radiosity-coupled). That surface is "
+            "convex, so no facet sees another, every view factor is zero and "
+            "facet-to-facet radiation contributes exactly nothing -- after "
+            "spending the minutes and the memory it takes to build the "
+            "matrix and find out. Turn radiation exchange off for a smooth "
+            "global run, or give it terrain (mesh.use_topographic, or an "
+            "imported mesh) for it to have something to exchange with.")
+
+    # -- Two albedo fields in one run ----------------------------------------
+    # The thermal surface boundary condition honors illumination.use_albedo_map.
+    # The radiation-coupling albedo load does NOT (ptm_thermal_sim.cpp:18180
+    # says so in a warning the engine prints only after the run has started),
+    # and no configuration key turns it off. With the map disabled and a
+    # res-matched per-face map on disk, the absorbed-flux albedo and the
+    # two-band radiosity source albedo are DIFFERENT FIELDS.
+    #
+    # Said here, before the run, naming the file. Warning rather than error: it
+    # is the engine's behavior, not a broken configuration, and refusing to
+    # launch would block re-running an archived config exactly as it ran.
+    if rad.get("enabled", False) and illum.get("use_albedo_map") is False:
+        map_path, n_map = radiation_coupling_albedo_map(
+            config, illum, project_root)
+        if map_path is not None:
+            report.warnings.append(
+                f"albedo: this run asks for a UNIFORM albedo "
+                f"(illumination.use_albedo_map is off), but radiation exchange "
+                f"is on and the radiation-coupling albedo load ignores that "
+                f"switch -- it will load {map_path} ({n_map} faces, matching "
+                f"this mesh) anyway. The absorbed-flux albedo and the two-band "
+                f"radiosity source albedo would then be two different fields "
+                f"in one run. Either turn the albedo map on so both use it, or "
+                f"turn radiation exchange off, or move the map out of the "
+                f"albedo directory.")
 
     # -- View-factor cost estimate (advisory: warns, never blocks) -----------
     if rad.get("enabled", False):

@@ -123,17 +123,27 @@ class BodyCard(BaseConfigTab):
         self._run_type = "time_series"
         self._report = None
         self._notes = []
+        #: True only while a card is being opened for a NEW run, i.e. under
+        #: `open_card(..., apply_defaults=True)`. A card may seed a default it
+        #: shows -- see `EuropaCard._ensure_terrain_emitted` -- ONLY while this
+        #: is set. Displaying an opened file is not an edit to it, and the same
+        #: `activate` runs on both paths.
+        self._seeding_defaults = False
         super().__init__(config_manager)
 
     # -- activation ---------------------------------------------------------
 
-    def activate(self, mode_key, run_type_key):
+    def activate(self, mode_key, run_type_key, seeding_defaults=False):
         """Make this the live card, for one mode and one run type."""
         self._active = True
         self._mode = mode_key
         self._run_type = run_type_key
-        self.apply_mode()
-        self.load_from_config()
+        self._seeding_defaults = bool(seeding_defaults)
+        try:
+            self.apply_mode()
+            self.load_from_config()
+        finally:
+            self._seeding_defaults = False
 
     def deactivate(self):
         self._active = False
@@ -775,7 +785,71 @@ class EuropaCard(BodyCard):
     def load_card(self):
         super().load_card()
         self._mirror_terrain()
+        self._ensure_terrain_emitted()
         self._refresh()
+
+    def _ensure_terrain_emitted(self):
+        """Put the terrain this card is SHOWING into the configuration.
+
+        WHY. The terrain combo is filled in ``init_ui`` and
+        ``currentIndexChanged`` is connected AFTER the fill loop, so populating
+        it never runs ``_on_terrain``. Opening this card therefore displayed
+        "Agenor -- 750 m posting" and the note
+        "data/external/sutton_DEMs/Agenor_DEM_750m_SOCET.ply -- on disk" over a
+        configuration whose ``mesh.import_file`` was the empty string. The
+        engine takes the icosphere branch when that key is empty
+        (``ptm_thermal_sim.cpp:15087``), so pressing Run gave a res-7 GLOBAL
+        SPHERE -- measured 2026-08-28: 327,680 faces, median radius 1560.8 km,
+        ``mesh_source=icosphere, resolution 7`` in the run's own provenance,
+        from a card whose whole subject is a 750 m regional DEM. The latitude
+        went the same way: the combo showed 0 while ``mesh.latitude_override``
+        stayed at the -999.0 "not placed" sentinel.
+
+        The rule is narrow on purpose. It writes ONLY when
+        ``mesh.import_file`` is empty -- a configuration the user opened, or a
+        terrain they picked, is never touched -- and it writes the latitude
+        only in that same case, because a file that deliberately leaves the DEM
+        at its own coordinates (-999.0) must keep them.
+
+        A terrain whose file is not on disk is still written. Emitting the path
+        is what turns a silent substitution into the pre-flight's refusal,
+        which names the missing file and where to get it; dropping it is the
+        defect this method exists to remove.
+        """
+        if self._mode != "local":
+            return
+        # ONLY while the card is being opened for a NEW run. The panel calls
+        # `load_from_config` on whichever card is ACTIVE, and `deactivate` has
+        # not run at that point -- so a Europa terrain card left open while
+        # another configuration is displayed is this card writing into somebody
+        # else's file. Measured while building this: opening
+        # `examples/quickstart_moon_diurnal.yaml` straight after a Europa
+        # terrain card put an Agenor DEM into the Moon configuration, which
+        # then routed to Moon/LOCAL (caught by
+        # `test_gui_body_first.test_loading_a_config_lands_on_its_own_card`).
+        # The same would happen to a Europa GLOBAL file, which the body check
+        # below cannot catch. Opening a file is not an edit to it.
+        if not self._seeding_defaults:
+            return
+        # ...and only into a EUROPA configuration, for the same reason from the
+        # other side: the route defaults have already written simulation.body
+        # by the time `activate` runs, so this is the card's own body.
+        body = str(self.config_manager.get_value("simulation.body", "") or "")
+        if body.strip().lower() != "europa":
+            return
+        if str(self.config_manager.get_value("mesh.import_file", "") or ""
+               ).strip():
+            return
+        entry = self._current_dem()
+        if entry is None or not entry.import_file:
+            return
+        self.config_manager.set_value("mesh.import_file", entry.import_file)
+        self.config_manager.set_value("radiation.view_factor_file",
+                                      entry.view_factor_file)
+        latitude = self.latitude_combo.currentData()
+        if latitude is not None:
+            self.config_manager.set_value("mesh.latitude_override",
+                                          float(latitude))
 
     def _mirror_terrain(self):
         current = str(
@@ -821,16 +895,60 @@ class EuropaCard(BodyCard):
 
         entry = self._current_dem()
         if entry is not None:
-            path = Path(root) / entry.import_file
-            state = ("on disk" if path.exists()
-                     else "NOT on disk — the Sutton DEMs are not distributed "
-                          "with PTM3D")
-            self.terrain_note.setText(f"{entry.import_file} — {state}")
-            vf = Path(root) / entry.view_factor_file
-            self.vf_note.setText(
-                f"View factors: {entry.view_factor_file} — "
-                + ("cached, will be loaded" if vf.exists()
-                   else "not cached, will be built on the first run"))
+            from gui_core.preflight import (is_dataless,
+                                            missing_external_data_hint,
+                                            resolve_data_path, resolve_path)
+            # The SAME resolver the pre-flight and the engine use for
+            # mesh.import_file, so the card cannot say "on disk" about a file
+            # the run then fails to find. mesh.import_file follows the
+            # PTM_DATA_ROOT contract (`preflight._ENGINE_DATA_ROOT_FIELDS`);
+            # radiation.view_factor_file deliberately does NOT, so it gets
+            # `resolve_path` below. Using one resolver for both would let the
+            # card say "cached, will be loaded" about a matrix the run rebuilds
+            # whenever PTM_DATA_ROOT is set.
+            path = resolve_data_path(entry.import_file, root)
+            if not path.exists():
+                # Named as a refusal, with the source, rather than as a note.
+                # This state used to read "NOT on disk" beside a Run button
+                # that launched anyway -- on an icosphere.
+                hint = missing_external_data_hint(path)
+                self.terrain_note.setText(
+                    f"{entry.import_file} — NOT on disk at {path}. This run "
+                    f"will be refused at launch. " + hint)
+            elif is_dataless(path):
+                self.terrain_note.setText(
+                    f"{entry.import_file} — present at {path} but DATALESS (a "
+                    f"cloud placeholder whose contents are not on this disk). "
+                    f"Reading it would hang the run; hydrate it in Finder "
+                    f"(right-click > \"Always Keep on This Device\") first. "
+                    f"This run will be refused at launch.")
+            else:
+                self.terrain_note.setText(f"{entry.import_file} — on disk")
+            # The view-factor cache gets the same treatment as the DEM: never
+            # a bare "not found". A matrix somebody has already built and
+            # verified is not interchangeable with one this machine rebuilds,
+            # so when it is missing the card states BOTH options and, when the
+            # cache is really sitting somewhere on this disk, says where.
+            vf = resolve_path(entry.view_factor_file, root)
+            if vf.exists() and not is_dataless(vf):
+                self.vf_note.setText(
+                    f"View factors: {entry.view_factor_file} — cached, will "
+                    f"be loaded")
+            elif vf.exists():
+                self.vf_note.setText(
+                    f"View factors: {entry.view_factor_file} — present at "
+                    f"{vf} but DATALESS (a cloud placeholder). Hydrate it "
+                    f"first, or the run will hang reading it.")
+            else:
+                vf_hint = missing_external_data_hint(vf)
+                self.vf_note.setText(
+                    f"View factors: {entry.view_factor_file} — NOT cached at "
+                    f"{vf}. Either point Radiation > view_factor_file at a "
+                    f"matrix already built for this mesh"
+                    + (f" ({vf_hint})" if vf_hint else "")
+                    + ", or run as-is and PTM3D will build the matrix and "
+                      "save it there. The launch check shows the estimated "
+                      "cost before anything starts.")
         points = europa_sweep_points(root)
         terrains = len({p[0] for p in points})
         latitudes = len({p[1] for p in points})
@@ -2652,7 +2770,7 @@ class BodyFirstPanel(BaseConfigTab):
         if apply_defaults:
             result = self._apply_route_defaults(body_key, mode_key,
                                                 run_type_key, previous_body)
-        card.activate(mode_key, run_type_key)
+        card.activate(mode_key, run_type_key, seeding_defaults=apply_defaults)
         self.card_stack.setCurrentWidget(card)
         run_type = RUN_TYPES_BY_KEY[run_type_key]
         self.card_title.setText(f"{body_key} — {run_type.title}")

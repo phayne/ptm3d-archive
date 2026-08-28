@@ -26,6 +26,76 @@ _YAML11_STRING_KEYS = (
     "illumination.bvh_cache_file",
 )
 
+
+def generic_body_is_configured(config):
+    """Is a generic body active in this configuration DICTIONARY?
+
+    The dictionary-level twin of :meth:`ConfigManager.generic_body_active`, for
+    callers that hold a config and not a manager. Same rule, and the same rule
+    the engine applies (``GenericBodyParams::isConfigured``,
+    ``config_parser.h:717``): a `generic_body:` SECTION is not a generic body.
+
+    Truthiness of the section is NOT the test, and reading it that way is a
+    check that can never fire: ``DEFAULT_CONFIG`` always carries a `generic_body`
+    scaffold of empty keys, so `bool(config["generic_body"])` is True on every
+    Moon and Europa run the GUI has ever made. Measured 2026-08-28 -- it had
+    silenced the mixed-albedo warning below on exactly the configurations that
+    warning exists for.
+    """
+    gb = (config or {}).get("generic_body") or {}
+    if not isinstance(gb, dict):
+        return False
+    if str(gb.get("config_file") or "").strip():
+        return True
+    if str(gb.get("name") or "").strip():
+        return True
+    try:
+        return float((gb.get("orbit") or {}).get("semi_major_axis_au", -1.0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def illumination_for_engine(illum):
+    """Translate the GUI-synthetic ``illumination.albedo_source`` mode into the
+    concrete engine keys, and return a NEW dict. The input is not modified.
+
+        builtin -> use_albedo_map: true, albedo_maps_directory data/albedo_maps
+        none    -> use_albedo_map: false, both paths cleared
+        custom  -> use_albedo_map: true, the user's paths kept as typed
+
+    A section with NO ``albedo_source`` key is returned UNCHANGED. That is not a
+    detail: `albedo_source` is GUI-synthetic and this function strips it, so an
+    already-emitted configuration has none -- and defaulting the absent key to
+    "builtin" rewrote such a document's `use_albedo_map: false` back to true and
+    restored the albedo directory it had just cleared. Measured 2026-08-28 on a
+    run configuration read back from disk. The engine keys already in the
+    section are the answer for a document that has been through here once.
+
+    MODULE-LEVEL, and used by both ``ConfigManager._config_for_yaml`` and
+    ``gui_core.preflight``. It used to be inline in ``_config_for_yaml`` only,
+    so the pre-flight -- which is handed ``get_config()``, the raw dictionary --
+    checked a DIFFERENT document from the one the engine was given: the raw
+    ``illumination.use_albedo_map`` is never updated when the albedo source
+    changes, so it reads True on a configuration that will be emitted with
+    False. One rule, one place, is the only way those two can agree.
+    """
+    out = deepcopy(illum) if isinstance(illum, dict) else {}
+    if "albedo_source" not in out:
+        return out
+    source = out.pop("albedo_source", "builtin")
+    if source == "builtin":
+        out["use_albedo_map"] = True
+        out["albedo_map"] = ""
+        out["albedo_maps_directory"] = "data/albedo_maps"
+    elif source == "none":
+        out["use_albedo_map"] = False
+        out["albedo_map"] = ""
+        out["albedo_maps_directory"] = ""
+    else:
+        out["use_albedo_map"] = True
+    return out
+
+
 #: Dotted keys this schema treats as SECTIONS (mappings), at any depth. A
 #: config that puts a scalar where one of these belongs has it dropped, which is
 #: what yaml-cpp does with a scalar section node under `if (root["radiation"])`.
@@ -1299,23 +1369,8 @@ class ConfigManager:
                 out[k] = mesh
                 continue
             if k == "illumination":
-                # Same translation for albedo_source:
-                #   builtin -> use_albedo_map: true, directory data/albedo_maps
-                #   none    -> use_albedo_map: false, both paths cleared
-                #   custom  -> user paths kept as typed
-                illum = _dc(v) if isinstance(v, dict) else {}
-                source = illum.pop("albedo_source", "builtin")
-                if source == "builtin":
-                    illum["use_albedo_map"] = True
-                    illum["albedo_map"] = ""
-                    illum["albedo_maps_directory"] = "data/albedo_maps"
-                elif source == "none":
-                    illum["use_albedo_map"] = False
-                    illum["albedo_map"] = ""
-                    illum["albedo_maps_directory"] = ""
-                else:
-                    illum["use_albedo_map"] = True
-                out[k] = illum
+                out[k] = illumination_for_engine(v if isinstance(v, dict)
+                                                 else {})
                 continue
             if k == "thermophysical" and not generic_active:
                 # Built-in body: the C++ parser IGNORES plain scalar keys in
