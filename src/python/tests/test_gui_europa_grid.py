@@ -111,10 +111,11 @@ def _shipped():
 _APP = None
 _CARD = None
 _MANAGER = None
+_PANEL = None
 
 
 def _card(scratch):
-    global _APP, _CARD, _MANAGER
+    global _APP, _CARD, _MANAGER, _PANEL
     if _CARD is not None:
         return _MANAGER, _CARD
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -137,7 +138,7 @@ def _card(scratch):
         raise Skip(f"the GUI panel stack is unavailable here ({exc})")
     _APP = QApplication.instance() or QApplication([])
     _MANAGER = ConfigManager()
-    panel = ConfigurationPanel(_MANAGER)
+    panel = _PANEL = ConfigurationPanel(_MANAGER)
     base = REPO_ROOT / "configs" / "europa_lat00_agenor.yaml"
     if not base.exists():
         raise Skip("the Europa DEM configurations are not in this checkout")
@@ -340,12 +341,167 @@ def test_the_property_translation_is_inert():
               f"card's overrides")
 
 
+def _fresh_terrain_card(scratch, dem_key, latitude=None):
+    """A terrain card opened from the LANDING SCREEN, not from a file.
+
+    ``_card`` above opens ``configs/europa_lat00_agenor.yaml``, which already
+    carries a ``mesh.import_file``. That is the right base for the grid
+    comparison and the wrong one for this check: the defect measured on
+    2026-08-28 lived on the OTHER path -- press Europa, press the terrain card,
+    press Run -- where nothing had ever written that key.
+    """
+    manager, _existing = _card(scratch)        # shares the QApplication
+    panel = _PANEL
+    manager.reset_to_defaults()
+    panel.load_from_config()
+    start = panel.tabs["start"]
+    start.choose_body("Europa")
+    start._choose_mode("local")
+    card = start.open_card("Europa", "local", "time_series",
+                           apply_defaults=True)
+    index = card.terrain_combo.findData(dem_key)
+    if index < 0:
+        raise Skip(f"the terrain {dem_key!r} is not offered in this checkout")
+    card.terrain_combo.setCurrentIndex(index)
+    if latitude is not None:
+        lat_index = card.latitude_combo.findData(latitude)
+        if lat_index < 0:
+            raise Skip(f"latitude {latitude} is not in the shipped grid")
+        card.latitude_combo.setCurrentIndex(lat_index)
+    return manager, card
+
+
+def test_the_card_emits_a_terrain_run_the_engine_actually_loads():
+    """End to end: press the card, and see the DEM in the engine's own log.
+
+    Three steps, because each answers a different question and the first two
+    were both green on the broken configuration:
+
+    1. the emitted file names an existing ``mesh.import_file``;
+    2. ``--validate-config`` accepts it (a SYNTAX check -- it accepted the
+       empty one too, which is why it is not the gate);
+    3. a SHORT real run, and the engine's own banner says it imported that PLY
+       with that face count. The 2026-08-28 run said
+       ``mesh_source=icosphere, resolution 7`` instead, and nothing in the
+       configuration, the card, or the pre-flight had said so.
+
+    Radiation exchange is OFF and the solver is on the processor: this arm is
+    about which mesh loads, and a view-factor build on a 30k-facet DEM would
+    turn a 30-second check into a long one without answering anything extra.
+    """
+    from gui_core.simulation_runner import SimulationRunner
+    exe = SimulationRunner.find_ptm_executable()
+    if not exe:
+        raise Skip("no ptm_thermal_sim to run")
+    kernels = REPO_ROOT / "data" / "kernels"
+    if not (kernels / "europa.tm").exists() or not (kernels / "lsk").exists():
+        raise Skip("the core SPICE kernel set is not in this checkout")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, _card_widget = _fresh_terrain_card(scratch, "pwyll", 0.0)
+        out = Path(scratch) / "pwyll_lat00"
+        out.mkdir(parents=True, exist_ok=True)
+        manager.set_value("output.directory", str(out))
+        # A few steps, on the processor, radiation off.
+        manager.set_value("simulation.timesteps", 8)
+        manager.set_value("thermal.equilibration_orbits", 1.0)
+        manager.set_value("thermal.use_gpu", False)
+        manager.set_value("radiation.enabled", False)
+        manager.set_value("output.vtk_mode", "none")
+        config_path = out / "config.yaml"
+        manager.save_run_yaml(str(config_path), REPO_ROOT)
+
+        import yaml as _yaml
+        emitted = _yaml.safe_load(config_path.read_text()) or {}
+        mesh_path = str((emitted.get("mesh") or {}).get("import_file") or "")
+        assert mesh_path, (
+            f"{config_path}: the terrain card emitted an empty "
+            f"mesh.import_file, so this would be a global icosphere")
+        resolved = Path(mesh_path)
+        if not resolved.is_absolute():
+            resolved = REPO_ROOT / resolved
+        if not resolved.exists():
+            raise Skip(
+                f"{resolved} is not on this disk (collaborator data, see "
+                f"data/external/README.md); the emission was checked, the run "
+                f"was not")
+
+        # The launch gate, on the card's OWN radiation-on configuration.
+        # Separate from the run below, which turns radiation off for speed:
+        # this is the check that the card produces something the GUI would
+        # actually launch, and it is where the missing-DEM and
+        # missing-view-factor-cache messages come from.
+        from gui_core.preflight import run_preflight
+        rad_config = _yaml.safe_load(config_path.read_text()) or {}
+        rad_config["radiation"] = dict(rad_config.get("radiation") or {},
+                                       enabled=True)
+        report = run_preflight(rad_config, lambda: str(exe),
+                               project_root=REPO_ROOT)
+        assert not report.errors, (
+            "the card's radiation-on terrain configuration is refused at "
+            "launch:\n  " + "\n  ".join(report.errors))
+        vf_line = [i for i in report.info if i.startswith("view factors:")]
+        if vf_line:
+            assert "matches mesh" in vf_line[0], vf_line[0]
+            print(f"    [terrain-preflight] {vf_line[0]}")
+        elif report.vf_rebuild_warning:
+            print(f"    [terrain-preflight] no view-factor cache on this "
+                  f"disk; the launch offers the choice rather than refusing: "
+                  f"{report.vf_rebuild_warning.splitlines()[0]}")
+        else:
+            # The third state: the cache is on disk but DATALESS. `report.ok`
+            # is False for it, so the assertion above has already fired -- but
+            # indexing the (empty) rebuild warning here would have raised an
+            # unrelated IndexError instead, which on this machine's
+            # cloud-synced data is a reachable path.
+            print(f"    [terrain-preflight] view-factor cache present but "
+                  f"dataless: {report.dataless}")
+
+        validated = subprocess.run(
+            [str(exe), "--config", str(config_path), "--validate-config"],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=300)
+        assert validated.returncode == 0, (
+            f"--validate-config rejected the card's terrain configuration: "
+            f"rc={validated.returncode}\n"
+            + (validated.stdout + validated.stderr)[-1500:])
+
+        result = subprocess.run(
+            [str(exe), "--config", str(config_path)],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=1800)
+        log = result.stdout + result.stderr
+        assert result.returncode == 0, (
+            f"the terrain run failed: rc={result.returncode}\n{log[-2000:]}")
+
+        # The engine's own record, not the log's prose: provenance.txt is
+        # written by the run and is what a reader would audit afterwards.
+        prov = {}
+        prov_path = out / "provenance.txt"
+        assert prov_path.exists(), f"{prov_path} was not written"
+        for line in prov_path.read_text().splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                prov[key.strip()] = value.strip()
+        assert "icosphere" not in prov.get("mesh_source", "").lower(), (
+            f"the run recorded mesh_source={prov.get('mesh_source')!r} -- the "
+            f"terrain card produced a procedural sphere again")
+        assert resolved.name in prov.get("mesh_source", ""), (
+            f"the run recorded mesh_source={prov.get('mesh_source')!r}, which "
+            f"is not {resolved.name}")
+        faces = int(prov.get("mesh_faces", "0") or 0)
+        assert faces > 0
+        print(f"    [terrain-run] {resolved.name}: mesh_source="
+              f"{prov.get('mesh_source')}, mesh_faces={faces}, "
+              f"mesh_length_unit={prov.get('mesh_length_unit')}, "
+              f"median radius {prov.get('mesh_median_radius')}")
+
+
 TESTS = [
     test_the_registry_is_read_from_the_shipped_files,
     test_the_grid_is_exactly_the_shipped_points,
     test_every_point_matches_its_shipped_configuration,
     test_the_view_factor_path_names_the_same_file,
     test_the_property_translation_is_inert,
+    test_the_card_emits_a_terrain_run_the_engine_actually_loads,
 ]
 
 

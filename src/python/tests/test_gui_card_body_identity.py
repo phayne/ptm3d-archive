@@ -284,8 +284,17 @@ def test_every_route_emits_its_own_body_after_every_other_route():
     Europa or to Bennu -- it was that nothing scoped the emitted configuration
     to the active card.
     """
+    from gui_core.body_cards import europa_dem_registry
     builtin = _builtin_names()
     routes = _routes()
+    # The Europa terrain card's own grid, for the positive claim below. Read
+    # from the shipped configurations, like the card itself; an empty registry
+    # (a checkout without them) simply skips that claim rather than inventing
+    # one.
+    _europa_grid = europa_dem_registry(REPO_ROOT)
+    _europa_meshes = {Path(e.import_file).name
+                      for e in _europa_grid.values()}
+    _europa_lats = {lat for e in _europa_grid.values() for lat in e.latitudes}
     with tempfile.TemporaryDirectory() as scratch:
         manager, panel = _panel(scratch)
         failures, checked = [], 0
@@ -360,11 +369,42 @@ def test_every_route_emits_its_own_body_after_every_other_route():
                             failures.append(
                                 f"{where}: carries {label} = {value!r}")
                     if prev_mode == "local":
-                        for key in ("latitude_override", "longitude_override"):
-                            if mesh.get(key) != -999.0:
+                        # The rule is that the PREVIOUS body's placement does
+                        # not survive -- NOT that the key comes out blank.
+                        # This arm used to assert the -999.0 "not placed"
+                        # sentinel, which forbade the one card whose subject IS
+                        # a placed terrain from placing it: the Europa
+                        # Sutton-DEM card must fill the latitude in, and the
+                        # positive claim for it is immediately below. Checked
+                        # against the poisoned values, which is the question
+                        # actually being asked.
+                        for key, poison in (("latitude_override", 80.0),
+                                            ("longitude_override", 12.5)):
+                            if mesh.get(key) == poison:
                                 failures.append(
-                                    f"{where}: carries mesh.{key} = "
-                                    f"{mesh.get(key)!r}")
+                                    f"{where}: carries the {prev_body} card's "
+                                    f"mesh.{key} = {mesh.get(key)!r}")
+                    if (body, mode) == ("Europa", "local") and _europa_grid:
+                        # ...and the positive half, on the destination card:
+                        # arriving from another body's terrain card, the Europa
+                        # terrain card still emits ITS OWN terrain at one of ITS
+                        # OWN latitudes. Before 2026-08-28 it emitted neither --
+                        # `mesh.import_file: ''` and the -999.0 sentinel -- and
+                        # every assertion in this arm stayed green while the run
+                        # became a global icosphere.
+                        got = Path(str(mesh.get("import_file") or "").strip()
+                                   ).name
+                        if got not in _europa_meshes:
+                            failures.append(
+                                f"{where}: the Europa terrain card emitted "
+                                f"mesh.import_file = {got!r}, which is not one "
+                                f"of its terrains")
+                        if mesh.get("latitude_override") not in _europa_lats:
+                            failures.append(
+                                f"{where}: the Europa terrain card emitted "
+                                f"mesh.latitude_override = "
+                                f"{mesh.get('latitude_override')!r}, which is "
+                                f"not one of its shipped latitudes")
                 else:
                     if name.strip().lower() in builtin:
                         failures.append(
@@ -496,6 +536,546 @@ def test_europa_global_wires_the_albedo_map_at_the_chosen_resolution():
                 f"wiring above was checked, the data file was not")
         print(f"    [albedo] Europa Global res{resolution}: "
               f"use_albedo_map on, map present ({status.detail})")
+
+
+# --------------------------------------------------------------------------
+# 4b. Europa Local: the terrain the card SHOWS is the terrain that runs
+# --------------------------------------------------------------------------
+#
+# The same defect as the Bennu one above, arrived at from the mesh side rather
+# than the body side, and it reached a real run on 2026-08-28. The Europa
+# terrain card displayed "Agenor -- 750 m posting" and the note
+# "data/external/sutton_DEMs/Agenor_DEM_750m_SOCET.ply -- on disk", and emitted
+# `mesh.import_file: ''`. The engine reaches the icosphere branch exactly when
+# that key is empty (`ptm_thermal_sim.cpp:15087`), so the run's own
+# provenance.txt recorded `mesh_source=icosphere, resolution 7`,
+# `mesh_faces=327680`, `mesh_median_radius=1560.78` km -- a whole moon, from a
+# card about a regional DEM -- and radiation exchange dutifully built a
+# 1.13M-block H-matrix of which every block was Zero, because a sphere is
+# convex.
+#
+# `test_gui_europa_grid.py` did not catch it and could not: it exercises
+# `sweep_plan`, whose `derived=` lambdas write `mesh.import_file` from the
+# registry directly. The interactive path -- open the card, press Run -- is
+# what nothing covered.
+
+def _europa_terrain_registry():
+    from gui_core.body_cards import europa_dem_registry
+    registry = europa_dem_registry(REPO_ROOT)
+    if not registry:
+        raise Skip("no configs/europa_*_<dem>.yaml in this checkout, so there "
+                   "is no terrain registry to check")
+    return registry
+
+
+def test_europa_terrain_card_emits_the_terrain_it_shows():
+    """Open the terrain card, change nothing, Run: what does the file say?
+
+    Three claims, all on the written run configuration:
+
+    1. ``mesh.import_file`` is NON-EMPTY. An empty one is not "no terrain
+       chosen", it is a global icosphere, and the card gives no sign of it.
+    2. It is the terrain the combo is DISPLAYING, not some other one.
+    3. ``mesh.latitude_override`` is a real latitude, not the -999.0 "not
+       placed" sentinel -- the latitude combo had the same defect as the
+       terrain combo and showed 0 over a configuration that carried -999.
+
+    Whether that file is ON DISK is checked too, and its absence is a SKIP with
+    the source named: the Sutton DEMs are collaborator data that PTM3D does not
+    distribute, so a clean checkout must not show a red gate for not having
+    them. The REFUSAL for that case is the next check.
+    """
+    registry = _europa_terrain_registry()
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        start.choose_body("Europa")
+        start._choose_mode("local")
+        card = start.open_card("Europa", "local", "time_series",
+                               apply_defaults=True)
+        shown_key = card.terrain_combo.currentData()
+        shown = registry.get(shown_key)
+        assert shown is not None, (
+            f"the terrain combo is showing {card.terrain_combo.currentText()!r} "
+            f"({shown_key!r}), which is not in the registry")
+        shown_latitude = card.latitude_combo.currentData()
+
+        emitted, path = _emit(manager, panel, "Europa", "local",
+                              "time_series", scratch, tag="_terrain")
+        mesh = emitted.get("mesh") or {}
+        got = str(mesh.get("import_file") or "").strip()
+        assert got, (
+            f"{path}: the Europa terrain card emitted mesh.import_file = "
+            f"{mesh.get('import_file')!r} while showing "
+            f"{card.terrain_combo.currentText()!r}. The engine takes the "
+            f"icosphere branch when that key is empty "
+            f"(ptm_thermal_sim.cpp:15087), so this run would be a global "
+            f"res-{mesh.get('resolution')!r} sphere -- which is what the "
+            f"2026-08-28 europa_test run was.")
+        assert Path(got).name == Path(shown.import_file).name, (
+            f"{path}: the card showed {shown.import_file!r} and emitted "
+            f"{got!r}")
+        latitude = mesh.get("latitude_override")
+        assert latitude != -999.0, (
+            f"{path}: mesh.latitude_override is the -999.0 'not placed' "
+            f"sentinel while the card showed "
+            f"{card.latitude_combo.currentText()!r}. The DEM would sit at its "
+            f"own coordinates, not at the latitude on screen.")
+        assert shown_latitude is None or float(latitude) == float(
+            shown_latitude), (
+            f"{path}: the card showed latitude {shown_latitude!r} and emitted "
+            f"{latitude!r}")
+
+        resolved = Path(got)
+        if not resolved.is_absolute():
+            resolved = REPO_ROOT / resolved
+        if not resolved.exists():
+            raise Skip(
+                f"{resolved} is not on this disk (the Sutton DEMs are "
+                f"collaborator data, see data/external/README.md). The "
+                f"emission was checked; the file was not.")
+        print(f"    [terrain] Europa Local emits {Path(got).name} at "
+              f"latitude {latitude}, and the file is on disk")
+
+
+def test_every_terrain_the_card_offers_reaches_the_emitted_file():
+    """Not just the one the combo happens to open on.
+
+    A pairwise-style sweep rather than a single case, for the same reason the
+    body arm above sweeps: the defect was not about Agenor, it was that nothing
+    connected the control to the configuration.
+    """
+    registry = _europa_terrain_registry()
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        failures = []
+        for key in sorted(registry):
+            manager.reset_to_defaults()
+            panel.load_from_config()
+            start = panel.tabs["start"]
+            start.choose_body("Europa")
+            start._choose_mode("local")
+            card = start.open_card("Europa", "local", "time_series",
+                                   apply_defaults=True)
+            index = card.terrain_combo.findData(key)
+            if index < 0:
+                failures.append(f"{key}: not offered by the terrain combo")
+                continue
+            card.terrain_combo.setCurrentIndex(index)
+            emitted, path = _emit(manager, panel, "Europa", "local",
+                                  "time_series", scratch, tag=f"_{key}")
+            mesh = emitted.get("mesh") or {}
+            got = str(mesh.get("import_file") or "").strip()
+            if Path(got).name != Path(registry[key].import_file).name:
+                failures.append(
+                    f"{key}: emitted {got!r}, expected "
+                    f"{registry[key].import_file!r}")
+            if mesh.get("latitude_override") == -999.0:
+                failures.append(f"{key}: emitted the -999.0 latitude sentinel")
+            vf = str((emitted.get("radiation") or {}).get(
+                "view_factor_file") or "")
+            if Path(vf).name != Path(registry[key].view_factor_file).name:
+                failures.append(
+                    f"{key}: emitted view_factor_file {vf!r}, expected "
+                    f"{registry[key].view_factor_file!r}")
+        assert not failures, "\n  ".join(
+            ["a terrain the card offers did not reach the emitted file:"]
+            + failures)
+        print(f"    [terrain] all {len(registry)} terrains reach "
+              f"mesh.import_file, their latitude and their view-factor path")
+
+
+def test_a_terrain_whose_file_is_absent_is_refused_and_says_where_to_get_it():
+    """The missing-file case, which is how this started.
+
+    The card writes the path whether or not the file is there -- that is
+    deliberate, and it is what turns a silent substitution into a refusal. This
+    check is the other half: that the refusal actually happens, names the exact
+    path, and says where the file comes from.
+
+    Negative control in the same arm: an ordinary missing file, not under
+    ``data/external/``, gets no sourcing hint invented for it.
+    """
+    from gui_core.preflight import missing_external_data_hint, run_preflight
+
+    registry = _europa_terrain_registry()
+    entry = registry[sorted(registry)[0]]
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / "data" / "external" / "sutton_DEMs").mkdir(parents=True)
+        exe = root / "build" / "bin" / "ptm_thermal_sim"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        config = {
+            "simulation": {"body": "Europa"},
+            "mesh": {"import_file": entry.import_file, "resolution": 5},
+            "radiation": {"enabled": False},
+            "illumination": {"albedo_source": "none"},
+            "output": {"directory": str(root / "out")},
+        }
+        report = run_preflight(config, lambda: str(exe), project_root=root)
+        assert not report.ok, (
+            "a configuration naming a Sutton DEM that is not on disk passed "
+            "pre-flight")
+        blocking = "\n".join(report.errors)
+        assert entry.import_file.split("/")[-1] in blocking, (
+            f"the refusal does not name the missing file:\n{blocking}")
+        assert "data/external/README.md" in blocking, (
+            f"the refusal does not say where the file comes from:\n{blocking}")
+        print("    [terrain] a missing DEM is refused by name, with its "
+              "source")
+
+    assert missing_external_data_hint("/tmp/somewhere/mesh.ply") == "", (
+        "a missing file outside data/external/ was given a collaborator-data "
+        "hint it has no business carrying")
+    hinted = missing_external_data_hint(
+        "/x/data/external/sutton_DEMs/Agenor_DEM_750m_SOCET.ply")
+    assert "data/external/README.md" in hinted, hinted
+    # A SOURCE PATH IS NAMED ONLY WHEN IT IS REALLY THERE. The table ships to
+    # every checkout, and "get it from <path>" that is wrong on the reader's
+    # machine is worse than no hint at all -- so the candidates are probed, and
+    # this is the check that they are.
+    for token in hinted.replace(",", " ").split():
+        if token.startswith("/") and token.endswith(".ply"):
+            assert Path(token).exists(), (
+                f"the hint names {token} as the source, and it is not on this "
+                f"disk")
+    # An external dataset with no table entry still gets told what it is.
+    generic = missing_external_data_hint("/x/data/external/nosuch/thing.ply")
+    assert "nosuch" in generic and "README" in generic, generic
+
+
+def test_a_missing_view_factor_cache_offers_the_choice_not_a_refusal():
+    """The SECOND missing artifact, hit the same afternoon as the first.
+
+    The card wires ``radiation.view_factor_file`` to
+    ``data/external/sutton_DEMs/<DEM>.vf``, which is a collaborator cache and
+    is not in any checkout. The pre-flight used to make that a hard ERROR --
+    which blocked all 45 shipped ``configs/europa_lat*_*.yaml`` on any machine
+    that had not built the caches, while the command line ran them happily,
+    because the engine's behavior for a named cache that does not exist is to
+    BUILD it and SAVE it there (``ptm_thermal_sim.cpp:15716-15734``).
+
+    So it is a CHOICE -- point at an existing matrix, or let this run build one
+    -- and the message has to say so. It is still gated: the PTM-19 override
+    checkbox and the cost estimate are what stand between a user and an
+    accidental multi-GB rebuild.
+
+    The negative control is the part that must NOT relax: a cache that EXISTS
+    with the wrong face count is still a refusal, because that one is not a
+    choice, it is the wrong matrix.
+    """
+    import struct
+    from gui_core.preflight import run_preflight
+
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        exe = root / "build" / "bin" / "ptm_thermal_sim"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        config = {
+            "simulation": {"body": "Europa"},
+            "mesh": {"resolution": 3, "import_file": "",
+                     "use_topographic": False},
+            "radiation": {
+                "enabled": True,
+                "view_factor_file":
+                    "data/external/sutton_DEMs/Agenor_DEM_750m_SOCET.vf"},
+            "illumination": {"albedo_source": "builtin"},
+            "output": {"directory": str(root / "out")},
+        }
+        report = run_preflight(config, lambda: str(exe), project_root=root)
+        assert not [e for e in report.errors
+                    if "view_factor_file" in e], (
+            "a view-factor cache that does not exist yet was refused; the "
+            "engine builds and saves one:\n" + "\n".join(report.errors))
+        warning = report.vf_rebuild_warning
+        assert warning, "nothing was said about the missing view-factor cache"
+        assert "Agenor_DEM_750m_SOCET.vf" in warning, warning
+        assert "POINT" in warning and "PROCEED" in warning, (
+            f"the message does not offer both choices:\n{warning}")
+
+        # negative control: the WRONG matrix is still a refusal.
+        vf = root / "data" / "external" / "sutton_DEMs"
+        vf.mkdir(parents=True)
+        wrong = vf / "Agenor_DEM_750m_SOCET.vf"
+        wrong.write_bytes(struct.pack("<IIQQ", 0x5646464D, 2, 999, 999)
+                          + b"\0" * 8)
+        report = run_preflight(config, lambda: str(exe), project_root=root)
+        assert [e for e in report.errors if "face count" in e], (
+            "a view-factor matrix built for a different mesh (999 faces vs "
+            "1280) was not refused:\n" + "\n".join(report.errors))
+        print("    [vf] a missing cache offers point-at-one or build-one; a "
+              "cache with the wrong face count is still refused")
+
+
+def test_the_terrain_card_writes_its_dem_only_into_a_europa_run():
+    """The mirror image of the rule this card is usually on the receiving end of.
+
+    The panel calls ``load_from_config`` on whichever card is ACTIVE, and
+    ``deactivate`` has not run at that point -- so a Europa terrain card left
+    open while a lunar configuration is loaded is a card writing a Europa DEM
+    into a Moon run. Measured while building the fix: the Moon configuration
+    then routed to Moon/LOCAL, because it had acquired an imported mesh.
+    """
+    _europa_terrain_registry()
+    moon = REPO_ROOT / "examples" / "quickstart_moon_diurnal.yaml"
+    if not moon.exists():
+        raise Skip("examples/quickstart_moon_diurnal.yaml is not in this "
+                   "checkout")
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        start.choose_body("Europa")
+        start._choose_mode("local")
+        start.open_card("Europa", "local", "time_series", apply_defaults=True)
+        assert str(manager.get_value("mesh.import_file", "") or "").strip(), (
+            "the terrain card did not write a terrain at all; this check is "
+            "measuring nothing")
+
+        # The Europa card is still ACTIVE. Load a lunar configuration.
+        manager.load_from_yaml(str(moon))
+        panel.load_from_config()
+        leaked = str(manager.get_value("mesh.import_file", "") or "").strip()
+        assert not leaked, (
+            f"loading {moon.name} while the Europa terrain card was open gave "
+            f"the lunar configuration mesh.import_file = {leaked!r}")
+        route = panel.land_on_loaded_config()
+        assert (route.body_key, route.mode_key) == ("Moon", "global"), (
+            f"{moon.name} landed on {route.body_key}/{route.mode_key}")
+
+        # The harder half, which a body check cannot catch: a EUROPA file that
+        # is a global icosphere run. Same card, same body, and it still must
+        # not acquire a regional DEM by being looked at.
+        glob = REPO_ROOT / "configs" / "europa_ico6_uniform-ice.yaml"
+        if glob.exists():
+            manager.reset_to_defaults()
+            panel.load_from_config()
+            start.choose_body("Europa")
+            start._choose_mode("local")
+            start.open_card("Europa", "local", "time_series",
+                            apply_defaults=True)
+            manager.load_from_yaml(str(glob))
+            panel.load_from_config()
+            leaked = str(manager.get_value("mesh.import_file", "") or "").strip()
+            assert not leaked, (
+                f"opening the global {glob.name} while the Europa terrain card "
+                f"was open gave it mesh.import_file = {leaked!r}, turning a "
+                f"whole-moon run into a regional DEM run")
+            route = panel.land_on_loaded_config()
+            assert (route.body_key, route.mode_key) == ("Europa", "global"), (
+                f"{glob.name} landed on {route.body_key}/{route.mode_key}")
+        print("    [terrain] an open Europa terrain card does not put a DEM "
+              "into a lunar configuration, nor into a Europa global one")
+
+
+# --------------------------------------------------------------------------
+# 4c. One albedo field, not two
+# --------------------------------------------------------------------------
+
+def test_the_europa_cards_never_emit_two_albedo_fields():
+    """`use_albedo_map: false` does not stop radiation coupling loading a map.
+
+    The thermal surface boundary condition honors the switch; the
+    radiation-coupling albedo load at ``ptm_thermal_sim.cpp:18086`` never has,
+    and no configuration key turns it off -- an empty
+    ``albedo_maps_directory`` falls back to the literal ``data/albedo_maps``
+    (``:18110``). The engine prints a warning about it at ``:18180``, AFTER the
+    run has started. The 2026-08-28 europa_test run printed exactly that.
+
+    So the rule the cards follow is: a GLOBAL Europa run uses the map (both
+    fields are the map), and a LOCAL Europa run uses a constant albedo on an
+    IMPORTED mesh, where the per-face map cannot load at all because it is
+    matched to an icosphere by face count. This checks both halves on the
+    emitted file, and then checks that the pre-flight names the mixed state
+    when a configuration does reach it.
+    """
+    from gui_core.preflight import radiation_coupling_albedo_map
+    from gui_core.config_manager import illumination_for_engine
+
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        emitted, path = _emit(manager, panel, "Europa", "global",
+                              "time_series", scratch, tag="_albedo_global")
+        assert (emitted.get("illumination") or {}).get(
+            "use_albedo_map") is True, (
+            f"{path}: the Europa Global card is the albedo-map card and "
+            f"emitted use_albedo_map off")
+
+        _europa_terrain_registry()
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        emitted, path = _emit(manager, panel, "Europa", "local",
+                              "time_series", scratch, tag="_albedo_local")
+        illum = emitted.get("illumination") or {}
+        assert illum.get("use_albedo_map") is False, (
+            f"{path}: a regional DEM run emitted use_albedo_map on; the "
+            f"per-face map is matched to an icosphere by face count and "
+            f"cannot apply to an imported mesh")
+        found, _n = radiation_coupling_albedo_map(emitted, illum, REPO_ROOT)
+        assert found is None, (
+            f"{path}: this configuration asks for a uniform albedo and "
+            f"radiation coupling would still load {found}, so the run would "
+            f"carry two different albedo fields")
+
+    # The measured 2026-08-28 configuration, and the detector that must fire
+    # on it. Without this the check above proves only that today's cards are
+    # clean, not that anything would notice if they stopped being.
+    #
+    # Driven through a REAL ConfigManager and handed `get_config()` -- the raw
+    # dictionary, which is exactly what `ptm3d_gui.run_simulation` passes to
+    # `run_preflight`. A hand-built dictionary here passed while the detector
+    # was DEAD on every actual GUI run: DEFAULT_CONFIG always carries a
+    # `generic_body` scaffold of empty keys, and the first draft read its
+    # truthiness as "this is a generic body" and bailed. A check exercised only
+    # on a shape of input the product never produces is not a check.
+    from gui_core.preflight import run_preflight
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        exe = root / "build" / "bin" / "ptm_thermal_sim"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        maps = REPO_ROOT / "data" / "albedo_maps"
+        if not (maps / "Europa_Albedo_res5.bin").exists():
+            raise Skip("data/albedo_maps/Europa_Albedo_res5.bin is not on this "
+                       "disk, so the mixed-albedo detector has nothing to find")
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        manager.set_value("simulation.body", "Europa")
+        manager.set_value("mesh.resolution", 5)
+        manager.set_value("mesh.import_file", "")
+        manager.set_value("mesh.use_topographic", False)
+        manager.set_value("radiation.enabled", True)
+        manager.set_value("radiation.view_factor_file", "")
+        manager.set_value("illumination.albedo_source", "none")
+        manager.set_value("output.directory", str(root / "out"))
+        assert manager.get_config().get("generic_body"), (
+            "DEFAULT_CONFIG no longer carries a generic_body scaffold, so this "
+            "check no longer covers the case it was written for")
+
+        def albedo_warnings():
+            report = run_preflight(manager.get_config(), lambda: str(exe),
+                                   project_root=REPO_ROOT,
+                                   config_manager=manager)
+            return [w for w in report.warnings if w.startswith("albedo:")]
+
+        mixed = albedo_warnings()
+        assert mixed, (
+            "a uniform-albedo radiation run with a res-matched per-face map on "
+            "disk was not reported as carrying two albedo fields")
+        assert "Europa_Albedo_res5.bin" in mixed[0], mixed[0]
+
+        # negative control 1: the map ON -- both fields are the map.
+        manager.set_value("illumination.albedo_source", "builtin")
+        assert not albedo_warnings(), (
+            "the mixed-albedo warning fired on a run that uses the map for "
+            "both fields")
+
+        # negative control 2: radiation off -- there is no second field.
+        manager.set_value("illumination.albedo_source", "none")
+        manager.set_value("radiation.enabled", False)
+        assert not albedo_warnings(), (
+            "the mixed-albedo warning fired with radiation exchange off")
+
+        # negative control 3: a real generic body has no published map, and
+        # `target_body_name` never reaches that loader at all.
+        manager.set_value("radiation.enabled", True)
+        manager.set_value("generic_body.name", "623 Chimaera (A907 BC)")
+        assert not albedo_warnings(), (
+            "the mixed-albedo warning fired on a generic body, whose "
+            "radiation-coupling load cannot resolve a map name at all")
+        manager.set_value("generic_body.name", "")
+
+        # and the translation the pre-flight now shares with the emitter --
+        # including the case that must be left ALONE, an already-emitted
+        # section with no albedo_source key.
+        assert illumination_for_engine(
+            {"albedo_source": "none", "use_albedo_map": True}
+        )["use_albedo_map"] is False
+        already = {"use_albedo_map": False, "albedo_map": "",
+                   "albedo_maps_directory": ""}
+        assert illumination_for_engine(already) == already, (
+            "translating an already-emitted illumination section changed it; "
+            "defaulting the absent albedo_source to 'builtin' turned a "
+            "uniform-albedo run back into a map run")
+        print("    [albedo] Europa Global uses the map, Europa Local cannot, "
+              "and the mixed state is named when it happens")
+
+
+# --------------------------------------------------------------------------
+# 4d. Radiation exchange on a convex sphere is a no-op that costs GB
+# --------------------------------------------------------------------------
+
+def test_radiation_on_a_smooth_global_icosphere_is_reported():
+    """It is not wrong, it is empty -- and it took two minutes and 18 GB.
+
+    A smooth icosphere is convex: no facet sees another, every view factor is
+    zero. The 2026-08-28 run's H-matrix was 1.13M blocks, all Zero, all row
+    sums 0.0, indirect flux 0 everywhere. The pre-flight says so; it does NOT
+    turn the switch off, because a global mesh WITH topography is a different
+    and perfectly good run.
+    """
+    from gui_core.preflight import run_preflight
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        exe = root / "build" / "bin" / "ptm_thermal_sim"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        base = {
+            "simulation": {"body": "Europa"},
+            "mesh": {"resolution": 5, "import_file": "", "occluder_file": "",
+                     "use_topographic": False},
+            "radiation": {"enabled": True, "view_factor_file": ""},
+            "illumination": {"albedo_source": "builtin"},
+            "output": {"directory": str(root / "out")},
+        }
+
+        def convex_warnings(cfg):
+            rep = run_preflight(cfg, lambda: str(exe), project_root=REPO_ROOT)
+            return [w for w in rep.warnings if "convex" in w]
+
+        assert convex_warnings(base), (
+            "radiation exchange on a smooth global icosphere was not reported "
+            "as a no-op")
+
+        # ...and an occluder ring does NOT rescue it. The engine adds that
+        # geometry to the shadow-ray BVH only -- "NOT thermally solved /
+        # radiosity-coupled / output" (ptm_thermal_sim.cpp:16405-16410) -- so
+        # the radiation problem is still convex. Treating the ring as terrain
+        # would silence this on exactly the lunar-polar-style configurations
+        # most likely to carry one.
+        ringed = {**base, "mesh": {**base["mesh"],
+                                   "occluder_file": "ring_Rcore3_Rext20km.ply"}}
+        assert convex_warnings(ringed), (
+            "an occluder ring silenced the convex-mesh warning; the occluder "
+            "is shadow-only and is not radiosity-coupled")
+
+        # negative control 1: topography -- real relief, real self-heating.
+        topo = {**base, "mesh": {**base["mesh"], "use_topographic": True}}
+        assert not convex_warnings(topo), (
+            "the convex-mesh warning fired on a global run WITH topography")
+
+        # negative control 2: an imported mesh.
+        imported = {**base, "mesh": {**base["mesh"],
+                                     "import_file": "some_terrain.ply"}}
+        assert not convex_warnings(imported), (
+            "the convex-mesh warning fired on an imported mesh")
+
+        # negative control 3: radiation off.
+        off = {**base, "radiation": {"enabled": False}}
+        assert not convex_warnings(off), (
+            "the convex-mesh warning fired with radiation exchange off")
+        print("    [convex] radiation exchange on a smooth global icosphere is "
+              "reported; topography, an imported mesh and radiation-off are "
+              "silent")
 
 
 # --------------------------------------------------------------------------
@@ -727,6 +1307,13 @@ CHECKS = [
     test_every_route_emits_its_own_body_after_every_other_route,
     test_a_builtin_body_card_writes_overrides_not_the_dead_block,
     test_europa_global_wires_the_albedo_map_at_the_chosen_resolution,
+    test_europa_terrain_card_emits_the_terrain_it_shows,
+    test_every_terrain_the_card_offers_reaches_the_emitted_file,
+    test_a_terrain_whose_file_is_absent_is_refused_and_says_where_to_get_it,
+    test_a_missing_view_factor_cache_offers_the_choice_not_a_refusal,
+    test_the_terrain_card_writes_its_dem_only_into_a_europa_run,
+    test_the_europa_cards_never_emit_two_albedo_fields,
+    test_radiation_on_a_smooth_global_icosphere_is_reported,
     test_the_conflict_detector_fires_on_a_configuration_that_has_one,
     test_every_shipped_configuration_names_one_body,
 ]
