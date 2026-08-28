@@ -469,15 +469,13 @@ def _kernel_dir(project_root, env=None):
     the engine honors, so a card looking for a fetched kernel looks where the
     run will look. ``docs/configuration.md``, "How
     generic_body.spice_metakernel is resolved".
+
+    Delegates to ``preflight.spice_kernel_dir``, which is the one definition.
+    Two copies of this ladder would let the card report "every kernel it loads
+    is on this disk" in front of a pre-flight that refuses the same file.
     """
-    env = env if env is not None else os.environ
-    explicit = str(env.get("PTM_SPICE_KERNELS", "") or "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    data_root = str(env.get("PTM_DATA_ROOT", "") or "").strip()
-    if data_root:
-        return Path(data_root).expanduser() / "kernels"
-    return Path(project_root) / "data" / "kernels"
+    from gui_core.preflight import spice_kernel_dir
+    return spice_kernel_dir(project_root, env)
 
 
 def _is_dataless(path):

@@ -51,6 +51,17 @@ from gui_core.body_cards import GENERIC_MESH_SHAPE
 from gui_core.config_manager import ConfigManager
 from gui_panels.config_panel import BaseConfigTab, get_tooltip
 
+# The engine's own generic-body surface defaults. Same two-step import as
+# `gui_core.body_cards`: `ptm` is on the path in an installed tree and needs
+# the bootstrap in a source checkout.
+try:
+    from ptm.body_capabilities import (GENERIC_BODY_SURFACE_DEFAULTS,
+                                       GENERIC_SURFACE_FIELDS)
+except ImportError:                                       # pragma: no cover
+    from gui_core import _ptm_bootstrap           # noqa: F401  (adds src/python)
+    from ptm.body_capabilities import (GENERIC_BODY_SURFACE_DEFAULTS,
+                                       GENERIC_SURFACE_FIELDS)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1311,7 +1322,10 @@ class GenericBodyCard(BodyCard):
             grid, 0, "Bond albedo:", "generic_body.surface.albedo", 0.0, 1.0,
             decimals=4)
         self.albedo_provenance = _muted("", size=10)
-        grid.addWidget(self.albedo_provenance, 9, 0, 1, 2)
+        # Row 13: below every control in this group. It used to sit at row 9,
+        # which is now the chi field -- two widgets in one grid cell overlap
+        # and one of them is unreachable.
+        grid.addWidget(self.albedo_provenance, 13, 0, 1, 2)
         #: The grid cell the albedo's own QLabel sits in, so the label can
         #: carry the p_V and G a fetched value was computed from.
         self._albedo_label_cell = (grid, 0)
@@ -1333,11 +1347,32 @@ class GenericBodyCard(BodyCard):
         self.add_double_field(grid, 6, "Heat capacity cp0 (J/kg/K):",
                               "generic_body.surface.cp0", 0.0, 10000.0,
                               decimals=3)
+        # H, chi and Qb had NO control anywhere in this application, on any
+        # page, while `generic_body.surface.{H,chi,Qb}` are keys the engine
+        # reads and this card is the only screen that describes a generic
+        # body's surface. So the card seeded or showed seven of the ten
+        # properties a run uses and the other three were unreachable -- which
+        # is worse than blank, because nothing said they existed. Their
+        # tooltips were already written; only the controls were missing.
+        self.add_double_field(grid, 7, "Regolith H scale (m):",
+                              "generic_body.surface.H", 0.0, 100.0,
+                              decimals=4)
+        self.add_double_field(grid, 8, "Radiative conductivity chi:",
+                              "generic_body.surface.chi", 0.0, 100.0,
+                              decimals=3)
+        self.add_double_field(grid, 9, "Geothermal heat flow Qb (W/m^2):",
+                              "generic_body.surface.Qb", 0.0, 10.0,
+                              decimals=6)
         self.ti_note = _muted("")
         self.ti_note.setToolTip(get_tooltip("ui.thermal_inertia_manual"))
-        grid.addWidget(self.ti_note, 7, 0, 1, 2)
+        grid.addWidget(self.ti_note, 10, 0, 1, 2)
+        #: Where the surface numbers came from. Its own line, because "engine
+        #: default" and "a value you typed" are different claims and the card
+        #: used to make neither.
+        self.surface_provenance = _muted("", size=10)
+        grid.addWidget(self.surface_provenance, 11, 0, 1, 2)
         self.surface_refusal = _muted("", color="#EF9A9A", size=10)
-        grid.addWidget(self.surface_refusal, 8, 0, 1, 2)
+        grid.addWidget(self.surface_refusal, 12, 0, 1, 2)
         surface.setLayout(grid)
         layout.addWidget(surface)
         for key in ("generic_body.surface.ks", "generic_body.surface.kd",
@@ -1713,9 +1748,23 @@ class GenericBodyCard(BodyCard):
             # configuration is on screen -- the cross-card residue the
             # body-identity gate exists to catch. The FILES are still on disk
             # and still correct; only the write into a live card is dropped.
-            logger.info("[body-fetch] discarding a %s result for %s; the "
-                        "active route is now %s", result.kind, route,
-                        self.route)
+            #
+            # SAID OUT LOUD, on the card and at WARNING. It used to be an
+            # `info` log and nothing else, while `_on_fetch_spk` had already
+            # written "Wiring <body> to <ephemeris>..." into this very note --
+            # a present-tense claim that the wiring was happening, left
+            # standing over a result that was thrown away. The user comes back
+            # to a card that says it did the thing, a configuration that never
+            # got the key, and a run the engine refuses.
+            logger.warning("[body-fetch] a %s result for %s was NOT applied; "
+                           "the active route is now %s. Nothing was changed.",
+                           result.kind, route, self.route)
+            note.setText(
+                f"NOT APPLIED. The {result.kind} answer came back after this "
+                f"card stopped being the one on screen, so nothing was "
+                f"written -- writing it now would put {route}'s properties "
+                f"into whatever body is open. Any files it fetched are on "
+                f"disk and are fine. Press the button again to apply it.")
             return
         self._apply_fetch(result, note)
 
@@ -1895,6 +1944,24 @@ class GenericBodyCard(BodyCard):
         self.albedo_provenance.setText(
             f"Source — {albedo_source or 'manual'}.")
 
+        # The surface group's own line. A seeded field says so by name, so
+        # "engine default" is never mistaken for a measurement of this body
+        # and an edited field stops claiming it (`on_widget_changed` drops the
+        # label). Named fields rather than a count: "3 fields are defaults" does
+        # not tell anyone WHICH conductivity they are about to publish.
+        seeded = [field for field in GENERIC_SURFACE_FIELDS
+                  if sources.get(f"generic_body.surface.{field}")
+                  == self.ENGINE_DEFAULT_LABEL]
+        if hasattr(self, "surface_provenance"):
+            self.surface_provenance.setText(
+                f"Source — {', '.join(seeded)} are the engine's generic-body "
+                f"defaults (GenericBody::defaultRockyAsteroid), shown so they "
+                f"are visible and editable; a run that omitted them would use "
+                f"these same values silently. Everything else is yours."
+                if seeded else
+                "Source — every surface property here was entered or fetched, "
+                "not defaulted.")
+
     @staticmethod
     def _grid_label(grid, row):
         item = grid.itemAtPosition(row, 0)
@@ -1902,15 +1969,42 @@ class GenericBodyCard(BodyCard):
         return widget if isinstance(widget, QLabel) else None
 
     def _on_ephemeris_changed(self, _checked):
+        """Record the choice, and never leave SPICE half-selected in silence.
+
+        This control writes ONE key. Choosing SPICE with the kernel field empty
+        therefore produces `ephemeris_source: spice` beside a
+        `spice_metakernel: ""` that `_config_for_yaml` then STRIPS -- so the
+        emitted YAML names a SPICE source and no kernel at all, and the engine
+        refuses it after the mesh is built (generic_body.h:94). That is
+        precisely the configuration a click-through produced on 2026-08-28;
+        reproducing it took the lookup, the shape button and this radio, and
+        the emitted file matched the failing one on 24 of 24 keys.
+
+        The radio still does what it says -- the choice is the user's -- but a
+        selection that cannot run now says so HERE, in the refusal color, next
+        to the button that fixes it, instead of surfacing as an engine abort.
+        """
         source = "keplerian" if self.kepler_radio.isChecked() else "spice"
         self.config_manager.set_value("generic_body.ephemeris_source", source)
-        self.coverage_note.setText(
-            "Keplerian elements, chosen deliberately. The run's own record "
-            "will say so."
-            if source == "keplerian" else
-            "SPICE. Check the kernel's coverage below: when a requested epoch "
-            "falls outside it the engine substitutes Keplerian elements for "
-            "that epoch and logs nothing at all.")
+        kernel = str(self.config_manager.get_value(
+            "generic_body.spice_metakernel", "") or "").strip()
+        if source == "keplerian":
+            self.coverage_note.setText(
+                "Keplerian elements, chosen deliberately. The run's own record "
+                "will say so.")
+        elif kernel:
+            self.coverage_note.setText(
+                "SPICE. Check the kernel's coverage below: when a requested "
+                "epoch falls outside it the engine substitutes Keplerian "
+                "elements for that epoch and logs nothing at all.")
+        else:
+            self.coverage_note.setText(
+                f"SPICE is selected and NO METAKERNEL IS SET, so this run "
+                f"cannot start: the engine refuses a SPICE ephemeris with no "
+                f"kernel and does not fall back to anything. Press "
+                f"'{self.spk_fetch_button.text()}' to wire one, pick a .tm "
+                f"file in the field below, or choose Keplerian elements "
+                f"instead so the record says that is what ran.")
         self.value_changed.emit()
 
     def _check_coverage(self):
@@ -2042,6 +2136,59 @@ class GenericBodyCard(BodyCard):
             "lunar and Europa terrain meshes are in meters; the run prints "
             "the units it inferred")
         self.shape_note.setText(". ".join(notes) + ".")
+
+    #: The label a seeded field carries until the user edits it. Matched by
+    #: `_refresh_surface`, so the wording lives in one place.
+    ENGINE_DEFAULT_LABEL = "engine default"
+
+    def seed_engine_surface_defaults(self):
+        """Fill EMPTY surface properties with the engine's own generic-body
+        defaults, and report which ones were filled.
+
+        Returns ``{dotted key: value}`` for the keys it wrote -- empty when
+        there was nothing to fill.
+
+        Why this exists. `generic_body.surface.*` has no entry in
+        DEFAULT_CONFIG, so a fresh asteroid card showed 0.0 in every box and
+        emitted no surface block at all. The run was not wrong -- the engine
+        starts from `GenericBody::defaultRockyAsteroid()` and overwrites only
+        the positive values a configuration supplies, so an absent block runs
+        on exactly the numbers seeded here -- but NOTHING SAID SO. A user
+        looking at a conductivity of 0.0 beside a thermal inertia of "0.0
+        J m^-2 K^-1 s^-1/2" reasonably concludes the card needs numbers and
+        types their own; that is what happened on 2026-08-28, and the guesses
+        that went in were not the engine's defaults.
+
+        Two rules make this safe rather than a silent substitution:
+
+        * it writes ONLY keys the configuration does not already have, so a
+          fetched albedo, a lookup's spin-derived value or anything the user
+          typed is never overwritten; and
+        * every key it writes is labeled `engine default` in the provenance
+          line under the group, and `on_widget_changed` drops that label the
+          moment the field is edited -- so the card never claims the engine
+          chose a number the user did.
+
+        It is called from the body-first flow when a card is opened to set up
+        a NEW run (`apply_defaults=True`), and NOT when landing on a
+        configuration the user opened: a file that omits these keys means "use
+        the engine's defaults", and writing them in would add ten keys to the
+        author's own file on the next save.
+        """
+        written = {}
+        for field in GENERIC_SURFACE_FIELDS:
+            key = f"generic_body.surface.{field}"
+            if self.config_manager.get_value(key, None) is not None:
+                continue
+            value = GENERIC_BODY_SURFACE_DEFAULTS[field]
+            self.config_manager.set_value(key, value)
+            written[key] = value
+        if written:
+            self._provenance().update(
+                {key: self.ENGINE_DEFAULT_LABEL for key in written})
+            self.load_from_config()
+            self._refresh_provenance()
+        return written
 
     def _refresh_surface(self):
         from gui_core.body_cards import tiny_surface_refusals
@@ -2552,6 +2699,18 @@ class BodyFirstPanel(BaseConfigTab):
         for key, value in RUN_TYPES_BY_KEY[run_type_key].sets.items():
             self.config_manager.set_value(key, value)
             result.applied[key] = value
+
+        # A generic body's surface, from the engine's own defaults. HERE and
+        # not in the preset: `presets.py`'s first rule is that it must not
+        # report a key that would be silently dropped, and `_config_for_yaml`
+        # emits `generic_body:` only once a body is actually active -- so the
+        # preset cannot honestly claim these. The card can, because it is the
+        # screen that shows them. Only on a NEW run (this method runs solely
+        # under `apply_defaults=True`); landing on an opened configuration
+        # leaves the author's file alone.
+        card = self.cards.get(body_key)
+        if card is not None and hasattr(card, "seed_engine_surface_defaults"):
+            result.applied.update(card.seed_engine_surface_defaults())
         if preset.needs_advanced:
             result.notes.append(
                 "The fields listed above are not on this card. 'Advanced "

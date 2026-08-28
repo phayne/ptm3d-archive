@@ -128,7 +128,13 @@ def test_committed_table_matches_cxx_sources():
 def test_generated_module_is_byte_current():
     """The committed file equals what --regenerate would write right now."""
     bodies, capabilities, patterns = _derive()
-    rendered = body_capabilities._render_module(bodies, capabilities, patterns)
+    # The generic-body surface defaults are re-derived here too, so a change to
+    # GenericBody::defaultRockyAsteroid() (or to the solver's chi fallback)
+    # shows up as this file being stale rather than as a GUI seeding a card
+    # with numbers the engine stopped using.
+    generic_defaults = body_capabilities.parse_generic_body_defaults(REPO_ROOT)
+    rendered = body_capabilities._render_module(bodies, capabilities, patterns,
+                                                generic_defaults)
     target = Path(body_capabilities.__file__).with_name("body_table.py")
     assert target.read_text() == rendered, (
         f"{target} differs from a fresh render; run "

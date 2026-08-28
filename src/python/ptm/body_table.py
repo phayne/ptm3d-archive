@@ -1,7 +1,8 @@
 """Implemented planetary bodies and their engine properties -- GENERATED.
 
-Do not edit by hand. Derived from src/cpp/thermal/planetary_properties.h and
-src/cpp/maps/albedo_manager.cpp by
+Do not edit by hand. Derived from src/cpp/thermal/planetary_properties.h,
+src/cpp/maps/albedo_manager.cpp, src/cpp/orbital/generic_body.h and
+src/cpp/main/ptm_thermal_sim.cpp by
 
     python3 -m ptm.body_capabilities --regenerate
 
@@ -127,3 +128,22 @@ TOPOGRAPHY_PATTERNS = (
     'topo_{body}_ico{res}.bin',
     '{Body}_Topo_res{res}.bin',
 )
+
+#: `generic_body.surface.*` for a body the engine has no table for. NOT a GUI
+#: suggestion: ptm_thermal_sim.cpp starts every generic body from
+#: GenericBody::defaultRockyAsteroid() and overwrites only the fields the
+#: configuration gives a positive value for, so a run with no
+#: `generic_body.surface:` block runs on exactly these. chi is the one that is
+#: not in that struct; the solver's own `? chi_override : 2.7`.
+GENERIC_BODY_SURFACE_DEFAULTS = {
+    'albedo': 0.1,
+    'emissivity': 0.95,
+    'ks': 0.01,
+    'kd': 0.5,
+    'rhos': 1500.0,
+    'rhod': 2500.0,
+    'H': 0.05,
+    'cp0': 800.0,
+    'Qb': 0.0,
+    'chi': 2.7,
+}
