@@ -62,13 +62,34 @@ needs, and names the command that fixes whatever is missing.
 | 01 | [`01_moon_diurnal.ipynb`](notebooks/01_moon_diurnal.ipynb) | Moon, `examples/quickstart_moon_diurnal.yaml` (ico3, 1,280 faces). Peak temperature on globes, config anatomy, the on-disk format, the color scale a planetary temperature field needs, the diurnal curve and its nighttime plateau, day/night contrast against latitude, section 9's same run on real LOLA topography (res-5) against a smooth-sphere control, and — section 10 — changing a thermophysical property: a three-point thermal-inertia sweep through `ptm.Sweep`, the two conventions the engine implements for one $\Gamma$, and the two habits that confirm the change reached the solver. The notebook counterpart of tutorial 02 above | 54 s end to end (eight engine runs, 39 s of engine time) | the `ptm` package (`pip install -e .`); Moon SPICE kernels, ~44 MB (`fetch_kernels.py --bodies moon`); for section 9, `fetch_data.py --core` (topography, property maps, albedo maps) | verified 2026-08-10 |
 | 02 | [`02_europa_thermal.ipynb`](notebooks/02_europa_thermal.ipynb) | Europa, `examples/quickstart_europa_diurnal.yaml` (ico4, 5,120 faces). A Jupiter eclipse inside the output window and its cooling signature, why Europa's night stays warm relative to the Moon's, a spin-up-length check that separates a numerical artifact from the real sub-Jupiter eclipse notch, section 8's observed global Bond-albedo map against uniform ice, tested against the $(1-A)^{1/4}$ law, and — section 9 — what the uniform albedo knob does when a per-face map is already loaded, which is almost nothing: the map out-ranks it | 98 s end to end (nine engine runs, 86 s of engine time) | the `ptm` package (`pip install -e .`); Europa SPICE kernels, ~1.1 GB including `jup365.bsp` (`fetch_kernels.py --bodies europa`); for section 8, `fetch_data.py --dataset albedo-maps` | verified 2026-08-10 |
 | 03 | [`03_asteroid_thermal.ipynb`](notebooks/03_asteroid_thermal.ipynb) | The generic-body path with no ephemeris file: a synthetic asteroid on a Keplerian orbit, `examples/quickstart_asteroid_diurnal.yaml`, run at two thermal inertias to show amplitude damping and phase lag, and — section 4 — which keys a generic body actually reads, the opposite set from a built-in body, with a thermophysical edit confirmed two ways when no log line reports it | 29 s end to end (three engine runs, 22 s of engine time) | the `ptm` package (`pip install -e .`) and only the SPICE leapseconds kernel (`fetch_kernels.py`, a few hundred kB) — no body ephemeris, no DEM, no maps | verified 2026-08-10 |
-| 04 | [`04_asteroid_spice.ipynb`](notebooks/04_asteroid_spice.ipynb) | The generic-body path on a real SPICE ephemeris and a real facet shape: (101955) Bennu at perihelion and aphelion, `examples/quickstart_asteroid_bennu.yaml`, with the shape/spin/ephemeris provenance written down, the Keplerian approximation of tutorial 03 as a third arm, and — section 7 — the OTES thermal-inertia range run out to its boulder end, to size what that measurement's uncertainty is worth in kelvin | 64 s end to end (four engine runs, 38 s of engine time) | the `ptm` package (`pip install -e .`); the radar shape model and archived SPK ship in the repository under `data/horizons_cache/`; generic SPICE kernels via `fetch_kernels.py` | verified 2026-08-10 |
+| 04 | [`04_asteroid_spice.ipynb`](notebooks/04_asteroid_spice.ipynb) | The generic-body path on a real SPICE ephemeris and a real facet shape: (101955) Bennu at perihelion and aphelion, `examples/quickstart_asteroid_bennu.yaml`, with the shape/spin/ephemeris provenance written down, the Keplerian approximation of tutorial 03 as a third arm, and — section 7 — the OTES thermal-inertia range run out to its boulder end, to size what that measurement's uncertainty is worth in kelvin | 64 s end to end (four engine runs, 38 s of engine time) | the `ptm` package (`pip install -e .`); the radar shape model ships in the repository under `data/horizons_cache/`; SPICE kernels **including Bennu's own** via `fetch_kernels.py` (`--bodies bennu`, 80.7 MB) | verified 2026-08-10 — **outputs predate the 2026-08-27 ephemeris upgrade** |
 
 The runtimes above were measured on a 48-core workstation against a default
 CPU-only build, which selects AVX-512 here; the portable `-DPTM_ARCH_NATIVE=OFF`
 build in INSTALL.md's TL;DR has AVX disabled, falls back to the scalar solver
 path and runs the engine roughly 2-3x slower. The two paths agreed to every
 printed digit in all four notebooks.
+
+**Notebook 04 has not been re-executed since 2026-08-27**, when Bennu's shipped
+ephemeris moved from JPL solution 76 (2015–2023, in the repository) to solution
+118 long-span (1900–2135, fetched) so that present-day start dates land inside
+coverage.
+
+**Run `python3 scripts/fetch_kernels.py --bodies bennu` before it.** The
+notebook's own preflight cell does not yet check for the fetched kernel, so on a
+`--bodies moon` checkout preflight passes and the first engine run then stops on
+`SPICE(NOSUCHFILE)`. Its markdown says so at the top; the preflight list itself
+is left alone until the notebook is re-executed, because editing a code cell
+without running it would leave a printed output that no longer matches the code
+above it.
+
+Its section 3 also still describes solution 76 and `furnsh`es it directly from
+`data/horizons_cache/` — that file is deliberately retained, so those cells run
+and report what they load. Only the **engine** runs moved, by at most 2.14e-4 K,
+so nothing the notebook concludes changes. Re-executing it is a pending
+follow-up, not a correction.
+`data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` has the full
+comparison.
 
 To record which binary and commit produced a given set of numbers, ask the
 package rather than the notebook:
