@@ -42,4 +42,41 @@ configuration is needed; set the `cache_dir` argument if you want it elsewhere.
 
 The `ema_*` campaign scripts do **not** read `index.json`; they build their paths
 from the `PTM` environment variable, so regenerating the cache does not affect
-them.
+them. They **do** read `body_config.yaml` — see the albedo note below.
+
+## `surface.albedo` is a BOND albedo, and the file says so
+
+Every `body_config.yaml` written before 2026-08-27 carried SBDB's **geometric**
+albedo p_V in `generic_body.surface.albedo`, which the engine reads as a **Bond**
+albedo: `thermal_model.cpp:2906` computes `1 - albedo` and multiplies the solar
+constant by it. The writer warned about it in a log and wrote the number anyway,
+and the warning did not hold — a generated (101955) Bennu configuration reached a
+run with `surface.albedo: 0.044`, Bennu's p_V, against a Bond albedo of 0.0118.
+
+Since then, every cached body carries the conversion and says which convention it
+is in:
+
+```yaml
+  surface:
+    albedo: 0.014526                    # the BOND albedo the engine consumes
+    albedo_type: bond                   # so no reader has to guess
+    albedo_geometric_pv: 0.037          # what SBDB published
+    albedo_slope_parameter_g: 0.15      # the G used, and whether it was assumed
+    albedo_provenance: "Bond albedo A_B = p_V x q, q = 0.290 + 0.684 G ..."
+```
+
+`A_B = p_V q` with `q = 0.290 + 0.684 G` (Bowell et al. 1989, *Asteroids II*;
+Harris 1998, *Icarus* 131, 291). `scripts/fix_cached_body_albedo.py` performs the
+rewrite, is idempotent, and leaves a file that already says `albedo_type: bond`
+alone. A file with **no** `albedo_type` predates the change and holds p_V; the
+GUI converts it on read and says it did.
+
+⚠️ **One consumer wants the other convention.** `scripts/ema_campaign_driver.py`
+reads this same field (`albedo=float(gb['surface']['albedo'])`) and uses it as the
+**geometric** albedo p — deliberately: its Hapke single-scattering albedos `w` are
+calibrated to reproduce those p values, and the absorbed-flux albedo it sets is
+`thermophysical.albedo_hapke_w`. Rewriting a cache that campaign reads would
+silently change the number it is built on. That is why
+`fix_cached_body_albedo.py` defaults to **this repository's** cache and requires
+`--cache-dir` for any other, and why the EMA campaign's own cache (under the
+OneDrive `PTM` tree) has deliberately **not** been rewritten.

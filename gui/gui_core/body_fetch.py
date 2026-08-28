@@ -253,6 +253,110 @@ def _coverage_verdict(spk_path, earliest, latest):
     return coverage.covers(earliest, latest), coverage
 
 
+def _accepts_body_type(client):
+    """Does this client's ``download_spk`` take a ``body_type``?"""
+    import inspect
+    try:
+        signature = inspect.signature(client.download_spk)
+    except (TypeError, ValueError):                          # pragma: no cover
+        return False
+    parameters = signature.parameters
+    if "body_type" in parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in parameters.values())
+
+
+def _spk_request_failed(scratch, command, name, exc, timeout,
+                        body_type="asteroid"):
+    """The message for a request that did not produce a kernel.
+
+    FIVE answers, not one. Until 2026-08-27 every one of these was reported as
+    "HORIZONS could not be reached, or refused this request, or did not answer
+    within 90 s" -- a sentence that names three unrelated causes and commits to
+    none, so the first live use of the button sent its user to check a network
+    that was up, while HORIZONS' own one-line explanation of what it objected
+    to sat in the exception text after the words "could not be reached".
+
+    "Could not be reached" now means the network, and nothing else does.
+    """
+    try:
+        scratch.unlink()
+    except OSError:
+        pass
+
+    tail = " No kernel was written and nothing has been changed."
+    try:
+        from horizons.horizons_client import (
+            HorizonsHTTPError, HorizonsNetworkError, HorizonsNotFoundError,
+            HorizonsParseError, HorizonsRefusalError)
+    except Exception:                                        # noqa: BLE001
+        HorizonsHTTPError = HorizonsNetworkError = ()        # noqa: N806
+        HorizonsNotFoundError = HorizonsParseError = ()      # noqa: N806
+        HorizonsRefusalError = ()                            # noqa: N806
+
+    if HorizonsRefusalError and isinstance(exc, HorizonsRefusalError):
+        precomputed = "pre-computed objects in the major body index" in str(exc)
+        small = str(body_type or "").strip().lower() in ("asteroid", "comet")
+        if precomputed and small:
+            advice = (
+                " HORIZONS builds SPK files only for small bodies, and not "
+                "even for all of those: it serves THIS object's ephemeris from "
+                "a pre-computed kernel of its own and will not generate a new "
+                "one, by any designation form -- measured for (101955) Bennu "
+                "on 2026-08-27 against four of them, and against the POST file "
+                "endpoint. This is not a fault at your end and a retry will "
+                "not change it. Get a kernel from the mission's SPICE archive "
+                "(NAIF distributes them), point the SPICE metakernel field at "
+                "it, and press Check coverage; or choose Keplerian elements "
+                "deliberately, so the record says which was used.")
+        elif precomputed:
+            advice = (
+                f" HORIZONS builds SPK files for small bodies only, and this "
+                f"one was asked for as a {body_type or 'major body'}. Use "
+                f"Keplerian elements, or a kernel you supply -- for a planet "
+                f"or a satellite a planetary ephemeris such as de440s covers "
+                f"it already.")
+        else:
+            advice = (
+                " HORIZONS does not build SPK files for every object. If this "
+                "is a major planet or a satellite, use Keplerian elements or a "
+                "kernel you supply.")
+        return FetchResult(kind="spk", message=(
+            f"HORIZONS was reached and REFUSED to build a kernel for {name}."
+            f"{tail} {exc}{advice}"))
+
+    if HorizonsNotFoundError and isinstance(exc, HorizonsNotFoundError):
+        return FetchResult(kind="spk", message=(
+            f"HORIZONS was reached and has NO SMALL-BODY RECORD matching "
+            f"{command!r}.{tail} Check the number or the designation in the "
+            f"Name and NAIF id fields -- press Look up to fill them from "
+            f"HORIZONS itself. Details: {exc}"))
+
+    if HorizonsHTTPError and isinstance(exc, HorizonsHTTPError):
+        return FetchResult(kind="spk", message=(
+            f"HORIZONS was reached and answered with an HTTP error "
+            f"{getattr(exc, 'status', '?')} for {command!r}.{tail} That is a "
+            f"fault at the service, not in this request; try again later. "
+            f"Details: {exc}"))
+
+    if HorizonsParseError and isinstance(exc, HorizonsParseError):
+        return FetchResult(kind="spk", message=(
+            f"HORIZONS was reached and answered for {command!r}, but this "
+            f"client did not understand the answer.{tail} That is a fault in "
+            f"PTM3D, not in HORIZONS and not in your request; the answer is "
+            f"quoted here so it can be reported. Details: {exc}"))
+
+    if HorizonsNetworkError and isinstance(exc, HorizonsNetworkError):
+        return FetchResult(kind="spk", message=(
+            f"HORIZONS could not be reached, or did not answer within "
+            f"{timeout} s ({exc}).{tail} Check the network and try again."))
+
+    return FetchResult(kind="spk", message=(
+        f"Asking HORIZONS for a kernel for {command!r} failed with an error "
+        f"this code does not classify ({type(exc).__name__}: {exc}).{tail}"))
+
+
 def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
               margin_days=SPK_MARGIN_DAYS, allow_online=True, refetch=False,
               timeout=HORIZONS_SPK_TIMEOUT_S, client_factory=None):
@@ -312,12 +416,16 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
 
     # -- ask HORIZONS ------------------------------------------------------
     start_text, stop_text = _margin_window(earliest, latest, margin_days)
+    # The identifier goes to the client AS IT IS. Building the HORIZONS
+    # COMMAND string is the client's job (`small_body_spk_command`) and used to
+    # be done here, wrongly: this appended a semicolon to whatever was in the
+    # NAIF id field, and that field holds an SPK ID -- 2101955 for Bennu,
+    # 20000623 for Chimaera. HORIZONS reads `<number>;` as a small-body RECORD
+    # number, which stop at 895910, so every numbered asteroid came back
+    # "DXREAD: requested IOBJ= ... is out of bounds" and the button had never
+    # worked for one. Two layers each doing half of a syntax decision is what
+    # made that invisible.
     command = str(naif_id or name).strip()
-    if body_type in ("asteroid", "comet"):
-        # A bare number is a MAJOR-body NAIF id to HORIZONS; the trailing
-        # semicolon is what makes it a small-body record number. Record 4 is
-        # Vesta and NAIF 4 is the Mars barycenter, so this is not cosmetic.
-        command = command.rstrip("; ") + ";"
 
     if client_factory is None:
         try:
@@ -341,21 +449,31 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
     # replace a kernel that covers the run with a truncated one if the request
     # failed halfway, and the file would still look like an SPK.
     scratch = body_dir / "ephemeris.spk.part"
+    # Constructing the client, inspecting it and calling it are all INSIDE the
+    # try. This function is called from a Qt slot, where an escaping exception
+    # is a qFatal that takes the window down with any unsaved edits (measured:
+    # exit 134); "returns a message, never raises" is the contract, and
+    # `client_factory()` and `_accepts_body_type` can both raise -- a factory
+    # that fails to build a client, or an object with no `download_spk` at all.
     try:
-        client_factory().download_spk(command, start_text, stop_text,
-                                      str(scratch))
+        client = client_factory()
+        extra = {"body_type": body_type}
+        if not _accepts_body_type(client):
+            # A client older than the command-form fix, or a stub. Say so:
+            # such a client is also the one that builds the COMMAND string the
+            # old, broken way, so a fetch that fails here fails for a reason
+            # this message is the only place that names.
+            logger.warning(
+                "[body-fetch] %s.download_spk does not take body_type, so this "
+                "body is being fetched with whatever command form that client "
+                "builds. A 'DXREAD ... out of bounds' answer means the client "
+                "predates the small-body command fix.", type(client).__name__)
+            extra = {}
+        client.download_spk(command, start_text, stop_text, str(scratch),
+                            **extra)
     except Exception as exc:                                 # noqa: BLE001
-        try:
-            scratch.unlink()
-        except OSError:
-            pass
-        return FetchResult(kind="spk", message=(
-            f"HORIZONS could not be reached, or refused this request, or did "
-            f"not answer within {timeout} s ({type(exc).__name__}: {exc}). No "
-            f"kernel was written and nothing has been changed. HORIZONS does "
-            f"not build SPK files for every object; if this body is a major "
-            f"planet or a satellite, use Keplerian elements or a kernel you "
-            f"supply."))
+        return _spk_request_failed(scratch, command, name, exc, timeout,
+                                   body_type)
 
     if not scratch.exists() or scratch.stat().st_size == 0:
         try:

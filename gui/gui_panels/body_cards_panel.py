@@ -64,6 +64,17 @@ _MINUTES_PER_RUN_GUESS = 25.0
 def _muted(text, color="gray", size=10):
     label = QLabel(text)
     label.setWordWrap(True)
+    # PLAIN TEXT, explicitly. These labels display text that came off the
+    # network verbatim -- HORIZONS' refusals, DAMIT's replies, and on an HTTP
+    # error the response BODY, which from a proxy or a CDN is HTML. A QLabel
+    # defaults to Qt.TextFormat.AutoText, which renders anything
+    # `mightBeRichText()` accepts AS rich text: the error the user needs to
+    # read gets silently mangled, and Qt's rich text can reference remote
+    # resources. Seven other labels in this GUI already pin PlainText for the
+    # same reason; these four -- the lookup, coverage, shape and provenance
+    # notes -- were the ones that did not, and they are the ones the fetches
+    # write into.
+    label.setTextFormat(Qt.TextFormat.PlainText)
     label.setStyleSheet(f"color: {color}; font-size: {size}px;")
     return label
 
@@ -1483,8 +1494,13 @@ class GenericBodyCard(BodyCard):
         source = ("the local cache" if result.source == "cache"
                   else "HORIZONS")
         self._provenance().update({key: source for key in result.values})
+        # A field the lookup CONVERTED on the way in overrides the blanket
+        # label, because "HORIZONS" beside a Bond albedo that HORIZONS
+        # published as a geometric one is the label that hid this for months.
+        self._provenance().update(dict(result.field_provenance))
         self.provenance_note.setText(result.provenance())
         lines = [result.message]
+        lines.extend(result.notes)
 
         # PTM-145. A kernel that does not span the run is not an error the
         # engine reports: it substitutes Keplerian elements for the epochs

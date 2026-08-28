@@ -17,7 +17,7 @@ generic_body:
     period_hours: 3.24305
     prime_meridian_deg: 0.0
   surface:
-    albedo: 0.139
+    albedo: 0.054571
     emissivity: 0.95
     ks: 0.01
     kd: 0.5
@@ -26,5 +26,12 @@ generic_body:
     H: 0.05
     cp0: 800.0
     Qb: 0.0
+    albedo_type: bond
+    albedo_geometric_pv: 0.139
+    albedo_slope_parameter_g: 0.15
+    albedo_provenance: Bond albedo A_B = p_V x q, q = 0.290 + 0.684 G (Bowell et al.
+      1989); p_V = 0.139 from SBDB, G = 0.15 (IAU default, SBDB publishes none), q
+      = 0.3926, A_B = 0.0545714. Rewritten from the geometric value by scripts/fix_cached_body_albedo.py
+      on 2026-08-27; G from IAU default (SBDB publishes none).
   spice_metakernel: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/metakernel.tm
   spk_file: data/horizons_cache/bodies/13294_Rockox_(1998_QO105)/ephemeris.spk

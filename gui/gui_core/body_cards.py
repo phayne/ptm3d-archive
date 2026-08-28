@@ -35,8 +35,11 @@ Three rules govern the tables below, and each of them was paid for:
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 try:                                              # the normal case
     from ptm.body_table import IMPLEMENTED_BODIES
@@ -898,6 +901,48 @@ def run_window(config):
             spin_up.strftime(iso) if spin_up else None, note)
 
 
+def _ensure_leapseconds(spiceypy):
+    """Put a leapseconds kernel in the pool if there is not one. Never raises.
+
+    ``spkcov`` reads the coverage as ephemeris seconds and needs NO kernel at
+    all; ``et2utc`` -- which turns those seconds into the ISO strings the run
+    window is compared against -- needs an LSK, and raises SPICE(MISSINGTIMEINFO)
+    without one.
+
+    That made this whole check inert on a fresh process. Measured 2026-08-27 on
+    a Chimaera kernel HORIZONS had just returned: with no LSK in the pool,
+    ``spk_coverage`` reported ``available=False`` ("could not be read by
+    SPICE"), which ``fetch_spk`` correctly turns into COVERAGE UNKNOWN and
+    which correctly declines to set ``ephemeris_source: spice`` -- so a
+    perfectly good kernel could never be accepted, and the reason showed up as
+    a SPICE error about the kernel rather than about the pool. The only reason
+    the failure was not obvious earlier is that the SPK download itself always
+    failed first.
+
+    Returns the path furnished, "" if the pool already had time data, or None
+    if no leapseconds kernel could be found -- in which case the caller reports
+    UNKNOWN coverage, which is the honest answer and not a silent pass.
+    """
+    try:
+        spiceypy.gdpool("DELTET/DELTA_T_A", 0, 1)
+        return ""                                    # already usable
+    except Exception:                                # noqa: BLE001
+        pass
+    for candidate in (Path(__file__).resolve().parents[2] / "data" / "kernels"
+                      / "lsk" / "naif0012.tls",):
+        if candidate.exists():
+            try:
+                spiceypy.furnsh(str(candidate))
+            except Exception as exc:                 # noqa: BLE001
+                logger.warning("[spk-coverage] %s could not be furnished (%s)",
+                               candidate, exc)
+                continue
+            logger.info("[spk-coverage] furnished %s so coverage can be "
+                        "reported as UTC", candidate)
+            return str(candidate)
+    return None
+
+
 def spk_coverage(spk_path, metakernel=None):
     """Read an SPK's own coverage window with ``spkcov``.
 
@@ -907,6 +952,9 @@ def spk_coverage(spk_path, metakernel=None):
     Justitia SPK covers 2034-10-12 to 2034-11-11, every SPICE-mode Justitia
     configuration targets 2035-08-24 onward, and all fifteen ran entirely on
     the silent Keplerian fallback.
+
+    Needs a leapseconds kernel to report the window as UTC; see
+    :func:`_ensure_leapseconds` for why that was not obvious.
     """
     path = Path(str(spk_path or "")).expanduser()
     if not str(spk_path or "").strip():
@@ -924,6 +972,13 @@ def spk_coverage(spk_path, metakernel=None):
     try:
         if metakernel and Path(metakernel).exists():
             spiceypy.furnsh(str(metakernel))
+        if _ensure_leapseconds(spiceypy) is None:
+            return SpkCoverage(False, detail=(
+                f"no leapseconds kernel is loaded and none was found at "
+                f"data/kernels/lsk/naif0012.tls, so {path.name}'s coverage "
+                f"cannot be converted to UTC and compared with the run "
+                f"window. The kernel itself may be perfectly good; this is "
+                f"UNKNOWN coverage, not bad coverage."))
         ids = spiceypy.spkobj(str(path))
         body_ids = [int(ids[i]) for i in range(len(ids))]
         if not body_ids:
