@@ -1112,6 +1112,18 @@ def test_horizons_failures_are_five_answers_not_one():
     2026-08-27 and trimmed only in length. The Bennu arm is the live failure
     Paul hit: HORIZONS was up, answered in 130 ms, and explained itself, and
     the card said it could not be reached.
+
+    **``curated=False`` is deliberate, and it is a disclosure.** Since the
+    curated-source tier landed, (101955) Bennu is served from the registry and
+    ``fetch_spk`` never builds a HORIZONS request for it -- so on the DEFAULT
+    path none of these six arms is reachable for this body any more, and every
+    one of them would come back as the same curated result. What is under test
+    here is the CLASSIFIER (``_spk_request_failed``), not the router, and the
+    captured fixtures are Bennu's own words, so the body stays and the router
+    is switched off for the duration. That the router now short-circuits this
+    body is asserted separately, in
+    ``test_gui_curated_sources.test_a_curated_body_never_reaches_horizons``
+    and at the end of this check.
     """
     from gui_core.body_fetch import fetch_spk
     from horizons.horizons_client import (
@@ -1154,7 +1166,8 @@ def test_horizons_failures_are_five_answers_not_one():
                         "[Errno 8] nodename nor servname provided"))):
                 outcomes[label] = fetch_spk(
                     _config(), root, name="101955 Bennu (1999 RQ36)",
-                    naif_id="2101955", client_factory=client_raising(exc))
+                    naif_id="2101955", client_factory=client_raising(exc),
+                    curated=False)
     finally:
         restore()
 
@@ -1209,9 +1222,33 @@ def test_horizons_failures_are_five_answers_not_one():
     finally:
         restore()
 
+    # The router, on the SAME body, with the SAME exploding client. Six
+    # distinguishable HORIZONS failures are worth having; a user reaching any
+    # of them for a body the registry can serve is not. Kept here rather than
+    # only in the curated suite so that switching `curated=False` on above can
+    # never quietly become "the curated tier was removed and nobody noticed".
+    with tempfile.TemporaryDirectory() as root:
+        routed = fetch_spk(_config(), root, name="101955 Bennu (1999 RQ36)",
+                           naif_id="2101955",
+                           client_factory=client_raising(
+                               HorizonsNetworkError("must not be reached")))
+    # NONE of the six classifier phrases, whatever state the scratch root is
+    # in -- and the curated source named instead. Asserting on a positive
+    # marker as well as the absent ones is what keeps this from passing
+    # vacuously if the message ever becomes empty.
+    for phrase in ("could not be reached", "REFUSED to build a kernel",
+                   "NO SMALL-BODY RECORD", "answered with an HTTP error",
+                   "fault in PTM3D"):
+        assert phrase not in routed.message, (
+            f"a curated body still reaches the HORIZONS failure classifier "
+            f"({phrase!r}): {routed.message[:200]}")
+    assert "JPL solution 118" in routed.message, (
+        f"the curated source is not named: {routed.message[:200]}")
+
     print("    [taxonomy] refusal, out-of-bounds, not-found, HTTP, parse and "
           "network are six messages, and only one blames the network; a "
-          "factory that raises is a message too, not a qFatal")
+          "factory that raises is a message too, not a qFatal. On the default "
+          "path a curated body reaches none of the six.")
 
 
 def test_an_spk_payload_that_is_not_a_kernel_is_not_written():

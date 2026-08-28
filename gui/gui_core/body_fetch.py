@@ -5,6 +5,20 @@ Three fetches, one shape. Each of them:
 * **is cache-first.** The local ``data/horizons_cache`` is authoritative and
   works offline; the network is asked only when the cache misses, or when the
   caller explicitly says to refetch.
+* **asks the curated registry before anything else.** For a body in
+  :mod:`gui_core.curated_sources` -- today (101955) Bennu -- neither HORIZONS
+  nor DAMIT can serve what is wanted, and both say so correctly. The order is::
+
+      curated registry (itself cache-first) -> body cache -> live service
+
+  and for a curated body neither of the last two is reached. The registry
+  comes BEFORE the body cache deliberately, not as a shortcut: Bennu's body
+  cache holds ``ephemeris.spk``, JPL solution 76, which covers 2015-2023 and
+  was superseded on 2026-08-27. Inside that span it would pass an ordinary
+  coverage check and be wired silently. The registry's own first step is
+  still a cache check -- "is the pinned kernel already fetched into
+  ``data/kernels``?" -- so a machine that has it reaches a wired card with no
+  network call at all. See :func:`fetch_spk` and :func:`fetch_damit_shape`.
 * **never runs by itself.** Every entry point here is called from a button.
   Nothing on this card reaches the network because a field changed.
 * **never hangs.** Every client is constructed with a timeout, and the timeout
@@ -59,6 +73,7 @@ __all__ = [
     "SPK_MARGIN_DAYS",
     "FetchResult",
     "body_cache_dir",
+    "fetch_curated_shape",
     "fetch_damit_shape",
     "fetch_spk",
     "fetch_sbdb_properties",
@@ -94,7 +109,7 @@ class FetchResult:
 
     def __init__(self, ok=False, kind="", values=None, provenance=None,
                  message="", warnings=(), paths=None, refusal="",
-                 from_cache=False):
+                 from_cache=False, offer="", offer_bytes=0):
         self.ok = bool(ok)
         #: "spk", "damit_shape" or "sbdb".
         self.kind = kind
@@ -114,6 +129,15 @@ class FetchResult:
         self.refusal = refusal
         #: True when nothing was fetched because the cache already had it.
         self.from_cache = bool(from_cache)
+        #: Non-empty when this is not a failure but a QUESTION: the fetch can
+        #: be completed, and it costs a download the user has not agreed to.
+        #: A FLAG rather than a phrase in ``message``, because the caller has
+        #: to branch on it and a caller that branched by searching the message
+        #: for words would break the first time the wording improved.
+        self.offer = offer
+        #: What agreeing to ``offer`` would transfer, in bytes. Disclosed
+        #: before the question, not after it.
+        self.offer_bytes = int(offer_bytes)
 
     def lines(self):
         """The block the card shows: message, refusal, then warnings."""
@@ -357,10 +381,208 @@ def _spk_request_failed(scratch, command, name, exc, timeout,
         f"this code does not classify ({type(exc).__name__}: {exc}).{tail}"))
 
 
+def _superseded_cache_warning(project_root, entry):
+    """Say when the body cache holds an ephemeris the curated one replaces.
+
+    Two kernels for one body on one disk, and only one of them used, is
+    exactly the situation that needs a sentence rather than a silence. Bennu's
+    cached ``ephemeris.spk`` is JPL solution 76 (2015-2023); the curated one
+    is solution 118 (1900-2135). A card that quietly wired the second while
+    the first sat in the body's own directory would leave the user with no way
+    to tell which had run.
+
+    Returns "" when there is nothing in the cache to mention.
+
+    The cache directory is resolved from ``entry.name``, NOT from what the
+    user typed. The registry accepts ``Bennu``, ``101955``, ``1999 RQ36`` and
+    ``(101955) Bennu``; the cache directory is
+    ``bodies/101955_Bennu_(1999_RQ36)``. Using the typed spelling made this
+    whole disclosure vanish for three of the four -- the superseded kernel
+    still on disk, and nothing said about it, for exactly the users who took
+    the shortest route to the card.
+    """
+    try:
+        cached = body_cache_dir(project_root, entry.name) / "ephemeris.spk"
+    except ValueError:
+        return ""
+    if not cached.exists():
+        return ""
+    from gui_core.body_cards import spk_coverage
+    coverage = spk_coverage(str(cached), naif_id=entry.ephemeris.naif_id,
+                            project_root=project_root)
+    span = (f"covering {coverage.start_utc} to {coverage.end_utc}"
+            if coverage.available else "whose coverage could not be read here")
+    return (f"NOT USED: {cached} is also on this disk, {span}. It is the "
+            f"body cache's own kernel and it is NOT what this card wired -- "
+            f"the curated entry above is. It is kept for provenance; delete "
+            f"nothing on account of this line, but do not assume a run used "
+            f"it.")
+
+
+def _curated_spk(entry, project_root, name, naif_id, earliest, latest, note,
+                 allow_online, curated_download, progress, downloader=None):
+    """The curated ephemeris tier: on-disk check, an offer, then the wiring.
+
+    Never asks HORIZONS. Never asks the network at all unless
+    ``curated_download`` is True AND something is genuinely missing.
+    """
+    from gui_core.body_cards import spk_coverage
+    from gui_core.curated_sources import (curated_kernel_status,
+                                          download_curated_kernels,
+                                          human_bytes)
+
+    ephemeris = entry.ephemeris
+    source_line = (f"Ephemeris source: {ephemeris.description}. "
+                   f"{ephemeris.reference}. Coverage as published: "
+                   f"{ephemeris.coverage_text()}.")
+    status = curated_kernel_status(entry, project_root)
+
+    download_lines = []
+    if not status.ready:
+        if not allow_online:
+            return FetchResult(kind="spk", message=(
+                f"{status.summary()} Online fetching is turned off, so "
+                f"nothing was downloaded and nothing has been changed. "
+                f"{source_line}"))
+        command = (f"python3 scripts/fetch_kernels.py --bodies "
+                   f"{ephemeris.fetch_bodies}")
+        if not status.can_download:
+            # Not ready, and a download would not fix it: the metakernel is
+            # absent, or a member is a cloud placeholder (which `download`
+            # would HYDRATE, since it finds a full-size file and hashes it),
+            # or a member has no pinned source. Offering a download for any of
+            # these spends bandwidth and changes nothing, and the "0 B" dialog
+            # the first draft produced said so to nobody.
+            return FetchResult(kind="spk", message=(
+                f"{status.summary()} Nothing was downloaded and nothing has "
+                f"been changed -- a download would not fix this. "
+                f"{source_line}"))
+        if not curated_download:
+            size = status.download_summary()
+            names = ", ".join(k.name for k in status.fetchable)
+            return FetchResult(
+                kind="spk",
+                offer=(f"Download {entry.name}'s ephemeris now? {names} "
+                       f"({size}), from {ephemeris.description}. These are "
+                       f"pinned files with recorded sha256 values, not a "
+                       f"HORIZONS request. A slow or flaky network is "
+                       f"retried up to five times with ten seconds between "
+                       f"attempts and cannot be cancelled from here, so it "
+                       f"may take several minutes; the same download runs "
+                       f"outside this window as `{command}`."),
+                offer_bytes=status.download_bytes,
+                message=(
+                f"{status.summary()} {entry.name}'s ephemeris is a pinned "
+                f"download, not a HORIZONS request -- {entry.why_curated} "
+                f"Confirm the download to fetch it here, or run `{command}` "
+                f"yourself. Nothing has been changed. {source_line}"))
+        ok, download_lines = download_curated_kernels(
+            entry, project_root, progress=progress, downloader=downloader)
+        status = curated_kernel_status(entry, project_root)
+        if not ok or not status.ready:
+            return FetchResult(kind="spk", warnings=tuple(download_lines),
+                               message=(
+                f"{entry.name}'s ephemeris was NOT installed: "
+                f"{status.summary()} Nothing about this card has been "
+                f"changed. {source_line}"))
+
+    # -- read the coverage back, exactly as the HORIZONS path does ----------
+    coverage = spk_coverage(ephemeris.metakernel,
+                            naif_id=ephemeris.naif_id,
+                            project_root=project_root)
+    warnings = list(download_lines)
+    warnings.extend(entry.notes)
+    superseded = _superseded_cache_warning(project_root, entry)
+    if superseded:
+        warnings.append(superseded)
+
+    if not coverage.available:
+        return FetchResult(
+            kind="spk", ok=False,
+            paths={"metakernel": str(status.metakernel_path)},
+            warnings=tuple(warnings),
+            message=(f"{entry.name}'s pinned kernels are on this disk and "
+                     f"{ephemeris.metakernel} names them. {source_line}"),
+            refusal=(f"COVERAGE UNKNOWN: {coverage.detail}. The ephemeris "
+                     f"source has been LEFT ALONE rather than set to SPICE. "
+                     f"The engine substitutes Keplerian elements for any "
+                     f"epoch outside a kernel and logs nothing, so an "
+                     f"unverified kernel is an unverified run -- and a "
+                     f"curated kernel is not exempt from being checked."))
+
+    verdict = coverage.covers(earliest, latest)
+    if verdict is None or not verdict:
+        return FetchResult(
+            kind="spk", ok=False,
+            paths={"metakernel": str(status.metakernel_path)},
+            warnings=tuple(warnings),
+            message=(f"{ephemeris.metakernel} covers {coverage.start_utc} to "
+                     f"{coverage.end_utc} ({coverage.days:.1f} days) for body "
+                     f"{ephemeris.naif_id}. {source_line}"),
+            refusal=(f"REFUSED: this run needs {earliest} to {latest} "
+                     f"({note}), which that kernel does NOT span. The "
+                     f"ephemeris source has been LEFT ALONE rather than set "
+                     f"to SPICE, because the engine would serve the uncovered "
+                     f"epochs from Keplerian elements silently. Move the run "
+                     f"inside the covered span, or choose Keplerian "
+                     f"deliberately so the record says so."
+                     if verdict is not None else
+                     f"COVERAGE UNKNOWN: the run window {earliest} to "
+                     f"{latest} and the kernel's own could not be compared, "
+                     f"so the ephemeris source has been LEFT ALONE."))
+
+    values = {
+        "generic_body.spice_metakernel": ephemeris.metakernel,
+        "generic_body.ephemeris_source": "spice",
+        "generic_body.naif_id": ephemeris.naif_id,
+    }
+    label = f"curated: {ephemeris.description}"
+    provenance = {key: label for key in values}
+    if naif_id and str(naif_id).rstrip("; ").strip() != ephemeris.naif_id:
+        warnings.append(
+            f"The NAIF id has been set to {ephemeris.naif_id}, which is the "
+            f"id this kernel declares; the card had {naif_id}. Small-body SPK "
+            f"ids exist in a 2000000+N and a 20000000+N convention and only "
+            f"the kernel's own works with it.")
+
+    # The cache index is written ONLY when this fetch actually put something
+    # on disk. The HORIZONS path always has -- it just downloaded a kernel --
+    # but the curated path's normal case installs nothing, and
+    # `data/horizons_cache/index.json` is a TRACKED file: recording "I looked
+    # and it was already here" in it would leave every user's checkout dirty
+    # after pressing a button that changed nothing. Wiring a kernel that is
+    # already present is a read, and a read does not write.
+    if download_lines:
+        _update_index(project_root, name, {
+            "naif_id": ephemeris.naif_id,
+            "body_type": "asteroid",
+            "curated_source": ephemeris.description,
+            "metakernel_path": str(status.metakernel_path),
+            "spk_path": ", ".join(str(f.path) for f in status.files),
+            "spk_start": coverage.start_utc,
+            "spk_stop": coverage.end_utc,
+        })
+
+    return FetchResult(
+        ok=True, kind="spk", values=values, provenance=provenance,
+        from_cache=not download_lines,
+        paths={"metakernel": str(status.metakernel_path)},
+        warnings=tuple(warnings),
+        message=(f"{source_line} {ephemeris.metakernel} covers "
+                 f"{coverage.start_utc} to {coverage.end_utc} "
+                 f"({coverage.days:.1f} days) for body {ephemeris.naif_id}; "
+                 f"this run needs {earliest} to {latest} ({note}), which is "
+                 f"inside it -- verified by reading the kernel back, not by "
+                 f"trusting the table. HORIZONS was not asked: "
+                 f"{entry.why_curated}"))
+
+
 def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
               margin_days=SPK_MARGIN_DAYS, allow_online=True, refetch=False,
-              timeout=HORIZONS_SPK_TIMEOUT_S, client_factory=None):
-    """Get an SPK that spans this run, from the cache or from HORIZONS.
+              timeout=HORIZONS_SPK_TIMEOUT_S, client_factory=None,
+              curated=True, curated_download=False, progress=None,
+              downloader=None):
+    """Get an SPK that spans this run: curated registry, cache, or HORIZONS.
 
     Returns a :class:`FetchResult`. ``values`` sets the metakernel path and
     ``generic_body.ephemeris_source`` -- and sets the SOURCE only when the
@@ -368,6 +590,24 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
     spin-up. An unverifiable or insufficient kernel leaves the ephemeris
     source alone, so a card cannot end up saying "spice" over a kernel that
     would be silently ignored for most of the run.
+
+    THE CURATED TIER COMES FIRST, and for a body in it HORIZONS is never
+    asked. That is not an optimization. HORIZONS' refusal for Bennu is correct
+    and permanent -- it serves that body from a pre-computed kernel and will
+    not generate another, by any designation form -- so asking is a slower
+    route to a message the user can do nothing with. What the curated tier
+    offers instead is the mission product the refusal points at.
+
+    For a curated body the tier's own first step is still a cache check: is
+    the pinned kernel already fetched into ``data/kernels``? If it is, this
+    function makes NO network call of any kind, and a machine with the kernel
+    on disk reaches a wired, coverage-verified card offline.
+
+    ``curated_download`` is the consent. With it False (the default) a curated
+    body whose kernel is missing gets an OFFER naming the size and the command,
+    and nothing is downloaded; the card asks, and calls again with it True.
+    Downloading 80 MB because somebody pressed a button labelled "fetch
+    kernel" would be a surprise measured in minutes.
     """
     name = str(name or "").strip()
     if not name:
@@ -380,6 +620,14 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
         return FetchResult(kind="spk", message=(
             f"The run window could not be worked out, so there is no window to "
             f"fetch a kernel for: {note}"))
+
+    if curated:
+        from gui_core.curated_sources import curated_body
+        entry = curated_body(name, naif_id)
+        if entry is not None:
+            return _curated_spk(entry, project_root, name, naif_id,
+                                earliest, latest, note, allow_online,
+                                curated_download, progress, downloader)
 
     try:
         body_dir = body_cache_dir(project_root, name)
@@ -664,10 +912,100 @@ def shape_provenance(path):
     return data if isinstance(data, dict) else {}
 
 
+def fetch_curated_shape(entry, project_root):
+    """Offer a curated body's shipped mission shape model.
+
+    No network, ever: the file is in the repository. What this returns is the
+    same shape of answer a DAMIT fetch returns -- values, provenance, warnings
+    -- so the card applies it through one code path and cannot end up with two
+    ways of writing a shape into a configuration.
+
+    The kind stays ``"damit_shape"``. It is the routing key the card's
+    ``_fetch_controls`` maps to the shape button and the shape note, and
+    inventing a second kind for the same slot would mean a second row in that
+    table and a second chance for the two to disagree about which widget a
+    result belongs to.
+    """
+    shape = entry.shape
+    from gui_core.curated_sources import curated_shape_path
+    path, present = curated_shape_path(entry, project_root)
+    if not present:
+        return FetchResult(kind="damit_shape", message=(
+            f"{entry.name}'s shape model should be at {path} and is not on "
+            f"this disk. It is a tracked file in this repository, so a "
+            f"checkout missing it is a checkout missing a tracked file -- "
+            f"restore it with `git checkout -- {shape.relpath}` rather than "
+            f"looking for it online. Nothing has been changed."))
+
+    values = {
+        "generic_body.shape.type": "custom_mesh",
+        "generic_body.shape.mesh_file": shape.relpath,
+        "generic_body.shape.mesh_scale": shape.mesh_scale,
+        "generic_body.shape.radius_km": shape.radius_km,
+    }
+    label = f"curated: {shape.description}"
+    provenance = {key: label for key in values}
+
+    # THE SPIN GOES WITH THE SHAPE, for the same reason the DAMIT path sends
+    # it: the mesh is defined in the body-fixed frame its own pole and period
+    # establish, so the mesh with somebody else's pole is the body pointing
+    # the wrong way, and no output shows it. Offering the mesh alone also
+    # made `spin_consistency` compare nothing and return "", which the card
+    # renders as an affirmative "these agree".
+    spin_label = f"curated: {shape.spin_reference}"
+    if shape.spin_period_hours > 0:
+        values["generic_body.spin.period_hours"] = shape.spin_period_hours
+        provenance["generic_body.spin.period_hours"] = spin_label
+    values["generic_body.spin.pole_ra_deg"] = shape.spin_pole_ra_deg
+    values["generic_body.spin.pole_dec_deg"] = shape.spin_pole_dec_deg
+    provenance["generic_body.spin.pole_ra_deg"] = spin_label
+    provenance["generic_body.spin.pole_dec_deg"] = spin_label
+
+    warnings = [
+        f"The spin came with the model and is offered with it: period "
+        f"{shape.spin_period_hours:g} h, pole RA/Dec "
+        f"({shape.spin_pole_ra_deg:g}, {shape.spin_pole_dec_deg:g}). "
+        f"{shape.spin_reference}. A shape model is defined in the body-fixed "
+        f"frame its own pole and period establish, so keeping the shape and a "
+        f"different spin orients the body wrongly and nothing downstream "
+        f"re-checks it.",
+        f"DAMIT was NOT searched for {entry.name}, and this is not a fallback: "
+        f"DAMIT publishes lightcurve inversions and this body's shape is not "
+        f"one. {entry.why_curated}",
+        f"Archive: {shape.archive}. {shape.vertices} vertices, {shape.faces} "
+        f"facets, already in {shape.units} -- so the shape-model scale is "
+        f"{shape.mesh_scale:g} and nothing is rescaled on the way in. Asteroid "
+        f"shape models are conventionally in kilometers here while lunar and "
+        f"Europa terrain meshes are in meters; the run prints the units it "
+        f"inferred.",
+    ]
+    if shape.provenance_relpath:
+        warnings.append(
+            f"Full provenance, including what this file supersedes and by how "
+            f"much: {shape.provenance_relpath}.")
+    if shape.tracked:
+        warnings.append(
+            f"This file is TRACKED in git and ships with the repository, even "
+            f"though *.obj is matched by .gitignore line 14 (a rule written "
+            f"for C object files -- PTM-303). It was force-added; a re-fetched "
+            f"copy would need `git add -f` to go back in.")
+    else:
+        warnings.append(
+            f"This file is NOT tracked in git: *.obj is matched by .gitignore "
+            f"line 14 (PTM-303), so it exists in one copy on this machine. "
+            f"Back it up, or add it with `git add -f {shape.relpath}`.")
+
+    return FetchResult(
+        ok=True, kind="damit_shape", values=values, provenance=provenance,
+        from_cache=True, paths={"shape": str(path)}, warnings=tuple(warnings),
+        message=(f"Mission shape model: {shape.description}. {path.name}, "
+                 f"{shape.faces} facets, mean radius {shape.radius_km:g} km."))
+
+
 def fetch_damit_shape(project_root, name="", naif_id="", radius_km=0.0,
                       allow_online=True, refetch=False, timeout=DAMIT_TIMEOUT_S,
-                      client_factory=None, converter=None):
-    """Download this body's DAMIT shape model into the cache, if one exists.
+                      client_factory=None, converter=None, curated=True):
+    """This body's shape model: the curated registry, the cache, or DAMIT.
 
     Returns a :class:`FetchResult` whose ``values`` carry the shape AND the
     spin solution that came with it. Those two travel together on purpose: a
@@ -675,12 +1013,24 @@ def fetch_damit_shape(project_root, name="", naif_id="", radius_km=0.0,
     establish, so taking the shape and keeping a different pole orients the
     model wrongly. The card offers both and flags a divergence rather than
     choosing; see :func:`spin_consistency`.
+
+    A body in the curated registry is served from it and DAMIT is NOT
+    searched. DAMIT's "no shape model for asteroid 101955" is a true answer to
+    the wrong question -- Bennu has a shape model, it is a radar product, and
+    DAMIT does not hold radar products -- so reporting that answer would send
+    the user looking for something that was never going to be there.
     """
     name = str(name or "").strip()
     if not name:
         return FetchResult(kind="damit_shape", message=(
             "This body has no name yet, so DAMIT cannot be searched and there "
             "is nowhere to cache a shape. Fill in the Name field first."))
+
+    if curated:
+        from gui_core.curated_sources import curated_body
+        entry = curated_body(name, naif_id)
+        if entry is not None:
+            return fetch_curated_shape(entry, project_root)
 
     number = _asteroid_number(naif_id, name)
     if number is None:
