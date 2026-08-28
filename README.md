@@ -211,9 +211,10 @@ python3 scripts/fetch_kernels.py --bodies moon   # Moon + Mercury core, ~44 MB
 ```
 
 The bare `fetch_kernels.py` also pulls the 1.1 GB Galilean ephemeris that the
-shipped `europa.tm` needs — ~1.15 GB total; use `--bodies moon` for this
-walkthrough. Downloads resume after an interruption and every file is SHA-256
-verified. Run `ptm_thermal_sim` **from the repository root**: the shipped
+shipped `europa.tm` needs, and the 80.7 MB Bennu ephemeris that `bennu.tm`
+needs — ~1.23 GB total; use `--bodies moon` for this walkthrough, or
+`--bodies bennu` for the Bennu quickstart. Downloads resume after an
+interruption and every file is SHA-256 verified. Run `ptm_thermal_sim` **from the repository root**: the shipped
 metakernels use repo-root-relative paths.
 
 ### 4. Run the first simulation

@@ -50,14 +50,28 @@ def _fake_checkout(tmp):
     return root
 
 
-def test_remedy_distinguishes_the_two_kernel_sets():
+def test_remedy_distinguishes_the_three_kernel_sets():
+    """Three body sets live under data/kernels, and --bodies moon fetches one.
+
+    Naming the wrong one is worse than naming none: the reader runs the command,
+    the file is still missing, and the second failure looks like the first. Bennu
+    joined this list on 2026-08-27, when its 80.7 MB ephemeris moved out of git.
+    """
     with tempfile.TemporaryDirectory() as td:
         root = _fake_checkout(td)
         moon = paths.remedy_for(root / "data/kernels/pck/pck00011.tpc", root)
         europa = paths.remedy_for(root / "data/kernels/spk/jup365.bsp", root)
+        bennu = paths.remedy_for(
+            root / "data/kernels/spk/sb-101955-118_long.bsp", root)
         assert moon == "python3 scripts/fetch_kernels.py --bodies moon", moon
         assert europa == "python3 scripts/fetch_kernels.py --bodies europa", europa
-        assert moon != europa, "the 1.1 GB Galilean set is not the Moon core set"
+        assert bennu == "python3 scripts/fetch_kernels.py --bodies bennu", bennu
+        assert len({moon, europa, bennu}) == 3, \
+            "each body set needs its own remedy; --bodies moon fetches neither " \
+            "the 1.1 GB Galilean set nor Bennu's ephemeris"
+        # The metakernels ship, so they are never the missing file -- but if one
+        # is ever asked about, it must not be answered with the Moon core set.
+        assert paths.remedy_for(root / "data/kernels/bennu.tm", root) == bennu
 
 
 def test_remedy_comes_from_the_manifest_not_a_hard_coded_table():
@@ -132,7 +146,7 @@ def test_find_repo_root_still_works():
 
 
 TESTS = [
-    test_remedy_distinguishes_the_two_kernel_sets,
+    test_remedy_distinguishes_the_three_kernel_sets,
     test_remedy_comes_from_the_manifest_not_a_hard_coded_table,
     test_remedy_for_the_engine_names_the_build,
     test_preflight_reports_and_raises_with_the_remedies,

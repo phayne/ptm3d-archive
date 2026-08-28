@@ -284,30 +284,41 @@ are not kept in the repository — fetch them from NASA NAIF with the bundled Py
 (no extra Python packages required):
 
 ```bash
-python3 scripts/fetch_kernels.py                  # default (auto): ~1.15 GB — see note
+python3 scripts/fetch_kernels.py                  # default (auto): ~1.23 GB — see note
 python3 scripts/fetch_kernels.py --bodies moon    # Moon + Mercury core only, ~44 MB
 python3 scripts/fetch_kernels.py --bodies europa  # core + jup365.bsp (1.1 GB) for Europa
+python3 scripts/fetch_kernels.py --bodies bennu   # core + Bennu's ephemeris (80.7 MB)
 ```
 
-**The bare command downloads ~1.15 GB, not ~44 MB.** In its default `--bodies auto` mode the
-script fetches the core set *and* whatever the metakernels present in `data/kernels/` require —
-and `europa.tm` ships with the repository, so it also pulls the Galilean ephemeris
-`jup365.bsp` (1.1 GB). That is deliberate (it is what the installed metakernels need, and it
-stops a Europa run failing twice on the same missing kernel), and the script announces the
-auto-add before downloading. If you only want the Moon/Mercury quickstart, pass
+**The bare command downloads ~1.23 GB, not ~44 MB.** In its default `--bodies auto` mode the
+script fetches the core set *and* whatever the metakernels present in `data/kernels/` require.
+Two of the shipped metakernels name a body kernel: `europa.tm` pulls the Galilean ephemeris
+`jup365.bsp` (1.1 GB), and `bennu.tm` pulls `sb-101955-118_long.bsp` (80.7 MB). That is
+deliberate (it is what the installed metakernels need, and it stops a Europa or Bennu run
+failing twice on the same missing kernel), and the script announces each auto-add before
+downloading. If you only want the Moon/Mercury quickstart, pass
 `--bodies moon`: `naif0012.tls` (5 KB) + `pck00011.tpc` (128 KB) + `de440s.bsp` (31.2 MB) +
 `moon_pa_de440_200625.bpc` (12.3 MB) + `moon_de440_250416.tf` (19 KB) = ~44 MB.
+
+`sb-101955-118_long.bsp` is the only kernel here that does **not** come from NAIF. It is JPL
+solution 118 for (101955) Bennu — the final OSIRIS-REx reconstruction, Farnocchia et al.
+(2021) — over 1900-01-01 to 2135-10-01, downloaded from
+`https://ssd.jpl.nasa.gov/ftp/xfr/`, which is the address JPL Horizons prints when it declines
+to generate a Bennu SPK on request. Because that is a transfer directory rather than a
+versioned archive path, the pinned SHA-256 is the only guarantee that the file has not changed
+under its name; a hash mismatch there is worth reading before assuming a corrupt download.
 
 This populates `data/kernels/` with the layout the binary expects:
 
 ```
 data/kernels/
-├── moon.tm  europa.tm  mercury.tm   # metakernel templates (shipped with the repo)
+├── moon.tm  europa.tm  mercury.tm  bennu.tm   # metakernel templates (shipped with the repo)
 ├── lsk/naif0012.tls                 # leapseconds (required even in Keplerian mode)
 ├── pck/pck00011.tpc                 # body orientation/shape constants
 ├── pck/moon_pa_de440_200625.bpc     # lunar principal-axes orientation
 ├── fk/moon_de440_250416.tf          # MOON_PA / MOON_ME frame definitions
-└── spk/de440s.bsp                   # planetary ephemeris
+├── spk/de440s.bsp                   # planetary ephemeris
+└── spk/sb-101955-118_long.bsp       # (101955) Bennu, 1900-2135 (--bodies bennu/auto)
 ```
 
 Interrupted downloads resume where they left off, every file is verified against a known
