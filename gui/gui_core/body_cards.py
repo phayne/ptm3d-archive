@@ -36,6 +36,7 @@ Three rules govern the tables below, and each of them was paid for:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -67,6 +68,8 @@ __all__ = [
     "detect_route",
     "europa_dem_registry",
     "europa_sweep_points",
+    "kernel_architecture",
+    "metakernel_members",
     "modes_for",
     "out_of_card_settings",
     "run_type_of",
@@ -74,6 +77,7 @@ __all__ = [
     "run_window",
     "spk_coverage",
     "tiny_surface_refusals",
+    "MetakernelMembers",
 ]
 
 
@@ -818,13 +822,21 @@ class SpkCoverage:
     """
 
     def __init__(self, available, start_utc="", end_utc="", days=0.0,
-                 detail="", bodies=()):
+                 detail="", bodies=(), intervals=()):
         self.available = available
         self.start_utc = start_utc
         self.end_utc = end_utc
         self.days = days
         self.detail = detail
         self.bodies = tuple(bodies)
+        #: Every covered interval, as ``(start_utc, end_utc)`` pairs. An SPK
+        #: may hold two arcs with a hole between them, and `start_utc` /
+        #: `end_utc` are only the OUTER ENVELOPE of those arcs. A run window
+        #: sitting in the hole is inside the envelope and outside the kernel,
+        #: which is where the silent per-epoch fallback lives -- so `covers`
+        #: asks about the intervals when they are known. Empty means "one
+        #: interval, or not recorded", and the envelope is then the answer.
+        self.intervals = tuple(intervals)
 
     #: The shape `spkcov` reports through `et2utc(..., "ISOC")`, and the shape
     #: `simulation.start_time` is written in. A lexicographic comparison of two
@@ -836,15 +848,27 @@ class SpkCoverage:
     _ISO = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 
     def covers(self, start_utc, end_utc):
-        """True/False/None -- None meaning the question could not be asked."""
+        """True/False/None -- None meaning the question could not be asked.
+
+        With more than one interval the window must fit inside ONE of them.
+        Reporting a run that falls in a gap as covered would be the same lie
+        the envelope tells, with a "WITH GAPS" note printed above it.
+        """
         if not self.available:
             return None
         for value in (start_utc, end_utc, self.start_utc, self.end_utc):
             if not self._ISO.match(str(value or "")):
                 return None
         start_utc, end_utc = str(start_utc)[:19], str(end_utc)[:19]
-        return bool(self.start_utc[:19] <= start_utc
-                    and end_utc <= self.end_utc[:19])
+        windows = [(low, high) for low, high in self.intervals
+                   if self._ISO.match(str(low or ""))
+                   and self._ISO.match(str(high or ""))]
+        if len(windows) != len(self.intervals):
+            return None
+        if not windows:
+            windows = [(self.start_utc, self.end_utc)]
+        return any(str(low)[:19] <= start_utc and end_utc <= str(high)[:19]
+                   for low, high in windows)
 
 
 def run_window(config):
@@ -901,7 +925,377 @@ def run_window(config):
             spin_up.strftime(iso) if spin_up else None, note)
 
 
-def _ensure_leapseconds(spiceypy):
+def _default_project_root():
+    """The repository root, from this file's own location.
+
+    ``gui/gui_core/body_cards.py`` -> ``parents[2]``. The same derivation
+    :func:`_ensure_leapseconds` has always used to find ``data/kernels``, kept
+    in one place now that kernel paths are resolved here as well.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def _spice_kernel_dirs(project_root, env=None):
+    """The kernel directories the engine searches, in the engine's order.
+
+    ``docs/configuration.md`` "How ``generic_body.spice_metakernel`` is
+    resolved": ``$PTM_SPICE_KERNELS``, then ``$PTM_DATA_ROOT/kernels``, then
+    the repository's ``data/kernels``. Each rung REPLACES the one below it for
+    the engine; here they are all offered, because a card that could not find
+    a kernel the run will find is worse than one that looks in an extra place.
+    """
+    env = env if env is not None else os.environ
+    dirs = []
+    explicit = str(env.get("PTM_SPICE_KERNELS", "") or "").strip()
+    if explicit:
+        dirs.append(Path(explicit).expanduser())
+    data_root = str(env.get("PTM_DATA_ROOT", "") or "").strip()
+    if data_root:
+        dirs.append(Path(data_root).expanduser() / "kernels")
+    dirs.append(Path(project_root) / "data" / "kernels")
+    return dirs
+
+
+def _resolve_kernel_path(value, project_root=None, env=None):
+    """``(path, candidates)`` for a configured kernel value.
+
+    Three forms, and the engine treats them differently
+    (``illumination_model.cpp:2678-2696``, tabulated in
+    ``docs/configuration.md``). The card has to agree with the run about which
+    file is meant, or it reports on a file the run will not open:
+
+    * ABSOLUTE -- used exactly as given. Prepending the kernel directory to an
+      absolute path is PTM-145, and it is why every EMA asteroid configuration
+      missed its metakernel.
+    * relative ``data/...`` -- the ``$PTM_DATA_ROOT`` contract shared with
+      ``mesh.import_file``. This is what the seven cached ``body_config.yaml``
+      files write, and resolving it against the WORKING DIRECTORY would answer
+      a question about where the GUI was launched from.
+    * any other relative value, e.g. the shipped ``bennu.tm`` -- the kernel
+      directory first, then the working directory.
+
+    ``candidates`` is every path tried, so a value that resolves nowhere can be
+    reported the way the engine reports it: by naming them all.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None, []
+    root = Path(project_root) if project_root else _default_project_root()
+    expanded = Path(raw).expanduser()
+    if expanded.is_absolute():
+        return expanded, [expanded]
+
+    normalized = raw.replace("\\", "/")
+    if normalized == "data" or normalized.startswith("data/"):
+        try:
+            from gui_core.preflight import resolve_data_path
+            resolved = Path(resolve_data_path(raw, root, env)).expanduser()
+        except Exception:                                # noqa: BLE001
+            resolved = root / expanded
+        return resolved, [resolved]
+
+    candidates = [directory / expanded
+                  for directory in _spice_kernel_dirs(root, env)]
+    cwd = Path.cwd() / expanded
+    if cwd not in candidates:
+        candidates.append(cwd)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate, candidates
+    return candidates[0], candidates
+
+
+def kernel_architecture(path):
+    """``(architecture, type)`` for a file, e.g. ``("DAF", "SPK")``.
+
+    SPICE's own ``getfat`` answers this, which is the point: the alternative
+    is guessing from the extension, and the committed metakernels are named
+    ``.tm`` while a hand-supplied one may be named anything. ``("?", "?")``
+    means the file is not a SPICE kernel at all; ``("", "")`` means the
+    question could not be asked.
+    """
+    try:
+        import spiceypy
+    except ImportError:                                  # pragma: no cover
+        return "", ""
+    try:
+        architecture, kind = spiceypy.getfat(str(path))
+    except Exception as exc:                             # noqa: BLE001
+        logger.info("[spk-coverage] getfat(%s) failed (%s)", path, exc)
+        return "", ""
+    return str(architecture), str(kind)
+
+
+#: A quoted kernel-pool string. SPICE writes an embedded apostrophe as two
+#: apostrophes, so a token body is "anything that is not a quote, or a doubled
+#: quote". `data/horizons_cache/bodies/269_Justitia_(A887_SA)` has parentheses
+#: in it and would survive a cruder pattern; a body with an apostrophe in its
+#: designation would not.
+#:
+#: Written in the unrolled form `[^']*(?:''[^']*)*` rather than the direct
+#: `(?:[^']|'')*`. The two accept exactly the same strings, but the direct form
+#: backtracks through an unterminated string: measured on 1 MB with a single
+#: opening quote, 0.201 s against 0.062 s, growing quadratically. See
+#: `_METAKERNEL_MAX_BYTES` for the bound that keeps either from being a hang.
+_KERNEL_POOL_STRING = re.compile(r"'([^']*(?:''[^']*)*)'")
+
+#: A metakernel is a list of file names. The committed ones are 446 to 1,309
+#: bytes and the generated ones are about 1 KB, so 4 MiB is four thousand times
+#: the real thing -- and it bounds both `read_text` and the quadratic term
+#: above (1 MB of pathological input parses in 0.201 s, measured 2026-08-27).
+#: Anything larger is not a metakernel and is refused rather than parsed.
+_METAKERNEL_MAX_BYTES = 4 * 1024 * 1024
+
+#: The start of a kernel-pool assignment -- `NAME = ...` or `NAME += ...`.
+#: The operator is captured because the two are not the same: `=` replaces.
+_KERNEL_POOL_ASSIGNMENT = re.compile(
+    r"^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*(\+?=)", re.MULTILINE)
+
+#: SPICE's string-continuation marker. A pool string ending in `+` is joined
+#: to the one after it, with the marker dropped. `SPKGenerator` emits every
+#: long path this way (`spk_generator.py:_continued_string_lines`) because a
+#: single pool string longer than about 99 characters is TRUNCATED rather than
+#: refused -- which is PTM-145, and which is why a parser that ignored this
+#: would resolve a deep OneDrive path to a shorter one that does not exist.
+_POOL_CONTINUATION = "+"
+
+
+def _join_pool_continuations(tokens):
+    """Fold SPICE `+` continuations in a list of pool strings."""
+    joined, pending = [], None
+    for token in tokens:
+        head = pending or ""
+        if token.endswith(_POOL_CONTINUATION):
+            pending = head + token[:-1]
+        else:
+            joined.append(head + token)
+            pending = None
+    if pending is not None:                  # a dangling '+': malformed, but
+        joined.append(pending)               # reported as a missing file, not
+    return joined                            # silently dropped
+
+
+def _kernel_pool_assignments(text):
+    """``{NAME: [string, ...]}`` for the ``\\begindata`` sections of a KPL file.
+
+    Only the data sections: everything a metakernel says between
+    ``\\begintext`` and the next ``\\begindata`` is prose, and the committed
+    metakernels' prose mentions the very file names being parsed for.
+    """
+    data, in_data = [], False
+    for line in str(text or "").splitlines():
+        marker = line.strip().lower()
+        if marker.startswith("\\begindata"):
+            in_data = True
+            continue
+        if marker.startswith("\\begintext"):
+            in_data = False
+            continue
+        if in_data:
+            data.append(line)
+    body = "\n".join(data)
+    out = {}
+    starts = list(_KERNEL_POOL_ASSIGNMENT.finditer(body))
+    for index, match in enumerate(starts):
+        stop = starts[index + 1].start() if index + 1 < len(starts) else len(body)
+        chunk = body[match.end():stop]
+        tokens = _join_pool_continuations(
+            [m.group(1).replace("''", "'")
+             for m in _KERNEL_POOL_STRING.finditer(chunk)])
+        name = match.group(1).upper()
+        # SPICE REPLACES on `=` and only appends on `+=`. Treating both as an
+        # append is not a harmless simplification: a hand-edited metakernel
+        # that re-declares PATH_VALUES to override a path would end up with
+        # ['old', 'new'], and `zip` would then pair the FIRST symbol with the
+        # stale value -- every member resolved under the wrong directory, and
+        # reported to the user as "not on disk".
+        if match.group(2) == "+=" and name in out:
+            out[name].extend(tokens)
+        else:
+            out[name] = tokens
+    return out
+
+
+class MetakernelMembers:
+    """What a text metakernel would load, worked out by READING it.
+
+    Parsed, never furnished. ``furnsh`` is global, permanent for the life of
+    the process, and would put a planetary ephemeris (de440s is 32 MB) into a
+    long-lived GUI's kernel pool every time somebody presses Check coverage --
+    and it would also need the working directory moved to the repository root,
+    because the committed metakernels' ``PATH_VALUES`` are relative to it. A
+    GUI process left ``chdir``-ed somewhere else is a file dialog that opens in
+    the wrong place and a relative output path that lands in the wrong tree,
+    so the parse route avoids both.
+
+    The four lists are kept apart because each is a DIFFERENT thing to tell
+    the user and a different thing to do about it -- and because any of them
+    being non-empty is fatal to the run, since ``furnsh`` signals an error on
+    the first member it cannot open rather than skipping it
+    (``illumination_model.cpp:5473``).
+    """
+
+    def __init__(self, kernels=(), missing=(), dataless=(), unresolved=(),
+                 error=""):
+        self.kernels = list(kernels)          # [(token, resolved Path)]
+        self.missing = list(missing)          # [(token, Path)]
+        self.dataless = list(dataless)        # [(token, Path)]
+        self.unresolved = list(unresolved)    # [token]
+        self.error = error
+        self._kinds = {}                      # str(path) -> (arch, type)
+
+    def _kind_of(self, path):
+        """``getfat``, memoized. Each answer costs a file open, and this is
+        asked once per member per query -- three queries on the normal path,
+        which on a metakernel naming thousands of kernels would be thousands
+        of opens on the GUI thread for one press of Check coverage."""
+        key = str(path)
+        if key not in self._kinds:
+            self._kinds[key] = kernel_architecture(path)
+        return self._kinds[key]
+
+    def of_type(self, architecture, kind):
+        """The resolved members whose ``getfat`` answer is this pair."""
+        return [path for _token, path in self.kernels
+                if self._kind_of(path) == (architecture, kind)]
+
+    def described(self):
+        """``[(name, "DAF/SPK"), ...]`` for every member that exists."""
+        out = []
+        for _token, path in self.kernels:
+            architecture, kind = self._kind_of(path)
+            out.append((path.name, f"{architecture}/{kind}"
+                        if architecture else "unreadable"))
+        return out
+
+
+def metakernel_members(mk_path, project_root=None):
+    """Resolve a KPL metakernel's ``KERNELS_TO_LOAD`` to paths on this disk.
+
+    ``$SYMBOL`` prefixes are substituted from ``PATH_SYMBOLS``/``PATH_VALUES``
+    by LONGEST match, which is what SPICE does and which matters as soon as
+    one symbol is a prefix of another. A member that is still relative after
+    substitution is resolved against the project root -- the convention the
+    committed metakernels state in their own prose ("Paths below are RELATIVE
+    to the repository root") -- rather than against the working directory,
+    which is what SPICE itself would use and which is exactly the thing a GUI
+    cannot rely on.
+
+    Never raises: it is reached from a Qt slot, where an escaping exception is
+    a ``qFatal`` and takes the window down with any unsaved edits.
+
+    A member naming a file OUTSIDE the project is resolved and looked at, the
+    same as SPICE would -- an absolute path is what every generated metakernel
+    uses, and the shared ``data/kernels`` tree is legitimately outside a body's
+    directory, so there is no boundary here to enforce. What bounds it instead
+    is what is done with the file: ``stat`` for existence, and ``getfat`` for
+    the first bytes of its header. Nothing else is opened, no contents are
+    read, and only a file that SPICE itself calls ``DAF/SPK`` is ever passed
+    to ``spkcov``.
+    """
+    path = Path(mk_path)
+    root = Path(project_root) if project_root else _default_project_root()
+    try:
+        size = path.stat().st_size
+        if size > _METAKERNEL_MAX_BYTES:
+            return MetakernelMembers(error=(
+                f"{path.name} is {size / (1024 * 1024):.1f} MB. A metakernel "
+                f"is a short list of file names -- the ones this project "
+                f"writes are about a kilobyte -- so this is not one, and it "
+                f"is not being parsed as one"))
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        return MetakernelMembers(error=f"{path.name} could not be read ({exc})")
+    pool = _kernel_pool_assignments(text)
+    values = pool.get("PATH_VALUES", [])
+    symbols = pool.get("PATH_SYMBOLS", [])
+
+    tokens = pool.get("KERNELS_TO_LOAD", [])
+    if not tokens:
+        return MetakernelMembers(error=(
+            f"{path.name} has no KERNELS_TO_LOAD entry, so it does not name "
+            f"any kernel to load"))
+    if len(symbols) != len(values):
+        # NOT a warning, and not "the surplus is ignored, as SPICE would":
+        # SPICE signals SPICE(PATHMISMATCH) -- "Number of path symbols is N;
+        # number of path values is M; counts must match" -- and loads NOTHING.
+        # A `zip` here would truncate silently and report a green window for a
+        # metakernel the run cannot open at all, which is the exact green-label
+        # failure this check exists to prevent. Measured with spiceypy.furnsh
+        # on a 3-value / 2-symbol fixture, 2026-08-27.
+        return MetakernelMembers(error=(
+            f"{path.name} declares {len(symbols)} PATH_SYMBOLS against "
+            f"{len(values)} PATH_VALUES. SPICE refuses a metakernel whose "
+            f"counts do not match (SPICE(PATHMISMATCH)) and loads none of its "
+            f"kernels, so this file would give the run no SPICE at all"))
+    table = {name: value for name, value in zip(symbols, values)}
+    # Longest first: with symbols BODY and BODYSHAPE defined, a token starting
+    # '$BODYSHAPE/...' must not be resolved as '$BODY' plus 'SHAPE/...'.
+    order = sorted(table, key=len, reverse=True)
+
+    kernels, missing, dataless, unresolved = [], [], [], []
+    for token in tokens:
+        resolved = token
+        if token.startswith("$"):
+            for name in order:
+                if token[1:].startswith(name):
+                    resolved = table[name] + token[1 + len(name):]
+                    break
+            else:
+                unresolved.append(token)
+                continue
+        if not str(resolved).strip():
+            # An empty pool string, or a dangling '+' continuation with
+            # nothing after it. `Path("")` is `.`, which joined to the project
+            # root is a DIRECTORY THAT EXISTS -- so without this guard a
+            # malformed metakernel is reported as a perfectly good one.
+            missing.append((token or "''", root / "<empty entry>"))
+            continue
+        try:
+            candidate = Path(resolved).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            present = candidate.is_file()
+            placeholder = present and _is_cloud_placeholder(candidate)
+        except (OSError, ValueError) as exc:
+            # A pool string can hold anything -- an embedded NUL raises
+            # ValueError out of `Path`, and a path longer than the file
+            # system's limit raises OSError out of `stat`. Neither may escape
+            # into a Qt slot.
+            logger.warning("[spk-coverage] %s: member %r could not be "
+                           "resolved (%s)", path.name, resolved[:80], exc)
+            missing.append((token, root / "<unusable path>"))
+            continue
+        if placeholder:
+            dataless.append((token, candidate))
+        elif present:
+            kernels.append((token, candidate))
+        else:
+            missing.append((token, candidate))
+    return MetakernelMembers(kernels, missing, dataless, unresolved)
+
+
+def _is_cloud_placeholder(path):
+    """True for an evicted OneDrive file. ``stat`` only -- never hydrates.
+
+    ``is_dataless`` asks "nonzero logical size, zero blocks", which a
+    DIRECTORY on APFS also answers yes to. Restricting the question to regular
+    files keeps a folder from being reported to the user as an evicted file --
+    measured on
+    ``13294_Rockox_(1998_QO105)/_corrupted_2026-07-03_20260703_174404``, which
+    is a directory.
+    """
+    try:
+        from gui_core.preflight import is_dataless
+    except ImportError:                                  # pragma: no cover
+        return False
+    try:
+        return bool(path.is_file()) and bool(is_dataless(path))
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _ensure_leapseconds(spiceypy, candidates=()):
     """Put a leapseconds kernel in the pool if there is not one. Never raises.
 
     ``spkcov`` reads the coverage as ephemeris seconds and needs NO kernel at
@@ -919,6 +1313,15 @@ def _ensure_leapseconds(spiceypy):
     the failure was not obvious earlier is that the SPK download itself always
     failed first.
 
+    ``candidates`` are tried before the shipped one, so a metakernel that
+    names its own leapseconds kernel is preferred over a guess at where
+    ``data/kernels`` is. It only has an effect on the FIRST call that finds
+    the pool empty: once any LSK is loaded, ``gdpool`` succeeds and this
+    returns immediately for the life of the process. That is deliberate --
+    re-furnishing per body would grow the pool on every press -- and it is
+    harmless, because two leapseconds kernels disagree by seconds where the
+    windows being compared are days wide.
+
     Returns the path furnished, "" if the pool already had time data, or None
     if no leapseconds kernel could be found -- in which case the caller reports
     UNKNOWN coverage, which is the honest answer and not a silent pass.
@@ -928,8 +1331,10 @@ def _ensure_leapseconds(spiceypy):
         return ""                                    # already usable
     except Exception:                                # noqa: BLE001
         pass
-    for candidate in (Path(__file__).resolve().parents[2] / "data" / "kernels"
-                      / "lsk" / "naif0012.tls",):
+    shipped = (_default_project_root() / "data" / "kernels" / "lsk"
+               / "naif0012.tls",)
+    for candidate in tuple(candidates) + shipped:
+        candidate = Path(candidate)
         if candidate.exists():
             try:
                 spiceypy.furnsh(str(candidate))
@@ -943,24 +1348,292 @@ def _ensure_leapseconds(spiceypy):
     return None
 
 
-def spk_coverage(spk_path, metakernel=None):
-    """Read an SPK's own coverage window with ``spkcov``.
+def _merge_intervals(intervals):
+    """Sorted, overlap-merged ``[(low, high), ...]``.
+
+    Two SPKs each holding one arc for the same body are ONE window when the
+    arcs touch, and two when they do not -- and the difference is the whole
+    point, because the engine's fallback engages epoch by epoch and would
+    serve a gap silently.
+    """
+    merged = []
+    for low, high in sorted(intervals):
+        if merged and low <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+        else:
+            merged.append((low, high))
+    return merged
+
+
+def _intersect_intervals(sets):
+    """The intervals covered by EVERY one of ``sets``.
+
+    Not ``max(low)..min(high)``: that is the intersection of the ENVELOPES,
+    and it reports a hole in one body's coverage as covered because another
+    body spans it. Each list is already sorted and merged.
+    """
+    if not sets:
+        return []
+    current = list(sets[0])
+    for other in sets[1:]:
+        common, i, j = [], 0, 0
+        while i < len(current) and j < len(other):
+            low = max(current[i][0], other[j][0])
+            high = min(current[i][1], other[j][1])
+            if low < high:
+                common.append((low, high))
+            if current[i][1] < other[j][1]:
+                i += 1
+            else:
+                j += 1
+        current = common
+        if not current:
+            break
+    return current
+
+
+def _spk_windows(spk_paths, spiceypy):
+    """``{body_id: [(low, high), ...]}`` across every SPK, in ET seconds."""
+    windows = {}
+    for spk in spk_paths:
+        ids = spiceypy.spkobj(str(spk))
+        for index in range(len(ids)):
+            body_id = int(ids[index])
+            cell = spiceypy.stypes.SPICEDOUBLE_CELL(2000)
+            spiceypy.spkcov(str(spk), body_id, cell)
+            for i in range(spiceypy.wncard(cell)):
+                low, high = spiceypy.wnfetd(cell, i)
+                windows.setdefault(body_id, []).append((low, high))
+    return {body_id: _merge_intervals(rows)
+            for body_id, rows in windows.items()}
+
+
+def _normalized_naif_id(naif_id):
+    """``(id, error)``. A blank id is not an error; an unparsable one is.
+
+    The trailing ``;`` is stripped, as ``body_config_writer.py:101`` and
+    ``body_fetch.py:597`` already do: HORIZONS returns small-body designations
+    that way, and ``body_lookup.py:438`` writes the field with a plain
+    ``strip()``, so one can reach here.
+    """
+    raw = str(naif_id if naif_id is not None else "").strip().rstrip("; ")
+    if not raw:
+        return None, ""
+    try:
+        return int(raw), ""
+    except ValueError:
+        return None, (f"generic_body.naif_id = {raw!r} is not an integer NAIF "
+                      f"ID, so coverage cannot be reported for one particular "
+                      f"body")
+
+
+def _coverage_from_windows(windows, naif_id, spiceypy, label):
+    """Turn ``{body: intervals}`` into a :class:`SpkCoverage`.
+
+    With a NAIF ID, the answer is that body's own window. WITHOUT one, the
+    answer is the window common to EVERY body present -- deliberately, and
+    deliberately conservative. A metakernel loads a planetary ephemeris
+    beside the target's arc, and ``de440s.bsp`` spans 1849 to 2150: taking the
+    min-to-max across all bodies, which is what the single-SPK path does and
+    what is right for a single-SPK file, would report a Justitia metakernel as
+    covering three centuries and pass every run window ever asked about. That
+    is the silent-fallback failure this check exists to prevent, wearing a
+    green label.
+    """
+    if not windows:
+        return SpkCoverage(False, detail=(
+            f"{label} declares bodies but no coverage intervals"))
+    if naif_id is not None:
+        rows = windows.get(naif_id)
+        if not rows:
+            present = ", ".join(str(b) for b in sorted(windows)[:12])
+            more = "" if len(windows) <= 12 else f", and {len(windows) - 12} more"
+            return SpkCoverage(False, detail=(
+                f"{label} carries no ephemeris for NAIF ID {naif_id}. The "
+                f"bodies it does carry are {present}{more}. Small-body IDs "
+                f"are 2000000 plus the asteroid number (Justitia, number 269, "
+                f"is 20000269 and not 2000269), so check "
+                f"generic_body.naif_id against the list above before "
+                f"trusting a SPICE run."), bodies=sorted(windows))
+        bodies = [naif_id]
+        detail = f"{label}, body {naif_id}"
+    else:
+        bodies = sorted(windows)
+        rows = _intersect_intervals([windows[body] for body in bodies])
+        detail = (f"{label}, {len(bodies)} bodies"
+                  if len(bodies) > 1 else f"{label}, body {bodies[0]}")
+        if len(bodies) > 1:
+            detail += " (window common to all)"
+        if not rows:
+            return SpkCoverage(False, detail=(
+                f"{label} has NO window covered by all {len(bodies)} of the "
+                f"bodies it carries, so no run window can be shown to be "
+                f"inside it. Set generic_body.naif_id so coverage is reported "
+                f"for the body this run is about."), bodies=bodies)
+    low, high = rows[0][0], rows[-1][1]
+    if len(rows) > 1:
+        detail += (f" -- WITH GAPS: the coverage is in {len(rows)} pieces, and "
+                   f"the span reported below is their outer envelope, so an "
+                   f"epoch inside it may still be uncovered")
+    return SpkCoverage(True, spiceypy.et2utc(low, "ISOC", 0),
+                       spiceypy.et2utc(high, "ISOC", 0),
+                       (high - low) / 86400.0,
+                       detail=detail, bodies=bodies,
+                       intervals=[(spiceypy.et2utc(a, "ISOC", 0),
+                                   spiceypy.et2utc(b, "ISOC", 0))
+                                  for a, b in rows])
+
+
+def _first_few(items, limit=3):
+    """``("a, b, c", ", and 4 more")`` -- a bounded list and its remainder.
+
+    A metakernel can name any number of kernels, and a message that pasted
+    all of them into a one-line note under a text field would be unreadable.
+    """
+    items = list(items)
+    tail = "" if len(items) <= limit else f", and {len(items) - limit} more"
+    return ", ".join(items[:limit]), tail
+
+
+def _lists_kernels_that(path, count):
+    """"<name> lists N kernel(s) that is/are", agreeing in number."""
+    return (f"{path.name} lists {count} "
+            f"kernel{'' if count == 1 else 's'} that "
+            f"{'is' if count == 1 else 'are'}")
+
+
+def _metakernel_coverage(path, naif_id, project_root, spiceypy):
+    """Coverage for a KPL metakernel, from the SPKs it would load.
+
+    Handing this file to ``spkobj`` is what used to happen, and SPICE answered
+    with ``SPICE(INVALIDARCHTYPE) -- ... has architecture KPL. The file must be
+    a binary SPK file to be readable by this routine``, six lines of banner and
+    a routine traceback, presented to the user as the reason their kernel was
+    no good. The kernel was fine. The reader was wrong about what it had.
+    """
+    members = metakernel_members(path, project_root)
+    if members.error:
+        return SpkCoverage(False, detail=(
+            f"{members.error}, so there is nothing to report coverage for. "
+            f"This is UNKNOWN coverage, not bad coverage."))
+    if members.dataless:
+        names, more = _first_few(str(p) for _t, p in members.dataless)
+        return SpkCoverage(False, detail=(
+            f"{_lists_kernels_that(path, len(members.dataless))} a cloud "
+            f"placeholder (dataless) rather than a real file on this disk: "
+            f"{names}{more}. Reading one here would hang the window while "
+            f"OneDrive hydrated it, and a run would stall the same way. Open "
+            f"the folder in Finder and choose 'Always Keep on This Device', "
+            f"then check again."))
+    if members.missing:
+        names, more = _first_few(f"{p} (from {t})" for t, p in members.missing)
+        return SpkCoverage(False, detail=(
+            f"{_lists_kernels_that(path, len(members.missing))} not on disk: "
+            f"{names}{more}. furnsh stops at the first member it cannot open, "
+            f"so this metakernel would give the run NO SPICE at all -- and "
+            f"the engine then serves every epoch from Keplerian elements "
+            f"without logging it. Fetch the missing kernel, or fix the path "
+            f"in the metakernel."))
+    if members.unresolved:
+        names, _more = _first_few(members.unresolved)
+        return SpkCoverage(False, detail=(
+            f"{path.name} refers to {names} but defines no such PATH_SYMBOLS "
+            f"entry, so that path cannot be resolved -- by this check or by "
+            f"SPICE. Add the symbol, or write the path out in full."))
+
+    spks = members.of_type("DAF", "SPK")
+    if not spks:
+        described = ", ".join(f"{name} [{kind}]"
+                              for name, kind in members.described()) or "none"
+        return SpkCoverage(False, detail=(
+            f"{path.name} is a SPICE metakernel and it loads no SPK at all. "
+            f"Its members are: {described}. There is no ephemeris here, so "
+            f"every epoch of the run would come from Keplerian elements, "
+            f"silently. Point this field at a metakernel that includes the "
+            f"body's .bsp/.spk, or at the kernel itself."))
+
+    normalized, id_error = _normalized_naif_id(naif_id)
+    if id_error:
+        return SpkCoverage(False, detail=(
+            f"{id_error}. {path.name} loads "
+            f"{', '.join(p.name for p in spks)}; correct the ID and check "
+            f"again."))
+    lsk = members.of_type("KPL", "LSK")
+    if _ensure_leapseconds(spiceypy, lsk) is None:
+        return SpkCoverage(False, detail=_no_leapseconds(path))
+    label = f"{path.name} -> {', '.join(p.name for p in spks)}"
+    return _coverage_from_windows(_spk_windows(spks, spiceypy),
+                                  normalized, spiceypy, label)
+
+
+#: What each KPL text-kernel type actually holds, for the message a user gets
+#: when they point the kernel field at one.
+_KPL_ROLE = {
+    "LSK": "leap seconds",
+    "PCK": "body orientation and shape constants",
+    "IK": "instrument parameters",
+    "FK": "reference-frame definitions",
+    "SCLK": "spacecraft clock coefficients",
+}
+
+
+def _no_leapseconds(path):
+    return (f"no leapseconds kernel is loaded and none was found at "
+            f"data/kernels/lsk/naif0012.tls, so {path.name}'s coverage "
+            f"cannot be converted to UTC and compared with the run "
+            f"window. The kernel itself may be perfectly good; this is "
+            f"UNKNOWN coverage, not bad coverage.")
+
+
+def spk_coverage(spk_path, metakernel=None, naif_id=None, project_root=None):
+    """Read a kernel's own coverage window -- binary SPK **or** text metakernel.
 
     Nothing in this repository has ever checked this -- ``grep -rn
     'spkcov|spkobj'`` over ``src/cpp``, ``src/python``, ``gui`` and ``scripts``
-    returned nothing before today. The cost is on the record: the committed
-    Justitia SPK covers 2034-10-12 to 2034-11-11, every SPICE-mode Justitia
-    configuration targets 2035-08-24 onward, and all fifteen ran entirely on
-    the silent Keplerian fallback.
+    returned nothing before 2026-08-27. The cost is on the record: the
+    committed Justitia SPK covered 2034-10-12 to 2034-11-11, every SPICE-mode
+    Justitia configuration targets 2035-08-24 onward, and all fifteen ran
+    entirely on the silent Keplerian fallback.
+
+    TWO file classes reach this function, because ``generic_body.
+    spice_metakernel`` is the field the card writes and the engine reads, and
+    what it holds is usually a ``.tm`` -- ``_spk_success`` writes the
+    metakernel path there whenever one could be written and the ``.spk`` only
+    as a fallback. Both are handled, and which one a file is is decided by
+    SPICE's own ``getfat`` rather than by its extension.
+
+    ``naif_id`` is what makes the metakernel answer meaningful: see
+    :func:`_coverage_from_windows` for why the union across a metakernel's
+    bodies would report three centuries of coverage for every asteroid.
+
+    ``metakernel`` no longer FURNISHES anything. It is now read for a
+    leapseconds kernel only -- see :class:`MetakernelMembers` for why a GUI
+    process must not accumulate a global kernel pool. No caller in this
+    repository passes it.
 
     Needs a leapseconds kernel to report the window as UTC; see
     :func:`_ensure_leapseconds` for why that was not obvious.
     """
-    path = Path(str(spk_path or "")).expanduser()
     if not str(spk_path or "").strip():
         return SpkCoverage(False, detail="no kernel selected")
+    path, candidates = _resolve_kernel_path(spk_path, project_root)
+    if _is_cloud_placeholder(path):
+        return SpkCoverage(False, detail=(
+            f"{path} is a cloud placeholder (dataless), not a file on this "
+            f"disk. Reading it here would hang the window while OneDrive "
+            f"hydrated it. Open its folder in Finder and choose 'Always Keep "
+            f"on This Device', then check again."))
     if not path.exists():
+        if len(candidates) > 1:
+            tried = "; ".join(str(c) for c in candidates)
+            return SpkCoverage(False, detail=(
+                f"{spk_path} is not on disk. It is a bare relative name, so "
+                f"it was looked for exactly where the engine looks: {tried}"))
         return SpkCoverage(False, detail=f"{path} is not on disk")
+    if path.is_dir():
+        return SpkCoverage(False, detail=(
+            f"{path} is a directory, not a kernel. Point this field at the "
+            f"body's .bsp/.spk, or at the metakernel that loads it."))
     try:
         import spiceypy
     except ImportError as exc:
@@ -970,36 +1643,71 @@ def spk_coverage(spk_path, metakernel=None):
             f"SPICE run: the engine falls back to Keplerian elements per "
             f"epoch and says nothing."))
     try:
-        if metakernel and Path(metakernel).exists():
-            spiceypy.furnsh(str(metakernel))
-        if _ensure_leapseconds(spiceypy) is None:
+        architecture, kind = kernel_architecture(path)
+        if (architecture, kind) == ("KPL", "MK"):
+            return _metakernel_coverage(path, naif_id, project_root, spiceypy)
+        if architecture == "KPL":
             return SpkCoverage(False, detail=(
-                f"no leapseconds kernel is loaded and none was found at "
-                f"data/kernels/lsk/naif0012.tls, so {path.name}'s coverage "
-                f"cannot be converted to UTC and compared with the run "
-                f"window. The kernel itself may be perfectly good; this is "
-                f"UNKNOWN coverage, not bad coverage."))
+                f"{path.name} is a SPICE text kernel of type {kind}, not an "
+                f"SPK and not a metakernel, so it carries no ephemeris and no "
+                f"coverage to report. {kind} kernels hold "
+                f"{_KPL_ROLE.get(kind, 'other kernel-pool data')}. Point this "
+                f"field at the body's .bsp/.spk, or at a metakernel that "
+                f"loads it."))
+        if architecture == "DAF" and kind != "SPK":
+            return SpkCoverage(False, detail=(
+                f"{path.name} is a binary SPICE kernel of type {kind}, not an "
+                f"SPK, so it carries no ephemeris and no coverage to report."))
+        if architecture == "?":
+            return SpkCoverage(False, detail=(
+                f"{path.name} is not a SPICE kernel -- SPICE does not "
+                f"recognize its architecture. Point this field at the body's "
+                f".bsp/.spk, or at a metakernel that loads it."))
+        if not architecture:
+            # spiceypy is importable but getfat could not answer. Fall through
+            # to the pre-2026-08-27 behavior -- try it as a binary SPK and let
+            # SPICE say why not -- rather than refusing on our own guess.
+            logger.info("[spk-coverage] %s: getfat gave no answer; trying it "
+                        "as a binary SPK", path)
+
+        # A binary SPK, read directly. `metakernel` is a leapseconds hint only.
+        hint = []
+        if metakernel:
+            hinted, _tried = _resolve_kernel_path(metakernel, project_root)
+            if hinted and hinted.exists():
+                hint = metakernel_members(hinted, project_root).of_type(
+                    "KPL", "LSK")
+        if _ensure_leapseconds(spiceypy, hint) is None:
+            return SpkCoverage(False, detail=_no_leapseconds(path))
         ids = spiceypy.spkobj(str(path))
-        body_ids = [int(ids[i]) for i in range(len(ids))]
-        if not body_ids:
+        if not len(ids):
             return SpkCoverage(False, detail=f"{path.name} declares no bodies")
-        starts, ends = [], []
-        for body_id in body_ids:
-            window = spiceypy.stypes.SPICEDOUBLE_CELL(2000)
-            spiceypy.spkcov(str(path), body_id, window)
-            for i in range(spiceypy.wncard(window)):
-                low, high = spiceypy.wnfetd(window, i)
-                starts.append(low)
-                ends.append(high)
-        if not starts:
+        windows = _spk_windows([path], spiceypy)
+        if not windows:
             return SpkCoverage(False, detail=(
                 f"{path.name} declares bodies but no coverage intervals"))
-        low, high = min(starts), max(ends)
-        start_utc = spiceypy.et2utc(low, "ISOC", 0)
-        end_utc = spiceypy.et2utc(high, "ISOC", 0)
-        return SpkCoverage(True, start_utc, end_utc,
+        normalized, id_error = _normalized_naif_id(naif_id)
+        if id_error:
+            return SpkCoverage(False, detail=f"{id_error}. Correct it and "
+                                             f"check again.")
+        if normalized is not None:
+            return _coverage_from_windows(windows, normalized, spiceypy,
+                                          path.name)
+        # No ID asked for: the historical answer, min-to-max over every body
+        # in this ONE file. A HORIZONS small-body SPK holds exactly one body,
+        # so for the path `fetch_spk` walks this is the same number it always
+        # was -- verified against a direct `spkcov` read on all eight cached
+        # kernels by `test_gui_spk_coverage.py`.
+        union = _merge_intervals(
+            [row for rows in windows.values() for row in rows])
+        low, high = union[0][0], union[-1][1]
+        return SpkCoverage(True, spiceypy.et2utc(low, "ISOC", 0),
+                           spiceypy.et2utc(high, "ISOC", 0),
                            (high - low) / 86400.0,
-                           detail=f"{path.name}", bodies=body_ids)
+                           detail=f"{path.name}", bodies=sorted(windows),
+                           intervals=[(spiceypy.et2utc(a, "ISOC", 0),
+                                       spiceypy.et2utc(b, "ISOC", 0))
+                                      for a, b in union])
     except Exception as exc:                              # noqa: BLE001
         return SpkCoverage(False, detail=(
             f"{path.name} could not be read by SPICE ({exc}). Treat this as "

@@ -1735,11 +1735,24 @@ class GenericBodyCard(BodyCard):
         UNKNOWN. Reporting "could not check" as "fine" is how fifteen runs
         completed on the silent per-epoch Keplerian fallback while recording
         SPICE, so an unanswerable question is answered as unanswerable.
+
+        The NAIF ID goes with the kernel path, and it is not optional detail.
+        This field usually holds a METAKERNEL, which loads a planetary
+        ephemeris (de440s spans 1849 to 2150) beside the target body's own
+        short arc; without an ID to report coverage FOR, the honest answer
+        would have to be the window common to every body in it. With the ID
+        the answer is about this asteroid, which is the question the card is
+        asking. The project root goes with it because the committed
+        metakernels are written with paths relative to the repository, not to
+        wherever the GUI happened to be launched from.
         """
         from gui_core.body_cards import run_window, spk_coverage
         kernel = str(self.config_manager.get_value(
             "generic_body.spice_metakernel", "") or "")
-        coverage = spk_coverage(kernel)
+        coverage = spk_coverage(
+            kernel,
+            naif_id=self.config_manager.get_value("generic_body.naif_id", ""),
+            project_root=self._project_root())
         if not coverage.available:
             self.coverage_note.setText(
                 f"Coverage UNKNOWN: {coverage.detail}. Unknown is not the same "
