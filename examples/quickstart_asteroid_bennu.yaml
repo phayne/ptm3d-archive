@@ -1,27 +1,33 @@
 # PTM3D quickstart: asteroid (101955) Bennu on its real SPICE ephemeris, with
-# its real DAMIT-class radar shape model, near the 2019-01-10 perihelion of
+# the OSIRIS-REx mission shape model, near the 2019-01-10 perihelion of
 # its orbit during the OSIRIS-REx proximity-operations era.
 #
 # Notebook counterpart of examples/quickstart_asteroid_diurnal.yaml (tutorial
 # 03, Keplerian orbit, fictional body). This config is that notebook's SPICE
 # counterpart: same generic-body thermal path, but the Sun-body vector comes
 # from a real ephemeris file instead of an analytic two-body propagation, and
-# the shape is Bennu's actual radar-derived facet model instead of a sphere.
+# the shape is Bennu's actual measured facet model instead of a sphere.
 # See docs/tutorials/notebooks/04_asteroid_spice.ipynb for the full walkthrough.
 #
-# CPU-only, laptop-friendly (2692-facet mesh, well under a minute measured on
-# an 8-thread run -- see the notebook's Provenance cell for the exact number).
+# CPU-only and laptop-friendly, on a 49,152-facet mesh.
 #
 # Run FROM THE REPOSITORY ROOT:
 #     ./build/bin/ptm_thermal_sim --config examples/quickstart_asteroid_bennu.yaml
 #
 # ---------------------------------------------------------------------------
-# Shape: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/bennu_radar_shape.obj
-# -- Nolan et al. (2013) radar+lightcurve shape model, archived at the PDS
-# Small Bodies Node (urn:nasa:pds:ast-bennu.radar.shape-model::1.1). 1348
-# vertices, 2692 facets, already in km, no decimation needed (see the file's
-# own header and the notebook's shape-sourcing section for the full citation
-# and the DAMIT-vs-PDS decision).
+# Shape: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/
+# g_06370mm_alt_obj_0000n00000_v021.obj -- the OSIRIS-REx global shape model,
+# OLA version 21, 6.37 m ground sample distance: 25,350 vertices, 49,152
+# facets, already in km, shipped byte for byte as the PDS Small Bodies Node
+# serves it (urn:nasa:pds:orex.altimetry:data_derived_altimetry_lidar_global_
+# models:g_06370mm_alt_obj_0000n00000_v021.obj). No decimation: the mission
+# publishes a resolution ladder and this is one of its rungs.
+#
+# The pre-encounter Nolan et al. (2013) radar model that this config used to
+# load is still in that directory as bennu_radar_shape.obj, archived, not on
+# any engine path. That directory's PROVENANCE.md carries the checksums, the
+# full citation, the closed-form mesh validation (volume, R_vol, watertightness,
+# frame) and the measured old-versus-new comparison.
 #
 # Ephemeris: data/kernels/spk/sb-101955-118_long.bsp, named by data/kernels/
 # bennu.tm and NOT in git -- fetch it with
@@ -106,8 +112,11 @@ generic_body:
   naif_id: '2101955'                   # read back from the SPK itself, not computed from 101955
   shape:
     type: custom_mesh
-    radius_km: 0.2447                  # mean radius of the shape model's own vertices
-    mesh_file: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/bennu_radar_shape.obj
+    radius_km: 0.2437                  # mean radius of the shape model's own vertices
+                                        # (0.243722 km measured over the 24,578 referenced
+                                        # vertices; load-bearing for CUSTOM_MESH -- it is the
+                                        # R_body the [mesh-units] guard cross-checks against)
+    mesh_file: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/g_06370mm_alt_obj_0000n00000_v021.obj
     mesh_scale: 1.0                    # already in km at the correct physical scale
   orbit:
     # Keplerian FALLBACK ONLY: the engine uses these elements if a requested

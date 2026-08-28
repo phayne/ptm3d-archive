@@ -65,6 +65,20 @@ import urllib.request
 FETCH_RETRIES = 5
 FETCH_RETRY_DELAY = 10  # seconds between attempts
 
+#: Sent on every request this module makes. NOT cosmetic, and not politeness.
+#: `urllib` otherwise identifies itself as `Python-urllib/3.x`, and the PDS
+#: Small Bodies Node at PSI rejects exactly that string with a flat HTTP 403 --
+#: measured 2026-08-28: curl carrying `Python-urllib/3.14` gets 403 while curl's
+#: own default gets 206, and urllib carrying any other agent gets 200. The
+#: failure is worse than a refusal, because `download` classes 403 as transient
+#: and retries it five times over 40 seconds while printing "transient failure",
+#: so a permanently blocked agent looks like a flaky network.
+#:
+#: An honest agent string with a contact URL is also what an archive asks for;
+#: NAIF and PSI both serve automated clients on that basis.
+USER_AGENT = ("PTM3D/1.0 (planetary thermophysical model; "
+              "https://github.com/phayne/ptm)")
+
 NAIF = "https://naif.jpl.nasa.gov/pub/naif/generic_kernels"
 
 # (subdir, filename, url, pinned sha256 or None)
@@ -148,7 +162,8 @@ def sha256_of(path):
 
 
 def remote_size(url):
-    req = urllib.request.Request(url, method="HEAD")
+    req = urllib.request.Request(url, method="HEAD",
+                                 headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=60) as resp:
         cl = resp.headers.get("Content-Length")
         return int(cl) if cl is not None else None
@@ -217,7 +232,7 @@ def _download_once(url, dest, expected_sha=None):
         os.remove(dest)
 
     offset = os.path.getsize(part) if os.path.exists(part) else 0
-    headers = {}
+    headers = {"User-Agent": USER_AGENT}
     mode = "wb"
     if offset and total and offset < total:
         headers["Range"] = f"bytes={offset}-"

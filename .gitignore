@@ -11,7 +11,23 @@ Makefile
 
 # Compiled object files
 *.o
+# `*.obj` is a C/C++ object-file rule that also matches every Wavefront OBJ
+# shape model in the tree (PTM-303). The curated body cache ships shape models
+# there, so they are excepted BY NAME rather than force-added: a force-add is
+# invisible to the next person, and the day someone re-adds one without -f it
+# would silently stop being tracked -- leaving a curated card that offers a
+# file no fresh checkout contains. No parent directory of these paths is
+# excluded, which is what makes the negations take effect.
+#
+# ONE LINE PER SHIPPED SHAPE, deliberately, rather than un-ignoring the whole
+# directory: scripts/fetch_data.py downloads OPTIONAL higher-resolution shape
+# models (bennu-shape-hires, 14 MB) into this same directory, and a directory
+# -wide negation would offer those to the next `git add -A`. Adding a curated
+# body is already a multi-file act (see gui/gui_core/curated_sources.py,
+# "Adding a body"); this is one more line of it.
 *.obj
+!data/horizons_cache/bodies/**/bennu_radar_shape.obj
+!data/horizons_cache/bodies/**/g_06370mm_alt_obj_0000n00000_v021.obj
 *.so
 *.dll
 *.dylib

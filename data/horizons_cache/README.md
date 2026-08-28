@@ -34,15 +34,27 @@ absolute paths as something you can follow, and do not hand a committed
 
 Bennu is the exception to both. It is not a Horizons-fetched entry at all — it
 has no `body_config.yaml`, no `metakernel.tm`, and no `index.json` record,
-because Horizons refuses to generate an SPK for it. Its directory holds two
-files that a fresh clone *can* use: the PDS radar shape model
-(`bennu_radar_shape.obj`), and `ephemeris.spk`, kept for provenance only.
+because Horizons refuses to generate an SPK for it. Its directory holds three
+files, only one of which a run loads:
 
-**`ephemeris.spk` is no longer what a Bennu run loads.** As of 2026-08-27
-`data/kernels/bennu.tm` loads `spk/sb-101955-118_long.bsp` instead, which
-`scripts/fetch_kernels.py` downloads. See
-`bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` for what the retained file is,
-what replaced it, and by how much the two differ.
+| file | status |
+|---|---|
+| `g_06370mm_alt_obj_0000n00000_v021.obj` | **live** — the OSIRIS-REx OLA v21 global shape model, 6.37 m sampling, 49,152 facets, km |
+| `bennu_radar_shape.obj` | archived — the pre-encounter Nolan et al. (2013) radar model, superseded 2026-08-28 |
+| `ephemeris.spk` | archived — JPL solution 76, superseded 2026-08-27 |
+
+**Neither archived file is on any engine path**, and both are kept deliberately:
+they are what earlier Bennu numbers from this repository were computed on, and
+`docs/tutorials/notebooks/04_asteroid_spice.ipynb` names both paths in its own
+cells. As of 2026-08-27 `data/kernels/bennu.tm` loads
+`spk/sb-101955-118_long.bsp`, which `scripts/fetch_kernels.py` downloads; as of
+2026-08-28 `examples/quickstart_asteroid_bennu.yaml` loads the OLA shape model.
+See `bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` for the checksums, the
+citations, the closed-form mesh validation and the measured differences.
+
+Note that the shape models are tracked despite `.gitignore`'s `*.obj` rule (a
+C/C++ object-file pattern that also matches every Wavefront shape model in the
+tree). They are excepted by name, not force-added — see that rule's comment.
 
 ## Regenerating a body locally
 
