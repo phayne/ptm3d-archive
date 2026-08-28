@@ -1175,7 +1175,7 @@ class GenericBodyCard(BodyCard):
             self._mirror_body_name)
         # The curated banner follows the name, so a user who types "Bennu"
         # sees what this body is served from BEFORE they press a button
-        # labelled for a service that will refuse them. A registry lookup and
+        # labeled for a service that will refuse them. A registry lookup and
         # two stat calls; the pinned-kernel table itself is memoized on its
         # own mtime, so this is not a file exec per keystroke.
         self.widgets["generic_body.name"].textChanged.connect(

@@ -529,7 +529,7 @@ def test_a_missing_curated_kernel_is_an_offer_and_downloads_nothing():
             "outside the window")
         assert "retried up to five times" in result.offer, (
             "the offer does not say how long a bad network can hold the "
-            "window, and the download cannot be cancelled from there")
+            "window, and the download cannot be canceled from there")
         assert not result.values, "an offer wrote values into the card"
         # The one file that was missing, and only that one: `de440s.bsp` is
         # legitimately in this same directory because the fixture put it there.

@@ -467,7 +467,7 @@ def _curated_spk(entry, project_root, name, naif_id, earliest, latest, note,
                        f"pinned files with recorded sha256 values, not a "
                        f"HORIZONS request. A slow or flaky network is "
                        f"retried up to five times with ten seconds between "
-                       f"attempts and cannot be cancelled from here, so it "
+                       f"attempts and cannot be canceled from here, so it "
                        f"may take several minutes; the same download runs "
                        f"outside this window as `{command}`."),
                 offer_bytes=status.download_bytes,
@@ -606,7 +606,7 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
     ``curated_download`` is the consent. With it False (the default) a curated
     body whose kernel is missing gets an OFFER naming the size and the command,
     and nothing is downloaded; the card asks, and calls again with it True.
-    Downloading 80 MB because somebody pressed a button labelled "fetch
+    Downloading 80 MB because somebody pressed a button labeled "fetch
     kernel" would be a surprise measured in minutes.
     """
     name = str(name or "").strip()
