@@ -133,8 +133,14 @@ _BUILD_REMEDY = (
 )
 
 #: SPICE kernel subtrees that only the Galilean-system runs need. Everything
-#: else under ``data/kernels`` comes with the Moon/Mercury core set.
+#: else under ``data/kernels`` comes with the Moon/Mercury core set, except the
+#: Bennu entries below.
 _EUROPA_KERNELS = ("spk/jup365.bsp", "europa.tm")
+
+#: The same, for (101955) Bennu. ``--bodies moon`` does NOT fetch these, so a
+#: remedy that named it would send the reader back for a second failure on the
+#: same missing file.
+_BENNU_KERNELS = ("spk/sb-101955-118_long.bsp", "bennu.tm")
 
 
 _MANIFEST_CACHE = {}
@@ -194,8 +200,16 @@ def remedy_for(path, root=None):
         return _BUILD_REMEDY
     if relative.startswith("data/kernels"):
         tail = relative[len("data/kernels/"):]
-        bodies = "europa" if any(tail.startswith(k) or tail == k
-                                 for k in _EUROPA_KERNELS) else "moon"
+
+        def _matches(names):
+            return any(tail.startswith(k) or tail == k for k in names)
+
+        if _matches(_EUROPA_KERNELS):
+            bodies = "europa"
+        elif _matches(_BENNU_KERNELS):
+            bodies = "bennu"
+        else:
+            bodies = "moon"
         return f"python3 scripts/fetch_kernels.py --bodies {bodies}"
     for directory, dataset in sorted(_dataset_remedies(root).items(),
                                      key=lambda kv: -len(kv[0])):

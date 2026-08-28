@@ -66,6 +66,36 @@ site-local flagship arms are still 2026-08-15's, unre-run.
 ~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json
 ```
 
+One arm of that bank has since been superseded on its own, by a data change
+rather than a code change:
+
+```
+~/projects/bennu_spk_2026-08-27/bank/baseline_manifest_bennu_sb118_2026-08-27.json
+~/projects/bennu_spk_2026-08-27/bank/baseline_manifest_bennu_sb118_archnative_2026-08-27.json
+```
+
+**`asteroid_bennu_spice_cpu`, 2026-08-27, re-banked for the ephemeris upgrade.**
+Bennu's shipped kernel moved from JPL solution 76 (2013; `data/horizons_cache/
+bodies/101955_Bennu_(1999_RQ36)/ephemeris.spk`, coverage 2015-01-01 to
+2023-05-31) to solution 118 long-span (`data/kernels/spk/
+sb-101955-118_long.bsp`, fetched, coverage 1900-01-01 to 2135-10-01,
+`https://ssd.jpl.nasa.gov/ftp/xfr/sb-101955-118_long.bsp`, sha256
+`2e25094e…a5c3b48f`), so that a present-day start date is inside coverage
+instead of silently reaching the Keplerian fallback. Both re-banks ran on the
+**same two binaries** as the manifests they supersede (`PTM_ARCH_NATIVE=OFF`
+md5 `9d657590009ade0c0d8f2d07d2faa7a2`, `ON` md5
+`59c9f743efe25c26ae0660f566d5173b`, both `51bf1688b0`), so the movement is the
+kernel and nothing else: **7 of 16 files, at most 2.14e-4 K** on
+`temperature_max` and 2.44e-4 W/m² on `direct_solar_max`, one to a few float32
+ULP — the same magnitude in both ISA settings; `primary_ir`,
+`primary_reflected` and `effective_albedo` are exactly zero. The two kernels
+differ by at most 31.97 km over their common 2015–2023 window (`spkdiff`, 1000
+samples). Both old manifests are **untouched** and their other six arms each
+remain current; the `_gpu` manifest does not carry this arm at all, so it
+needed no re-bank. Before each re-bank the old kernel was re-run on the same
+binary and reproduced the superseded digests 16/16, so these numbers are the
+kernel's and not the harness's.
+
 The CPU arms are banked **twice**, because **`PTM_ARCH_NATIVE` is part of the
 baseline and nobody had recorded it** (section 6). The first manifest is the
 documented onboarding and CI configuration, `PTM_ARCH_NATIVE=OFF`; the second is

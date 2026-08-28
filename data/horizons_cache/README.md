@@ -11,10 +11,10 @@ and updates it; a body that is not in the cache is fetched on first use.
 
 ## What is checked into git, and what it is for
 
-Three bodies are committed — 269 Justitia, 623 Chimaera, 13294 Rockox. They are
-here as **provenance for published small-body runs**, so the orbit and spin
-elements those runs used can be inspected. They are **not runnable inputs on a
-fresh clone**, for two independent reasons:
+Four bodies are committed — 269 Justitia, 623 Chimaera, 13294 Rockox, and
+101955 Bennu. They are here as **provenance for published small-body runs**, so
+the orbit and spin elements those runs used can be inspected. They are **not
+runnable inputs on a fresh clone**, for two independent reasons:
 
 1. **The shape meshes are not distributed.** Each `body_config.yaml` points at a
    `shape*.obj` (for example `shape_refined.obj`) that `.gitignore` excludes.
@@ -31,6 +31,18 @@ run re-queries Horizons and rewrites the entry with paths valid for *your*
 machine. Nothing silently uses a wrong ephemeris. But do not read the committed
 absolute paths as something you can follow, and do not hand a committed
 `metakernel.tm` to SPICE directly — regenerate it.
+
+Bennu is the exception to both. It is not a Horizons-fetched entry at all — it
+has no `body_config.yaml`, no `metakernel.tm`, and no `index.json` record,
+because Horizons refuses to generate an SPK for it. Its directory holds two
+files that a fresh clone *can* use: the PDS radar shape model
+(`bennu_radar_shape.obj`), and `ephemeris.spk`, kept for provenance only.
+
+**`ephemeris.spk` is no longer what a Bennu run loads.** As of 2026-08-27
+`data/kernels/bennu.tm` loads `spk/sb-101955-118_long.bsp` instead, which
+`scripts/fetch_kernels.py` downloads. See
+`bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` for what the retained file is,
+what replaced it, and by how much the two differ.
 
 ## Regenerating a body locally
 

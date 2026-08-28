@@ -19,19 +19,21 @@ directory). See INSTALL.md, section "SPICE kernel data".
 Core download set (Moon + Mercury capable, ~44 MB):
     naif0012.tls, pck00011.tpc, de440s.bsp, moon_pa_de440_200625.bpc,
     moon_de440_250416.tf
-The Galilean ephemeris jup365.bsp (Jupiter/Europa position, 1.1 GB) is the
-extra that europa.tm requires. Because europa.tm ships with the repository,
-the DEFAULT (--bodies auto) download is therefore ~1.15 GB, not ~44 MB; pass
---bodies moon for the Moon/Mercury core alone.
+Two body-specific extras exist: the Galilean ephemeris jup365.bsp
+(Jupiter/Europa position, 1.1 GB) that europa.tm requires, and Bennu's
+sb-101955-118_long.bsp (80.7 MB) that bennu.tm requires. Both metakernels ship
+with the repository, so the DEFAULT (--bodies auto) download is ~1.23 GB, not
+~44 MB; pass --bodies moon for the Moon/Mercury core alone.
 
-By default (--bodies auto) the script fetches the core set and, when europa.tm
-is present in the kernel directory, ALSO fetches jup365.bsp — so a bare
-`python3 scripts/fetch_kernels.py` pulls exactly what the installed metakernels
-need. This matters because the engine's "missing kernel" errors tell the user
-to run that bare command, and a Europa config ships europa.tm whose jup365.bsp
-dependency the Moon-only default would otherwise omit (leaving the run to fail
-on the same missing kernel again). Pass --bodies moon/europa/all to force a set
-regardless of which .tm files are present.
+By default (--bodies auto) the script fetches the core set and, for each
+metakernel present in the kernel directory, the body kernel that metakernel
+names — so a bare `python3 scripts/fetch_kernels.py` pulls exactly what the
+installed metakernels need. This matters because the engine's "missing kernel"
+errors tell the user to run that bare command, and the Europa and Bennu configs
+ship metakernels whose body-kernel dependencies the Moon-only default would
+otherwise omit (leaving the run to fail on the same missing kernel again). Pass
+--bodies moon/europa/bennu/all to force a set regardless of which .tm files are
+present.
 
 Downloads are resumable: an interrupted transfer leaves a .part file that is
 continued with an HTTP Range request on the next run; completed files whose
@@ -39,9 +41,10 @@ size matches the server's are skipped. SHA-256 of every completed file is
 printed (and checked against a pinned value where one is recorded below).
 
 Usage:
-    python3 scripts/fetch_kernels.py                 # auto: core + Galilean if europa.tm present
+    python3 scripts/fetch_kernels.py                 # auto: core + whatever the .tm files name
     python3 scripts/fetch_kernels.py --bodies moon   # force Moon/Mercury core only
     python3 scripts/fetch_kernels.py --bodies europa # force core + Galilean ephemeris
+    python3 scripts/fetch_kernels.py --bodies bennu  # force core + Bennu ephemeris
     python3 scripts/fetch_kernels.py --bodies all
     python3 scripts/fetch_kernels.py --dest /path/to/kernels
 """
@@ -86,6 +89,31 @@ KERNELS_EUROPA = [
     ("spk", "jup365.bsp", f"{NAIF}/spk/satellites/jup365.bsp", None),
 ]
 
+# (101955) Bennu's heliocentric ephemeris, for bennu.tm.
+#
+# JPL small-body solution 118 (Farnocchia et al. 2021, the final OSIRIS-REx
+# reconstruction), long-span variant: body 2101955 w.r.t. the Sun over
+# 1900-01-01 to 2135-10-01. 80.7 MB.
+#
+# This is the URL JPL Horizons itself prints when it declines to generate a
+# Bennu SPK on demand: Bennu's Horizons record is *SPECIAL*, sourced from
+# ORX_merged, and answers "SPK creation is not available for pre-computed
+# objects in the major body index". NAIF's own copy of solution 118
+# (pub/naif/ORX/kernels/spk/sb-101955-118.bsp) covers only 2015-2023 and so
+# cannot serve a present-day run; measured against this file over that
+# overlap the two agree to 0.4 mm.
+#
+# UNLIKE the NAIF entries above, /ftp/xfr/ is a transfer directory, not a
+# versioned archive path, so this filename is not documented as immutable. The
+# pinned hash is therefore load-bearing in a second way: a mismatch may mean
+# JPL published a different file under the same name.
+SSD_XFR = "https://ssd.jpl.nasa.gov/ftp/xfr"
+
+KERNELS_BENNU = [
+    ("spk", "sb-101955-118_long.bsp", f"{SSD_XFR}/sb-101955-118_long.bsp",
+     "2e25094e62542f388071b43e6f7b794024ca3fa4e399306976ac62a1a5c3b48f"),
+]
+
 
 def human(nbytes):
     for unit in ("B", "KB", "MB", "GB"):
@@ -109,18 +137,43 @@ def remote_size(url):
         return int(cl) if cl is not None else None
 
 
+class ChecksumMismatch(Exception):
+    """A complete file whose sha256 is not the pinned one.
+
+    Distinct from every other failure here because it is NOT transient: the
+    bytes are already on disk, and _download_once's "already present —
+    skipping download" short-circuit means a retry re-hashes the same bytes
+    and fails identically. Retrying it burns the delay four times over an
+    80 MB file and reports "transient failure", which is the opposite of true.
+    """
+
+
 def download(url, dest, expected_sha=None,
              retries=FETCH_RETRIES, delay=FETCH_RETRY_DELAY):
     """Download url -> dest with bounded retry on transient network failure.
 
     Wraps _download_once, which already resumes from a .part file, so each
-    retry continues where the last left off rather than starting over. The
-    pinned-sha256 verification inside _download_once is untouched; a corrupt
-    or changed file still fails, just after the retries are exhausted.
+    retry continues where the last left off rather than starting over.
+
+    A pinned-sha256 mismatch is terminal, not retried: see ChecksumMismatch.
+    The bad file is moved aside rather than deleted (an 80 MB re-download is
+    not free, and the bytes are the evidence) and rather than left in place
+    (where the next run would skip the download and fail the same way).
     """
     for attempt in range(1, retries + 1):
-        if _download_once(url, dest, expected_sha):
-            return True
+        try:
+            if _download_once(url, dest, expected_sha):
+                return True
+        except ChecksumMismatch:
+            kept = dest + ".sha256-mismatch"
+            try:
+                os.replace(dest, kept)
+                print(f"  the file that failed is kept at {kept}")
+            except OSError as e:
+                print(f"  WARNING: could not move the failed file aside: {e}")
+            print(f"  NOT RETRYING {url}: what failed is the checksum, not "
+                  f"the transfer.")
+            return False
         if attempt < retries:
             print(f"  retry {attempt}/{retries - 1} in {delay}s "
                   f"(transient failure fetching {url})")
@@ -195,9 +248,13 @@ def verify(dest, expected_sha):
     print(f"  {os.path.basename(dest)}: {human(size)}  sha256={digest}")
     if expected_sha and digest != expected_sha:
         print(f"  ERROR: sha256 mismatch (expected {expected_sha}).")
-        print("  The file is corrupt or NAIF changed a supposedly immutable file.")
-        print(f"  Delete {dest} and re-run; if it persists, report an issue.")
-        return False
+        print("  The file is corrupt, or the provider replaced it: NAIF's "
+              "versioned filenames are")
+        print("  documented as immutable, but JPL's /ftp/xfr/ transfer area "
+              "(Bennu) is not.")
+        print(f"  Re-run to fetch it again; if the same digest comes back "
+              f"twice, the file changed at the source.")
+        raise ChecksumMismatch(dest)
     return True
 
 
@@ -205,14 +262,15 @@ def select_kernels(bodies, dest):
     """Return the kernels to fetch for the requested --bodies mode.
 
     bodies == "auto" (the default): the core set, plus the Galilean ephemeris
-    (jup365.bsp) when europa.tm is present in `dest` -- i.e. fetch exactly what
-    the installed metakernels require. This lets a bare invocation satisfy a
-    Europa config (which ships europa.tm) without the user having to know to add
-    --bodies europa; otherwise the run fails again on the same missing kernel.
-    The auto-addition is announced, never silent.
+    (jup365.bsp) when europa.tm is present in `dest`, plus Bennu's ephemeris
+    when bennu.tm is present -- i.e. fetch exactly what the installed
+    metakernels require. This lets a bare invocation satisfy a Europa or a
+    Bennu config (both metakernels ship) without the user having to know to add
+    --bodies europa/bennu; otherwise the run fails again on the same missing
+    kernel. Each auto-addition is announced, never silent.
 
-    An explicit bodies value (moon/europa/all) forces that set regardless of
-    which .tm files are present.
+    An explicit bodies value (moon/europa/bennu/all) forces that set regardless
+    of which .tm files are present.
     """
     kernels = list(KERNELS_CORE)
     if bodies in ("europa", "all"):
@@ -221,6 +279,12 @@ def select_kernels(bodies, dest):
         print("europa.tm present in kernel directory -> also fetching the "
               "Galilean ephemeris jup365.bsp (europa.tm requires it).")
         kernels += KERNELS_EUROPA
+    if bodies in ("bennu", "all"):
+        kernels += KERNELS_BENNU
+    elif bodies == "auto" and os.path.exists(os.path.join(dest, "bennu.tm")):
+        print("bennu.tm present in kernel directory -> also fetching Bennu's "
+              "ephemeris sb-101955-118_long.bsp (bennu.tm requires it).")
+        kernels += KERNELS_BENNU
     return kernels
 
 
@@ -230,10 +294,12 @@ def main():
     ap.add_argument("--dest", default=os.path.join(repo_root, "data", "kernels"),
                     help="kernel directory (default: <repo>/data/kernels)")
     ap.add_argument("--bodies", default="auto",
-                    choices=["auto", "moon", "europa", "all"],
-                    help="auto (default) = core set + Galilean ephemeris when "
-                         "europa.tm is present; moon = core only; europa/all "
-                         "add jup365.bsp unconditionally")
+                    choices=["auto", "moon", "europa", "bennu", "all"],
+                    help="auto (default) = core set, plus the Galilean "
+                         "ephemeris when europa.tm is present and Bennu's when "
+                         "bennu.tm is present; moon = core only; europa adds "
+                         "jup365.bsp, bennu adds sb-101955-118_long.bsp, all "
+                         "adds both -- unconditionally")
     args = ap.parse_args()
 
     kernels = select_kernels(args.bodies, args.dest)
@@ -247,7 +313,7 @@ def main():
         print(f"[{subdir}/{name}] <- {url}")
         ok = download(url, dest, sha) and ok
 
-    tm_present = [f for f in ("moon.tm", "europa.tm", "mercury.tm")
+    tm_present = [f for f in ("moon.tm", "europa.tm", "mercury.tm", "bennu.tm")
                   if os.path.exists(os.path.join(args.dest, f))]
     print()
     print(f"Metakernels present in {args.dest}: {', '.join(tm_present) or 'NONE'}")
@@ -263,6 +329,16 @@ def main():
               "Europa simulation will fail with an unresolved-kernel error.\n"
               "         Fetch it with:  python3 scripts/fetch_kernels.py "
               "--bodies europa")
+    # Same gap, same reasoning, for Bennu: bennu.tm names the body SPK, and a
+    # Bennu run without it stops on SPICE(NOSUCHFILE) rather than substituting
+    # anything. Say so here instead of letting the run be the messenger.
+    if "bennu.tm" in tm_present and not os.path.exists(
+            os.path.join(args.dest, "spk", "sb-101955-118_long.bsp")):
+        print("WARNING: bennu.tm is present but spk/sb-101955-118_long.bsp is "
+              "missing — a Bennu simulation will fail with an "
+              "unresolved-kernel error.\n"
+              "         Fetch it with:  python3 scripts/fetch_kernels.py "
+              "--bodies bennu")
     print("NOTE: the shipped metakernels use repo-root-relative paths "
           "(PATH_VALUES = 'data/kernels'); run ptm_thermal_sim from the "
           "repository root, or edit PATH_VALUES to an absolute path.")

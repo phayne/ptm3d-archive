@@ -23,14 +23,22 @@
 # own header and the notebook's shape-sourcing section for the full citation
 # and the DAMIT-vs-PDS decision).
 #
-# Ephemeris: data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/ephemeris.spk
-# -- the OSIRIS-REx navigation team's own archived Bennu SPK (NAIF/PDS mission
-# archive), not a Horizons-generated file -- Horizons' small-body SPK service
-# declines ad hoc SPK generation for Bennu (see the notebook and the
-# metakernel's own header comment for the exact server message and the
-# fallback path). Coverage 2014-12-31 to 2023-05-30; 2019-01-10 is real
-# perihelion (r=0.897 AU) within that window, found by scanning the SPK, not
-# assumed from a catalog.
+# Ephemeris: data/kernels/spk/sb-101955-118_long.bsp, named by data/kernels/
+# bennu.tm and NOT in git -- fetch it with
+#     python3 scripts/fetch_kernels.py --bodies bennu
+# (the bare command does it too). JPL solution 118, the final OSIRIS-REx
+# reconstruction (Farnocchia et al. 2021), covering 1900-01-01 to 2135-10-01,
+# so a present-day start date is inside coverage. Not a Horizons-generated
+# file: Horizons declines ad hoc SPK generation for Bennu, and the URL above
+# is the one its refusal message prints. See the metakernel's own header for
+# the URL, checksum and the full provenance.
+#
+# 2019-01-10 is real perihelion (r=0.897 AU), found by scanning the SPK, not
+# assumed from a catalog. This config used to run on solution 76 (2013,
+# coverage 2015-2023), still in the repository as data/horizons_cache/bodies/
+# 101955_Bennu_(1999_RQ36)/ephemeris.spk; on this window the two solutions
+# differ by at most 13.9 km, worth 2.1e-4 K here. See that directory's
+# PROVENANCE.md.
 #
 # Spin: period 4.29746 h (Hergenrother et al. 2013, same PDS archive as the
 # shape); pole (ecliptic lambda=45 deg, beta=-88 deg -> equatorial
@@ -103,9 +111,16 @@ generic_body:
     mesh_scale: 1.0                    # already in km at the correct physical scale
   orbit:
     # Keplerian FALLBACK ONLY: the engine uses these elements if a requested
-    # epoch falls outside ephemeris.spk's coverage (illumination_model.cpp,
+    # epoch falls outside the loaded SPK's coverage (illumination_model.cpp,
     # getSunPosition) -- not used for any epoch inside this tutorial's window,
     # included so the fallback is well-defined rather than a zero orbit.
+    #
+    # That fallback is SILENT: the banner still says "Ephemeris: SPICE" and the
+    # run still exits 0. It is also a poor substitute this far from the
+    # element epoch below -- measured at 2026-01-01 against the real ephemeris,
+    # 0.092 AU in heliocentric distance, 23.5 deg in solar direction and up to
+    # 23.9 K in surface temperature. The 1900-2135 kernel keeps any plausible
+    # start date inside coverage, which is why it is the one this config uses.
     semi_major_axis_au: 1.128922045323413
     eccentricity: 0.2046513239154546
     inclination_deg: 6.025539444076259
