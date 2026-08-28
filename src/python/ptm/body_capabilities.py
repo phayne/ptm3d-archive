@@ -53,8 +53,8 @@ from pathlib import Path
 
 from .body_table import (ALBEDO_BINARY_PATTERN, ALBEDO_FITS_PATTERNS,
                          ALBEDO_MAP_RESOLUTIONS, BODY_CAPABILITIES,
-                         CAPABILITY_FIELDS, IMPLEMENTED_BODIES,
-                         TOPOGRAPHY_PATTERNS)
+                         CAPABILITY_FIELDS, GENERIC_BODY_SURFACE_DEFAULTS,
+                         IMPLEMENTED_BODIES, TOPOGRAPHY_PATTERNS)
 
 __all__ = [
     "ALBEDO_BINARY_PATTERN",
@@ -62,12 +62,15 @@ __all__ = [
     "ALBEDO_MAP_RESOLUTIONS",
     "BODY_CAPABILITIES",
     "CAPABILITY_FIELDS",
+    "GENERIC_BODY_SURFACE_DEFAULTS",
+    "GENERIC_SURFACE_FIELDS",
     "IMPLEMENTED_BODIES",
     "TOPOGRAPHY_PATTERNS",
     "albedo_map_status",
     "capability_for",
     "is_implemented",
     "parse_body_capabilities",
+    "parse_generic_body_defaults",
     "solar_day_days",
     "topography_status",
 ]
@@ -75,6 +78,12 @@ __all__ = [
 _HEADER = "src/cpp/thermal/planetary_properties.h"
 _ALBEDO = "src/cpp/maps/albedo_manager.cpp"
 _MESH = "src/cpp/mesh/mesh_utils.cpp"
+_GENERIC = "src/cpp/orbital/generic_body.h"
+_SIM = "src/cpp/main/ptm_thermal_sim.cpp"
+
+#: The `generic_body.surface.*` keys, in the order the card shows them.
+GENERIC_SURFACE_FIELDS = ("albedo", "emissivity", "ks", "kd", "rhos", "rhod",
+                          "H", "cp0", "Qb", "chi")
 
 _SECONDS_PER_DAY = 24.0 * 3600.0
 
@@ -228,11 +237,11 @@ def _eval_cxx_number(expr, symbols):
     return walk(tree)
 
 
-def _function_body(text, name):
+def _function_body(text, name, source=_HEADER):
     """The braced body of ``static ThermophysicalProperties <name>() { ... }``."""
     match = re.search(r"\b" + re.escape(name) + r"\s*\(\s*\)\s*\{", text)
     if match is None:
-        raise ValueError(f"{_HEADER}: no function {name}()")
+        raise ValueError(f"{source}: no function {name}()")
     start = match.end() - 1
     depth = 0
     for i in range(start, len(text)):
@@ -242,7 +251,7 @@ def _function_body(text, name):
             depth -= 1
             if depth == 0:
                 return text[start + 1:i]
-    raise ValueError(f"{_HEADER}: {name}() is not brace-balanced")
+    raise ValueError(f"{source}: {name}() is not brace-balanced")
 
 
 _SCALAR_FIELDS = ("day", "year", "rAU", "S", "albedo", "emissivity", "Qb",
@@ -285,6 +294,62 @@ def _parse_one_body(body_text):
         out["year_days"] = _round_sig(out.pop("year") / _SECONDS_PER_DAY)
     if "body_radius_km" in out:
         out["radius_km"] = out.pop("body_radius_km")
+    return out
+
+
+def parse_generic_body_defaults(repo_root):
+    """The engine's own surface properties for a body it has no table for.
+
+    ``{field: value}`` over :data:`GENERIC_SURFACE_FIELDS`, read from the two
+    places the engine keeps them:
+
+    * ``GenericBody::defaultRockyAsteroid()`` (``generic_body.h``) for the nine
+      ``thermo`` values. This is not a suggestion the parser applies when the
+      YAML is silent -- ``ptm_thermal_sim.cpp:14759`` starts EVERY generic body
+      from this struct and then overwrites only the fields the configuration
+      gives a positive value for. A generic-body run with no
+      ``generic_body.surface:`` block is a run on exactly these numbers.
+    * ``chi``, which is not in that struct: the solver takes
+      ``(chi_override >= 0) ? chi_override : 2.7`` (``ptm_thermal_sim.cpp``,
+      Hayne et al. 2017), so the default is a literal at the forwarding site
+      and is read from there rather than copied.
+
+    Why this is worth parsing rather than typing: the asteroid card left every
+    one of these blank, so a user either ran on values they never saw or, as on
+    2026-08-28, typed their own guesses in to make the card stop complaining.
+    Seeding the card from a hand-copied table would have made the GUI's idea of
+    "the default" drift away from the engine's the first time either moved.
+    """
+    root = Path(repo_root)
+    generic = _strip_comments((root / _GENERIC).read_text())
+    body = _function_body(generic, "defaultRockyAsteroid", source=_GENERIC)
+
+    symbols = {}
+    for name, expr in re.findall(
+            r"constexpr\s+double\s+(\w+)\s*=\s*([^;]+);", body):
+        symbols[name] = _eval_cxx_number(expr, symbols)
+
+    out = {}
+    for field in GENERIC_SURFACE_FIELDS:
+        matches = re.findall(
+            r"body\.thermo\." + field + r"\s*=\s*([^;]+);", body)
+        if matches:
+            out[field] = _eval_cxx_number(matches[-1], symbols)
+
+    sim = _strip_comments((root / _SIM).read_text())
+    chi = re.search(
+        r"chi_override\s*>=\s*0\s*\)\s*\?\s*chi_override\s*:\s*([0-9.]+)", sim)
+    if chi is None:
+        raise ValueError(
+            f"{_SIM}: no `(chi_override >= 0) ? chi_override : <default>` "
+            f"expression; the generic-body chi default would be invented")
+    out["chi"] = float(chi.group(1))
+
+    missing = [f for f in GENERIC_SURFACE_FIELDS if f not in out]
+    if missing:
+        raise ValueError(
+            f"{_GENERIC}: defaultRockyAsteroid() no longer assigns "
+            f"{', '.join(missing)}; the card would seed an incomplete surface")
     return out
 
 
@@ -370,8 +435,9 @@ def parse_body_capabilities(repo_root):
 _GENERATED_HEADER = '''\
 """Implemented planetary bodies and their engine properties -- GENERATED.
 
-Do not edit by hand. Derived from src/cpp/thermal/planetary_properties.h and
-src/cpp/maps/albedo_manager.cpp by
+Do not edit by hand. Derived from src/cpp/thermal/planetary_properties.h,
+src/cpp/maps/albedo_manager.cpp, src/cpp/orbital/generic_body.h and
+src/cpp/main/ptm_thermal_sim.cpp by
 
     python3 -m ptm.body_capabilities --regenerate
 
@@ -408,6 +474,14 @@ ALBEDO_MAP_RESOLUTIONS = {resolutions}
 #: Topography grid names (MeshUtils::checkForTopographicMesh), relative to the
 #: topography directory.
 TOPOGRAPHY_PATTERNS = {topo}
+
+#: `generic_body.surface.*` for a body the engine has no table for. NOT a GUI
+#: suggestion: ptm_thermal_sim.cpp starts every generic body from
+#: GenericBody::defaultRockyAsteroid() and overwrites only the fields the
+#: configuration gives a positive value for, so a run with no
+#: `generic_body.surface:` block runs on exactly these. chi is the one that is
+#: not in that struct; the solver's own `? chi_override : 2.7`.
+GENERIC_BODY_SURFACE_DEFAULTS = {generic_defaults}
 '''
 
 
@@ -429,7 +503,15 @@ def _render_capabilities(capabilities, fields):
     return "\n".join(out)
 
 
-def _render_module(bodies, capabilities, patterns):
+def _render_generic_defaults(defaults):
+    out = ["{"]
+    for field in GENERIC_SURFACE_FIELDS:
+        out.append(f"    {field!r}: {defaults[field]!r},")
+    out.append("}")
+    return "\n".join(out)
+
+
+def _render_module(bodies, capabilities, patterns, generic_defaults):
     fits, binary, resolutions, topo = patterns
     fields = tuple(sorted({f for row in capabilities.values() for f in row}))
     return _GENERATED_HEADER.format(
@@ -441,6 +523,7 @@ def _render_module(bodies, capabilities, patterns):
         binary=binary,
         resolutions=repr(resolutions),
         topo=_render_tuple(topo),
+        generic_defaults=_render_generic_defaults(generic_defaults),
     )
 
 
@@ -459,8 +542,9 @@ def _main(argv=None):
         parser.error("no PTM3D checkout found; pass --repo-root")
 
     bodies, capabilities, patterns = parse_body_capabilities(root)
+    generic_defaults = parse_generic_body_defaults(root)
     target = Path(__file__).with_name("body_table.py")
-    rendered = _render_module(bodies, capabilities, patterns)
+    rendered = _render_module(bodies, capabilities, patterns, generic_defaults)
     if args.regenerate:
         target.write_text(rendered)
         print(f"wrote {target} ({len(bodies)} bodies: {', '.join(bodies)})")

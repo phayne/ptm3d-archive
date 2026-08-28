@@ -129,6 +129,10 @@ _FILE_FIELDS = [
     "generic_body.spice_metakernel",
 ]
 
+#: The one path field with its own resolution contract. Named once so the
+#: absolutizer and the existence check cannot drift apart on it.
+METAKERNEL_KEY = "generic_body.spice_metakernel"
+
 #: Data-path fields that follow the PTM_DATA_ROOT contract but must NOT be
 #: existence-checked, because a first run is supposed to find them missing.
 #: (config_parser.cpp resolves illumination.bvh_cache_file with resolveDataPath
@@ -331,6 +335,77 @@ def resolve_data_path(value, project_root, env=None):
         rest = value_s[5:] if value_s.startswith("data/") else ""
         return (Path(data_root) / rest) if rest else Path(data_root)
     return Path(project_root) / p
+
+
+def spice_kernel_dir(project_root, env=None):
+    """The directory the engine reads bare metakernel names out of.
+
+    Its default (``<repo>/data/kernels``) and the two environment rungs the
+    engine honors, so anything asking "will this kernel be found" looks where
+    the run will look. ``docs/configuration.md``, "How
+    generic_body.spice_metakernel is resolved".
+
+    THE ONE definition. ``curated_sources._kernel_dir`` delegates here: the
+    card's readiness banner and the pre-flight's existence check disagreeing
+    about which directory holds a kernel is a card asserting a file is present
+    in front of a launch that refuses it.
+    """
+    env = env if env is not None else os.environ
+    explicit = str(env.get("PTM_SPICE_KERNELS", "") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    data_root = str(env.get("PTM_DATA_ROOT", "") or "").strip()
+    if data_root:
+        return Path(data_root).expanduser() / "kernels"
+    return Path(project_root) / "data" / "kernels"
+
+
+def metakernel_candidates(value, project_root, env=None):
+    """Every path the engine will try for `generic_body.spice_metakernel`.
+
+    In the engine's own order. An ABSOLUTE value is used exactly as given
+    (illumination_model.cpp:2681); a RELATIVE one is tried under the SPICE
+    kernel directory first and the working directory second (:2684-2696).
+
+    This key is the one path field that does NOT follow the plain
+    PTM_DATA_ROOT contract, and treating it as though it did is what broke
+    the curated Bennu run: `resolve_data_path` turned the bare `bennu.tm`
+    -- the form the curated registry writes, and the form
+    `docs/configuration.md` documents -- into `<project_root>/bennu.tm`, a
+    file that has never existed anywhere. The pre-flight then reported it
+    missing and the engine, handed the absolutized value, refused with
+    "SPICE meta-kernel not found" and listed that one fabricated path.
+    Measured 2026-08-28 on the click path.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    p = Path(raw).expanduser()
+    if p.is_absolute():
+        return [p]
+    out = [spice_kernel_dir(project_root, env) / p, Path(project_root) / p]
+    # Deduplicated, because naming the same path twice in a "paths tried"
+    # message reads as two separate misses.
+    seen, unique = set(), []
+    for candidate in out:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def resolve_metakernel_path(value, project_root, env=None):
+    """The metakernel the engine will actually read, or None.
+
+    None means "the engine will not find this either" -- and the caller must
+    then leave the configured value ALONE rather than rewrite it, so the
+    engine's own fail-loud message names the file the user typed.
+    """
+    for candidate in metakernel_candidates(value, project_root, env):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def find_project_root(executable=None):
@@ -793,6 +868,16 @@ def absolutize_config_paths(config, project_root):
         parent = cfg
         for k in parts[:-1]:
             parent = parent.setdefault(k, {})
+        if dotted == METAKERNEL_KEY:
+            # Its own contract; see metakernel_candidates. Absolutize only when
+            # a candidate EXISTS, and otherwise leave the value verbatim: the
+            # engine searches the kernel directory for a bare name, and a
+            # fabricated <project_root>/<name> both fails that search and hides
+            # what the user actually configured.
+            resolved = resolve_metakernel_path(val, project_root)
+            if resolved is not None:
+                parent[parts[-1]] = str(resolved)
+            continue
         # Data-path keys follow the engine's PTM_DATA_ROOT contract;
         # output/VF keys resolve against the project root as before.
         resolver = resolve_data_path if dotted in data_fields else resolve_path
@@ -1021,12 +1106,27 @@ def run_preflight(config, find_executable, project_root=None,
         # blocked for a file that exists, or waved through for one that does
         # not -- and for thermal.eq_indirect_flux_file that changes the deep
         # answer rather than merely failing.
-        resolver = (resolve_data_path if dotted in _ENGINE_DATA_ROOT_FIELDS
-                    else resolve_path)
-        p = resolver(val, project_root)
-        if not p.exists():
-            report.errors.append(f"{dotted}: file not found: {p}")
-            continue
+        if dotted == METAKERNEL_KEY:
+            # Looked for where the ENGINE looks, and every candidate is named
+            # when none of them exists -- the same courtesy
+            # illumination_model.cpp extends. Reporting one fabricated
+            # <project_root>/<name> instead is what blocked a correctly wired
+            # curated Bennu run.
+            p = resolve_metakernel_path(val, project_root)
+            if p is None:
+                tried = ", ".join(
+                    str(c) for c in metakernel_candidates(val, project_root))
+                report.errors.append(
+                    f"{dotted}: kernel not found: {val!r}. Tried {tried}. "
+                    f"Fetch it with: python3 scripts/fetch_kernels.py")
+                continue
+        else:
+            resolver = (resolve_data_path if dotted in _ENGINE_DATA_ROOT_FIELDS
+                        else resolve_path)
+            p = resolver(val, project_root)
+            if not p.exists():
+                report.errors.append(f"{dotted}: file not found: {p}")
+                continue
         if not os.access(p, os.R_OK):
             report.errors.append(f"{dotted}: file not readable: {p}")
             continue

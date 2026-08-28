@@ -1625,6 +1625,31 @@ class ConfigManager:
         if num(therm.get("equilibration_orbits"), 0.0) < 0:
             errors.append("Equilibration cycles cannot be negative")
 
+        # A SPICE ephemeris needs a kernel. The engine refuses this exactly
+        # (generic_body.h:94, "SPICE ephemeris source requires a metakernel for
+        # body '<name>'"), and `--validate-config` does NOT reach it -- that
+        # mode's own banner lists "generic-body construction" under NOT checked
+        # -- so a configuration missing the kernel passes every gate this
+        # application has and dies after the mesh is built.
+        #
+        # It is reachable without touching the kernel field at all: choosing
+        # SPICE writes `ephemeris_source` alone, and `_strip_sentinels` drops
+        # the empty `spice_metakernel` on the way out, so the emitted YAML
+        # carries a SPICE source and no kernel key whatsoever. Reproduced
+        # 2026-08-28 against a click-path config, 24 of 24 keys identical.
+        gb_cfg = self.config.get("generic_body")
+        gb_cfg = gb_cfg if isinstance(gb_cfg, dict) else {}
+        if (self.generic_body_active()
+                and str(gb_cfg.get("ephemeris_source", "") or "").strip().lower()
+                == "spice"
+                and not str(gb_cfg.get("spice_metakernel", "") or "").strip()):
+            errors.append(
+                "Positions are set to SPICE but no metakernel is set. The "
+                "engine refuses this outright; nothing falls back. Either "
+                "press the ephemeris button on the body card to wire one, "
+                "pick a kernel file yourself, or choose Keplerian elements "
+                "so the run's record says that is what was used.")
+
         # Radiation parameters
         rad = self.config.get("radiation")
         rad = rad if isinstance(rad, dict) else {}
