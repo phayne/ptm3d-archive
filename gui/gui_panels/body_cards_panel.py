@@ -1071,9 +1071,17 @@ class _FetchWorker(QThread):
     """
 
     done = pyqtSignal(object, object)
+    #: One line of a long transfer's own output, forwarded to the GUI thread.
+    #: A SIGNAL rather than a callback that touches a widget: a QLabel written
+    #: from a worker thread is undefined behavior in Qt, and an 80 MB download
+    #: with no sign of life is indistinguishable from a hung window.
+    progress = pyqtSignal(str)
 
     def __init__(self, call, route, kind):
         super().__init__()
+        #: `call` takes the progress emitter when it wants one. Passed as an
+        #: argument rather than read off the worker so `body_fetch` stays free
+        #: of Qt -- the whole fetch layer is measurable without a window.
         self._call = call
         self.route = route
         self.kind = kind
@@ -1081,7 +1089,7 @@ class _FetchWorker(QThread):
     def run(self):
         from gui_core.body_fetch import FetchResult
         try:
-            result = self._call()
+            result = self._call(self.progress.emit)
         except Exception as exc:                             # noqa: BLE001
             result = FetchResult(
                 kind=self.kind,
@@ -1104,6 +1112,15 @@ class GenericBodyCard(BodyCard):
     """
 
     ASTEROID = False
+
+    #: The two button labels for a body no registry covers. They are CONSTANTS
+    #: rather than literals inside `init_ui` because `_refresh_curated` swaps
+    #: them for a curated body and has to be able to swap them back -- a card
+    #: is reused across bodies, and a button still reading "Install ephemeris
+    #: (JPL solution 118)" over 623 Chimaera would be the same cross-card
+    #: residue `_repair_body_name` and `_provenance` each remove elsewhere.
+    SPK_BUTTON_DEFAULT = "Fetch kernel from HORIZONS"
+    SHAPE_BUTTON_DEFAULT = "DAMIT shape model…"
 
     def init_ui(self):
         content = QWidget()
@@ -1156,6 +1173,13 @@ class GenericBodyCard(BodyCard):
         # than a new one. See `_mirror_body_name`.
         self.widgets["generic_body.name"].textChanged.connect(
             self._mirror_body_name)
+        # The curated banner follows the name, so a user who types "Bennu"
+        # sees what this body is served from BEFORE they press a button
+        # labeled for a service that will refuse them. A registry lookup and
+        # two stat calls; the pinned-kernel table itself is memoized on its
+        # own mtime, so this is not a file exec per keystroke.
+        self.widgets["generic_body.name"].textChanged.connect(
+            lambda _t: self._refresh_curated())
 
         # -- ephemeris, with the coverage check the project never had ---------
         ephemeris = QGroupBox("Ephemeris")
@@ -1180,23 +1204,37 @@ class GenericBodyCard(BodyCard):
         # The kernel can be FETCHED as well as picked. Both stay: a fetch
         # covers the ordinary case and needs a network, a file picker covers a
         # kernel somebody already has and needs none.
-        self.spk_fetch_button = QPushButton("Fetch kernel from HORIZONS")
+        self.spk_fetch_button = QPushButton(self.SPK_BUTTON_DEFAULT)
         self.spk_fetch_button.setToolTip(get_tooltip("ui.fetch_spk"))
-        self.spk_fetch_button.clicked.connect(self._on_fetch_spk)
+        # A zero-argument lambda, NOT `connect(self._on_fetch_spk)`. Qt's
+        # `clicked(bool checked)` is delivered to any slot that can take an
+        # argument, and `_on_fetch_spk`'s first parameter is now
+        # `curated_download` -- so a direct connection binds the checked state
+        # to the download consent. It is False today because this button is
+        # not checkable, which is exactly the kind of accident that survives
+        # until somebody makes it checkable and an 80 MB transfer starts with
+        # no dialog.
+        self.spk_fetch_button.clicked.connect(lambda: self._on_fetch_spk())
         egrid.addWidget(self.spk_fetch_button, 1, 0, 1, 2)
         self.add_file_field(egrid, 2, "SPICE metakernel:",
                             "generic_body.spice_metakernel",
                             "Metakernels (*.tm);;Kernels (*.bsp);;All Files (*)")
+        #: What a body in the curated registry is served from, shown BEFORE
+        #: anything is pressed. Blue rather than red: it is a statement of
+        #: provenance, not a warning, and it is the sentence that replaces
+        #: HORIZONS' (correct, useless) refusal for such a body.
+        self.curated_note = _muted("", color="#64b5f6", size=10)
+        egrid.addWidget(self.curated_note, 3, 0, 1, 2)
         self.coverage_note = _muted("", color="#EF9A9A", size=10)
-        egrid.addWidget(self.coverage_note, 3, 0, 1, 2)
+        egrid.addWidget(self.coverage_note, 4, 0, 1, 2)
         check = QPushButton("Check SPK coverage")
         check.setToolTip(get_tooltip("ui.spk_coverage"))
         check.clicked.connect(self._check_coverage)
-        egrid.addWidget(check, 4, 1)
+        egrid.addWidget(check, 5, 1)
         orbit_button = QPushButton("Orbital elements on the Body page…")
         orbit_button.setToolTip(get_tooltip("ui.orbit_on_body_page"))
         orbit_button.clicked.connect(self._open_body_page)
-        egrid.addWidget(orbit_button, 5, 1)
+        egrid.addWidget(orbit_button, 6, 1)
         ephemeris.setLayout(egrid)
         layout.addWidget(ephemeris)
 
@@ -1241,7 +1279,7 @@ class GenericBodyCard(BodyCard):
         self.add_double_field(grid, 3, "Shape model scale:",
                               "generic_body.shape.mesh_scale", 0.0, 100000.0,
                               decimals=6)
-        self.damit_button = QPushButton("DAMIT shape model…")
+        self.damit_button = QPushButton(self.SHAPE_BUTTON_DEFAULT)
         self.damit_button.setToolTip(get_tooltip("ui.fetch_damit_shape"))
         self.damit_button.clicked.connect(self._on_fetch_damit)
         grid.addWidget(self.damit_button, 4, 1)
@@ -1401,9 +1439,88 @@ class GenericBodyCard(BodyCard):
         self.kepler_radio.setChecked(source != "spice")
         self.spice_radio.blockSignals(False)
         self.kepler_radio.blockSignals(False)
+        self._refresh_curated()
         self._refresh_shape()
         self._refresh_surface()
         self._refresh_provenance()
+
+    # -- the curated tier -----------------------------------------------------
+
+    def _curated_entry(self):
+        """This card's body in the curated registry, or None. Never raises.
+
+        Reached from `load_card` and from the name field's own handler, so it
+        runs on the GUI thread on every open. It is a table lookup and two
+        `stat` calls -- no network, and deliberately no hashing of an 80 MB
+        kernel, which is what `curated_kernel_status` would cost if it
+        verified rather than looked.
+        """
+        try:
+            from gui_core.curated_sources import curated_body
+            return curated_body(
+                str(self.config_manager.get_value(
+                    "generic_body.name", "") or ""),
+                str(self.config_manager.get_value(
+                    "generic_body.naif_id", "") or ""))
+        except Exception:                                    # noqa: BLE001
+            logger.warning("[curated] the registry could not be consulted; "
+                           "this card falls back to the live services",
+                           exc_info=True)
+            return None
+
+    def _refresh_curated(self):
+        """Say what a curated body is served from, before anything is pressed.
+
+        The whole point of the tier is that the user never meets HORIZONS'
+        refusal for such a body, so the replacement statement has to be on the
+        card at rest -- not only in the answer to a button they may never
+        press because the button's own label sent them elsewhere.
+
+        Wrapped whole. This is connected to the Name field's ``textChanged``,
+        and an exception escaping a Qt slot is a ``qFatal`` that takes the
+        window down with any unsaved edits. ``curated_kernel_status`` reaches
+        ``fetch_kernels_module``, which EXECUTES ``scripts/fetch_kernels.py``:
+        a locally broken copy of that script would otherwise kill the GUI on
+        the next keystroke rather than degrading to the live services.
+        """
+        try:
+            self._refresh_curated_unguarded()
+        except Exception:                                    # noqa: BLE001
+            logger.warning("[curated] the banner could not be refreshed; the "
+                           "card falls back to the live services",
+                           exc_info=True)
+            self.curated_note.setText("")
+            self.spk_fetch_button.setText(self.SPK_BUTTON_DEFAULT)
+            self.damit_button.setText(self.SHAPE_BUTTON_DEFAULT)
+
+    def _refresh_curated_unguarded(self):
+        entry = self._curated_entry()
+        if entry is None:
+            self.curated_note.setText("")
+            self.spk_fetch_button.setText(self.SPK_BUTTON_DEFAULT)
+            self.damit_button.setText(self.SHAPE_BUTTON_DEFAULT)
+            return
+
+        ephemeris = entry.ephemeris
+        self.spk_fetch_button.setText(f"Use {ephemeris.short}")
+        self.damit_button.setText("Mission shape model (radar)…")
+
+        from gui_core.curated_sources import curated_kernel_status
+        status = curated_kernel_status(entry, self._project_root())
+        # "Ready" is every kernel the metakernel NAMES, not just the body's
+        # own SPK. The first draft reported "already on this disk" over a tree
+        # missing three of bennu.tm's four members, and the coverage check
+        # then refused -- a banner asserting readiness in front of a refusal.
+        state = ("every kernel it loads is on this disk — no download and no "
+                 "network needed" if status.ready else status.summary())
+        name = (status.metakernel_path.name if status.metakernel_path
+                else ephemeris.metakernel)
+        self.curated_note.setText(
+            f"Ephemeris source: {ephemeris.description}. "
+            f"{ephemeris.reference}. {name} → {state}\n"
+            f"HORIZONS is not asked for this body and DAMIT is not searched "
+            f"for its shape; both would answer correctly that they have "
+            f"nothing, which is a dead end rather than an answer.")
 
     # -- name -> parameters (item 3) ------------------------------------------
 
@@ -1547,6 +1664,12 @@ class GenericBodyCard(BodyCard):
     def _start_fetch(self, kind, call, button, note):
         """Run `call` on a worker thread, with the one-at-a-time guard.
 
+        `call` takes ONE argument: a function that reports a line of progress.
+        Fetches with nothing to report ignore it. It is passed in rather than
+        read off the worker so that `gui_core.body_fetch` stays free of Qt --
+        the whole fetch layer is measurable without a window, and that is what
+        lets the curated tier be tested at all.
+
         Starting a second fetch of the same kind would rebind the attribute
         holding the running QThread and drop the last reference to it, which
         Qt answers with "QThread: Destroyed while thread is still running" and
@@ -1562,6 +1685,11 @@ class GenericBodyCard(BodyCard):
         button.setEnabled(False)
         worker = _FetchWorker(call, self.route, kind)
         worker.done.connect(self._on_fetch_done)
+        # Queued across the thread boundary by Qt, so the label is only ever
+        # written on the GUI thread. Bound to THIS note, so a long transfer
+        # reports into the same place its result will land.
+        worker.progress.connect(
+            lambda line, target=note: target.setText(line))
         worker.finished.connect(worker.deleteLater)
         worker.finished.connect(
             lambda: setattr(self, attribute, None))
@@ -1613,13 +1741,28 @@ class GenericBodyCard(BodyCard):
 
         note.setText("\n".join(result.lines()))
         self._refresh_provenance()
+        self._refresh_curated()
         self._refresh_shape()
         self._refresh_surface()
         if result.ok and result.values:
             self.value_changed.emit()
+        # AFTER the message is on screen, so the dialog appears over a card
+        # that already says what is being asked and why -- and only for a
+        # result that carries the flag, never for one whose message happens to
+        # mention a download.
+        if getattr(result, "offer", ""):
+            self._offer_curated_download(result)
 
-    def _on_fetch_spk(self):
-        """Fetch a kernel spanning this run, with a year of margin each end."""
+    def _on_fetch_spk(self, curated_download=False):
+        """Get this run's ephemeris: the curated registry, or HORIZONS.
+
+        `curated_download` is False on the button press and True only on the
+        second pass, after the user has answered the confirmation the first
+        pass produced. That two-pass shape is why the offer is a FLAG on the
+        result rather than a phrase in its message: the card has to be able to
+        tell "this needs your consent" from "this failed" without reading
+        English.
+        """
         from gui_core.body_fetch import fetch_spk
 
         name = str(self.config_manager.get_value(
@@ -1628,18 +1771,55 @@ class GenericBodyCard(BodyCard):
             "generic_body.naif_id", "") or "").strip()
         config = self.config_manager.get_config()
         project_root = self._project_root()
-        self.coverage_note.setText(
-            f"Asking HORIZONS for a kernel covering this run, with a year of "
-            f"margin at each end. Nothing is changed unless what arrives is "
-            f"read back and shown to span the window.")
+        entry = self._curated_entry()
+        if entry is not None:
+            self.coverage_note.setText(
+                f"Wiring {entry.name} to {entry.ephemeris.description}. "
+                f"HORIZONS is not being asked. Nothing is changed unless the "
+                f"kernel is read back and shown to span this run.")
+        else:
+            self.coverage_note.setText(
+                "Asking HORIZONS for a kernel covering this run, with a year "
+                "of margin at each end. Nothing is changed unless what "
+                "arrives is read back and shown to span the window.")
+        # `emit` is the worker's own progress signal, so a long transfer's
+        # output reaches the card LIVE and on the GUI thread. Wiring
+        # `progress=None` here instead would leave the whole reporting path --
+        # which the tests require, because an 80 MB download with no sign of
+        # life is indistinguishable from a hung window -- dead in the one
+        # place it matters.
         self._start_fetch(
             "spk",
-            lambda: fetch_spk(config, project_root, name=name,
-                              naif_id=naif_id),
+            lambda emit: fetch_spk(config, project_root, name=name,
+                                   naif_id=naif_id,
+                                   curated_download=curated_download,
+                                   progress=emit),
             self.spk_fetch_button, self.coverage_note)
 
+    def _offer_curated_download(self, result):
+        """Ask before spending a download, and run it if the answer is yes.
+
+        Returns True when the question was asked, so the caller stops: the
+        answer arrives through a second `_on_fetch_spk`, not through this
+        return value.
+        """
+        if not result.offer:
+            return False
+        answer = QMessageBox.question(
+            self, "Download this body's ephemeris?", result.offer,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            self.coverage_note.setText(
+                "Nothing was downloaded and nothing has been changed. The "
+                "same file can be fetched outside this window: see the "
+                "message above for the command.")
+            return True
+        self._on_fetch_spk(curated_download=True)
+        return True
+
     def _on_fetch_damit(self):
-        """Fetch this body's DAMIT shape model, and the spin that goes with it."""
+        """This body's shape: the curated registry, or DAMIT."""
         from gui_core.body_fetch import fetch_damit_shape
 
         name = str(self.config_manager.get_value(
@@ -1648,12 +1828,17 @@ class GenericBodyCard(BodyCard):
             "generic_body.naif_id", "") or "").strip()
         radius_km = self._number("generic_body.shape.radius_km", 0.0)
         project_root = self._project_root()
+        entry = self._curated_entry()
         self.shape_provenance.setText(
+            f"Offering {entry.name}'s mission shape model: "
+            f"{entry.shape.description}. DAMIT is not being searched."
+            if entry is not None else
             "Asking DAMIT for a shape model. Most asteroids do not have one.")
         self._start_fetch(
             "damit_shape",
-            lambda: fetch_damit_shape(project_root, name=name,
-                                      naif_id=naif_id, radius_km=radius_km),
+            lambda _emit: fetch_damit_shape(project_root, name=name,
+                                            naif_id=naif_id,
+                                            radius_km=radius_km),
             self.damit_button, self.shape_provenance)
 
     def _on_fetch_sbdb(self):
@@ -1671,7 +1856,7 @@ class GenericBodyCard(BodyCard):
             f"Asking the Small-Body Database about {query}...")
         self._start_fetch(
             "sbdb",
-            lambda: fetch_sbdb_properties(query),
+            lambda _emit: fetch_sbdb_properties(query),
             self.sbdb_button, self.lookup_note)
 
     def on_widget_changed(self, key, value):
@@ -1834,7 +2019,21 @@ class GenericBodyCard(BodyCard):
         else:
             notes.append(f"{path} is NOT on disk")
         if str(path).lower().endswith(".obj"):
+            # The .gitignore line is real (line 14, `*.obj`, a rule for C
+            # object files) but "therefore untracked" is not always true: a
+            # curated body's shape is force-added and SHIPS. Saying it is
+            # untracked over a file that is in git would send a user to back
+            # up something the repository already carries, and would make the
+            # same sentence untrustworthy where it IS true.
+            entry = self._curated_entry()
+            tracked = (entry is not None and entry.shape.tracked
+                       and str(path).replace("\\", "/").endswith(
+                           entry.shape.relpath))
             notes.append(
+                "shape models in .obj are matched by this project's "
+                ".gitignore, but this one is force-added and TRACKED, so it "
+                "ships with the repository"
+                if tracked else
                 "shape models in .obj are excluded by this project's "
                 ".gitignore, so this file is untracked and may exist in one "
                 "copy only — back it up, or add an exception for it")

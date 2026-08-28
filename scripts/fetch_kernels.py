@@ -114,6 +114,23 @@ KERNELS_BENNU = [
      "2e25094e62542f388071b43e6f7b794024ca3fa4e399306976ac62a1a5c3b48f"),
 ]
 
+#: The body-specific kernel sets, keyed by the ``--bodies`` selector that
+#: fetches them. THE SAME LIST OBJECTS as above, not copies: `select_kernels`
+#: reads this table and so does the GUI's curated-source registry
+#: (`gui/gui_core/curated_sources.py`), so the URL and the pinned sha256 for a
+#: body exist in exactly one place in this repository. A second copy of a
+#: pinned hash is a hash that goes stale silently, which is the whole failure
+#: mode the pin exists to prevent.
+#:
+#: Keyed by the selector rather than by body name on purpose: the key is what
+#: a user types after `--bodies`, so the message a card prints when a kernel
+#: is missing ("python3 scripts/fetch_kernels.py --bodies bennu") is built
+#: from the registry rather than written out again beside it.
+BODY_KERNELS = {
+    "europa": KERNELS_EUROPA,
+    "bennu": KERNELS_BENNU,
+}
+
 
 def human(nbytes):
     for unit in ("B", "KB", "MB", "GB"):
@@ -274,17 +291,17 @@ def select_kernels(bodies, dest):
     """
     kernels = list(KERNELS_CORE)
     if bodies in ("europa", "all"):
-        kernels += KERNELS_EUROPA
+        kernels += BODY_KERNELS["europa"]
     elif bodies == "auto" and os.path.exists(os.path.join(dest, "europa.tm")):
         print("europa.tm present in kernel directory -> also fetching the "
               "Galilean ephemeris jup365.bsp (europa.tm requires it).")
-        kernels += KERNELS_EUROPA
+        kernels += BODY_KERNELS["europa"]
     if bodies in ("bennu", "all"):
-        kernels += KERNELS_BENNU
+        kernels += BODY_KERNELS["bennu"]
     elif bodies == "auto" and os.path.exists(os.path.join(dest, "bennu.tm")):
         print("bennu.tm present in kernel directory -> also fetching Bennu's "
               "ephemeris sb-101955-118_long.bsp (bennu.tm requires it).")
-        kernels += KERNELS_BENNU
+        kernels += BODY_KERNELS["bennu"]
     return kernels
 
 
