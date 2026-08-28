@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -181,6 +182,215 @@ class PhysicalParams:
     albedo_is_geometric: bool = True
 
 
+# ---------------------------------------------------------------------------
+# What went wrong, as five different answers
+# ---------------------------------------------------------------------------
+#
+# Every failure out of this client used to be a bare RuntimeError, and the one
+# caller that mattered -- the GUI's "Fetch kernel from HORIZONS" button --
+# turned all of them into "HORIZONS could not be reached".  It said that while
+# HORIZONS was up, had answered in 130 ms, and had explained in the response
+# body exactly what it objected to.  A message that names the wrong subsystem
+# sends whoever reads it to check their network instead of their request.
+#
+# These all derive from RuntimeError so that existing `except RuntimeError`
+# call sites keep working unchanged.
+
+
+class HorizonsError(RuntimeError):
+    """Base for everything this client raises."""
+
+    def __init__(self, message, server_text=""):
+        super().__init__(message)
+        #: What the server itself said, verbatim and untruncated. The message
+        #: carries a shortened form; this is here for a log.
+        self.server_text = str(server_text or "")
+
+
+class HorizonsNetworkError(HorizonsError):
+    """The service could not be reached, or did not answer in time.
+
+    THE ONLY ONE that means "check the network". Nothing else does.
+    """
+
+
+class HorizonsHTTPError(HorizonsError):
+    """The service answered with an HTTP error status."""
+
+    def __init__(self, message, status=0, server_text=""):
+        super().__init__(message, server_text)
+        self.status = int(status or 0)
+
+
+class HorizonsRefusalError(HorizonsError):
+    """The service understood the request, resolved the body, and said no.
+
+    The Bennu case: HORIZONS will not generate an SPK for an object that has a
+    pre-computed ephemeris in its major-body index, and says so.  That is not a
+    network fault, not a bad designation, and not something a retry fixes.
+    """
+
+
+class HorizonsNotFoundError(HorizonsError):
+    """The service answered, and nothing matched the designation."""
+
+
+class HorizonsParseError(HorizonsError):
+    """The service answered with something this client does not understand.
+
+    Distinct from a refusal on purpose: a refusal is HORIZONS working as
+    designed and this is the client being out of date with it.  Reporting the
+    second as the first hides a client bug behind a server message.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Addressing a small body the way HORIZONS actually wants it
+# ---------------------------------------------------------------------------
+
+#: The highest IAU asteroid number HORIZONS' small-body record index accepts,
+#: read out of its own refusal text ("IAU numbered asteroids: 1- 895910") on
+#: 2026-08-27.  It grows as asteroids are numbered; it is used only to decide
+#: whether a bare number is plausibly a record number rather than an SPK ID,
+#: and the two ranges are nowhere near each other, so drift is harmless.
+SMALL_BODY_RECORD_MAX = 895910
+
+#: HORIZONS' own record boundaries for the other two small-body classes, from
+#: the same refusal text.  A number inside either is passed through as a record
+#: number rather than treated as an SPK ID.
+UNNUMBERED_RECORD_RANGE = (50000001, 50663878)
+COMET_RECORD_RANGE = (90000001, 90004975)
+
+
+def small_body_spk_command(body_id, body_type="asteroid"):
+    """The HORIZONS ``COMMAND`` string that selects this small body.
+
+    THIS IS THE BUG THAT BROKE THE BUTTON, so it is worth stating precisely.
+
+    HORIZONS has two different numeric namespaces for a small body and the
+    trailing semicolon selects between them and the major-body index -- but
+    only ONE of the two small-body numbers goes in front of the semicolon:
+
+    * ``COMMAND='623;'`` -- 623 is the IAU **record number**, and this works.
+    * ``COMMAND='DES=2000623;'`` -- 2000623 is the **SPK ID**, and the ``DES=``
+      keyword is what makes a number mean an SPK ID (JPL's Horizons API
+      documentation, "COMMAND Parameter": ``'99942;'`` and ``'DES=2099942;'``
+      select the same object).
+    * ``COMMAND='2000623;'`` -- an SPK ID in the record-number slot.  HORIZONS
+      answers ``DXREAD: requested IOBJ= 2000623 is out of bounds``, because
+      record numbers stop at 895910.
+
+    The card's lookup fills ``generic_body.naif_id`` with the SPK ID (2101955
+    for Bennu, 20000623 for Chimaera) -- correctly: that is the id SPICE needs,
+    and ``_spk_success`` deliberately re-reads it out of the kernel.  The old
+    ``fetch_spk`` then appended a semicolon to it, producing the third form, so
+    **every numbered asteroid failed**, not only Bennu.  Measured live on
+    2026-08-27: ``'20000623;'`` out of bounds, ``'623;'`` and
+    ``'DES=2000623;'`` both return a kernel.
+
+    Both SPK-ID conventions are mapped back to the IAU number here, because the
+    numeric record form is documented as a guaranteed-unique match and a name
+    search is not.  HORIZONS migrated small-body SPK IDs from 2000000+N to
+    20000000+N and this project's own cache carries both.
+
+    ``body_type`` is honored: anything that is not an asteroid or a comet is
+    passed through untouched, so a major body reaches HORIZONS as a major body
+    and is refused as one.  Appending ``;`` to a major-body id would silently
+    select a DIFFERENT OBJECT -- ``'599'`` is Jupiter and ``'599;'`` is asteroid
+    599 Luisa, and both return an answer.
+
+    Raises ``ValueError`` on an empty identifier rather than sending HORIZONS a
+    bare semicolon, which it reads as "user-supplied osculating elements
+    follow".
+    """
+    text = str(body_id or "").strip().rstrip(";").strip()
+    if not text:
+        raise ValueError(
+            "There is no body identifier to ask HORIZONS about. A NAIF id, an "
+            "asteroid number, a designation or a name is required.")
+
+    if str(body_type or "").strip().lower() not in ("asteroid", "comet"):
+        # Not ours to rewrite. Pass it through and let HORIZONS answer for it.
+        return str(body_id or "").strip()
+
+    if text.upper().startswith("DES="):
+        return text + ";"
+
+    if text.isdigit():
+        value = int(text)
+        if 1 <= value <= SMALL_BODY_RECORD_MAX:
+            return f"{value};"                      # IAU record number
+        for base in (20000000, 2000000):
+            # An SPK ID. Map it back to the IAU number it encodes; the
+            # remainder must still be a legal record number, or this is some
+            # other number that happens to be large and DES= is the honest
+            # thing to send.
+            if base < value < base + SMALL_BODY_RECORD_MAX:
+                return f"{value - base};"
+        for low, high in (UNNUMBERED_RECORD_RANGE, COMET_RECORD_RANGE):
+            if low <= value <= high:
+                return f"{value};"
+        return f"DES={value};"
+
+    # Text. A provisional or survey designation ("1999 RQ36", "2116 T-2",
+    # "A907 BC") needs the DES= keyword; a name does not, and HORIZONS resolves
+    # "Chimaera;" on its own (measured: returns 20000623).
+    if re.match(r"^(?:[A-Z]?\d{4}|A\d{3})\s+[A-Za-z]{1,2}[-\d]*$", text):
+        return f"DES={text};"
+    return f"{text};"
+
+
+#: How much of HORIZONS' own text a raised error carries. The refusals worth
+#: reading are one to six lines; 600 characters holds the longest of them
+#: (the DXREAD record-boundary table) whole, and the untruncated text is on
+#: the exception as ``server_text`` either way.
+SERVER_TEXT_LIMIT = 600
+
+
+def _tidy(text):
+    """HORIZONS' response text, whitespace-normalized and length-capped."""
+    body = " ".join(str(text or "").split())
+    if len(body) <= SERVER_TEXT_LIMIT:
+        return body
+    return body[:SERVER_TEXT_LIMIT] + f" [... {len(body)} characters total]"
+
+
+def _spk_failure(body_id, command, data):
+    """The right exception for an SPK response that carried no kernel.
+
+    Four outcomes, and they are four different things to do about it:
+
+    ``error``           HORIZONS resolved the request and declined it. Its own
+                        words are quoted; there is nothing to retry.
+    "No matches found"  the DASTCOM index search returned nothing, so the
+                        designation is wrong, not the request.
+    neither             the reply has a shape this client does not know. That
+                        is a client bug and is labeled as one rather than
+                        reported as a server refusal.
+
+    Returns the exception; the caller raises it, so the traceback starts at
+    the request rather than in here.
+    """
+    error = data.get("error")
+    result = data.get("result", "")
+    if error:
+        return HorizonsRefusalError(
+            f"HORIZONS resolved COMMAND='{command}' (asked for {body_id!r}) "
+            f"and refused to build an SPK. HORIZONS said: {_tidy(error)}",
+            server_text=str(error))
+    if "No matches found" in str(result):
+        return HorizonsNotFoundError(
+            f"HORIZONS' small-body index has no match for COMMAND='{command}' "
+            f"(asked for {body_id!r}). HORIZONS said: {_tidy(result)}",
+            server_text=str(result))
+    return HorizonsParseError(
+        f"HORIZONS answered COMMAND='{command}' (asked for {body_id!r}) with "
+        f"no 'spk' payload, no 'error' and no index-search miss, so this "
+        f"client does not know what happened. Keys returned: "
+        f"{sorted(data)}. HORIZONS said: {_tidy(result)}",
+        server_text=str(result))
+
+
 @dataclass
 class HorizonsBody:
     """Combined data for a body from HORIZONS + SBDB."""
@@ -210,16 +420,27 @@ class HorizonsClient:
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"HORIZONS API error {e.code}: {body[:500]}"
-            ) from e
+            raise HorizonsHTTPError(
+                f"HORIZONS API error {e.code}: {body[:500]}",
+                status=e.code, server_text=body) from e
         except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"Network error contacting HORIZONS: {e.reason}"
-            ) from e
+            raise HorizonsNetworkError(
+                f"Network error contacting HORIZONS: {e.reason}") from e
+        except socket.timeout as e:                          # pragma: no cover
+            raise HorizonsNetworkError(
+                f"HORIZONS did not answer within {self.timeout} s") from e
+        try:
+            return json.loads(raw)
+        except ValueError as e:
+            # A 200 whose body is not JSON. That is the client and the service
+            # disagreeing about the contract, not a network fault, and calling
+            # it one sends the reader to check their network.
+            raise HorizonsParseError(
+                f"HORIZONS answered with something that is not JSON "
+                f"({e}): {raw[:300]}", server_text=raw) from e
 
     def _fetch_raw(self, url: str, params: dict) -> str:
         """Fetch raw text response from HORIZONS API."""
@@ -235,9 +456,12 @@ class HorizonsClient:
                 return resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"HORIZONS API error {e.code}: {body[:500]}"
-            ) from e
+            raise HorizonsHTTPError(
+                f"HORIZONS API error {e.code}: {body[:500]}",
+                status=e.code, server_text=body) from e
+        except urllib.error.URLError as e:
+            raise HorizonsNetworkError(
+                f"Network error contacting HORIZONS: {e.reason}") from e
 
     # ------------------------------------------------------------------
     # Search
@@ -547,37 +771,57 @@ class HorizonsClient:
         start_time: str,
         stop_time: str,
         output_path: str,
+        body_type: str = "asteroid",
     ) -> str:
         """
         Download a binary SPK ephemeris file from HORIZONS.
 
-        SPK files are available for small bodies (asteroids, comets).
-        The file is base64-encoded in the API response.
+        SPK generation is restricted to small bodies -- asteroids and comets --
+        and HORIZONS refuses it for a further subset even of those: an object
+        whose ephemeris it serves pre-computed out of its major-body index gets
+        ``SPK creation is not available for pre-computed objects in the major
+        body index``, whichever designation form is used.  (101955) Bennu, whose
+        record HORIZONS marks ``*SPECIAL*`` and sources from ``ORX_merged``, is
+        one; measured 2026-08-27 against ``101955;``, ``DES=101955;``,
+        ``DES=2101955;`` and ``DES=1999 RQ36;``, all four refused, while
+        VECTORS for the same object are served normally.  That is a
+        :class:`HorizonsRefusalError`, not a network fault and not a bad
+        designation, and the caller is told which.
+
+        ``body_id`` is whatever the caller has -- an SPK ID, an IAU number, a
+        designation or a name.  Turning it into the COMMAND string HORIZONS
+        wants happens HERE, in :func:`small_body_spk_command`, and not in the
+        caller: the old arrangement had the GUI append the semicolon itself,
+        which is how an SPK ID ended up in the record-number slot and broke the
+        fetch for every numbered asteroid.
 
         Parameters
         ----------
         body_id : str
-            HORIZONS command (NAIF ID or designation).
-        start_time : str
-            Start time in ISO format (e.g. "2025-01-01").
-        stop_time : str
-            Stop time in ISO format (e.g. "2030-01-01").
+            SPK ID, IAU number, designation or name.
+        start_time, stop_time : str
+            ISO dates. A "T" separator is accepted and normalized.
         output_path : str
             Local path to write the SPK file.
+        body_type : str
+            "asteroid"/"comet" get the small-body command form; anything else
+            is passed to HORIZONS untouched.
 
         Returns
         -------
         str
             Path to the written SPK file.
         """
+        command = small_body_spk_command(body_id, body_type)
+
         # HORIZONS SPK generation doesn't accept ISO "T" separator in dates.
-        # Convert "2025-01-01T00:00:00" → "2025-01-01 00:00:00" or just the date.
+        # Convert "2025-01-01T00:00:00" -> "2025-01-01 00:00:00".
         clean_start = start_time.replace("T", " ")
         clean_stop = stop_time.replace("T", " ")
 
         params = {
             "format": "json",
-            "COMMAND": f"'{body_id}'",
+            "COMMAND": f"'{command}'",
             "OBJ_DATA": "NO",
             "MAKE_EPHEM": "YES",
             "EPHEM_TYPE": "SPK",
@@ -586,23 +830,35 @@ class HorizonsClient:
             "STOP_TIME": f"'{clean_stop}'",
         }
 
+        logger.info("HORIZONS SPK request: COMMAND='%s' (from %r), %s to %s",
+                    command, body_id, clean_start, clean_stop)
         data = self._fetch_json(HORIZONS_API_URL, params)
 
         spk_b64 = data.get("spk")
         if not spk_b64:
-            # Check if the response indicates an error
-            result = data.get("result", "")
-            raise RuntimeError(
-                f"No SPK data returned for body '{body_id}'. "
-                f"SPK may not be available for this body type. "
-                f"Response: {result[:300]}"
-            )
+            raise _spk_failure(body_id, command, data)
 
-        spk_bytes = base64.b64decode(spk_b64)
+        try:
+            spk_bytes = base64.b64decode(spk_b64)
+        except Exception as exc:                             # noqa: BLE001
+            raise HorizonsParseError(
+                f"HORIZONS returned an 'spk' payload for {command!r} that is "
+                f"not valid base64 ({exc}). Nothing was written.") from exc
+
+        # A payload that decodes but is not a kernel would otherwise be written
+        # out with a .spk name and fail much later, inside SPICE, as somebody
+        # else's problem. Every SPK begins "DAF/SPK " (NAIF DAF spec).
+        if not spk_bytes.startswith(b"DAF/SPK "):
+            raise HorizonsParseError(
+                f"HORIZONS returned {len(spk_bytes)} bytes for {command!r} that "
+                f"do not begin with the SPK file signature 'DAF/SPK ' (got "
+                f"{spk_bytes[:16]!r}). Nothing was written.")
+
         with open(output_path, "wb") as f:
             f.write(spk_bytes)
 
-        logger.info("Wrote SPK file (%d bytes): %s", len(spk_bytes), output_path)
+        logger.info("Wrote SPK file (%d bytes, HORIZONS spk_file_id %s): %s",
+                    len(spk_bytes), data.get("spk_file_id", "?"), output_path)
         return output_path
 
     def get_spk_id(self, body_id: str) -> Optional[str]:

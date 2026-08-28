@@ -59,10 +59,30 @@ __all__ = [
 ]
 
 
+def _arithmetic():
+    """The canonical implementation, imported lazily.
+
+    RE-EXPORTED, not reimplemented. The arithmetic lives in
+    ``horizons.albedo`` because the config WRITER and the cache-rewrite script
+    need it too and neither may import a GUI module. This module keeps the
+    labels -- what the card shows -- and nothing else. Same arrangement as
+    ``ecliptic_pole_to_equatorial`` below, and for the same reason.
+    """
+    import sys
+    from pathlib import Path
+    here = Path(__file__).resolve().parents[2] / "src" / "python"
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    from horizons import albedo as impl
+    return impl
+
+
 #: The IAU H, G system's default slope parameter, used when a body has no
 #: fitted G. It is not a neutral placeholder -- it is the value the H
 #: magnitudes in every catalog were themselves derived under -- but it IS an
 #: assumption, so anything that falls back to it says so in the label.
+#: Mirrored from ``horizons.albedo``; the module-level check below fails loudly
+#: if the two ever disagree.
 DEFAULT_SLOPE_PARAMETER = 0.15
 
 #: The range over which ``q = 0.290 + 0.684 G`` is a fit rather than an
@@ -81,7 +101,7 @@ def phase_integral(slope_parameter=DEFAULT_SLOPE_PARAMETER):
     ``q = 0.290 + 0.684 G`` (Bowell et al. 1989). At the default G = 0.15 this
     is 0.3926.
     """
-    return 0.290 + 0.684 * float(slope_parameter)
+    return _arithmetic().phase_integral(slope_parameter)
 
 
 class AlbedoConversion:
@@ -147,47 +167,24 @@ def bond_albedo(geometric_albedo, slope_parameter=None):
     ``slope_parameter`` of None means "not published", and the IAU default
     stands in with ``slope_assumed`` set so the label can say so.
     """
-    try:
-        p_v = float(geometric_albedo)
-    except (TypeError, ValueError):
+    impl = _arithmetic()
+    if (impl.DEFAULT_SLOPE_PARAMETER != DEFAULT_SLOPE_PARAMETER
+            or tuple(impl.SLOPE_PARAMETER_RANGE) != SLOPE_PARAMETER_RANGE):
+        # These are mirrored for the tooltips, and a mirror that has drifted
+        # would label a conversion with constants the conversion did not use.
+        raise RuntimeError(
+            f"gui_core.body_properties and horizons.albedo disagree about the "
+            f"IAU H,G constants: default G {DEFAULT_SLOPE_PARAMETER} vs "
+            f"{impl.DEFAULT_SLOPE_PARAMETER}, fitted range "
+            f"{SLOPE_PARAMETER_RANGE} vs {tuple(impl.SLOPE_PARAMETER_RANGE)}.")
+
+    record = impl.bond_albedo_from_pv(geometric_albedo, slope_parameter)
+    if record is None:
         return None
-    # SBDB uses 0.0 and this project uses -1.0 as "not set". A real geometric
-    # albedo is positive and at most about 1.7 (Enceladus-class ices exceed 1
-    # because p_V is a ratio to a Lambert disk, not a fraction of anything),
-    # so the upper bound is generous on purpose and only rejects nonsense.
-    if not (p_v > 0.0) or p_v != p_v or p_v > 2.0:
-        return None
-
-    warnings = []
-    assumed = slope_parameter is None
-    if assumed:
-        slope = DEFAULT_SLOPE_PARAMETER
-    else:
-        try:
-            slope = float(slope_parameter)
-        except (TypeError, ValueError):
-            slope = DEFAULT_SLOPE_PARAMETER
-            assumed = True
-        else:
-            if slope != slope:                            # NaN
-                slope, assumed = DEFAULT_SLOPE_PARAMETER, True
-
-    low, high = SLOPE_PARAMETER_RANGE
-    if not assumed and not (low <= slope <= high):
-        # NOT clamped. The number is used and the extrapolation is declared.
-        warnings.append(
-            f"WARNING: G = {slope:g} is outside the {low:g} to {high:g} range "
-            f"the q(G) relation was fitted over, so the phase integral here is "
-            f"an extrapolation. The value is used as published, not clamped -- "
-            f"check it before trusting the Bond albedo.")
-
-    q = phase_integral(slope)
-    bond = p_v * q
-    if bond >= 1.0:
-        warnings.append(
-            f"WARNING: this gives a Bond albedo of {bond:.4g}, at or above 1, "
-            f"which would absorb no sunlight at all. Check p_V and G.")
-    return AlbedoConversion(p_v, slope, q, bond, assumed, warnings)
+    return AlbedoConversion(record["geometric_albedo"],
+                            record["slope_parameter"], record["q"],
+                            record["bond"], record["slope_assumed"],
+                            record["warnings"])
 
 
 # ---------------------------------------------------------------------------

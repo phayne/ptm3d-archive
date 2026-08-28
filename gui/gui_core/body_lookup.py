@@ -48,11 +48,21 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ALBEDO_TYPE_KEY",
     "CACHE_RELPATH",
     "BodyLookupResult",
     "cache_entries",
+    "cached_bond_albedo",
     "lookup_body",
 ]
+
+#: The key a cached ``body_config.yaml`` uses to say WHICH albedo its
+#: ``surface.albedo`` is. Added 2026-08-27. Every cache written before that
+#: date holds a GEOMETRIC albedo p_V in a field the engine reads as a BOND
+#: albedo (``thermal_model.cpp`` computes ``1 - albedo`` and scales the solar
+#: constant by it), and carries no way to tell -- so a file with no
+#: ``albedo_type`` is treated as the legacy p_V case, loudly.
+ALBEDO_TYPE_KEY = "albedo_type"
 
 #: Where the cache lives, relative to the project root.
 CACHE_RELPATH = Path("data") / "horizons_cache"
@@ -92,6 +102,15 @@ class BodyLookupResult:
     """
 
     found: bool = False
+    #: ``{dotted config key: source label}`` for the fields whose source is
+    #: NOT simply "the cache" or "HORIZONS" -- today, an albedo that was
+    #: CONVERTED on the way in. A converted number with no visible conversion
+    #: is indistinguishable from an unconverted one, which is the whole reason
+    #: p_V reached a run configuration as a Bond albedo in the first place.
+    field_provenance: dict = field(default_factory=dict)
+    #: Lines the card appends under the lookup message. Non-empty when
+    #: something was converted or assumed and the user has to be able to see it.
+    notes: tuple = ()
     #: True when the query named MORE THAN ONE body. Distinct from "not found",
     #: and it STOPS the lookup rather than escalating: falling through to
     #: HORIZONS would answer an ambiguous question with one confident body,
@@ -216,8 +235,83 @@ def _matches(query, name, naif_id):
     return all(token in have for token in wanted)
 
 
+def cached_bond_albedo(surface):
+    """``(bond_albedo, source_label, note)`` from a cached ``surface:`` block.
+
+    THE TRAP THIS EXISTS FOR. ``generic_body.surface.albedo`` is a BOND albedo
+    to the engine -- ``thermal_model.cpp`` computes ``1 - albedo`` and scales
+    the solar constant by it -- and every ``body_config.yaml`` in this
+    project's cache was written by ``BodyConfigWriter._default_surface`` with
+    SBDB's GEOMETRIC albedo p_V in it instead. That writer emitted a runtime
+    warning about it and wrote the number anyway; a warning in a log is not a
+    guard, and on 2026-08-27 a generated (101955) Bennu configuration reached a
+    run with ``surface.albedo: 0.044`` -- Bennu's p_V, against a Bond albedo of
+    0.0118. For a bright body the error is a quarter of the absorbed flux.
+
+    So the cache now SAYS which one it holds, in ``surface.albedo_type``:
+
+    ``bond``            already converted. Used as it is.
+    ``geometric``       p_V. Converted here, with ``surface.albedo_slope_
+                        parameter_g`` if the cache recorded one and the IAU
+                        default G = 0.15 otherwise.
+    absent              a cache written before 2026-08-27. Treated as p_V,
+                        because that is what all seven of this project's
+                        cached bodies actually held, and the note says so.
+
+    Returns ``(None, "", note)`` when there is no usable albedo, so the caller
+    leaves the field alone rather than inventing one.
+    """
+    from gui_core.body_properties import bond_albedo
+
+    if not isinstance(surface, dict):
+        return None, "", ""
+    raw = surface.get("albedo")
+    if raw is None or raw == "":
+        return None, "", ""
+
+    declared = str(surface.get(ALBEDO_TYPE_KEY) or "").strip().lower()
+    if declared in ("bond", "a_b", "ab"):
+        return raw, "the local cache (Bond albedo, as stored)", ""
+
+    slope = surface.get("albedo_slope_parameter_g")
+    conversion = bond_albedo(raw, slope)
+    if conversion is None:
+        return None, "", (
+            f"The cached albedo {raw!r} is not a usable geometric albedo, so "
+            f"the surface albedo field was left alone.")
+
+    if declared in ("geometric", "geometrical", "pv", "p_v"):
+        origin = "declared geometric"
+        note_head = (
+            f"The cached albedo is DECLARED geometric (p_V = "
+            f"{conversion.geometric_albedo:g}) and has been converted to the "
+            f"Bond albedo the engine reads")
+    else:
+        origin = "undeclared, assumed geometric"
+        note_head = (
+            f"The cached body_config.yaml carries no '{ALBEDO_TYPE_KEY}', so "
+            f"it predates 2026-08-27 and its albedo "
+            f"{conversion.geometric_albedo:g} has been ASSUMED to be the "
+            f"geometric p_V -- which is what every cache this project wrote "
+            f"before that date held -- and converted to a Bond albedo")
+
+    note = (f"{note_head}: A_B = p_V x q, q = 0.290 + 0.684 G = "
+            f"{conversion.q:.4f}, giving {conversion.bond:.6g}"
+            + (f", with the IAU default G = {conversion.slope_parameter:g} "
+               f"assumed because the cache records none."
+               if conversion.slope_assumed
+               else f", with the cached G = {conversion.slope_parameter:g}.")
+            + " Rewrite the cache with scripts/fix_cached_body_albedo.py to "
+              "settle this permanently.")
+    label = (f"the local cache, CONVERTED ({origin} p_V="
+             f"{conversion.geometric_albedo:g}, "
+             f"{'G assumed' if conversion.slope_assumed else 'G'}="
+             f"{conversion.slope_parameter:g})")
+    return round(conversion.bond, 6), label, note
+
+
 def _from_cached_generic(generic):
-    """`generic_body:` mapping -> ``{dotted config key: value}``."""
+    """``(values, field_provenance, notes)`` from a `generic_body:` mapping."""
     values = {}
     for suffix in _COPIED:
         node = generic
@@ -235,7 +329,19 @@ def _from_cached_generic(generic):
     if isinstance(axes, (list, tuple)) and len(axes) == 3:
         for key, value in zip(("a", "b", "c"), axes):
             values[f"generic_body.shape.semi_axis_{key}_km"] = value
-    return values
+
+    # The albedo is the one field that is NOT copied verbatim. See
+    # `cached_bond_albedo`.
+    provenance, notes = {}, []
+    key = "generic_body.surface.albedo"
+    values.pop(key, None)
+    bond, label, note = cached_bond_albedo(generic.get("surface"))
+    if bond is not None:
+        values[key] = bond
+        provenance[key] = label
+    if note:
+        notes.append(note)
+    return values, provenance, notes
 
 
 def _resolve_kernel(generic, config_path, project_root):
@@ -272,10 +378,13 @@ def lookup_from_cache(query, project_root):
             message=(f"{query!r} matches {len(hits)} cached bodies ({names}). "
                      f"Type more of the name or its number."))
     name, config_path, generic = hits[0]
-    values = _from_cached_generic(generic)
+    values, provenance, notes = _from_cached_generic(generic)
+    if notes:
+        logger.warning("[body-lookup] %s: %s", config_path, " ".join(notes))
     return BodyLookupResult(
         found=True, source="cache", name=name,
         naif_id=str(generic.get("naif_id") or ""), values=values,
+        field_provenance=provenance, notes=tuple(notes),
         kernel=_resolve_kernel(generic, config_path, project_root),
         message=(f"Found {name} in the local cache "
                  f"({config_path.parent.name}); filled in "
@@ -363,9 +472,26 @@ def lookup_from_horizons(query, timeout=ONLINE_TIMEOUT_S, client_factory=None):
         value = getattr(physical, attr, None)
         if value not in (None, "", -1.0):
             values[f"generic_body.{key}"] = value
-    albedo = getattr(physical, "albedo", None)
-    if albedo not in (None, 0.0, -1.0):
-        values["generic_body.surface.albedo"] = albedo
+    # THE ALBEDO IS CONVERTED, NOT COPIED. `physical.albedo` is SBDB's visual
+    # GEOMETRIC albedo p_V (the dataclass even carries `albedo_is_geometric =
+    # True` to say so) and `generic_body.surface.albedo` is a BOND albedo. This
+    # line used to copy it straight across, and it is how a generated Bennu
+    # configuration reached a run on 2026-08-27 carrying `surface.albedo:
+    # 0.044` -- Bennu's p_V -- where the Bond albedo is 0.0118. The button
+    # NEXT TO this one (`fetch_sbdb_properties`) converted correctly the whole
+    # time; two paths filling one field, one of them converting, is how the
+    # unconverted one survived review.
+    provenance, notes = {}, []
+    from gui_core.body_properties import bond_albedo
+    conversion = bond_albedo(getattr(physical, "albedo", None),
+                             getattr(physical, "slope_parameter_g", None))
+    if conversion is not None:
+        values["generic_body.surface.albedo"] = round(conversion.bond, 6)
+        provenance["generic_body.surface.albedo"] = (
+            f"SBDB p_V={conversion.geometric_albedo:g}, "
+            f"{'G assumed' if conversion.slope_assumed else 'G'}="
+            f"{conversion.slope_parameter:g}, converted to Bond")
+        notes.append(conversion.detail())
     diameter = getattr(physical, "diameter_km", None)
     if diameter not in (None, 0.0, -1.0):
         # HORIZONS reports a DIAMETER; the engine wants a radius. Getting this
@@ -390,7 +516,7 @@ def lookup_from_horizons(query, timeout=ONLINE_TIMEOUT_S, client_factory=None):
         where += f" (NAIF {naif_id})"
     return BodyLookupResult(
         found=True, source="horizons", name=name, naif_id=naif_id,
-        values=values,
+        values=values, field_provenance=provenance, notes=tuple(notes),
         message=f"{where}; filled in {len(values)} field(s).{note}")
 
 

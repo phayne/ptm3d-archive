@@ -357,15 +357,22 @@ def _with_stub_coverage(coverage):
 
 
 class _SpkClient:
-    """A HORIZONS stub that writes a plausible file and records the request."""
+    """A HORIZONS stub that writes a plausible file and records the request.
+
+    The signature MATCHES the real client's, ``body_type`` included -- a stub
+    with a narrower signature is a stub that cannot catch the caller passing
+    the wrong thing, and the argument this one records is exactly the one that
+    was wrong live on 2026-08-27.
+    """
 
     calls = []
 
     def __init__(self, payload=b"DAF/SPK stub payload"):
         self.payload = payload
 
-    def download_spk(self, body_id, start, stop, output_path):
-        type(self).calls.append((body_id, start, stop))
+    def download_spk(self, body_id, start, stop, output_path,
+                     body_type="asteroid"):
+        type(self).calls.append((body_id, start, stop, body_type))
         Path(output_path).write_bytes(self.payload)
         return output_path
 
@@ -452,7 +459,7 @@ def test_the_fetched_window_carries_a_year_of_margin_at_each_end():
         restore()
 
     assert _SpkClient.calls, "no request was made"
-    body_id, start_text, stop_text = _SpkClient.calls[-1]
+    body_id, start_text, stop_text, body_type = _SpkClient.calls[-1]
     start = datetime.fromisoformat(start_text)
     stop = datetime.fromisoformat(stop_text)
 
@@ -465,10 +472,20 @@ def test_the_fetched_window_carries_a_year_of_margin_at_each_end():
     latest = run_start.timestamp() + 10.0 * 86400.0
     assert (stop.timestamp() - latest) / 86400.0 >= SPK_MARGIN_DAYS - 1.5, (
         f"requested stop {stop_text} is not a year past the run end")
-    assert body_id.endswith(";"), (
-        f"{body_id!r} has no small-body marker; HORIZONS would read a bare "
-        f"number as a major-body NAIF id (record 4 is Vesta, NAIF 4 is the "
-        f"Mars barycenter)")
+    # THIS ASSERTION USED TO BE `body_id.endswith(";")`, and it is why the
+    # button shipped broken: it demanded that `fetch_spk` append the semicolon
+    # itself, which put the SPK ID 20000269 into HORIZONS' small-body RECORD
+    # slot (record numbers stop at 895910) and got "DXREAD: requested IOBJ=
+    # 20000269 is out of bounds" for every numbered asteroid. The gate asserted
+    # the bug. The identifier now reaches the client UNTOUCHED and the client
+    # builds the command -- see `small_body_spk_command`, which is checked
+    # against HORIZONS' documented forms in
+    # test_the_small_body_spk_command_is_the_form_horizons_accepts.
+    assert body_id == "20000269", (
+        f"the identifier reached the client as {body_id!r}; the GUI must pass "
+        f"it through unchanged and leave the HORIZONS command syntax to the "
+        f"client, which is the one place that knows it")
+    assert body_type == "asteroid", body_type
 
     print(f"    [margin] run 2035-08-24 +10 d with {spin_up_days:.1f} d of "
           f"spin-up -> requested {start_text} to {stop_text}")
@@ -1023,6 +1040,372 @@ def test_a_body_name_cannot_place_the_cache_outside_the_cache():
           "not rewritten, and never raises out of a slot")
 
 
+# --------------------------------------------------------------------------
+# 7. The SPK request itself: the form HORIZONS accepts, and five failures
+# --------------------------------------------------------------------------
+
+def test_the_small_body_spk_command_is_the_form_horizons_accepts():
+    """The bug that broke the button on its first live click.
+
+    HORIZONS has two numeric namespaces for a small body, and only ONE of them
+    goes in front of the semicolon:
+
+        '623;'          the IAU RECORD number       -> a kernel
+        'DES=2000623;'  the SPK ID as a designation -> the same kernel
+        '2000623;'      an SPK ID in the record slot -> DXREAD out of bounds
+
+    Record numbers stop at 895910. The card's NAIF id field holds the SPK ID --
+    correctly, it is what SPICE needs -- so appending ';' to it produced the
+    third form for EVERY numbered asteroid, Bennu and Chimaera alike.
+
+    Every expectation below was measured against the live service on
+    2026-08-27 (see scripts/probe_horizons_spk.py) and matches JPL's Horizons
+    API documentation, "COMMAND Parameter": "COMMAND='99942;' (IAU number) and
+    COMMAND='DES=2099942;' (SPK ID) ... both select the object Apophis".
+    """
+    from horizons.horizons_client import small_body_spk_command as command
+
+    # SPK IDs, both conventions this project's own cache carries, map back to
+    # the IAU record number.
+    assert command("20000623") == "623;"          # Chimaera, 20000000 + N
+    assert command("2101955") == "101955;"        # Bennu, 2000000 + N
+    assert command("20000269") == "269;"          # Justitia
+    # A bare IAU number is already a record number.
+    assert command("623") == "623;"
+    assert command("1") == "1;"
+    # The two other record classes HORIZONS names in its own refusal text are
+    # passed through rather than mistaken for SPK IDs.
+    assert command("50000123") == "50000123;"     # unnumbered asteroid
+    assert command("90000123") == "90000123;"     # comet
+    # DES= is kept, with the semicolon HORIZONS requires.
+    assert command("DES=2000623") == "DES=2000623;"
+    assert command("DES=1999 RQ36;") == "DES=1999 RQ36;"
+    # A provisional or survey designation needs DES=; a name does not.
+    assert command("1999 RQ36") == "DES=1999 RQ36;"
+    assert command("2116 T-2") == "DES=2116 T-2;"
+    assert command("A907 BC") == "DES=A907 BC;"
+    assert command("Chimaera") == "Chimaera;"
+
+    # NOT ours to rewrite. '599' is Jupiter and '599;' is asteroid 599 Luisa,
+    # and HORIZONS answers for both -- so a semicolon appended to a major-body
+    # id does not fail, it silently returns a DIFFERENT OBJECT.
+    assert command("599", body_type="planet") == "599"
+    assert command("301", body_type="satellite") == "301"
+
+    # An empty identifier is refused rather than sent. A bare ';' tells
+    # HORIZONS that user-supplied osculating elements follow.
+    try:
+        command("")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an empty body id was turned into a command")
+
+    print("    [command] SPK IDs map back to IAU record numbers; '20000623' "
+          "-> '623;', not the '20000623;' that was out of bounds")
+
+
+def test_horizons_failures_are_five_answers_not_one():
+    """"Could not be reached" now means the network, and nothing else does.
+
+    The responses below are the REAL ones, captured from ssd.jpl.nasa.gov on
+    2026-08-27 and trimmed only in length. The Bennu arm is the live failure
+    Paul hit: HORIZONS was up, answered in 130 ms, and explained itself, and
+    the card said it could not be reached.
+    """
+    from gui_core.body_fetch import fetch_spk
+    from horizons.horizons_client import (
+        HorizonsHTTPError, HorizonsNetworkError, HorizonsNotFoundError,
+        HorizonsParseError, HorizonsRefusalError)
+
+    bennu = (" SPK creation is not available for pre-computed objects in the "
+             "major body index")
+    dxread = ("DXREAD: requested IOBJ= 20000623 is out of bounds, no action "
+              "taken.\nRecord boundaries:\n IAU numbered asteroids: 1- 895910")
+    notfound = ("JPL/DASTCOM Small-body Index Search Results\n\n DES = "
+                "101955;\n\n Matching small-bodies:\n    No matches found.")
+
+    def client_raising(exc):
+        class _Client:
+            def download_spk(self, body_id, start, stop, output_path,
+                             body_type="asteroid"):
+                raise exc
+        return _Client
+
+    restore = _with_stub_coverage(_FakeCoverage(False, detail="no spiceypy"))
+    outcomes = {}
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            for label, exc in (
+                    ("refusal", HorizonsRefusalError(
+                        f"HORIZONS resolved COMMAND='101955;' and refused to "
+                        f"build an SPK. HORIZONS said: {bennu}",
+                        server_text=bennu)),
+                    ("out_of_bounds", HorizonsRefusalError(
+                        f"HORIZONS said: {dxread}", server_text=dxread)),
+                    ("not_found", HorizonsNotFoundError(
+                        f"HORIZONS said: {notfound}", server_text=notfound)),
+                    ("http", HorizonsHTTPError("HORIZONS API error 503",
+                                               status=503)),
+                    ("parse", HorizonsParseError(
+                        "no 'spk' payload, no 'error'")),
+                    ("network", HorizonsNetworkError(
+                        "Network error contacting HORIZONS: "
+                        "[Errno 8] nodename nor servname provided"))):
+                outcomes[label] = fetch_spk(
+                    _config(), root, name="101955 Bennu (1999 RQ36)",
+                    naif_id="2101955", client_factory=client_raising(exc))
+    finally:
+        restore()
+
+    for label, result in outcomes.items():
+        assert not result.ok, label
+        assert result.values == {}, f"{label} wrote {result.values}"
+        assert result.message, label
+
+    messages = {label: r.message for label, r in outcomes.items()}
+    assert len(set(messages.values())) == len(messages), (
+        f"two failure modes give the same message: {sorted(messages)}")
+
+    # THE ONE THAT MATTERS. Only the network arm may say "could not be
+    # reached"; the other five said it too, until today.
+    for label, text in messages.items():
+        if label == "network":
+            assert "could not be reached" in text, text
+        else:
+            assert "could not be reached" not in text, (
+                f"the {label} arm still blames the network: {text}")
+
+    assert "REFUSED" in messages["refusal"], messages["refusal"]
+    assert bennu.strip() in messages["refusal"], (
+        "the refusal does not quote what HORIZONS actually said")
+    assert "SPICE archive" in messages["refusal"], (
+        "the pre-computed refusal does not say what to do instead")
+    assert "NO SMALL-BODY RECORD" in messages["not_found"]
+    assert "503" in messages["http"]
+    assert "fault in PTM3D" in messages["parse"], (
+        "a client-side parse failure is being reported as a HORIZONS problem")
+
+    # And the contract this whole layer rests on: a fetch RETURNS a message.
+    # It is called from a Qt slot, where an escaping exception is a qFatal that
+    # takes the window down with any unsaved edits. A factory that cannot build
+    # a client, and an object with no download_spk at all, are both inside it.
+    class _NoClient:
+        pass
+
+    def _broken_factory():
+        raise OSError("the HORIZONS client could not be constructed")
+
+    restore = _with_stub_coverage(_FakeCoverage(False, detail="no spiceypy"))
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            for label, factory in (("factory raises", _broken_factory),
+                                   ("no download_spk", _NoClient)):
+                result = fetch_spk(_config(), root, name="623 Chimaera",
+                                   naif_id="20000623", client_factory=factory)
+                assert not result.ok, label
+                assert result.message, label
+                assert result.values == {}, label
+    finally:
+        restore()
+
+    print("    [taxonomy] refusal, out-of-bounds, not-found, HTTP, parse and "
+          "network are six messages, and only one blames the network; a "
+          "factory that raises is a message too, not a qFatal")
+
+
+def test_an_spk_payload_that_is_not_a_kernel_is_not_written():
+    """A base64 blob that decodes is not therefore an SPK.
+
+    HORIZONS returns the kernel base64-encoded in the JSON. The old code
+    decoded whatever was in the 'spk' key and wrote it out with a .spk name,
+    so anything that was not a kernel became somebody else's problem inside
+    SPICE, much later. Every SPK begins 'DAF/SPK ' (NAIF DAF specification).
+    """
+    import base64
+
+    from horizons.horizons_client import HorizonsClient, HorizonsParseError
+
+    client = HorizonsClient(timeout=1)
+    payloads = {
+        "html error page": b"<html>503 Service Unavailable</html>",
+        "a text ephemeris": b"$$SOE\n2460000.5 = A.D. 2023-Feb-24\n$$EOE",
+    }
+    with tempfile.TemporaryDirectory() as root:
+        target = Path(root) / "ephemeris.spk"
+        for label, blob in payloads.items():
+            client._fetch_json = lambda url, params, _b=blob: {
+                "spk": base64.b64encode(_b).decode("ascii"),
+                "spk_file_id": "20000623"}
+            try:
+                client.download_spk("623", "2025-01-01", "2025-02-01",
+                                    str(target))
+            except HorizonsParseError as exc:
+                assert "DAF/SPK" in str(exc), str(exc)
+            else:
+                raise AssertionError(f"{label} was accepted as a kernel")
+            assert not target.exists(), (
+                f"{label} was written to disk before it was checked")
+
+        # And the positive control: a real DAF/SPK header IS written.
+        good = b"DAF/SPK " + b"\x00" * 64
+        client._fetch_json = lambda url, params: {
+            "spk": base64.b64encode(good).decode("ascii"),
+            "spk_file_id": "20000623"}
+        client.download_spk("623", "2025-01-01", "2025-02-01", str(target))
+        assert target.read_bytes() == good
+
+    print("    [payload] a non-kernel payload is refused before it is written; "
+          "a DAF/SPK one is written")
+
+
+# --------------------------------------------------------------------------
+# 8. The albedo, on BOTH paths that fill the field
+# --------------------------------------------------------------------------
+
+def test_neither_lookup_path_puts_a_geometric_albedo_in_the_bond_slot():
+    """Two paths fill ``surface.albedo``; one of them did not convert.
+
+    ``fetch_sbdb_properties`` converted p_V to a Bond albedo from the start.
+    ``lookup_from_horizons`` -- the Look up button, a different button on the
+    same card -- copied it straight across, and that is the path that produced
+    Paul's Bennu configuration on 2026-08-27 with ``surface.albedo: 0.044``.
+    0.044 is Bennu's p_V; with SBDB's fitted G = -0.031 the Bond albedo is
+    0.044 x (0.290 + 0.684 x -0.031) = 0.044 x 0.268796 = 0.0118270.
+
+    The cached-body path is the third way in, and it is checked here too: a
+    ``body_config.yaml`` with no ``albedo_type`` predates 2026-08-27 and holds
+    p_V, and must not be copied verbatim either.
+    """
+    import yaml
+
+    from gui_core.body_lookup import cached_bond_albedo, lookup_from_horizons
+
+    # -- the HORIZONS path -------------------------------------------------
+    class _Physical:
+        albedo = 0.044                      # SBDB p_V for Bennu
+        slope_parameter_g = -0.031          # SBDB's fitted G
+        diameter_km = 0.48444
+        rotation_period_hours = 4.296061
+        pole_ra_deg = 85.4522
+        pole_dec_deg = -60.3678
+
+    class _Body:
+        name = "101955 Bennu (1999 RQ36)"
+        naif_id = "2101955"
+        elements = None
+        physical = _Physical()
+
+    class _Client:
+        def get_body(self, query, epoch="2451545.0"):
+            return _Body()
+
+    result = lookup_from_horizons("Bennu", client_factory=_Client)
+    assert result.found, result.message
+    albedo = result.values["generic_body.surface.albedo"]
+    assert abs(albedo - 0.011827) < 1e-6, (
+        f"the Look up button wrote {albedo} into generic_body.surface.albedo; "
+        f"SBDB's 0.044 is the GEOMETRIC albedo and the engine reads that field "
+        f"as a BOND albedo (1 - albedo x solar constant). Expected 0.011827.")
+    assert albedo != 0.044, "p_V reached the Bond slot unconverted"
+    provenance = result.field_provenance["generic_body.surface.albedo"]
+    assert "p_V=0.044" in provenance and "Bond" in provenance, provenance
+    assert result.notes, "the conversion was made but not reported"
+
+    # -- the cache path, legacy file with no albedo_type --------------------
+    legacy = {"albedo": 0.037, "emissivity": 0.95}
+    bond, label, note = cached_bond_albedo(legacy)
+    # 0.037 x 0.3926 = 0.0145262, rounded to the 6 decimals the field carries.
+    assert bond == 0.014526, bond
+    assert "CONVERTED" in label, label
+    assert "albedo_type" in note and "ASSUMED" in note, note
+
+    # -- the cache path, a file this project's own tool has rewritten -------
+    rewritten = {"albedo": 0.014526, "albedo_type": "bond",
+                 "albedo_geometric_pv": 0.037}
+    bond, label, note = cached_bond_albedo(rewritten)
+    assert bond == 0.014526, bond
+    assert note == "", f"a converted cache was converted twice: {note}"
+
+    # -- and the shipped cache is in the rewritten state --------------------
+    cache = REPO_ROOT / "data" / "horizons_cache" / "bodies"
+    if cache.is_dir():
+        stale = []
+        for path in sorted(cache.glob("*/body_config.yaml")):
+            surface = ((yaml.safe_load(path.read_text()) or {})
+                       .get("generic_body", {}).get("surface") or {})
+            if "albedo" in surface and surface.get("albedo_type") != "bond":
+                stale.append(path.parent.name)
+        assert not stale, (
+            f"these cached bodies still carry an albedo of unstated type: "
+            f"{stale}. Run scripts/fix_cached_body_albedo.py.")
+
+    print("    [albedo] Look up, the cache and SBDB all deliver a BOND albedo; "
+          "Bennu 0.044 p_V -> 0.011827 A_B")
+
+
+def test_the_albedo_arithmetic_has_exactly_one_implementation():
+    """The GUI's label module re-exports; it does not reimplement.
+
+    Two copies of a unit conversion is how the two copies drift, and this one
+    now has three callers -- the card, the config writer and the cache-rewrite
+    script -- of which only the first may import Qt-adjacent code.
+    """
+    from gui_core.body_properties import bond_albedo, phase_integral
+    from horizons.albedo import bond_albedo_from_pv
+    from horizons.albedo import phase_integral as impl_phase_integral
+
+    for slope in (-0.12, 0.0, 0.15, 0.32, 0.60):
+        assert phase_integral(slope) == impl_phase_integral(slope), slope
+
+    for p_v, slope in ((0.42, 0.32), (0.044, -0.031), (0.037, None),
+                       (0.0, 0.15), (-1.0, 0.15), (None, None)):
+        gui = bond_albedo(p_v, slope)
+        impl = bond_albedo_from_pv(p_v, slope)
+        if impl is None:
+            assert gui is None, (p_v, slope)
+            continue
+        assert gui is not None, (p_v, slope)
+        assert gui.bond == impl["bond"], (p_v, slope)
+        assert gui.q == impl["q"], (p_v, slope)
+        assert gui.slope_assumed == impl["slope_assumed"], (p_v, slope)
+
+    print("    [one impl] gui_core.body_properties and horizons.albedo agree "
+          "on every case, because they are the same arithmetic")
+
+
+def test_a_written_body_config_declares_which_albedo_it_holds():
+    """The writer that made all seven stale caches now converts, and labels."""
+    from horizons.body_config_writer import BodyConfigWriter
+    from horizons.horizons_client import OrbitalElements, PhysicalParams
+
+    try:
+        import yaml
+    except ImportError:                                      # pragma: no cover
+        raise Skip("PyYAML is not installed")
+
+    physical = PhysicalParams(albedo=0.037, slope_parameter_g=None,
+                              diameter_km=44.09,
+                              rotation_period_hours=14.635)
+    with tempfile.TemporaryDirectory() as root:
+        target = Path(root) / "body_config.yaml"
+        BodyConfigWriter().write_config(
+            str(target), "623 Chimaera (A907 BC)", OrbitalElements(), physical)
+        surface = ((yaml.safe_load(target.read_text()) or {})
+                   .get("generic_body", {}).get("surface") or {})
+
+    assert surface["albedo_type"] == "bond", surface
+    assert abs(surface["albedo"] - 0.014526) < 1e-6, surface["albedo"]
+    assert surface["albedo_geometric_pv"] == 0.037, surface
+    assert surface["albedo_slope_parameter_g"] == 0.15, surface
+    assert "Bowell" in surface["albedo_provenance"], surface
+    assert "IAU default" in surface["albedo_provenance"], (
+        "an assumed G was not declared as assumed")
+
+    print("    [writer] a newly written body_config.yaml holds A_B = 0.014526 "
+          "and says albedo_type: bond, with the p_V and G it came from")
+
+
 CHECKS = [
     test_geometric_albedo_becomes_bond_albedo,
     test_a_missing_slope_parameter_is_assumed_and_labeled,
@@ -1043,6 +1426,12 @@ CHECKS = [
     test_a_refused_kernel_writes_nothing_into_the_card,
     test_an_answer_that_arrives_for_another_card_is_discarded,
     test_the_field_label_carries_the_conversion_and_a_hand_edit_drops_it,
+    test_the_small_body_spk_command_is_the_form_horizons_accepts,
+    test_horizons_failures_are_five_answers_not_one,
+    test_an_spk_payload_that_is_not_a_kernel_is_not_written,
+    test_neither_lookup_path_puts_a_geometric_albedo_in_the_bond_slot,
+    test_the_albedo_arithmetic_has_exactly_one_implementation,
+    test_a_written_body_config_declares_which_albedo_it_holds,
 ]
 
 
