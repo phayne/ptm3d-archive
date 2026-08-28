@@ -526,15 +526,22 @@ def test_the_thermal_solver_controls_are_in_the_thermal_section():
         assert not misfiled, "\n  ".join(
             ["a thermal-solver control is filed under where the run's files "
              "go, or under the mesh geometry:"] + misfiled)
-        # Europa's integration window moved out of the mesh section too.
+        # Europa's integration window moved out of the mesh section, and then
+        # out of Thermal as well: on the integrated run type it is THE duration
+        # control -- the only one that card offers -- so it belongs with the
+        # other durations. What must never come back is the mesh section, and
+        # `_misfiled` above still holds that line for every `thermal.*` key on
+        # every card, so this assertion pins the destination rather than
+        # re-checking the prohibition.
         europa = panel.tabs["card_europa"]
         assert _owning_section(
-            europa.widgets["thermal.integration_days"]) == "Thermal", (
-            "thermal.integration_days is still filed under the Europa card's "
-            "mesh section")
+            europa.widgets["thermal.integration_days"]) == "Time window", (
+            "thermal.integration_days is not in the Time window section, "
+            "where the duration controls live")
         print(f"    [sections] {len(cards)} cards: thermal.use_gpu, "
               f"thermal.equilibration_orbits in Thermal; output.directory in "
-              f"Output; 0 thermal keys under Output")
+              f"Output; integration_days in Time window; 0 thermal keys "
+              f"under Output or a mesh section")
 
 
 def test_a_body_the_presentation_table_forgets_is_loud():
