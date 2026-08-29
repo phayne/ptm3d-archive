@@ -47,7 +47,9 @@ from PyQt6.QtWidgets import (
     QRadioButton, QScrollArea, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from gui_core.body_cards import GENERIC_MESH_SHAPE
+from gui_core.body_cards import (GENERIC_MESH_SHAPE, WINDOW_UNIT_DAYS,
+                                 WINDOW_UNIT_DIURNAL, WINDOW_UNIT_ORBITAL,
+                                 WINDOW_UNITS, window_unit_days)
 from gui_core.config_manager import ConfigManager
 from gui_panels.config_panel import BaseConfigTab, get_tooltip
 
@@ -139,6 +141,13 @@ class BodyCard(BaseConfigTab):
         self._mode = mode_key
         self._run_type = run_type_key
         self._seeding_defaults = bool(seeding_defaults)
+        #: The two things the window note can say beyond what the units are
+        #: worth: a sentinel that was resolved, and a unit that was refused.
+        #: Both are shown until this card is opened again, and both are cleared
+        #: HERE, at the one point that means "a new opening" -- not inside the
+        #: methods that set them, which run more than once per opening.
+        self._window_resolution_note = ""
+        self._window_refusal_note = ""
         try:
             self.apply_mode()
             # NOT inside `apply_mode`: every card overrides that and none of
@@ -245,9 +254,37 @@ class BodyCard(BaseConfigTab):
     #: hours display, 3.551181 d showed as 85.23 h, which is 3.551250 d.
     DURATION_DECIMALS = 6
 
-    #: Display units offered beside a duration. The CONFIGURATION KEY IS ALWAYS
-    #: DAYS; these change the number shown and nothing else.
-    DURATION_UNITS = ("days", "hours", "synodic periods")
+    #: Display units offered beside a plain duration. The CONFIGURATION KEY IS
+    #: ALWAYS DAYS; these change the number shown and nothing else.
+    #:
+    #: "diurnal periods", not "synodic periods": they name the same span -- the
+    #: body's solar day -- and the card already says "diurnal" everywhere else
+    #: ("one diurnal cycle", "Spin-up (diurnal cycles)"). One word for one
+    #: thing. The window control beside it offers the same word, so the two
+    #: rows cannot read as two different periods.
+    DURATION_UNITS = ("days", "hours", WINDOW_UNIT_DIURNAL)
+
+    #: Hours, which is the one display unit that is not a period of anything
+    #: and so needs no body to resolve.
+    DURATION_UNIT_HOURS = "hours"
+
+    #: The units that ARE a period of something. They step by half a period
+    #: and their worth depends on the body; the rest step by one and do not.
+    PERIOD_UNITS = (WINDOW_UNIT_DIURNAL, WINDOW_UNIT_ORBITAL)
+
+    #: The configuration key the window control is bound to. Named once: five
+    #: methods below reach for it, and a card that spelled it differently in
+    #: one of them would resolve a sentinel it then never displayed.
+    WINDOW_KEY = "thermal.integration_days"
+
+    #: Shortest integration window the card will offer, in days. A real
+    #: duration, not the engine's -1: about 1.4 minutes, far below any run
+    #: anybody starts and far above zero.
+    WINDOW_FLOOR_DAYS = 0.001
+
+    #: Every run type a card can be opened on. A duration row that names a
+    #: subset is only offered -- and only loaded -- on those.
+    ALL_RUN_TYPES = ("time_series", "integrated", "sweep")
 
     def _duration_state(self):
         state = getattr(self, "_duration_controls", None)
@@ -256,43 +293,71 @@ class BodyCard(BaseConfigTab):
         return state
 
     def _synodic_days(self):
-        """One synodic day for the body this card is showing, in days."""
-        from gui_tooltips import get_synodic_period_days
-        try:
-            days = float(get_synodic_period_days(self.config_manager))
-        except Exception:                                    # noqa: BLE001
-            days = 0.0
-        return days if days > 0 else 0.0
+        """One synodic day for the body this card is showing, in days.
+
+        Through :meth:`_unit_days`, so the card has ONE answer to "how long is
+        a day here". It used to ask ``gui_tooltips.get_synodic_period_days``
+        while the display conversion asked ``body_cards.synodic_period_days``,
+        two lines apart -- and the two took different routes for a generic
+        body. 0 when there is none, which every caller already handles.
+        """
+        days, _why = self._unit_days(WINDOW_UNIT_DIURNAL)
+        return float(days) if days else 0.0
+
+    def _unit_days(self, unit):
+        """``(days_per_unit, provenance)`` for a display unit on THIS body.
+
+        The single place a unit name becomes a number, for both directions of
+        every duration control on every card. ``hours`` is here rather than in
+        ``gui_core.body_cards`` because it is not a period of anything -- it is
+        a unit of time, and needs no body to resolve.
+
+        ``(None, why)`` when the body has no such period. Callers must refuse
+        rather than fall back to days: a control that silently read "2" as two
+        days when the user asked for two orbits would be off by a factor of
+        1220 on Europa.
+        """
+        if unit == self.DURATION_UNIT_HOURS:
+            return 1.0 / 24.0, self.DURATION_UNIT_HOURS
+        return window_unit_days(unit, self.route,
+                                self.config_manager.get_config())
+
+    def _per_unit(self, key):
+        """Days per display unit for one control, or 1.0 when it cannot say.
+
+        The 1.0 is a LAST RESORT and never a silent reading of a period as
+        days: every path that can act on an unresolvable unit -- the edit, the
+        unit change, and the activation sweep -- refuses first, so what reaches
+        here is a control already on days or one being torn down.
+        """
+        unit = self._duration_state().get(key, {}).get("unit", WINDOW_UNIT_DAYS)
+        per_unit, _why = self._unit_days(unit)
+        return per_unit or 1.0
 
     def _days_to_display(self, key, days):
-        unit = self._duration_state().get(key, {}).get("unit", "days")
-        if unit == "hours":
-            return days * 24.0
-        if unit == "synodic periods":
-            synodic = self._synodic_days()
-            return days / synodic if synodic > 0 else days
-        return days
+        return days / self._per_unit(key)
 
     def _display_to_days(self, key, value):
-        unit = self._duration_state().get(key, {}).get("unit", "days")
-        if unit == "hours":
-            return value / 24.0
-        if unit == "synodic periods":
-            synodic = self._synodic_days()
-            return value * synodic if synodic > 0 else value
-        return value
+        return value * self._per_unit(key)
 
-    def duration_row(self, grid, row, label_text, key, minimum=0.001):
+    def duration_row(self, grid, row, label_text, key, minimum=0.001,
+                     units=None, unit_tooltip="ui.duration_units",
+                     run_types=None):
         """A duration spin box with a display-unit combo beside it.
 
         Returns ``(label, container)`` so the caller can show or hide the whole
         row: which duration a card offers depends on the run type.
 
+        `units` picks the vocabulary. A plain duration takes
+        :data:`DURATION_UNITS`; the integration window takes
+        ``body_cards.WINDOW_UNITS``, which drops hours (nobody sets a
+        statistics window in hours) and adds the body's orbit.
+
         **The toggle round-trips exactly, because nothing flows back through
         it.** Changing the unit re-reads the canonical value from the
         configuration and re-displays it; it never converts the number that is
         already in the box and writes the result back. A toggle chain
-        days -> hours -> synodic periods -> days therefore returns the original
+        days -> hours -> diurnal periods -> days therefore returns the original
         value bit for bit, however coarse the display is, because the display
         was never the source. The alternative -- converting what is shown --
         loses a digit per hop at any finite `decimals`.
@@ -313,17 +378,20 @@ class BodyCard(BaseConfigTab):
         spin.setToolTip(get_tooltip(key))
         box.addWidget(spin, stretch=1)
 
+        offered = tuple(units or self.DURATION_UNITS)
         combo = QComboBox()
-        combo.addItems(self.DURATION_UNITS)
+        combo.addItems(offered)
         combo.setMaximumWidth(140)
-        combo.setToolTip(get_tooltip("ui.duration_units"))
+        combo.setToolTip(get_tooltip(unit_tooltip))
         box.addWidget(combo)
 
         grid.addWidget(container, row, 1)
         self.widgets[key] = spin
         self._duration_state()[key] = {
-            "unit": "days", "spin": spin, "combo": combo,
-            "label": label, "container": container, "minimum": float(minimum)}
+            "unit": offered[0], "spin": spin, "combo": combo,
+            "label": label, "container": container, "minimum": float(minimum),
+            "units": offered, "unit_tooltip": unit_tooltip,
+            "run_types": tuple(run_types or self.ALL_RUN_TYPES)}
         self._apply_duration_range(key)
 
         spin.valueChanged.connect(
@@ -337,38 +405,71 @@ class BodyCard(BaseConfigTab):
 
         The BOUNDS are converted by exactly the same function as the value.
         Converting one and not the other is how a control ends up unable to
-        display what it holds: `thermal.integration_days` carries the engine's
-        -1 "use the output window" sentinel, and a floor pinned at 0 for one of
-        the units would clamp that -1 to 0 on the way to the screen -- a
-        control showing a setting the run does not have.
+        display what it holds -- a floor pinned at 0 for one unit and converted
+        for another shows a number the configuration does not carry.
         """
         state = self._duration_state().get(key)
         if state is None:
             return
         spin, unit = state["spin"], state["unit"]
+        low = self._days_to_display(key, state["minimum"])
+        # ...AND NEVER BELOW ONE DIGIT OF THE DISPLAY. A QDoubleSpinBox rounds
+        # its own bounds to `decimals`, so a floor that converts to less than
+        # that becomes exactly 0 -- and 0 is a sentinel too: the engine tests
+        # `integration_days > 0.0` (ptm_thermal_sim.cpp:1158), so a window
+        # dialed to zero would silently mean "the whole output window" again.
+        # Europa's 0.001 d floor is 2.3e-7 orbital periods, which is how this
+        # was found.
+        if state["minimum"] > 0:
+            low = max(low, 10.0 ** -spin.decimals())
         blocked = spin.blockSignals(True)
         try:
-            spin.setRange(self._days_to_display(key, state["minimum"]),
-                          self._days_to_display(key, 365000.0))
-            spin.setSingleStep(1.0 if unit != "synodic periods" else 0.5)
+            spin.setRange(low, self._days_to_display(key, 365000.0))
+            spin.setSingleStep(0.5 if unit in self.PERIOD_UNITS else 1.0)
         finally:
             spin.blockSignals(blocked)
 
     def _on_duration_edited(self, key, display_value):
-        """The user moved a duration control. Convert to days and store."""
+        """The user moved a duration control. Convert to days and store.
+
+        The unit is re-resolved on every edit, not trusted from when it was
+        chosen. A period can go away underneath a selected unit -- clear a
+        generic body's rotation period, or its semi-major axis, and the combo
+        still reads "diurnal periods" -- and the WRITE path is where that
+        turns from a wrong label into a wrong configuration: "2" would be
+        stored as 2 days and copied into the run length.
+        """
         if self._loading or getattr(self, "_unit_syncing", False):
             # Showing a configuration is not an edit to it -- the same rule
             # `load_from_config` states, applied to the unit conversion so a
             # card that merely DISPLAYS a duration cannot rewrite it.
             return
+        state = self._duration_state().get(key)
+        if state is not None:
+            per_unit, why = self._unit_days(state["unit"])
+            if not per_unit:
+                self._refuse_window_unit(key, state["unit"], why)
+                return
         self.on_widget_changed(key, self._display_to_days(key, display_value))
         self.derive_from_duration(key)
 
     def _on_duration_unit_changed(self, key, unit):
-        """Re-display the stored value in a new unit. Writes nothing."""
+        """Re-display the stored value in a new unit. Writes nothing.
+
+        A unit this body has no period for is REFUSED, not approximated. The
+        combo snaps back to days and the card says why, because the quiet
+        alternative -- reading the number in the box as days when the user
+        asked for orbits -- is wrong by the ratio of the two periods, which on
+        Europa is a factor of 1220.
+        """
         state = self._duration_state().get(key)
         if state is None:
             return
+        per_unit, why = self._unit_days(unit)
+        if not per_unit:
+            self._refuse_window_unit(key, unit, why)
+            return
+        self._window_refusal_note = ""
         state["unit"] = unit
         self._unit_syncing = True
         try:
@@ -382,15 +483,89 @@ class BodyCard(BaseConfigTab):
                 spin.blockSignals(blocked)
         finally:
             self._unit_syncing = False
+        self.refresh_window_units()
+
+    def _refuse_window_unit(self, key, unit, why):
+        """Put the combo back to days and SAY SO. Never a silent fallback.
+
+        The message names the ROW, because the card has two duration controls
+        and both can offer a period unit, and it is shown whatever the run
+        type -- a refusal written where the current run type does not draw it
+        is exactly the silent fallback this method exists to prevent.
+        """
+        state = self._duration_state().get(key)
+        if state is None:
+            return
+        combo = state["combo"]
+        blocked = combo.blockSignals(True)
+        try:
+            combo.setCurrentText(WINDOW_UNIT_DAYS)
+        finally:
+            combo.blockSignals(blocked)
+        # Days always resolves, so this branch of `_on_duration_unit_changed`
+        # cannot recurse back into here; it re-ranges and re-displays, and
+        # clears the refusal note, which is why the note is written after it.
+        self._on_duration_unit_changed(key, WINDOW_UNIT_DAYS)
+        row = state["label"].text().rstrip(":")
+        self._window_refusal_note = (
+            f"{row}: {unit} cannot be used here — {why}. The value is shown "
+            f"in days instead.")
+        self.refresh_window_units()
 
     def set_numeric(self, key, value):
-        """Load a number, converting a duration into the unit on display."""
-        if key in self._duration_state():
-            try:
-                value = self._days_to_display(key, float(value))
-            except (TypeError, ValueError):
-                pass
-        super().set_numeric(key, value)
+        """Load a number, converting a duration into the unit on display.
+
+        AND PUT THE STORED VALUE BACK IN DAYS. ``BaseConfigTab.set_numeric``
+        deliberately writes the coerced number to the configuration -- it is
+        how a YAML string like ``5e3`` becomes a float instead of a str that
+        raises on the next comparison (``config_panel.py:624``). Combined with
+        a display conversion, that wrote the DISPLAY units into the
+        configuration key: showing a 29.530588 d window in diurnal periods
+        stored 1.0, and the next load showed 1 d.
+
+        Measured on the base commit 4e00f8a, where it needed the unit combo to
+        have been moved off days before a reload -- so it was reachable, not
+        theoretical, and it silently divided ``simulation.duration_days`` by
+        the synodic day. It became unmissable here only because the window
+        control now OPENS in diurnal periods. Reported as
+        GUI-DURATION-DISPLAY-UNITS-STORED.
+        """
+        state = self._duration_state().get(key)
+        if state is None:
+            super().set_numeric(key, value)
+            return
+        if self._run_type not in state["run_types"]:
+            # A control this run type does not offer is not displayed, so
+            # there is nothing to convert and nothing to say. Loading it
+            # anyway is how the hidden integration window logged "-0.0338 is
+            # outside the range" on every time-series card: the number in the
+            # message was the display conversion of a -1 the configuration was
+            # right to be keeping.
+            return
+        try:
+            canonical = float(value)
+        except (TypeError, ValueError):
+            # Not a number: let the base implementation warn and leave the box.
+            super().set_numeric(key, value)
+            return
+        super().set_numeric(key, self._days_to_display(key, canonical))
+        # The key is days, in every unit. Written explicitly rather than left
+        # to the base call, whose whole point is that it must write something.
+        self.config_manager.set_value(key, canonical)
+
+    #: Keys a window unit's PERIOD is computed from. Editing any of them
+    #: changes what "1 diurnal period" or "1 orbital period" is worth, so the
+    #: card re-resolves rather than going on describing the old body.
+    PERIOD_KEYS = ("generic_body.orbit.semi_major_axis_au",
+                   "generic_body.spin.period_hours",
+                   "simulation.body")
+
+    def on_widget_changed(self, key, value):
+        """Store an edit, and re-resolve the periods if it moved one."""
+        super().on_widget_changed(key, value)
+        if key in self.PERIOD_KEYS and not self._loading:
+            self._revalidate_duration_units()
+            self.refresh_window_units()
 
     def derive_from_duration(self, key):
         """Write the keys the integrated card no longer asks for.
@@ -411,22 +586,23 @@ class BodyCard(BaseConfigTab):
           the previous run type used would sample a 200-day window with the
           144 steps chosen for a 3.55-day one.
         """
-        if self._run_type != "integrated" or key != "thermal.integration_days":
+        if self._run_type != "integrated" or key != self.WINDOW_KEY:
             return
         from gui_core.body_cards import samples_for_window
 
-        window = self._number("thermal.integration_days", 0.0)
+        window = self._number(self.WINDOW_KEY, 0.0)
         if not window > 0:
-            # -1 is the engine's "use the output window" sentinel, and with no
-            # separate duration control on this card there is no output window
-            # for it to mean. Left alone rather than guessed at.
+            # Unreachable from the control -- its floor is a real duration --
+            # so this can only be a configuration that arrived carrying the
+            # engine's -1. `_resolve_integration_window` turns that into the
+            # length it already means BEFORE anything is derived from it.
             return
         self.config_manager.set_value("simulation.duration_days", window)
         self.config_manager.set_value(
             "simulation.timesteps",
             samples_for_window(window, self._synodic_days()))
 
-    def time_group(self, title="Time window", integration_window=False):
+    def time_group(self, title="Time window"):
         """The time controls, which depend on WHAT THE RUN PRODUCES.
 
         A time series is a window plus a sampling density, so it carries a
@@ -445,9 +621,16 @@ class BodyCard(BaseConfigTab):
         rather than asked for -- see `derive_from_duration` -- so the emission
         stays a valid, complete configuration.
 
-        `integration_window` keeps the row visible in EVERY run type, for the
-        one card that offered it before this change (Europa). Without it that
-        card would have lost a control it had.
+        NO SENTINEL REACHES THIS SCREEN. The integration window's floor is a
+        real duration, so the engine's -1 ("integrate the output window")
+        cannot be typed, dialed or displayed here. It has no honest reading on
+        a card whose only duration control IS the window: -1 means "as long as
+        the run", and the run is as long as this control says.
+
+        The window is given as a COUNT and a PERIOD -- 1 diurnal period, 2
+        orbital periods -- because that is how a run length is decided.
+        `body_cards.WINDOW_UNITS` says why there is no separate "seasonal"
+        entry.
         """
         group = QGroupBox(title)
         grid = QGridLayout()
@@ -461,12 +644,15 @@ class BodyCard(BaseConfigTab):
                            1, 100000)
         self._samples_row = (grid.itemAtPosition(2, 0).widget(),
                              self.widgets["simulation.timesteps"])
-        # -1 is the engine's "use the output window" sentinel, so the minimum
-        # is negative here and NOT the 0.001 a real duration takes.
-        self._duration_rows["thermal.integration_days"] = self.duration_row(
-            grid, 3, "Integration window:", "thermal.integration_days",
-            minimum=-1.0)
-        self._always_show_integration = bool(integration_window)
+        self._duration_rows[self.WINDOW_KEY] = self.duration_row(
+            grid, 3, "Integration window:", self.WINDOW_KEY,
+            minimum=self.WINDOW_FLOOR_DAYS, units=WINDOW_UNITS,
+            unit_tooltip="ui.window_units", run_types=("integrated",))
+        #: What the chosen unit resolves to for THIS body, and any refusal.
+        #: Under the row rather than only in the tooltip, because the number a
+        #: unit stands for is the whole content of the choice.
+        self.window_note = _muted("")
+        grid.addWidget(self.window_note, 4, 0, 1, 2)
         group.setLayout(grid)
         return group
 
@@ -480,8 +666,184 @@ class BodyCard(BaseConfigTab):
             widget.setVisible(not integrated)
         for widget in self._samples_row:
             widget.setVisible(not integrated)
-        for widget in rows["thermal.integration_days"]:
-            widget.setVisible(integrated or self._always_show_integration)
+        for widget in rows[self.WINDOW_KEY]:
+            widget.setVisible(integrated)
+        if integrated:
+            self._resolve_integration_window()
+            self._start_window_in_its_own_unit()
+        self._revalidate_duration_units()
+        self.refresh_window_units()
+
+    def _revalidate_duration_units(self):
+        """Drop any selected unit whose period has gone away, out loud.
+
+        A unit is chosen once and lives as long as the card does, while the
+        period behind it comes from the configuration and can be edited or
+        cleared -- a generic body's rotation period, its semi-major axis, or
+        simply a different body arriving on the same reused card. Checked on
+        every activation so a stale unit is caught when the card is shown
+        rather than when the user next types into it.
+        """
+        for key, state in list(self._duration_state().items()):
+            if self._run_type not in state["run_types"]:
+                continue
+            per_unit, why = self._unit_days(state["unit"])
+            if not per_unit:
+                self._refuse_window_unit(key, state["unit"], why)
+
+    def _resolve_integration_window(self):
+        """Replace a sentinel integration window with the length it means.
+
+        A configuration can arrive carrying ``thermal.integration_days: -1``
+        -- it is the engine's default and the value every shipped file that
+        mentions the key uses. On the integrated run type the card's only
+        duration control IS that key, so -1 has to become a number before it
+        can be shown at all.
+
+        It is written, not merely displayed, and the SAME RUN comes out:
+        ``computeIntegrationWindow`` takes ``integration_days > 0 ?
+        integration_days : output_days`` (``ptm_thermal_sim.cpp:1158``) and
+        ``requested_integ_days`` does the same at ``:15958``, so replacing -1
+        with ``simulation.duration_days`` puts the identical double into both.
+        The card SAYS it did it -- a resolution nobody is told about is the
+        silent substitution this project keeps paying for.
+        """
+        window = self._number(self.WINDOW_KEY, 0.0)
+        if window > 0:
+            # Nothing to resolve. The note is NOT cleared here: this method
+            # runs again from `load_from_config`, after the resolution it just
+            # made, and clearing on that second pass is how the disclosure
+            # disappeared before it reached the screen. `activate` clears it,
+            # once per opening.
+            return
+        from gui_core.body_cards import default_duration_days
+        output = self._number("simulation.duration_days", 0.0)
+        if output > 0:
+            # The equivalent case, and the only one where the run really is
+            # untouched. ONE KEY is written, and only the one being resolved:
+            # `derive_from_duration` would also rewrite
+            # `simulation.timesteps` to this card's sampling cadence --
+            # measured at 144 -> 61 on a 12.5 d file -- and that is the
+            # author's output cadence, not a restatement of their sentinel.
+            self.config_manager.set_value(self.WINDOW_KEY, output)
+            self._window_resolution_note = (
+                f"This file asked for the whole run window ({window:g}); that "
+                f"is {output:g} days here, the length it already sets, and "
+                f"the window below now says so. The run is unchanged.")
+            return
+
+        # No run length either. -1 then meant "the engine's own output
+        # window", which is not a number this card can claim to be preserving,
+        # so BOTH keys are set to the default window and the note says the run
+        # has been given a length rather than that it is unchanged.
+        replacement, why = default_duration_days(
+            self.route, self.config_manager.get_config())
+        if not replacement or not replacement > 0:
+            self._window_resolution_note = (
+                f"This file sets no run length and asks for the whole window "
+                f"({window:g}), and this body has no known period to propose "
+                f"one from — {why}. Type a window below before running.")
+            return
+        self.config_manager.set_value(self.WINDOW_KEY, replacement)
+        self.config_manager.set_value("simulation.duration_days", replacement)
+        self._window_resolution_note = (
+            f"This file asked for the whole run window ({window:g}) without "
+            f"setting a run length. Both are now {replacement:g} days — "
+            f"{why}. Change the window below if that is not what you want.")
+
+    def _start_window_in_its_own_unit(self):
+        """Open the window control in diurnal periods where there are any."""
+        from gui_core.body_cards import default_window_unit
+        state = self._duration_state().get(self.WINDOW_KEY)
+        if state is None:
+            return
+        unit = default_window_unit(self.route, self.config_manager.get_config())
+        if unit == state["unit"]:
+            return
+        combo = state["combo"]
+        blocked = combo.blockSignals(True)
+        try:
+            combo.setCurrentText(unit)
+        finally:
+            combo.blockSignals(blocked)
+        self._on_duration_unit_changed(self.WINDOW_KEY, unit)
+
+    def refresh_window_units(self):
+        """Say what each window unit is worth on THIS body, and in what.
+
+        On the combo, because that is the control the question is about, and in
+        the note under the row, because a tooltip nobody hovers is not a
+        disclosure. Both are recomputed from the live configuration on every
+        call, and :meth:`on_widget_changed` calls it whenever a key a period
+        depends on moves -- so editing a generic body's semi-major axis moves
+        the orbital period this card offers, with nothing cached in between.
+        """
+        state = self._duration_state().get(self.WINDOW_KEY)
+        if state is None:
+            return
+        resolved = []
+        for unit in state["units"]:
+            if unit == WINDOW_UNIT_DAYS:
+                continue
+            days, why = self._unit_days(unit)
+            resolved.append(f"1 {unit[:-1]} = {days:g} d ({why})"
+                            if days else f"{unit}: {why}")
+        # Joined BEFORE the call: `setToolTip` may not be handed a string
+        # literal, not even a separator, or the single-source gate reads it as
+        # tooltip prose authored in a panel.
+        detail = "; ".join(resolved)
+        tooltip_key = state["unit_tooltip"]
+        state["combo"].setToolTip(get_tooltip(tooltip_key).format(detail))
+
+        note = getattr(self, "window_note", None)
+        if note is None:
+            return
+        # ONE place builds this label, from state, every time -- so a line that
+        # stopped being true (the window description after a switch to a run
+        # type that has no window control) cannot survive by being left alone.
+        # Neither note is CONSUMED here: this runs two or three times per
+        # activation, once directly and once per unit change, and a note
+        # consumed by the first of those would never reach the screen. They are
+        # cleared by `activate` and by the next successful unit change.
+        lines = [text for text in (getattr(self, "_window_refusal_note", ""),
+                                   getattr(self, "_window_resolution_note", ""))
+                 if text]
+        if self._run_type in state["run_types"]:
+            days = self._number(self.WINDOW_KEY, 0.0)
+            if days > 0:
+                lines.append(f"Window: {days:g} days in total.")
+            lines.extend(resolved)
+            capped = self._sampling_cap_note()
+            if capped:
+                lines.append(capped)
+        note.setText("  ".join(lines))
+        note.setVisible(bool(lines))
+
+    def _sampling_cap_note(self):
+        """Say when the derived output-sample count hit its ceiling.
+
+        ``samples_for_window`` keeps the sampling density at
+        ``SAMPLES_PER_SYNODIC_DAY`` per diurnal cycle, bounded at 100000 --
+        which a window of a few orbital periods reaches easily now that the
+        control offers them: two Europa orbits is 8665 days, or 351,000
+        samples at the corpus cadence. The bound is right, and the run is
+        still correct; what would be wrong is the user not being told the
+        density they were promised is no longer the one they are getting.
+        """
+        from gui_core.body_cards import (SAMPLES_PER_SYNODIC_DAY,
+                                         samples_for_window)
+        window = self._number(self.WINDOW_KEY, 0.0)
+        synodic = self._synodic_days()
+        if not (window > 0 and synodic > 0):
+            return ""
+        wanted = SAMPLES_PER_SYNODIC_DAY * window / synodic
+        got = samples_for_window(window, synodic)
+        if wanted <= got + 0.5:
+            return ""
+        return (f"This window is long enough that the output samples are "
+                f"capped at {got:,}: {round(wanted):,} would be needed to "
+                f"keep {SAMPLES_PER_SYNODIC_DAY} samples per diurnal cycle, "
+                f"so the statistics are counted more coarsely than that.")
 
     def thermal_group(self, title="Thermal"):
         """The thermal-solver controls, in one section.
@@ -728,11 +1090,22 @@ class BodyCard(BaseConfigTab):
         # (radiation.rms_slope_deg follows radiation.beaming). Loading a file
         # with `beaming: true, rms_slope_deg: 25.0` therefore rewrote the slope
         # to 32.5. Opening a file is not an edit to it.
+        # Before the load, not only on `activate`. A -1 window can arrive
+        # after the card is already open -- the All settings view still offers
+        # the sentinel, and `BodyFirstPanel.refresh_active_card` re-loads the
+        # card without re-activating it -- and a window control whose
+        # configuration says -1 would otherwise display its own floor.
+        if self._run_type == "integrated" \
+                and self.WINDOW_KEY in self._duration_state():
+            self._resolve_integration_window()
+
         self._loading = True
         try:
             self.load_card()
         finally:
             self._loading = False
+        self._revalidate_duration_units()
+        self.refresh_window_units()
 
     #: Combo controls a card owns, and the values each accepts. Without these
     #: the generic mirror below silently skipped every QComboBox -- a card
@@ -1077,11 +1450,17 @@ class EuropaCard(BodyCard):
 
         self._registry = europa_dem_registry(self._project_root())
 
-        # `integration_window=True`: this is the one card that offered
-        # `thermal.integration_days` before the control became the integrated
-        # run type's duration, so it keeps it in every run type rather than
-        # losing a control it had.
-        layout.addWidget(self.time_group(integration_window=True))
+        # This card used to keep `thermal.integration_days` visible in EVERY
+        # run type, because it is the one card that offered the key before the
+        # control became the integrated run type's duration. It no longer does.
+        # In a time series the key's own default is -1, "integrate the output
+        # window", and the output window is the Duration control two rows up:
+        # the only honest thing to put in the box was a sentinel, and a
+        # sentinel is what Paul asked to be rid of. A run that genuinely needs
+        # a statistics window SHORTER than its output window sets it in All
+        # settings, where the sentinel is documented and the output window is
+        # a separate control that can disagree with it on purpose.
+        layout.addWidget(self.time_group())
 
         # -- global Europa ----------------------------------------------------
         # `thermal.integration_days` used to sit here, in a mesh-geometry

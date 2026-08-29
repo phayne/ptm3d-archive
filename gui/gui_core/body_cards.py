@@ -43,10 +43,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 try:                                              # the normal case
+    from ptm.body_capabilities import (HELIOCENTRIC_PERIOD_DAYS,
+                                       kepler_period_days)
     from ptm.body_table import BODY_CAPABILITIES, IMPLEMENTED_BODIES
     from ptm.engine_defaults import ENGINE_DEFAULTS
 except ImportError:                               # pragma: no cover
     from gui_core import _ptm_bootstrap           # noqa: F401  (adds src/python)
+    from ptm.body_capabilities import (HELIOCENTRIC_PERIOD_DAYS,
+                                       kepler_period_days)
     from ptm.body_table import BODY_CAPABILITIES, IMPLEMENTED_BODIES
     from ptm.engine_defaults import ENGINE_DEFAULTS
 
@@ -64,7 +68,14 @@ __all__ = [
     "SAMPLES_PER_SYNODIC_DAY",
     "EQ_VALIDATED_CYCLES",
     "EQ_REFERENCE_THERMAL_B",
+    "WINDOW_UNITS",
+    "WINDOW_UNIT_DAYS",
+    "WINDOW_UNIT_DIURNAL",
+    "WINDOW_UNIT_ORBITAL",
     "BodyRoute",
+    "default_window_unit",
+    "orbital_period_days",
+    "window_unit_days",
     "DemEntry",
     "SpkCoverage",
     "auto_equilibration_cycles",
@@ -368,10 +379,23 @@ def synodic_period_days(body_key, config=None):
     period -- the table says so itself, and the two differ by three sidereal
     rotations per two orbits on Mercury.
 
-    For a GENERIC body there is no table row, so the rotation period from
-    ``generic_body.spin.period_hours`` is used and LABELED as the sidereal
-    period it is, because the card would otherwise present a sidereal period as
-    a solar day.
+    For a GENERIC body there is no table row, so it is computed the way
+    ``GenericBody::updateDerivedProperties`` computes it
+    (``generic_body.h:39-49``): from the SIDEREAL rotation period
+    ``generic_body.spin.period_hours`` and the orbital period Kepler's third
+    law gives for ``generic_body.orbit.semi_major_axis_au``,
+
+        1/P_solar = |1/P_sidereal - 1/P_orbital|
+
+    with the synchronous case (the two within a second of each other) falling
+    back to the sidereal period, exactly as the engine does. That is the period
+    the engine FORCES at, so it is the one a window should be counted in.
+
+    Without a semi-major axis the sidereal period is returned and LABELED as
+    the approximation it is, because the card would otherwise present a
+    sidereal period as a solar day. The two differ by the ratio of the rotation
+    period to the year -- 0.09% on a 33.8 h rotator at 2.62 AU -- so this is a
+    labeling question, not a large number.
     """
     row = BODY_CAPABILITIES.get(body_key)
     if row is not None:
@@ -382,18 +406,122 @@ def synodic_period_days(body_key, config=None):
         if days > 0:
             return days, f"{body_key} solar day, from the engine's body table"
 
-    spin = ((config or {}).get("generic_body") or {}).get("spin") or {}
+    generic = (config or {}).get("generic_body") or {}
+    spin = generic.get("spin") or {}
     try:
         hours = float(spin.get("period_hours", 0.0) or 0.0)
     except (TypeError, ValueError):
         hours = 0.0
     if hours > 0:
-        return (hours / 24.0,
+        sidereal = hours / 24.0
+        orbital = kepler_period_days(
+            (generic.get("orbit") or {}).get("semi_major_axis_au", 0.0))
+        if orbital and abs(sidereal - orbital) > 1.0 / 86400.0:
+            solar = 1.0 / abs(1.0 / sidereal - 1.0 / orbital)
+            return solar, ("solar day from generic_body.spin.period_hours and "
+                           "the orbit, by the same formula the engine uses")
+        if orbital:
+            return sidereal, ("rotation period from "
+                              "generic_body.spin.period_hours; this body is "
+                              "synchronous, so that is its solar day too")
+        return (sidereal,
                 "rotation period from generic_body.spin.period_hours, which is "
-                "the SIDEREAL period and so an approximation to the solar day")
+                "the SIDEREAL period and so an approximation to the solar day "
+                "until generic_body.orbit.semi_major_axis_au is set")
     return None, (f"no synodic period is known for {body_key or 'this body'}: "
                   f"it is not a built-in body and generic_body.spin."
                   f"period_hours is not set")
+
+
+def orbital_period_days(body_key, config=None):
+    """``(days, provenance)`` -- one HELIOCENTRIC orbit, or ``(None, why)``.
+
+    Around the SUN, on every body, including the moons. That is the distinction
+    that matters and the one the engine does not make: ``props.year`` is the
+    period the equilibration machinery counts against, and for Europa the
+    engine sets it equal to the day -- the 3.55 d orbit around Jupiter
+    (``planetary_properties.h:189``). Offering that as "one orbital period"
+    would give Europa two controls with the same number in them, and would call
+    3.55 d a seasonal cycle.
+
+    ``ptm.body_capabilities.HELIOCENTRIC_PERIOD_DAYS`` carries the built-in
+    bodies' values and ``test_body_capabilities.py`` holds each of them against
+    Kepler's third law on that body's own engine ``rAU``.
+
+    For a GENERIC body it is computed from
+    ``generic_body.orbit.semi_major_axis_au`` by the same formula the engine
+    uses (``OrbitalElements::orbitalPeriod``), so editing the semi-major axis
+    moves the period the card offers -- there is nothing cached to go stale.
+    """
+    period = HELIOCENTRIC_PERIOD_DAYS.get(body_key)
+    if period:
+        return float(period), (f"{body_key}'s orbit around the Sun, which is "
+                               f"also its seasonal cycle")
+
+    orbit = ((config or {}).get("generic_body") or {}).get("orbit") or {}
+    a_au = orbit.get("semi_major_axis_au", 0.0)
+    days = kepler_period_days(a_au)
+    if days:
+        return days, (f"Kepler's third law on the semi-major axis this body "
+                      f"is given, {float(a_au):g} AU — the same formula the "
+                      f"engine uses")
+    return None, (f"no orbital period is known for {body_key or 'this body'}: "
+                  f"it is not a built-in body and "
+                  f"generic_body.orbit.semi_major_axis_au is not set")
+
+
+#: The units a run WINDOW may be given in, in the order the combo offers them.
+#:
+#: SEASONAL IS NOT AMONG THEM, and that is a measurement rather than an
+#: omission. The seasonal cycle is the period of the subsolar latitude, and on
+#: every body this project ships it IS the heliocentric orbit: Europa's
+#: seasons are Jupiter's trip around the Sun, Mercury's are its own 87.969 d
+#: year, and a generic body's are one orbit of whatever semi-major axis it was
+#: given. The Moon is the only body with a formally distinct number -- its
+#: subsolar latitude cycles on the draconic year, 346.62 d rather than 365.25,
+#: because the lunar node regresses in 18.6 years -- and that is a 5%
+#: difference on a +-1.54 degree excursion, which does not earn a fourth entry
+#: in a combo. A "seasonal periods" unit would therefore be a second name for
+#: "orbital periods" on every body but one, and on that one it would be a
+#: number the engine's own geometry does not key on.
+WINDOW_UNIT_DIURNAL = "diurnal periods"
+WINDOW_UNIT_ORBITAL = "orbital periods"
+WINDOW_UNIT_DAYS = "days"
+WINDOW_UNITS = (WINDOW_UNIT_DIURNAL, WINDOW_UNIT_ORBITAL, WINDOW_UNIT_DAYS)
+
+
+def window_unit_days(unit, body_key, config=None):
+    """``(days_per_unit, provenance)`` for a window unit, or ``(None, why)``.
+
+    The ONE place a unit name becomes a number. A control converts through
+    this and nothing else, so "1 orbital period" means the same span wherever
+    it is written and a body with no such period cannot be given a window in
+    it -- ``None`` is returned and the caller must refuse, not fall back to
+    days and let the user believe they asked for an orbit.
+    """
+    if unit == WINDOW_UNIT_DAYS:
+        return 1.0, "days"
+    if unit == WINDOW_UNIT_DIURNAL:
+        days, why = synodic_period_days(body_key, config)
+        return (days, why) if days else (None, why)
+    if unit == WINDOW_UNIT_ORBITAL:
+        days, why = orbital_period_days(body_key, config)
+        return (days, why) if days else (None, why)
+    return None, (f"{unit!r} is not one of the window units this card offers "
+                  f"({', '.join(WINDOW_UNITS)})")
+
+
+def default_window_unit(body_key, config=None):
+    """The unit a window control starts in: diurnal periods where there are any.
+
+    ONE DIURNAL PERIOD is the default window (:func:`default_duration_days`),
+    so the control opens in the unit that shows it as the number 1. A body
+    whose diurnal period is unknown -- a generic body with no rotation period
+    yet -- opens in days instead, because a control that opened in a unit it
+    cannot convert would be showing a window nobody chose.
+    """
+    days, _why = window_unit_days(WINDOW_UNIT_DIURNAL, body_key, config)
+    return WINDOW_UNIT_DIURNAL if days else WINDOW_UNIT_DAYS
 
 
 def default_duration_days(body_key, config=None):

@@ -64,11 +64,14 @@ __all__ = [
     "CAPABILITY_FIELDS",
     "GENERIC_BODY_SURFACE_DEFAULTS",
     "GENERIC_SURFACE_FIELDS",
+    "HELIOCENTRIC_PERIOD_DAYS",
     "IMPLEMENTED_BODIES",
     "TOPOGRAPHY_PATTERNS",
     "albedo_map_status",
     "capability_for",
+    "heliocentric_period_days",
     "is_implemented",
+    "kepler_period_days",
     "parse_body_capabilities",
     "parse_generic_body_defaults",
     "solar_day_days",
@@ -132,6 +135,116 @@ def capability_for(body):
 def solar_day_days(body):
     """Solar (synodic) day in Earth days -- the period the engine forces at."""
     return capability_for(body)["solar_day_days"]
+
+
+# --------------------------------------------------------------------------
+# The heliocentric orbit -- which is NOT the engine's `year` on every body
+# --------------------------------------------------------------------------
+
+#: GM of the Sun and the astronomical unit, spelled EXACTLY as the engine
+#: spells them (``src/cpp/orbital/orbital_elements.h``: ``gm::SUN`` and
+#: ``OrbitalElements::AU_TO_M``). A generic body's orbital period is computed
+#: by the engine from these two numbers, so anything offering "orbital periods"
+#: as a unit has to use the same two or it labels a window with a period the
+#: run does not have.
+_GM_SUN = 1.32712440018e20                    # m^3/s^2
+_AU_M = 1.495978707e11                        # m
+
+
+def kepler_period_days(a_au):
+    """Period of a heliocentric orbit of semi-major axis ``a_au``, in days.
+
+    ``2 pi sqrt(a^3 / GM_sun)`` -- the engine's own
+    ``OrbitalElements::orbitalPeriod()``, in the units a user thinks in.
+
+    Returns ``None`` for a non-positive, unparseable or absurd ``a``, rather
+    than a number. There is no period to report for those, and reporting one
+    would be an invention: a card that showed "1 orbital period = 0 d" would be
+    offering a window of zero length.
+
+    ``a`` is read straight from a configuration file, so it is bounded rather
+    than trusted, and this is reached from a Qt slot, where an escaping
+    exception is a process abort rather than a message -- the same class as the
+    ``resolution: 1e5`` guard in the GUI's ``icosphere_note``. Two ways it
+    escapes: ``yaml.safe_load`` hands back an unbounded Python ``int`` for a
+    long integer literal and ``float()`` of one raises ``OverflowError``, and
+    ``float ** 3`` raises rather than returning an infinity above about
+    1e102 AU.
+    """
+    import math
+    try:
+        a = float(a_au)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (a > 0) or a != a or a > _MAX_SEMI_MAJOR_AXIS_AU:
+        return None
+    a_m = a * _AU_M
+    return 2.0 * math.pi * math.sqrt(a_m ** 3 / _GM_SUN) / _SECONDS_PER_DAY
+
+
+#: Largest semi-major axis this returns a period for. The Sun's Hill radius is
+#: of order 1e5 AU, so anything beyond this is not an orbit around it; the
+#: bound is generous on purpose -- it is there to keep the cube finite, not to
+#: adjudicate dynamics.
+_MAX_SEMI_MAJOR_AXIS_AU = 1.0e6
+
+
+#: One HELIOCENTRIC orbit, in Earth days, for each implemented body.
+#:
+#: **This is not ``BODY_CAPABILITIES[body]['year_days']`` and must not be
+#: replaced by it.** The engine's ``props.year`` is the period the equilibration
+#: machinery counts against, and for a synchronously rotating moon the engine
+#: deliberately sets it equal to the day: ``planetary_properties.h:189`` writes
+#: ``props.year = 3.55 * 24 * 3600;  // Same as day for synchronous rotation``.
+#: That is Europa's orbit around JUPITER. A GUI unit called "orbital periods"
+#: that resolved to it would offer Europa a second control identical to
+#: "diurnal periods", and would silently mislabel the seasonal cycle -- which
+#: on Europa is Jupiter's trip around the Sun, three and a half orbits of
+#: magnitude longer.
+#:
+#: The Moon and Mercury need no such distinction: their ``year_days`` IS the
+#: heliocentric period, and the values here are the engine's own to the digit.
+#: ``test_body_capabilities.py`` asserts both halves of that -- every value
+#: agrees with Kepler's third law on the body's own engine ``rAU`` to within
+#: 1%, and any body whose value differs from ``year_days`` has to be named in
+#: :data:`_ENGINE_YEAR_IS_NOT_HELIOCENTRIC` with the reason. A body added to
+#: the engine therefore fails a test here rather than inheriting an exception.
+#:
+#: Provenance: Moon 365.25 d and Mercury 87.969 d are the engine's own
+#: ``props.year``; Europa 4332.589 d is Jupiter's sidereal orbital period
+#: (JPL/IAU), the period of Europa's own heliocentric motion.
+HELIOCENTRIC_PERIOD_DAYS = {
+    "Moon": 365.25,
+    "Europa": 4332.589,
+    "Mercury": 87.969,
+}
+
+#: Bodies whose engine ``year`` is NOT a heliocentric orbit, and why. A moon
+#: the engine models with synchronous rotation belongs here; anything else does
+#: not, and the test refuses a silent addition.
+_ENGINE_YEAR_IS_NOT_HELIOCENTRIC = {
+    "Europa": ("the engine's year is Europa's 3.55 d orbit around Jupiter "
+               "(planetary_properties.h:189, 'Same as day for synchronous "
+               "rotation'); the heliocentric period is Jupiter's"),
+}
+
+
+def heliocentric_period_days(body):
+    """One heliocentric orbit for ``body``, in Earth days.
+
+    ``KeyError`` for anything not implemented, matching
+    :func:`capability_for`: a generic body has no row here and its period comes
+    from its own semi-major axis through :func:`kepler_period_days`.
+    """
+    lowered = str(body or "").strip().lower()
+    for name in IMPLEMENTED_BODIES:
+        if lowered == name.lower():
+            return HELIOCENTRIC_PERIOD_DAYS[name]
+    raise KeyError(
+        f"{body!r} is not an implemented body, so it has no shipped "
+        f"heliocentric period. Implemented: {', '.join(IMPLEMENTED_BODIES)}. "
+        f"For a generic_body: run, compute it from "
+        f"generic_body.orbit.semi_major_axis_au with kepler_period_days().")
 
 
 def albedo_map_status(body, data_root):

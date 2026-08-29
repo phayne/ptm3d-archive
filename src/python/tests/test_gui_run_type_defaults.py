@@ -33,6 +33,25 @@ than converting what is in the box, so a chain of toggles cannot lose a digit
 -- which at the old two-decimal hours display it did, showing 3.551181 d as
 85.23 h, or 3.551250 d.
 
+**5. The integrated run's window is a COUNT OF PERIODS, and no sentinel is
+reachable.** ``thermal.integration_days`` is the only duration on that run
+type, so the engine's -1 ("integrate the output window") had nothing left to
+refer to: it showed as the default, and the card offered no way to say how
+long the run should be. The control now reads "N diurnal periods" or "N
+orbital periods", its floor is a real duration in every unit it offers, and a
+file that arrives carrying -1 is resolved to the length -1 already meant, with
+the resolution announced.
+
+The orbital period is HELIOCENTRIC on every body, which the engine's own
+``props.year`` is not: for Europa the engine sets the year equal to the day,
+the 3.55 d orbit around Jupiter. ``ptm.body_capabilities`` carries the
+heliocentric values and ``test_body_capabilities`` holds each against Kepler's
+third law on the body's own ``rAU``.
+
+**6. Displaying a duration in another unit does not rewrite it.** A real
+corruption, measured on the base commit and closed here: see
+:func:`test_showing_a_duration_in_another_unit_does_not_rewrite_it`.
+
 Run directly::
 
     python3 src/python/tests/test_gui_run_type_defaults.py
@@ -155,7 +174,8 @@ def test_the_integrated_card_offers_only_the_integration_window():
 
 def test_the_integrated_window_derives_the_keys_the_engine_reads():
     """The two derived keys follow the one control, on seed AND on edit."""
-    from gui_core.body_cards import samples_for_window, synodic_period_days
+    from gui_core.body_cards import (WINDOW_UNIT_DIURNAL, samples_for_window,
+                                     synodic_period_days)
 
     manager, start = _fresh()
     card = start.open_card("Moon", "global", "integrated", apply_defaults=True)
@@ -169,11 +189,22 @@ def test_the_integrated_window_derives_the_keys_the_engine_reads():
         "the output window does not follow the integration window, so the "
         "engine would simulate a span it does not integrate over")
 
+    # ...and the control OPENS in diurnal periods, showing that window as 1.
+    state = card._duration_controls["thermal.integration_days"]
+    assert state["combo"].currentText() == WINDOW_UNIT_DIURNAL, (
+        f"the window control opened in {state['combo'].currentText()!r}, not "
+        f"in the diurnal periods its default window is one of")
+    assert abs(state["spin"].value() - 1.0) < 1e-9, (
+        f"the default window reads {state['spin'].value()} diurnal periods, "
+        f"not 1")
+
     # An edit to the one control moves both derived keys.
-    two = 2.0 * synodic
-    card._duration_controls["thermal.integration_days"]["spin"].setValue(two)
+    state["spin"].setValue(2.0)                    # two diurnal periods
     _qt().processEvents()
-    assert manager.get_value("thermal.integration_days") == two
+    two = 2.0 * synodic
+    assert manager.get_value("thermal.integration_days") == two, (
+        f"two diurnal periods stored "
+        f"{manager.get_value('thermal.integration_days')!r} d, not {two} d")
     assert manager.get_value("simulation.duration_days") == two, (
         "editing the integration window left the output window behind")
     expected_steps = samples_for_window(two, synodic)
@@ -184,8 +215,51 @@ def test_the_integrated_window_derives_the_keys_the_engine_reads():
     assert got > 144, (
         "a window twice as long was sampled no more finely than a one-cycle "
         "window, so the statistics are smeared over the same slots")
-    print(f"    [derive] window {two:g} d -> duration {two:g} d, "
-          f"{got} samples (from {seeded:g} d / 144)")
+    print(f"    [derive] 2 diurnal periods -> window {two:g} d, duration "
+          f"{two:g} d, {got} samples")
+
+
+def test_the_window_unit_toggle_round_trips_exactly():
+    """Same property, on the window control and its two period units.
+
+    The exactness matters MORE here than on the duration row, because the
+    periods are large: a hop through orbital periods on Europa divides by
+    4332.589 and multiplies back, and any conversion that went through the
+    six-decimal display instead of the stored value would return a different
+    number.
+    """
+    manager, start = _fresh()
+    card = start.open_card("Europa", "global", "integrated",
+                           apply_defaults=True)
+    key = "thermal.integration_days"
+    manager.set_value(key, 3.551181)
+    card.activate("global", "integrated")
+    before = manager.get_value(key)
+    assert before == 3.551181, (
+        f"activating the card rewrote the window: 3.551181 -> {before!r}")
+
+    state = card._duration_controls[key]
+    seen = {}
+    for unit in ("orbital periods", "days", "diurnal periods",
+                 "orbital periods", "days"):
+        state["combo"].setCurrentText(unit)
+        _qt().processEvents()
+        seen[unit] = state["spin"].value()
+        assert manager.get_value(key) == before, (
+            f"toggling the display to {unit!r} changed the stored window: "
+            f"{before!r} -> {manager.get_value(key)!r}. The units control is "
+            f"display-only and must never write.")
+    # The DISPLAY is rounded to the control's decimals -- that is what the
+    # rounding is for -- so each reading is checked against the true ratio to
+    # within half a digit. The STORED value, asserted above, is exact.
+    resolution = 0.5 * 10.0 ** -state["spin"].decimals()
+    for unit, period in (("diurnal periods", 3.55),
+                         ("orbital periods", 4332.589)):
+        assert abs(seen[unit] - before / period) <= resolution, (
+            f"the {unit} reading is {seen[unit]}, not {before / period} -- "
+            f"further off than the {resolution} the display rounds to")
+    print(f"    [round trip] {before} d survives 5 window-unit toggles; "
+          f"orbital reads {seen['orbital periods']:.6f}")
 
 
 def test_the_duration_unit_toggle_round_trips_exactly():
@@ -202,7 +276,7 @@ def test_the_duration_unit_toggle_round_trips_exactly():
 
     state = card._duration_controls[key]
     seen = {}
-    for unit in ("hours", "synodic periods", "days", "hours", "days"):
+    for unit in ("hours", "diurnal periods", "days", "hours", "days"):
         state["combo"].setCurrentText(unit)
         _qt().processEvents()
         seen[unit] = state["spin"].value()
@@ -220,36 +294,434 @@ def test_the_duration_unit_toggle_round_trips_exactly():
           f"{seen['hours']} (exactly x24)")
 
 
-def test_the_integration_sentinel_survives_every_display_unit():
-    """-1 means "use the output window", and must reach the screen intact.
+#: One window in each unit, per route, with the days it MUST emit -- computed
+#: here from the periods rather than from the code under test.
+#:
+#: The two periods are different questions and the asteroid case is the one
+#: that proves it: 3.55 d is Europa's day AND the engine's ``props.year``
+#: (``planetary_properties.h:189``, "Same as day for synchronous rotation"),
+#: while its orbital period is Jupiter's 4332.589 d. Anything that resolved
+#: "orbital periods" from the engine's year would pass every other case here
+#: and be wrong by a factor of 1220 on Europa.
+_MOON_DAY = 29.530588          # planetary_properties.h, Moon solar day
+_EUROPA_DAY = 3.55             # ...synchronous rotation
+_MERCURY_DAY = 175.938         # ...3 x the 58.646 d sidereal rotation
+_MOON_YEAR = 365.25            # the Moon orbits the Sun with the Earth
+_EUROPA_YEAR = 4332.589        # Jupiter's sidereal orbital period
+_MERCURY_YEAR = 87.969
 
-    The bounds of a duration control are converted by the same function as its
-    value. When they were not, the "synodic periods" floor stayed at 0 and the
-    engine's -1 sentinel was clamped to 0 on the way to the display -- a
-    control showing a setting the run does not have.
+#: A generic body at 2.5 AU, computed from Kepler's third law WRITTEN OUT --
+#: 2 pi sqrt(a^3 / GM_sun) -- on the engine's own constants
+#: (``orbital_elements.h``: gm::SUN, AU_TO_M). Not a call to the function
+#: under test.
+_ASTEROID_A_AU = 2.5
+_ASTEROID_YEAR = (2.0 * 3.141592653589793 * (
+    ((2.5 * 1.495978707e11) ** 3 / 1.32712440018e20) ** 0.5)) / 86400.0
+
+WINDOW_CASES = (
+    # (body, mode, count, unit, expected days)
+    ("Moon", "global", 1.0, "diurnal periods", _MOON_DAY),
+    ("Moon", "global", 3.0, "orbital periods", 3.0 * _MOON_YEAR),
+    ("Moon", "local", 0.5, "days", 0.5),
+    ("Europa", "global", 1.0, "diurnal periods", _EUROPA_DAY),
+    ("Europa", "global", 1.0, "orbital periods", _EUROPA_YEAR),
+    ("Europa", "local", 2.0, "orbital periods", 2.0 * _EUROPA_YEAR),
+    ("Mercury", "global", 2.0, "diurnal periods", 2.0 * _MERCURY_DAY),
+    ("Mercury", "global", 1.0, "orbital periods", _MERCURY_YEAR),
+)
+
+
+def test_the_window_units_emit_the_days_they_promise():
+    """What the user chose, in days, in the key the engine reads.
+
+    The unit is a DISPLAY choice and ``thermal.integration_days`` is always
+    days, so the whole content of the control is this multiplication. Each
+    expectation is computed above from the period, not from the code being
+    checked.
     """
-    manager, start = _fresh()
-    card = start.open_card("Europa", "global", "time_series",
-                           apply_defaults=False)
-    key = "thermal.integration_days"
-    manager.set_value(key, -1.0)
-    card.activate("global", "time_series")
-    state = card._duration_controls[key]
-    for unit, expect in (("days", -1.0), ("hours", -24.0),
-                         ("synodic periods", None), ("days", -1.0)):
+    for body, mode, count, unit, expected in WINDOW_CASES:
+        manager, start = _fresh()
+        card = start.open_card(body, mode, "integrated", apply_defaults=True)
+        state = card._duration_controls["thermal.integration_days"]
         state["combo"].setCurrentText(unit)
         _qt().processEvents()
-        shown = state["spin"].value()
-        assert manager.get_value(key) == -1.0, (
-            f"the sentinel was rewritten while displaying it in {unit!r}: "
-            f"{manager.get_value(key)!r}")
-        assert shown < 0, (
-            f"the -1 sentinel displays as {shown} in {unit!r}, so it has been "
-            f"clamped by a bound that was not converted with it")
-        if expect is not None:
-            assert abs(shown - expect) < 1e-9, (unit, shown, expect)
-    print("    [sentinel] integration_days = -1 survives days, hours and "
-          "synodic periods intact")
+        assert state["combo"].currentText() == unit, (
+            f"{body}/{mode}: the window control refused the unit {unit!r}, "
+            f"which every body this card serves has a period for")
+        state["spin"].setValue(count)
+        _qt().processEvents()
+        got = manager.get_value("thermal.integration_days")
+        assert abs(got - expected) <= 1e-9 * expected, (
+            f"{body}/{mode}: {count:g} {unit} emitted {got!r} d, not the "
+            f"{expected!r} d that many periods is")
+        assert manager.get_value("simulation.duration_days") == got, (
+            f"{body}/{mode}: the output window did not follow the "
+            f"{count:g} {unit} window")
+
+        # ...and the control SAYS what a period is worth on this body, in
+        # days, where the choice is made: on the combo and under the row.
+        one = f"{expected / count:g}"
+        tip, note = state["combo"].toolTip(), card.window_note.text()
+        assert one in tip, (
+            f"{body}/{mode}: the unit help does not resolve {unit} to "
+            f"{one} d for this body: {tip!r}")
+        assert one in note, (
+            f"{body}/{mode}: the note under the window does not say what "
+            f"{unit} is worth here: {note!r}")
+    print(f"    [units] {len(WINDOW_CASES)} hand-computed cases emit their "
+          f"own days; each is stated in the unit help and under the row")
+
+
+def test_an_asteroids_orbital_period_comes_from_its_own_semi_major_axis():
+    """Kepler's third law, live: edit `a` and the window the card emits moves.
+
+    A generic body has no row in any period table -- it has an orbit. The
+    period is computed from ``generic_body.orbit.semi_major_axis_au`` by the
+    formula the ENGINE uses (``OrbitalElements::orbitalPeriod``), so there is
+    nothing cached to go stale when the semi-major axis changes.
+    """
+    manager, start = _fresh()
+    manager.set_value("generic_body.orbit.semi_major_axis_au", _ASTEROID_A_AU)
+    manager.set_value("generic_body.spin.period_hours", 7.0)
+    card = start.open_card("asteroid", "body", "integrated",
+                           apply_defaults=True)
+    state = card._duration_controls["thermal.integration_days"]
+    state["combo"].setCurrentText("orbital periods")
+    _qt().processEvents()
+    state["spin"].setValue(1.0)
+    _qt().processEvents()
+    got = manager.get_value("thermal.integration_days")
+    assert abs(got - _ASTEROID_YEAR) <= 1e-9 * _ASTEROID_YEAR, (
+        f"one orbit at a = {_ASTEROID_A_AU} AU emitted {got!r} d, not the "
+        f"{_ASTEROID_YEAR!r} d Kepler's third law gives")
+
+    # ...and moving the semi-major axis moves the period, with nothing cached.
+    # a -> 4a is P -> 8P exactly, by the three-halves power.
+    manager.set_value("generic_body.orbit.semi_major_axis_au",
+                      4.0 * _ASTEROID_A_AU)
+    state["spin"].setValue(2.0)                # re-emit at the new period
+    state["spin"].setValue(1.0)
+    _qt().processEvents()
+    moved = manager.get_value("thermal.integration_days")
+    assert abs(moved - 8.0 * _ASTEROID_YEAR) <= 1e-9 * moved, (
+        f"after a -> 4a the same 1 orbital period emitted {moved!r} d; "
+        f"Kepler's third law makes it exactly 8x, {8.0 * _ASTEROID_YEAR!r} d")
+
+    # ...and the DISPLAY follows too, with no cached period: a window of the
+    # old orbit is one eighth of the new one, and the card says so as soon as
+    # it is shown again.
+    manager.set_value("thermal.integration_days", _ASTEROID_YEAR)
+    card.activate("body", "integrated")
+    state["combo"].setCurrentText("orbital periods")
+    _qt().processEvents()
+    shown = state["spin"].value()
+    assert abs(shown - 0.125) < 1e-6, (
+        f"the old one-orbit window reads {shown} orbital periods against the "
+        f"new 4x semi-major axis, not the 0.125 it now is -- the period the "
+        f"card converts with has gone stale")
+    print(f"    [kepler] a = {_ASTEROID_A_AU} AU -> {got:.1f} d; "
+          f"a = {4 * _ASTEROID_A_AU} AU -> {moved:.1f} d (exactly 8x); the "
+          f"same window then reads {shown:g} orbits")
+
+
+def test_no_sentinel_is_reachable_from_the_integrated_card():
+    """Paul's first rule, as geometry: -1 cannot be typed, dialed or shown.
+
+    The floor of the control is a real duration in every unit it offers, and
+    the seeded value is positive on every route. There is no combination of
+    unit and spin box that produces the engine's "use the output window"
+    sentinel, so a user cannot arrive at a window that has no end time.
+    """
+    from gui_core.body_cards import WINDOW_UNITS
+
+    for body, mode in ROUTES + (("asteroid", "body"),):
+        manager, start = _fresh()
+        if body == "asteroid":
+            manager.set_value("generic_body.spin.period_hours", 7.0)
+            manager.set_value("generic_body.orbit.semi_major_axis_au", 2.5)
+        card = start.open_card(body, mode, "integrated", apply_defaults=True)
+        state = card._duration_controls["thermal.integration_days"]
+        assert set(state["units"]) == set(WINDOW_UNITS), (
+            f"{body}/{mode}: the window offers {state['units']}")
+        seeded = manager.get_value("thermal.integration_days")
+        assert seeded > 0, (
+            f"{body}/{mode}: the card seeded {seeded!r}, which is the "
+            f"sentinel and not a window")
+        for unit in state["units"]:
+            state["combo"].setCurrentText(unit)
+            _qt().processEvents()
+            assert state["spin"].minimum() > 0, (
+                f"{body}/{mode}: in {unit!r} the window control's floor is "
+                f"{state['spin'].minimum()}, so a sentinel is reachable")
+            # Try to type one anyway. The spin box clamps, and what is stored
+            # must stay a real window.
+            state["spin"].setValue(-1.0)
+            _qt().processEvents()
+            stored = manager.get_value("thermal.integration_days")
+            assert stored > 0, (
+                f"{body}/{mode}: typing -1 with {unit!r} selected stored "
+                f"{stored!r}")
+    print(f"    [no sentinel] {len(ROUTES) + 1} routes x "
+          f"{len(WINDOW_UNITS)} units: floor positive, -1 unreachable")
+
+
+def test_an_opened_sentinel_becomes_the_window_it_already_means():
+    """A file carrying -1 is resolved, and the card says so.
+
+    -1 is the engine's default and every shipped file that mentions the key
+    uses it, so an opened configuration WILL carry it. The card cannot show it
+    -- the whole point above -- so it writes the length -1 already stands for:
+    ``simulation.duration_days``. The run is unchanged, because
+    ``computeIntegrationWindow`` takes ``integration_days > 0 ?
+    integration_days : output_days`` (``ptm_thermal_sim.cpp:1158``) and both
+    branches now produce the same double.
+
+    The resolution is ANNOUNCED. A silent one would be the substitution this
+    project keeps paying for.
+    """
+    manager, start = _fresh()
+    manager.set_value("simulation.body", "Moon")
+    manager.set_value("simulation.duration_days", 12.5)
+    manager.set_value("thermal.integration_days", -1.0)
+    card = start.open_card("Moon", "global", "integrated",
+                           apply_defaults=False)
+    resolved = manager.get_value("thermal.integration_days")
+    assert resolved == 12.5, (
+        f"the opened -1 became {resolved!r}, not the 12.5 d output window it "
+        f"already meant")
+    note = card.window_note.text()
+    assert "12.5" in note and "unchanged" in note, (
+        f"the card resolved the sentinel without saying so: {note!r}")
+    print(f"    [sentinel] -1 over a 12.5 d run resolved to 12.5 d, announced: "
+          f"{note[:60]}...")
+
+
+def test_a_sentinel_arriving_after_the_card_is_open_is_resolved_too():
+    """All settings still offers -1, and the card is reloaded, not reopened.
+
+    ``BodyFirstPanel.refresh_active_card`` calls ``load_from_config`` alone,
+    so a resolution that ran only from ``activate`` would leave the window
+    control displaying its own floor over a configuration that says "integrate
+    the whole output window".
+    """
+    manager, start = _fresh()
+    card = start.open_card("Moon", "global", "integrated", apply_defaults=True)
+    window = manager.get_value("thermal.integration_days")
+    assert window > 0
+
+    manager.set_value("thermal.integration_days", -1.0)   # as All settings does
+    start.refresh_active_card()
+    _qt().processEvents()
+    resolved = manager.get_value("thermal.integration_days")
+    assert resolved > 0, (
+        f"a -1 set after the card was open survived the reload as {resolved!r}")
+    assert resolved == manager.get_value("simulation.duration_days"), (
+        f"the resolved window {resolved!r} is not the output window "
+        f"{manager.get_value('simulation.duration_days')!r} it stood for")
+    shown = card._duration_controls["thermal.integration_days"]["spin"].value()
+    assert shown > card._duration_controls[
+        "thermal.integration_days"]["spin"].minimum(), (
+        f"the control is sitting at its floor ({shown}), which is what it "
+        f"shows when it cannot display what the configuration holds")
+    print(f"    [reload] a -1 set from All settings resolved to {resolved:g} d "
+          f"on the next card reload")
+
+
+def test_a_period_that_goes_away_takes_its_unit_with_it():
+    """The unit is re-resolved, not trusted from when it was chosen.
+
+    A unit outlives the number behind it: choose "diurnal periods" on an
+    asteroid, then clear the rotation period. The silent failure is that the
+    box goes on reading "diurnal periods" and stores a typed 2 as two DAYS,
+    which ``derive_from_duration`` then copies into the run length.
+    """
+    manager, start = _fresh()
+    manager.set_value("generic_body.spin.period_hours", 7.0)
+    manager.set_value("generic_body.orbit.semi_major_axis_au", 2.5)
+    card = start.open_card("asteroid", "body", "integrated",
+                           apply_defaults=True)
+    state = card._duration_controls["thermal.integration_days"]
+    assert state["combo"].currentText() == "diurnal periods", (
+        state["combo"].currentText())
+
+    # The rotation period is cleared -- on the Body page, or by a lookup.
+    manager.set_value("generic_body.spin.period_hours", 0.0)
+
+    # THE WRITE PATH, with no reload in between: an edit must be refused, not
+    # read as days under a label that says periods.
+    state["spin"].setValue(2.0)
+    _qt().processEvents()
+    assert state["combo"].currentText() == "days", (
+        f"the combo still reads {state['combo'].currentText()!r} with no "
+        f"period behind it")
+    assert manager.get_value("thermal.integration_days") != 2.0, (
+        "a 2 typed under 'diurnal periods' was stored as 2 days")
+    note = card.window_note.text()
+    assert "diurnal periods" in note and "period_hours" in note, (
+        f"the refusal does not say what went missing: {note!r}")
+    print("    [stale unit] a cleared rotation period refuses its own unit on "
+          "the next edit, and says which key is missing")
+
+
+def test_editing_the_semi_major_axis_moves_what_the_units_are_worth():
+    """The "nothing cached" claim, with the hook that makes it true."""
+    manager, start = _fresh()
+    manager.set_value("generic_body.spin.period_hours", 7.0)
+    manager.set_value("generic_body.orbit.semi_major_axis_au", 2.5)
+    card = start.open_card("asteroid", "body", "integrated",
+                           apply_defaults=True)
+    before = card.window_note.text()
+    assert f"{_ASTEROID_YEAR:g}" in before, before
+
+    card.on_widget_changed("generic_body.orbit.semi_major_axis_au", 10.0)
+    _qt().processEvents()
+    after = card.window_note.text()
+    assert f"{8.0 * _ASTEROID_YEAR:g}" in after, (
+        f"after a -> 4a the card still says an orbit is "
+        f"{_ASTEROID_YEAR:g} d: {after!r}")
+    print(f"    [live] editing a from 2.5 to 10 AU moved the stated orbit "
+          f"from {_ASTEROID_YEAR:.0f} d to {8 * _ASTEROID_YEAR:.0f} d")
+
+
+def test_a_window_too_long_to_sample_says_so():
+    """`samples_for_window` caps at 100000, and the cap is not silent.
+
+    Two Europa orbits is 8665 days; keeping 144 samples per 3.55 d diurnal
+    cycle would need about 351,000 of them. The run is still correct at the
+    cap -- what would be wrong is the promised density quietly not holding.
+    """
+    from gui_core.body_cards import SAMPLES_PER_SYNODIC_DAY
+
+    manager, start = _fresh()
+    card = start.open_card("Europa", "global", "integrated",
+                           apply_defaults=True)
+    state = card._duration_controls["thermal.integration_days"]
+    state["combo"].setCurrentText("orbital periods")
+    _qt().processEvents()
+    state["spin"].setValue(2.0)
+    _qt().processEvents()
+    card.refresh_window_units()
+    assert manager.get_value("simulation.timesteps") == 100000, (
+        f"expected the sample count to reach its cap, got "
+        f"{manager.get_value('simulation.timesteps')!r}")
+    note = card.window_note.text()
+    assert "capped at 100,000" in note and str(SAMPLES_PER_SYNODIC_DAY) in note, (
+        f"the sampling cap was applied without saying so: {note!r}")
+    print("    [cap] 2 Europa orbits: samples capped at 100,000 and the card "
+          "says the density is no longer 144 per diurnal cycle")
+
+
+def test_a_file_with_neither_a_window_nor_a_length_is_not_called_unchanged():
+    """The one branch where "the run is unchanged" would be a false claim.
+
+    -1 with no positive ``simulation.duration_days`` meant the ENGINE's own
+    output window, which the card cannot claim to be preserving. It sets both
+    keys and words the note as the change it is.
+    """
+    manager, start = _fresh()
+    manager.set_value("simulation.body", "Moon")
+    manager.set_value("simulation.duration_days", 0.0)
+    manager.set_value("thermal.integration_days", -1.0)
+    card = start.open_card("Moon", "global", "integrated",
+                           apply_defaults=False)
+    window = manager.get_value("thermal.integration_days")
+    assert window == 29.530588, window
+    assert manager.get_value("simulation.duration_days") == window, (
+        "the run length was left at 0 while the window was set, so the engine "
+        "would integrate over a span it does not simulate")
+    note = card.window_note.text()
+    assert "unchanged" not in note, (
+        f"the card claims the run is unchanged when it has just given it a "
+        f"length: {note!r}")
+    print("    [no length] -1 over a run with no length sets both keys and "
+          "does not claim the run is unchanged")
+
+
+def test_the_window_note_does_not_outlive_the_control_it_describes():
+    """A label is state, and state that is only ever appended to goes stale.
+
+    "Window: 29.5306 d in total" is true under a window control and false
+    under a Duration control, which is what sits there on the time-series run
+    type. The note is rebuilt from state on every refresh rather than left
+    alone, so switching run types cannot leave the previous run type's
+    sentence on screen.
+    """
+    manager, start = _fresh()
+    card = start.open_card("Moon", "global", "integrated", apply_defaults=True)
+    assert "Window:" in card.window_note.text(), card.window_note.text()
+
+    card.activate("global", "time_series")
+    _qt().processEvents()
+    assert "Window:" not in card.window_note.text(), (
+        f"the integrated run type's window description survived onto the time "
+        f"series card: {card.window_note.text()!r}")
+    assert not card.window_note.isVisible() \
+        or not card.window_note.text(), card.window_note.text()
+    print("    [stale note] the window description does not survive a switch "
+          "to a run type with no window control")
+
+
+def test_a_unit_with_no_period_is_refused_not_approximated():
+    """A body with no orbit cannot be given a window in orbits.
+
+    The wrong answer here is silent: read "2" as two days when the user asked
+    for two orbits. The combo goes back to days and the card says why.
+    """
+    manager, start = _fresh()
+    manager.set_value("generic_body.spin.period_hours", 7.0)
+    manager.set_value("generic_body.orbit.semi_major_axis_au", 0.0)
+    card = start.open_card("asteroid", "body", "integrated",
+                           apply_defaults=True)
+    state = card._duration_controls["thermal.integration_days"]
+    before = manager.get_value("thermal.integration_days")
+    state["combo"].setCurrentText("orbital periods")
+    _qt().processEvents()
+    assert state["combo"].currentText() == "days", (
+        f"a body with no semi-major axis accepted the unit "
+        f"{state['combo'].currentText()!r}")
+    assert manager.get_value("thermal.integration_days") == before, (
+        "refusing the unit changed the stored window")
+    note = card.window_note.text()
+    assert "orbital periods" in note and "semi_major_axis_au" in note, (
+        f"the refusal does not say what is missing: {note!r}")
+    print(f"    [refusal] no semi-major axis: orbital periods refused, days "
+          f"kept, reason shown")
+
+
+def test_showing_a_duration_in_another_unit_does_not_rewrite_it():
+    """GUI-DURATION-DISPLAY-UNITS-STORED, closed. This one CORRUPTED files.
+
+    ``BaseConfigTab.set_numeric`` writes the coerced number back to the
+    configuration on purpose -- it is how a YAML string like ``5e3`` stops
+    being a str that raises on the next comparison. The card's override
+    converted the value to the DISPLAY unit first and then let that base call
+    write it, so every reload of a card whose unit combo was off days divided
+    the stored duration by the period again.
+
+    Measured on the base commit 4e00f8a, Moon, one diurnal cycle::
+
+        after open   29.530588       after reload  1.0
+        after unit   29.530588       after 2nd     0.033863192971301484
+
+    Compounding, silent, and it is ``simulation.duration_days`` -- the length
+    of the run. Four reloads here, because two were needed to see it.
+    """
+    manager, start = _fresh()
+    card = start.open_card("Moon", "global", "time_series",
+                           apply_defaults=True)
+    key = "simulation.duration_days"
+    before = manager.get_value(key)
+    card._duration_controls[key]["combo"].setCurrentText("diurnal periods")
+    _qt().processEvents()
+    for reload_number in range(1, 5):
+        card.activate("global", "time_series")
+        _qt().processEvents()
+        assert manager.get_value(key) == before, (
+            f"reload {reload_number} rewrote the duration: {before!r} -> "
+            f"{manager.get_value(key)!r}. The display unit is reaching the "
+            f"configuration.")
+    print(f"    [no rewrite] {before} d survives 4 card reloads with the "
+          f"unit combo off days")
 
 
 def test_every_duration_control_shows_the_same_precision():
@@ -461,8 +933,20 @@ CHECKS = [
     test_the_default_window_is_one_synodic_day_from_the_engines_table,
     test_the_integrated_card_offers_only_the_integration_window,
     test_the_integrated_window_derives_the_keys_the_engine_reads,
+    test_the_window_units_emit_the_days_they_promise,
+    test_an_asteroids_orbital_period_comes_from_its_own_semi_major_axis,
+    test_no_sentinel_is_reachable_from_the_integrated_card,
+    test_an_opened_sentinel_becomes_the_window_it_already_means,
+    test_a_sentinel_arriving_after_the_card_is_open_is_resolved_too,
+    test_a_file_with_neither_a_window_nor_a_length_is_not_called_unchanged,
+    test_a_period_that_goes_away_takes_its_unit_with_it,
+    test_editing_the_semi_major_axis_moves_what_the_units_are_worth,
+    test_a_window_too_long_to_sample_says_so,
+    test_the_window_note_does_not_outlive_the_control_it_describes,
+    test_a_unit_with_no_period_is_refused_not_approximated,
+    test_the_window_unit_toggle_round_trips_exactly,
     test_the_duration_unit_toggle_round_trips_exactly,
-    test_the_integration_sentinel_survives_every_display_unit,
+    test_showing_a_duration_in_another_unit_does_not_rewrite_it,
     test_every_duration_control_shows_the_same_precision,
     test_the_spin_up_is_set_automatically_on_every_route,
     test_the_spin_up_rule_scales_with_the_column_and_the_window,
