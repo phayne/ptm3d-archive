@@ -43,11 +43,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 try:                                              # the normal case
-    from ptm.body_table import IMPLEMENTED_BODIES
+    from ptm.body_table import BODY_CAPABILITIES, IMPLEMENTED_BODIES
     from ptm.engine_defaults import ENGINE_DEFAULTS
 except ImportError:                               # pragma: no cover
     from gui_core import _ptm_bootstrap           # noqa: F401  (adds src/python)
-    from ptm.body_table import IMPLEMENTED_BODIES
+    from ptm.body_table import BODY_CAPABILITIES, IMPLEMENTED_BODIES
     from ptm.engine_defaults import ENGINE_DEFAULTS
 
 
@@ -61,11 +61,18 @@ __all__ = [
     "RUN_TYPES",
     "RUN_TYPES_BY_KEY",
     "SURFACE_ROUND_TRIP_FLOOR",
+    "SAMPLES_PER_SYNODIC_DAY",
+    "EQ_VALIDATED_CYCLES",
+    "EQ_REFERENCE_THERMAL_B",
     "BodyRoute",
     "DemEntry",
     "SpkCoverage",
+    "auto_equilibration_cycles",
     "body_buttons",
+    "default_duration_days",
     "detect_route",
+    "samples_for_window",
+    "synodic_period_days",
     "europa_dem_registry",
     "europa_sweep_points",
     "kernel_architecture",
@@ -311,6 +318,204 @@ def run_type_of(config):
     if isinstance(skip, str):
         skip = skip.strip().lower() in ("true", "yes", "on", "1")
     return "integrated" if skip else "time_series"
+
+
+# ---------------------------------------------------------------------------
+# 2b. The durations a card proposes, and the spin-up it proposes with them
+# ---------------------------------------------------------------------------
+#
+# All of this is HERE, not in the Qt panel, for the reason at the top of the
+# file: it can then be measured without a window.
+
+#: Output samples per synodic day, for a duration a card proposes itself.
+#:
+#: The number is the shipped corpus's own: both `lunar_global_diurnal` and
+#: `europa_diurnal` pair one synodic day with `simulation.timesteps: 144`
+#: (`gui_core/presets.py`). It is NOT the engine default (72), which no shipped
+#: preset uses.
+#:
+#: For reference and not as the target: `docs/equilibration-paper.md` §6
+#: measures the worst-case per-layer error against samples per diurnal cycle --
+#: 11.9 K at 24, 0.99 K at 192, 0.21 K at 768, scaling as O(dt^2). 144 sits
+#: just under the 192 the paper calls the production cadence.
+SAMPLES_PER_SYNODIC_DAY = 144
+
+#: Spin-up cycles the paper's own cross-validation used, and the top of the
+#: band it quotes for production. See :func:`auto_equilibration_cycles`.
+EQ_VALIDATED_CYCLES = 6.0
+
+#: Skin depths to the bottom of the column at the engine's DEFAULT depth grid
+#: -- `thermal.thermal_b`, which is `config.thermal.grid_b`
+#: (`config_parser.cpp:404`, default 15 at `config_parser.h:216`).
+#: `eq_certificate.cpp:381` confirms the reading: the grid's skin depth is
+#: `z_max / grid_b`, so `grid_b` is the column depth measured in skin depths.
+#:
+#: Read only. Retuning `thermal_b` is a known trap and nothing here writes it.
+EQ_REFERENCE_THERMAL_B = 15.0
+
+
+def synodic_period_days(body_key, config=None):
+    """``(days, provenance)`` -- one solar day on this body, or ``(None, why)``.
+
+    From ``ptm.body_table``, which is GENERATED from the engine's own
+    ``planetary_properties.h`` and re-derived by
+    ``src/python/tests/test_body_capabilities.py`` on every run. That is the
+    point of reading it from there rather than typing 29.530588 into the GUI:
+    a period retuned in the C++ becomes a test failure and a diff, not a card
+    that quietly proposes a window the engine does not force at.
+
+    ``solar_day_days`` is the SOLAR (synodic) day and not the sidereal rotation
+    period -- the table says so itself, and the two differ by three sidereal
+    rotations per two orbits on Mercury.
+
+    For a GENERIC body there is no table row, so the rotation period from
+    ``generic_body.spin.period_hours`` is used and LABELED as the sidereal
+    period it is, because the card would otherwise present a sidereal period as
+    a solar day.
+    """
+    row = BODY_CAPABILITIES.get(body_key)
+    if row is not None:
+        try:
+            days = float(row["solar_day_days"])
+        except (KeyError, TypeError, ValueError):
+            days = 0.0
+        if days > 0:
+            return days, f"{body_key} solar day, from the engine's body table"
+
+    spin = ((config or {}).get("generic_body") or {}).get("spin") or {}
+    try:
+        hours = float(spin.get("period_hours", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        hours = 0.0
+    if hours > 0:
+        return (hours / 24.0,
+                "rotation period from generic_body.spin.period_hours, which is "
+                "the SIDEREAL period and so an approximation to the solar day")
+    return None, (f"no synodic period is known for {body_key or 'this body'}: "
+                  f"it is not a built-in body and generic_body.spin."
+                  f"period_hours is not set")
+
+
+def default_duration_days(body_key, config=None):
+    """``(days, provenance)`` for a card's proposed run length, or ``(None, why)``.
+
+    ONE synodic period. A diurnal cycle is the shortest window in which every
+    face of a body is both lit and unlit, so it is the shortest window whose
+    statistics mean anything; it is also what both shipped diurnal presets
+    already use.
+    """
+    days, why = synodic_period_days(body_key, config)
+    if days is None:
+        return None, why
+    return days, f"one diurnal cycle ({days:g} d) — {why}"
+
+
+def samples_for_window(window_days, synodic_days,
+                       per_day=SAMPLES_PER_SYNODIC_DAY):
+    """``simulation.timesteps`` for a window, at the corpus sampling cadence.
+
+    Keeps the sampling density fixed at :data:`SAMPLES_PER_SYNODIC_DAY` per
+    synodic day however long the window is, so a two-day window is sampled
+    twice as often as a one-day window rather than being smeared over the same
+    144 slots. At least 2 -- one sample is not a window -- and bounded by the
+    range the control offers.
+    """
+    try:
+        window = float(window_days)
+        synodic = float(synodic_days)
+    except (TypeError, ValueError):
+        return int(per_day)
+    if not (window > 0) or not (synodic > 0):
+        return int(per_day)
+    return max(2, min(100000, int(round(per_day * window / synodic))))
+
+
+def auto_equilibration_cycles(body_key, config=None):
+    """``(cycles, reason)`` -- the spin-up length a card proposes.
+
+    **This is the GUI's rule, not the engine's.** The engine has no ``auto``:
+    ``thermal.equilibration_orbits`` is a plain double
+    (``config_parser.cpp:405``) whose default is 1.0, and there is no pre-run
+    estimator in the C++ to ask -- ``ptm_eq_certify`` certifies a run that has
+    already happened. So the number is computed here, shown with its reasoning,
+    and left editable. Moving it into the engine is a separate change.
+
+    THE RULE, and where each part of it comes from:
+
+    * **A floor of 6 cycles.** ``docs/equilibration-paper.md`` §6 validates the
+      full equilibration-plus-output pipeline against Hayne et al. (2017) using
+      **six** equilibration orbits, and §7 quotes 2-6 as the production band
+      for large meshes. The paper's own sufficiency claim is two cycles "to
+      reach the periodic attractor to sub-Kelvin accuracy at all latitudes",
+      but two is stated for near-isothermal regolith at the diurnal period and
+      a card cannot know the user is in that regime. Six is the number the
+      project actually validated against data, so six is the floor.
+
+      It is deliberately well above the engine default of 1.0, which is below
+      even the paper's minimum.
+
+    * **Scaled by the depth of the column, as its square.** The spin-up has to
+      relax the deepest layer that participates. For a column of depth L the
+      slowest diffusive mode relaxes on tau = 4L^2/(pi^2 kappa); with
+      L = b * skin depth and skin depth = sqrt(kappa P / pi), that is
+      tau/P = 4 b^2 / pi^3 -- quadratic in b, and independent of the
+      conductivity, which cancels. The paper's 2-6 band is quoted at the
+      engine's default grid, so the floor is scaled by ``(b / 15)^2`` and a
+      deeper column asks for proportionally more spin-up. At the default
+      ``thermal_b`` this factor is exactly 1 and the answer is 6.
+
+    * **At least the length of the run itself.** A window longer than one
+      diurnal cycle carries forcing periods longer than a diurnal cycle, and a
+      spin-up shorter than the window cannot have settled them.
+
+    The thermal inertia does NOT enter. That is the point of working in skin
+    depths: the diffusivity cancels out of tau/P, so a low-inertia and a
+    high-inertia surface need the same NUMBER of cycles, differing only in how
+    much wall clock each cycle costs.
+
+    A number is ALWAYS returned: the floor and the depth scaling are both
+    period-independent, so a body with no known synodic period still gets the
+    six-cycle floor -- only the "at least the length of the run" term needs the
+    period, and it is skipped when there is none. Rounded UP to a whole cycle,
+    because the engine counts integrated diurnal cycles.
+    """
+    synodic, _why = synodic_period_days(body_key, config)
+    config = config or {}
+    thermal = config.get("thermal") or {}
+    simulation = config.get("simulation") or {}
+
+    def number(node, key, fallback):
+        try:
+            value = float(node.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return fallback if value != value else value
+
+    thermal_b = number(thermal, "thermal_b", EQ_REFERENCE_THERMAL_B)
+    if not (thermal_b > 0):
+        thermal_b = EQ_REFERENCE_THERMAL_B
+    depth_factor = (thermal_b / EQ_REFERENCE_THERMAL_B) ** 2
+    floor = EQ_VALIDATED_CYCLES * depth_factor
+
+    cycles = floor
+    reason = (f"{EQ_VALIDATED_CYCLES:g} cycles, the number the equilibration "
+              f"paper validated against Hayne et al. (2017)")
+    if abs(depth_factor - 1.0) > 1e-9:
+        reason += (f", scaled by (thermal_b/{EQ_REFERENCE_THERMAL_B:g})^2 = "
+                   f"{depth_factor:.2f} for the deeper column")
+
+    duration = number(simulation, "duration_days", 0.0)
+    if synodic and synodic > 0 and duration > 0:
+        window_cycles = duration / synodic
+        if window_cycles > cycles:
+            cycles = window_cycles
+            reason = (f"{window_cycles:.2f} cycles, the length of the run "
+                      f"itself ({duration:g} d over a {synodic:g} d diurnal "
+                      f"cycle) — a spin-up shorter than the window cannot "
+                      f"have settled it")
+    import math
+    cycles = float(math.ceil(cycles - 1e-9))
+    return cycles, reason
 
 
 # ---------------------------------------------------------------------------

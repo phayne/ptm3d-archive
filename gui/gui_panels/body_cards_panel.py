@@ -40,7 +40,7 @@ import logging
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
@@ -141,6 +141,10 @@ class BodyCard(BaseConfigTab):
         self._seeding_defaults = bool(seeding_defaults)
         try:
             self.apply_mode()
+            # NOT inside `apply_mode`: every card overrides that and none of
+            # them calls super(), so a run-type rule put there would apply to
+            # whichever cards happened to remember it.
+            self.apply_time_mode()
             self.load_from_config()
         finally:
             self._seeding_defaults = False
@@ -225,22 +229,261 @@ class BodyCard(BaseConfigTab):
                     f"shown for it; edit the field to change it.")
         return f"ico{level} — {20 * (4 ** level):,} faces"
 
-    def time_group(self, title="Time window"):
-        """The three time controls every card carries."""
+    # -- durations, and the units they are shown in --------------------------
+
+    #: Decimals for EVERY duration control, in every unit, on every screen.
+    #:
+    #: It is one number on purpose. ``simulation.duration_days`` used to be
+    #: shown at FOUR decimals by the Simulation tab and at SIX by these cards
+    #: (GUI-DURATION-DECIMALS-4-VS-6), so the same configuration read
+    #: differently depending on which screen you were on: the shipped Europa
+    #: duration 3.551181 d displayed as "3.5512" on one and "3.551181" on the
+    #: other. Measured 2026-08-28, the stored value survives -- displaying does
+    #: NOT rewrite the configuration, because the write-back is guarded -- so
+    #: this is a fidelity defect and not a corruption. It still matters: the
+    #: rounded number is what the user EDITS from, and at the old two-decimal
+    #: hours display, 3.551181 d showed as 85.23 h, which is 3.551250 d.
+    DURATION_DECIMALS = 6
+
+    #: Display units offered beside a duration. The CONFIGURATION KEY IS ALWAYS
+    #: DAYS; these change the number shown and nothing else.
+    DURATION_UNITS = ("days", "hours", "synodic periods")
+
+    def _duration_state(self):
+        state = getattr(self, "_duration_controls", None)
+        if state is None:
+            state = self._duration_controls = {}
+        return state
+
+    def _synodic_days(self):
+        """One synodic day for the body this card is showing, in days."""
+        from gui_tooltips import get_synodic_period_days
+        try:
+            days = float(get_synodic_period_days(self.config_manager))
+        except Exception:                                    # noqa: BLE001
+            days = 0.0
+        return days if days > 0 else 0.0
+
+    def _days_to_display(self, key, days):
+        unit = self._duration_state().get(key, {}).get("unit", "days")
+        if unit == "hours":
+            return days * 24.0
+        if unit == "synodic periods":
+            synodic = self._synodic_days()
+            return days / synodic if synodic > 0 else days
+        return days
+
+    def _display_to_days(self, key, value):
+        unit = self._duration_state().get(key, {}).get("unit", "days")
+        if unit == "hours":
+            return value / 24.0
+        if unit == "synodic periods":
+            synodic = self._synodic_days()
+            return value * synodic if synodic > 0 else value
+        return value
+
+    def duration_row(self, grid, row, label_text, key, minimum=0.001):
+        """A duration spin box with a display-unit combo beside it.
+
+        Returns ``(label, container)`` so the caller can show or hide the whole
+        row: which duration a card offers depends on the run type.
+
+        **The toggle round-trips exactly, because nothing flows back through
+        it.** Changing the unit re-reads the canonical value from the
+        configuration and re-displays it; it never converts the number that is
+        already in the box and writes the result back. A toggle chain
+        days -> hours -> synodic periods -> days therefore returns the original
+        value bit for bit, however coarse the display is, because the display
+        was never the source. The alternative -- converting what is shown --
+        loses a digit per hop at any finite `decimals`.
+        """
+        label = QLabel(label_text)
+        self._apply_tooltip(label, key)
+        label.setToolTip(get_tooltip(key))
+        grid.addWidget(label, row, 0)
+
+        container = QWidget()
+        box = QHBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+
+        spin = QDoubleSpinBox()
+        spin.setDecimals(self.DURATION_DECIMALS)
+        spin.setSingleStep(1.0)
+        spin.setToolTip(get_tooltip(key))
+        box.addWidget(spin, stretch=1)
+
+        combo = QComboBox()
+        combo.addItems(self.DURATION_UNITS)
+        combo.setMaximumWidth(140)
+        combo.setToolTip(get_tooltip("ui.duration_units"))
+        box.addWidget(combo)
+
+        grid.addWidget(container, row, 1)
+        self.widgets[key] = spin
+        self._duration_state()[key] = {
+            "unit": "days", "spin": spin, "combo": combo,
+            "label": label, "container": container, "minimum": float(minimum)}
+        self._apply_duration_range(key)
+
+        spin.valueChanged.connect(
+            lambda value, k=key: self._on_duration_edited(k, value))
+        combo.currentTextChanged.connect(
+            lambda unit, k=key: self._on_duration_unit_changed(k, unit))
+        return label, container
+
+    def _apply_duration_range(self, key):
+        """Range the spin box in the unit it is currently displaying.
+
+        The BOUNDS are converted by exactly the same function as the value.
+        Converting one and not the other is how a control ends up unable to
+        display what it holds: `thermal.integration_days` carries the engine's
+        -1 "use the output window" sentinel, and a floor pinned at 0 for one of
+        the units would clamp that -1 to 0 on the way to the screen -- a
+        control showing a setting the run does not have.
+        """
+        state = self._duration_state().get(key)
+        if state is None:
+            return
+        spin, unit = state["spin"], state["unit"]
+        blocked = spin.blockSignals(True)
+        try:
+            spin.setRange(self._days_to_display(key, state["minimum"]),
+                          self._days_to_display(key, 365000.0))
+            spin.setSingleStep(1.0 if unit != "synodic periods" else 0.5)
+        finally:
+            spin.blockSignals(blocked)
+
+    def _on_duration_edited(self, key, display_value):
+        """The user moved a duration control. Convert to days and store."""
+        if self._loading or getattr(self, "_unit_syncing", False):
+            # Showing a configuration is not an edit to it -- the same rule
+            # `load_from_config` states, applied to the unit conversion so a
+            # card that merely DISPLAYS a duration cannot rewrite it.
+            return
+        self.on_widget_changed(key, self._display_to_days(key, display_value))
+        self.derive_from_duration(key)
+
+    def _on_duration_unit_changed(self, key, unit):
+        """Re-display the stored value in a new unit. Writes nothing."""
+        state = self._duration_state().get(key)
+        if state is None:
+            return
+        state["unit"] = unit
+        self._unit_syncing = True
+        try:
+            self._apply_duration_range(key)
+            days = self._number(key, 0.0)
+            spin = state["spin"]
+            blocked = spin.blockSignals(True)
+            try:
+                spin.setValue(self._days_to_display(key, days))
+            finally:
+                spin.blockSignals(blocked)
+        finally:
+            self._unit_syncing = False
+
+    def set_numeric(self, key, value):
+        """Load a number, converting a duration into the unit on display."""
+        if key in self._duration_state():
+            try:
+                value = self._days_to_display(key, float(value))
+            except (TypeError, ValueError):
+                pass
+        super().set_numeric(key, value)
+
+    def derive_from_duration(self, key):
+        """Write the keys the integrated card no longer asks for.
+
+        On the integrated run type the integration window is the ONLY duration
+        the user sets, so the two keys that used to be controls are derived
+        from it here:
+
+        * ``simulation.duration_days`` = the window. The engine simulates
+          ``max(output_days, offset + integ_days)`` after equilibration
+          (`ptm_thermal_sim.cpp:15975`), so making the output window equal to
+          the integration window is what keeps the run from integrating over
+          a span it did not simulate -- or simulating one it does not use.
+        * ``simulation.timesteps`` = the window at the corpus sampling
+          cadence. It is not dead on this run type: with no per-sample files
+          written it still sets the cadence the statistics window is counted
+          in (`computeIntegrationWindow`, `:1134`), so leaving it at whatever
+          the previous run type used would sample a 200-day window with the
+          144 steps chosen for a 3.55-day one.
+        """
+        if self._run_type != "integrated" or key != "thermal.integration_days":
+            return
+        from gui_core.body_cards import samples_for_window
+
+        window = self._number("thermal.integration_days", 0.0)
+        if not window > 0:
+            # -1 is the engine's "use the output window" sentinel, and with no
+            # separate duration control on this card there is no output window
+            # for it to mean. Left alone rather than guessed at.
+            return
+        self.config_manager.set_value("simulation.duration_days", window)
+        self.config_manager.set_value(
+            "simulation.timesteps",
+            samples_for_window(window, self._synodic_days()))
+
+    def time_group(self, title="Time window", integration_window=False):
+        """The time controls, which depend on WHAT THE RUN PRODUCES.
+
+        A time series is a window plus a sampling density, so it carries a
+        duration and an output-sample count. Integrated statistics are not
+        sampled for output at all -- every per-sample file is skipped -- so
+        offering "duration" and "output samples" beside "integration window"
+        asked the user for three numbers to describe one window, two of which
+        only mattered through their ratio. Paul's ruling: for that run type the
+        INTEGRATION WINDOW is the only duration control.
+
+        The other two keys are still written, because the engine still reads
+        them (`ptm_thermal_sim.cpp:15958`, `computeIntegrationWindow` at
+        `:1134`): `simulation.duration_days` is the output window that
+        `post_eq_days_needed` is taken from, and `simulation.timesteps` sets
+        the cadence the statistics window is counted in. They are DERIVED here
+        rather than asked for -- see `derive_from_duration` -- so the emission
+        stays a valid, complete configuration.
+
+        `integration_window` keeps the row visible in EVERY run type, for the
+        one card that offered it before this change (Europa). Without it that
+        card would have lost a control it had.
+        """
         group = QGroupBox(title)
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
         self.add_string_field(grid, 0, "Start (UTC):", "simulation.start_time")
-        spin = self.add_double_field(
-            grid, 1, "Duration (days):", "simulation.duration_days",
-            0.001, 365000.0, decimals=6)
-        spin.setSingleStep(1.0)
+        self._duration_rows = {
+            "simulation.duration_days": self.duration_row(
+                grid, 1, "Duration:", "simulation.duration_days"),
+        }
         self.add_int_field(grid, 2, "Output samples:", "simulation.timesteps",
                            1, 100000)
+        self._samples_row = (grid.itemAtPosition(2, 0).widget(),
+                             self.widgets["simulation.timesteps"])
+        # -1 is the engine's "use the output window" sentinel, so the minimum
+        # is negative here and NOT the 0.001 a real duration takes.
+        self._duration_rows["thermal.integration_days"] = self.duration_row(
+            grid, 3, "Integration window:", "thermal.integration_days",
+            minimum=-1.0)
+        self._always_show_integration = bool(integration_window)
         group.setLayout(grid)
         return group
 
-    def thermal_group(self, title="Thermal", integration_window=False):
+    def apply_time_mode(self):
+        """Show the duration controls this run type actually uses."""
+        rows = getattr(self, "_duration_rows", None)
+        if not rows:
+            return
+        integrated = self._run_type == "integrated"
+        for widget in rows["simulation.duration_days"]:
+            widget.setVisible(not integrated)
+        for widget in self._samples_row:
+            widget.setVisible(not integrated)
+        for widget in rows["thermal.integration_days"]:
+            widget.setVisible(integrated or self._always_show_integration)
+
+    def thermal_group(self, title="Thermal"):
         """The thermal-solver controls, in one section.
 
         THIS SECTION EXISTS BECAUSE ITS CONTROLS WERE FILED BY ACCIDENT.
@@ -253,28 +496,216 @@ class BodyCard(BaseConfigTab):
         Output -- is the one the All settings view already draws between its
         Thermal and Output pages.
 
-        `integration_window` adds ``thermal.integration_days``, which was
-        likewise misfiled: it sat inside the Europa card's mesh-geometry
-        section, where it is neither geometry nor Europa-specific.
+        ``thermal.integration_days`` used to be added here by an
+        `integration_window` flag. It moved to :meth:`time_group`, because it
+        is a DURATION and on the integrated card it is THE duration.
         """
         group = QGroupBox(title)
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        row = 0
-        if integration_window:
-            self.add_double_field(grid, row, "Integration window (days):",
-                                  "thermal.integration_days", -1.0, 365000.0,
-                                  decimals=4)
-            row += 1
         spin = self.add_double_field(
-            grid, row, "Spin-up (diurnal cycles):",
+            grid, 0, "Spin-up (diurnal cycles):",
             "thermal.equilibration_orbits", 0.0, 100000.0, decimals=2)
         spin.setSingleStep(1.0)
-        row += 1
-        self.add_bool_field(grid, row, "Run the thermal solver on the GPU",
+        #: Says where the spin-up number came from and why. Filled in by
+        #: `announce_auto_equilibration` when a card seeds its defaults, and
+        #: left in place afterwards -- the control stays editable, and the note
+        #: describes the value that was PROPOSED, not the one now in the box.
+        self.equilibration_note = _muted("")
+        grid.addWidget(self.equilibration_note, 1, 0, 1, 2)
+        self.add_bool_field(grid, 2, "Run the thermal solver on the GPU",
                             "thermal.use_gpu")
         group.setLayout(grid)
         return group
+
+    def announce_auto_equilibration(self, cycles, reason):
+        """Show the automatic spin-up with its provenance."""
+        note = getattr(self, "equilibration_note", None)
+        if note is not None:
+            note.setText(f"auto: {cycles:g} cycles — {reason}. Editable; "
+                         f"change the number above to override it.")
+
+    # -- the built-in bodies' surface, via the keys the engine READS ---------
+
+    #: ``(config key, body-table field, label, low, high, decimals)`` for every
+    #: surface property a BUILT-IN body can actually override.
+    #:
+    #: The suffix is the whole point. On a built-in body the engine reads
+    #: ``thermophysical.albedo_override`` and IGNORES ``thermophysical.albedo``:
+    #: the parser's own read-list is `albedo_hapke_w, albedo_model,
+    #: albedo_override, conductivity_model, constant_thermal_inertia,
+    #: emissivity_override, H_override, incidence_angle_albedo, kd_override,
+    #: ks_override, use_default_albedo` (`config_parser.cpp:170-182`), and
+    #: anything else under that block draws a "read by nothing and have NO
+    #: effect" warning at parse time. That is PTM-67, and it is why the
+    #: Properties tab's `thermophysical.ks` cannot be reused here -- those keys
+    #: are honored only under `generic_body.surface:`.
+    #:
+    #: FIVE properties, not the nine the Properties tab shows. There is no
+    #: `rhos_override`, `rhod_override`, `cp0_override` or `Qb_override` in the
+    #: engine, so a control for them would be exactly the silently-ignored
+    #: field this list exists to avoid.
+    BUILTIN_OVERRIDES = (
+        ("thermophysical.albedo_override", "albedo",
+         "Bond albedo:", 0.0, 1.0, 4),
+        ("thermophysical.emissivity_override", "emissivity",
+         "Emissivity:", 0.0, 1.0, 4),
+        ("thermophysical.ks_override", "ks",
+         "Surface conductivity (W/m/K):", 0.0, 100.0, 6),
+        ("thermophysical.kd_override", "kd",
+         "Deep conductivity (W/m/K):", 0.0, 100.0, 6),
+        ("thermophysical.H_override", "H",
+         "Density e-folding depth H (m):", 0.0, 10.0, 4),
+    )
+
+    #: The value every one of those keys carries when it is NOT overriding.
+    #: The engine tests `> 0` (and `>= 0` for albedo) against this sentinel,
+    #: `config_parser.h:732-748`.
+    OVERRIDE_UNSET = -1.0
+
+    def builtin_surface_group(self, body_key, title="Surface properties"):
+        """The five engine-honored overrides, with the engine's own values in.
+
+        Each row is a number and a "Use the engine's value" tick. Ticked -- the
+        state a new run starts in -- the key is written as
+        :data:`OVERRIDE_UNSET` and the engine uses its built-in property; the
+        box still SHOWS that built-in value, from the generated body table, so
+        the card discloses what the run will use instead of showing a blank or
+        a sentinel. Unticked, the number beside it is written and the run uses
+        that.
+
+        The tick is deliberately NOT a configuration key: the engine has no
+        `use_default_*_override`, and inventing one would put a key in the
+        emitted YAML that nothing reads -- the very defect PTM-67 names.
+        """
+        from ptm.body_table import BODY_CAPABILITIES
+
+        engine = BODY_CAPABILITIES.get(body_key, {})
+        group = QGroupBox(title)
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+        self._override_rows = {}
+
+        for row, (key, field, label_text, low, high, decimals) in enumerate(
+                self.BUILTIN_OVERRIDES):
+            label = QLabel(label_text)
+            self._apply_tooltip(label, key)
+            label.setToolTip(get_tooltip(key))
+            grid.addWidget(label, row, 0)
+
+            spin = QDoubleSpinBox()
+            spin.setRange(low, high)
+            spin.setDecimals(decimals)
+            spin.setToolTip(get_tooltip(key))
+            grid.addWidget(spin, row, 1)
+
+            tick = QCheckBox("Use the engine's value")
+            tick.setToolTip(get_tooltip("ui.use_body_default"))
+            grid.addWidget(tick, row, 2)
+
+            default = engine.get(field)
+            try:
+                default = float(default)
+            except (TypeError, ValueError):
+                default = None
+            self.widgets[key] = spin
+            self._override_rows[key] = {
+                "spin": spin, "tick": tick, "engine": default, "field": field}
+
+            spin.valueChanged.connect(
+                lambda value, k=key: self._on_override_edited(k, value))
+            tick.toggled.connect(
+                lambda checked, k=key: self._on_override_default_toggled(
+                    k, checked))
+
+        self.override_note = _muted("")
+        grid.addWidget(self.override_note, len(self.BUILTIN_OVERRIDES), 0, 1, 3)
+        group.setLayout(grid)
+        self._refresh_override_note()
+        return group
+
+    def _override_state(self):
+        return getattr(self, "_override_rows", {}) or {}
+
+    def _on_override_edited(self, key, value):
+        if self._loading or getattr(self, "_override_syncing", False):
+            return
+        state = self._override_state().get(key)
+        if state is not None and state["tick"].isChecked():
+            # Editing the number means the user wants their number.
+            state["tick"].setChecked(False)
+            return                        # the toggle writes it
+        self.on_widget_changed(key, value)
+        self._refresh_override_note()
+
+    def _on_override_default_toggled(self, key, use_engine):
+        state = self._override_state().get(key)
+        if state is None:
+            return
+        state["spin"].setEnabled(not use_engine)
+        if self._loading or getattr(self, "_override_syncing", False):
+            return
+        if use_engine:
+            self.on_widget_changed(key, self.OVERRIDE_UNSET)
+            if state["engine"] is not None:
+                self._show_override(key, state["engine"])
+        else:
+            self.on_widget_changed(key, state["spin"].value())
+        self._refresh_override_note()
+
+    def _show_override(self, key, value):
+        """Put a number in an override box without writing anything."""
+        state = self._override_state().get(key)
+        if state is None:
+            return
+        self._override_syncing = True
+        try:
+            spin = state["spin"]
+            blocked = spin.blockSignals(True)
+            try:
+                spin.setValue(float(value))
+            finally:
+                spin.blockSignals(blocked)
+        finally:
+            self._override_syncing = False
+
+    def load_overrides(self):
+        """Mirror the five override keys, sentinel and all."""
+        self._override_syncing = True
+        try:
+            for key, state in self._override_state().items():
+                stored = self._number(key, self.OVERRIDE_UNSET)
+                overriding = stored > 0 or (
+                    key.endswith("albedo_override") and stored >= 0)
+                tick = state["tick"]
+                blocked = tick.blockSignals(True)
+                try:
+                    tick.setChecked(not overriding)
+                finally:
+                    tick.blockSignals(blocked)
+                state["spin"].setEnabled(overriding)
+                shown = stored if overriding else state["engine"]
+                if shown is not None:
+                    self._show_override(key, shown)
+        finally:
+            self._override_syncing = False
+        self._refresh_override_note()
+
+    def _refresh_override_note(self):
+        """Say, in one line, which properties the run is taking from where."""
+        note = getattr(self, "override_note", None)
+        if note is None:
+            return
+        edited = [key.split(".")[-1].replace("_override", "")
+                  for key, state in sorted(self._override_state().items())
+                  if not state["tick"].isChecked()]
+        if edited:
+            note.setText("Provenance: " + ", ".join(edited)
+                         + " set on this card; the rest are engine defaults.")
+        else:
+            note.setText("Provenance: engine default — every value above is "
+                         "the engine's own for this body, and none of them is "
+                         "written to the configuration.")
 
     def output_group(self, title="Output"):
         """Where the run's files land, and nothing else."""
@@ -359,7 +790,12 @@ class BodyCard(BaseConfigTab):
 
     def load_card(self):
         """Mirror the configuration into this card's controls."""
-        skip = self.custom_loaded_keys()
+        skip = set(self.custom_loaded_keys())
+        # The override rows carry a SENTINEL (-1) that must not reach their
+        # spin boxes: the box shows the effective value and the tick carries
+        # "not overriding". `load_overrides` does both, so the generic mirror
+        # must keep its hands off these five keys.
+        skip.update(self._override_state())
         for key, widget in self.widgets.items():
             if key in skip:
                 continue
@@ -389,6 +825,8 @@ class BodyCard(BaseConfigTab):
                     self.set_enum(key, value, aliases)
             elif isinstance(widget, QLineEdit):
                 self.set_text(key, value)
+        if self._override_state():
+            self.load_overrides()
 
 
 # ===========================================================================
@@ -490,6 +928,7 @@ class MoonCard(BodyCard):
         self.widgets["radiation.beaming"].toggled.connect(
             self._on_beaming_toggled)
 
+        layout.addWidget(self.builtin_surface_group("Moon"))
         layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
@@ -638,7 +1077,11 @@ class EuropaCard(BodyCard):
 
         self._registry = europa_dem_registry(self._project_root())
 
-        layout.addWidget(self.time_group())
+        # `integration_window=True`: this is the one card that offered
+        # `thermal.integration_days` before the control became the integrated
+        # run type's duration, so it keeps it in every run type rather than
+        # losing a control it had.
+        layout.addWidget(self.time_group(integration_window=True))
 
         # -- global Europa ----------------------------------------------------
         # `thermal.integration_days` used to sit here, in a mesh-geometry
@@ -719,7 +1162,8 @@ class EuropaCard(BodyCard):
         # is setting up, and the number it quoted holds only for the
         # Jupiter-facing hemisphere. A card describes the run in front of the
         # user.
-        layout.addWidget(self.thermal_group(integration_window=True))
+        layout.addWidget(self.builtin_surface_group("Europa"))
+        layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
         layout.addStretch()
@@ -1125,6 +1569,7 @@ class MercuryCard(BodyCard):
         surface.setLayout(grid)
         layout.addWidget(surface)
 
+        layout.addWidget(self.builtin_surface_group("Mercury"))
         layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
@@ -2352,8 +2797,34 @@ class _BigButton(QPushButton):
     this button's own minimum width, in this button's own font, the three
     run-type summaries wanted 962, 1348 and 1122 px against 156 px of room --
     so all three were cut off, and the reader saw a fragment ending in an
-    ellipsis. A wrapping QLabel makes the button grow downward instead, and
-    `sizeHint` then reports the height the text really needs.
+    ellipsis. A wrapping QLabel makes the button grow downward instead.
+
+    **And the height must be RE-ASSERTED, because the application stylesheet
+    silently throws the constructor's away.** That fix left
+    ``setMinimumHeight(96)`` in the constructor and the text went on being cut
+    off -- vertically this time -- in the real window. Measured 2026-08-28:
+    `ModernStyle.get_stylesheet()` carries ``QPushButton { padding: 8px 16px;
+    min-height: 28px; }``, and ``QStyleSheetStyle`` applies a stylesheet box by
+    OVERWRITING the widget's minimum size. The button's own minimum height
+    became 28 + 8 + 8 + 1 + 1 = 46 px, the layout then had 46 - 24 (margins) -
+    4 (spacing) = 18 px for two labels, and each got 9 px where each needed 16:
+
+    ======================  ==========  =========  =======
+    what                    given       needed     verdict
+    ======================  ==========  =========  =======
+    title, every run type      9 px       16 px    clipped
+    summary, every run type    9 px       16 px    clipped
+    ======================  ==========  =========  =======
+
+    Nothing in the widget noticed, because a QPushButton's own ``sizeHint`` is
+    computed from its Qt text and IGNORES a layout set on it -- measured
+    ``sizeHint().height() == 29`` on a button whose children need 60. So the
+    height can be neither left to the size hint nor set once in the
+    constructor. :meth:`required_height` derives it from ``QFontMetrics``, and
+    :meth:`_apply_required_height` re-applies it after every event that could
+    have re-polished the widget. The alternative of putting the number in the
+    button's own stylesheet was measured and rejected: a bare ``min-height``
+    there is inherited by the child QLabels, which then became 120 px tall.
 
     `text()` still returns the TITLE. The Qt text is emptied so the button does
     not paint it underneath the labels, and this override keeps `.text()`
@@ -2368,11 +2839,30 @@ class _BigButton(QPushButton):
     #: Smaller and not bold. The summary is a sentence, not a heading, and at
     #: 12 pt bold it needed six lines of a four-line button.
     SUBTITLE_POINT_SIZE = 10
+    #: The height a large button is MEANT to have. It is a floor, not the
+    #: answer: a wrapped summary that needs more gets more.
+    DESIGN_MIN_HEIGHT = 96
+    #: Vertical gap between the title and the summary, matching the layout.
+    LABEL_SPACING_PX = 4
+
+    #: CLASS-level defaults, so the height hooks are safe during construction.
+    #: `QPushButton.__init__` and `setFont` both deliver a `changeEvent`, which
+    #: reaches `_apply_required_height` BEFORE the instance attributes exist --
+    #: an AttributeError out of a Qt event handler, which is an abort, not a
+    #: traceback. Looking these up on the class instead makes the early call
+    #: return the design floor harmlessly.
+    subtitle_label = None
+    title_label = None
+    _subtitle = ""
+    _sizing = False
 
     def __init__(self, title, subtitle="", tooltip=""):
         super().__init__("")
         self._title = title
-        self.setMinimumHeight(96)
+        self._subtitle = subtitle
+        #: Guards the re-entry from `setMinimumHeight` -> resize -> re-apply.
+        self._sizing = False
+        self.setMinimumHeight(self.DESIGN_MIN_HEIGHT)
         self.setMinimumWidth(180)
         self.setToolTip(tooltip)
         font = QFont()
@@ -2395,7 +2885,7 @@ class _BigButton(QPushButton):
         half = self.TEXT_PADDING_PX // 2
         box = QVBoxLayout(self)
         box.setContentsMargins(half, half, half, half)
-        box.setSpacing(4)
+        box.setSpacing(self.LABEL_SPACING_PX)
         self.title_label = QLabel(title)
         self.title_label.setFont(font)
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignLeft
@@ -2420,6 +2910,73 @@ class _BigButton(QPushButton):
         font.setPointSize(self.SUBTITLE_POINT_SIZE)
         font.setBold(False)
         return font
+
+    # -- height, derived rather than assumed ---------------------------------
+
+    def required_height(self, width=None):
+        """The height this button's text needs at `width`, from font metrics.
+
+        The same arithmetic the layout does, done ahead of it: the vertical
+        margins, the title's line height, the spacing, and the height the
+        WRAPPED summary occupies at the width the summary label will actually
+        get. `width` defaults to the button's current width; before the first
+        layout that is Qt's 640 px default, so a caller that needs the
+        narrowest (and therefore tallest) case passes `minimumWidth()`.
+
+        A button with no summary has no child layout at all -- Qt draws its own
+        text -- so it gets the design floor and nothing more.
+        """
+        from PyQt6.QtCore import QRect
+
+        if self.subtitle_label is None:
+            return self.DESIGN_MIN_HEIGHT
+
+        width = self.width() if width is None else int(width)
+        inner = max(1, width - self.TEXT_PADDING_PX)
+        metrics = QFontMetrics(self.subtitle_font())
+        wrapped = metrics.boundingRect(
+            QRect(0, 0, inner, 10_000),
+            int(Qt.TextFlag.TextWordWrap), self._subtitle).height()
+        title = QFontMetrics(self.font()).height()
+        needed = (self.TEXT_PADDING_PX + title + self.LABEL_SPACING_PX
+                  + wrapped)
+        return max(self.DESIGN_MIN_HEIGHT, needed)
+
+    def _apply_required_height(self):
+        """Re-assert the derived minimum height.
+
+        Called after anything that could have re-polished the widget. The
+        stylesheet's `min-height` is applied by overwriting the widget's
+        minimum size, so this must run AFTER that, not once in the constructor
+        -- which is the whole defect.
+        """
+        if self._sizing:
+            return
+        self._sizing = True
+        try:
+            needed = self.required_height()
+            if self.minimumHeight() != needed:
+                self.setMinimumHeight(needed)
+        finally:
+            self._sizing = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_required_height()
+
+    def resizeEvent(self, event):
+        # A wrapping label's height depends on its width, so a narrower button
+        # is a TALLER one. Recomputing here is what makes the fit hold at every
+        # width the window can take rather than only at the one it opened at.
+        super().resizeEvent(event)
+        self._apply_required_height()
+
+    def changeEvent(self, event):
+        from PyQt6.QtCore import QEvent
+
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.StyleChange, QEvent.Type.FontChange):
+            self._apply_required_height()
 
     def text(self):
         """The button's TITLE.
@@ -2817,6 +3374,8 @@ class BodyFirstPanel(BaseConfigTab):
         for key, value in RUN_TYPES_BY_KEY[run_type_key].sets.items():
             self.config_manager.set_value(key, value)
             result.applied[key] = value
+        result.applied.update(
+            self._apply_time_defaults(body_key, run_type_key, result))
 
         # A generic body's surface, from the engine's own defaults. HERE and
         # not in the preset: `presets.py`'s first rule is that it must not
@@ -2837,6 +3396,62 @@ class BodyFirstPanel(BaseConfigTab):
                 "at the top of this card to get to them.")
             self.advanced_requested.emit(preset.key)
         return result
+
+    def _apply_time_defaults(self, body_key, run_type_key, result):
+        """The window and the spin-up a NEW run starts from.
+
+        Both are announced, both stay editable, and both are computed rather
+        than typed -- see `gui_core.body_cards`, where the rules live so they
+        can be measured without a window.
+
+        * **The window is one diurnal cycle**, from
+          ``ptm.body_table.solar_day_days``. That table is generated from
+          ``planetary_properties.h`` and re-derived by a test on every run, so
+          a period retuned in the C++ becomes a failing test rather than a card
+          proposing a window the engine does not force at.
+        * **The spin-up is the automatic value**, which is the part Paul asked
+          for across all run types: the engine's own default is 1.0 cycle,
+          below the two the equilibration paper calls a minimum.
+
+        Only on a NEW run: this method is reached solely under
+        ``apply_defaults=True``, so landing on an opened configuration leaves
+        the author's numbers alone.
+        """
+        from gui_core.body_cards import (auto_equilibration_cycles,
+                                         default_duration_days,
+                                         samples_for_window)
+        applied = {}
+
+        days, why = default_duration_days(body_key,
+                                          self.config_manager.get_config())
+        if days is not None:
+            samples = samples_for_window(days, days)
+            if run_type_key == "integrated":
+                # The integrated card's ONE control is the integration window,
+                # so that is the key the default lands on; the other two are
+                # derived from it exactly as an edit to the control would
+                # derive them, and not left at the preset's values.
+                self.config_manager.set_value("thermal.integration_days", days)
+                applied["thermal.integration_days"] = days
+            self.config_manager.set_value("simulation.duration_days", days)
+            self.config_manager.set_value("simulation.timesteps", samples)
+            applied["simulation.duration_days"] = days
+            applied["simulation.timesteps"] = samples
+            result.notes.append(f"Run window: {why}.")
+        else:
+            result.notes.append(
+                f"The run window was left as it was: {why}.")
+
+        cycles, reason = auto_equilibration_cycles(
+            body_key, self.config_manager.get_config())
+        self.config_manager.set_value("thermal.equilibration_orbits", cycles)
+        applied["thermal.equilibration_orbits"] = cycles
+        result.notes.append(f"Spin-up set automatically to {cycles:g} diurnal "
+                            f"cycles: {reason}. It stays editable.")
+        card = self.cards.get(body_key)
+        if card is not None:
+            card.announce_auto_equilibration(cycles, reason)
+        return applied
 
     def _project_root(self):
         from gui_core.preflight import find_project_root

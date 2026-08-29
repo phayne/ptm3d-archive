@@ -654,6 +654,54 @@ TOOLTIPS = {
         "override the body's value.\n"
         "YAML key: thermophysical.albedo"
     ),
+    # The five properties a BUILT-IN body can override. The suffix matters:
+    # on the Moon, Europa or Mercury the engine reads these and ignores the
+    # unsuffixed names above, which are honored only for a custom body.
+    "thermophysical.albedo_override": (
+        "Bond albedo for this run: the fraction of sunlight the surface "
+        "reflects at all wavelengths and in all directions. The rest is "
+        "absorbed, so lowering it makes the surface hotter.\n"
+        "Leave the tick set to use the engine's own value for this body -- "
+        "0.12 for the Moon, 0.5 for Europa, 0.07 for Mercury. Untick it to "
+        "study a brighter or darker surface than the body's average.\n"
+        "YAML key: thermophysical.albedo_override"
+    ),
+    "thermophysical.emissivity_override": (
+        "How efficiently the surface radiates heat away, as a fraction of a "
+        "perfect radiator at the same temperature. Lower values trap heat and "
+        "raise the daytime peak.\n"
+        "Leave the tick set for the engine's value -- 0.95 for the Moon, 0.9 "
+        "for Europa. Rock and ice are close to 1, so this is rarely moved far "
+        "from it.\n"
+        "YAML key: thermophysical.emissivity_override"
+    ),
+    "thermophysical.ks_override": (
+        "How well the loose surface layer conducts heat, in watts per meter "
+        "per kelvin. This is the single most important number for how far the "
+        "daily temperature swing reaches, and how cold the night gets.\n"
+        "Leave the tick set for the engine's value -- 0.00074 for lunar "
+        "regolith, 0.0096 for Europa's ice. Raise it for a rockier or more "
+        "compacted surface.\n"
+        "YAML key: thermophysical.ks_override"
+    ),
+    "thermophysical.kd_override": (
+        "How well the deep, compacted material conducts heat, in watts per "
+        "meter per kelvin. It sets the temperature the surface relaxes toward "
+        "at depth, below the reach of the daily cycle.\n"
+        "Leave the tick set for the engine's value -- 0.0034 for the Moon, "
+        "0.05 for Europa. It is several times the surface value, because the "
+        "material is denser with depth.\n"
+        "YAML key: thermophysical.kd_override"
+    ),
+    "thermophysical.H_override": (
+        "The depth over which the surface material compacts, in meters: over "
+        "this distance the density rises from its loose surface value toward "
+        "its deep value. Smaller means the change happens nearer the top.\n"
+        "Leave the tick set for the engine's value -- 0.06 m for the Moon, "
+        "0.07 m for Europa. Change it to model a thicker or thinner blanket "
+        "of loose material.\n"
+        "YAML key: thermophysical.H_override"
+    ),
     "thermophysical.emissivity": (
         "How efficiently the surface radiates heat away compared with a "
         "perfect blackbody, between 0 and 1. It appears in both the surface "
