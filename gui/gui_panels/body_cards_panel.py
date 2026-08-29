@@ -659,8 +659,8 @@ class EuropaCard(BodyCard):
         self.widgets["mesh.resolution"].valueChanged.connect(
             lambda _v: self._refresh())
 
-        # -- a Sutton DEM site -----------------------------------------------
-        self.local_group = QGroupBox("Local mesh (Sutton DEM)")
+        # -- a Europa DEM site -----------------------------------------------
+        self.local_group = QGroupBox("Local mesh (DEM)")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
 
@@ -2796,7 +2796,7 @@ class BodyFirstPanel(BaseConfigTab):
         # -- another body's terrain, cleared on the body change ---------------
         # BEFORE the preset, so the preset's beaming rule measures what is
         # actually going to be used. Scoped to a CHANGE of body on purpose:
-        # the lunar crater card and the Europa Sutton-DEM card both write
+        # the lunar crater card and the Europa DEM card both write
         # mesh.import_file, mesh.latitude_override and
         # radiation.view_factor_file, so going from one to the other carried a
         # crater mesh, a lunar latitude and a view-factor matrix built for a

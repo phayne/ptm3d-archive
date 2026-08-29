@@ -98,7 +98,7 @@ GENERIC_BODY_CLEARS = (
 #:
 #: The rule is about the BODY changing, so it is applied where the body change
 #: is known -- `BodyFirstPanel._apply_route_defaults`. The lunar crater card
-#: and the Europa Sutton-DEM card both write `mesh.import_file`,
+#: and the Europa DEM card both write `mesh.import_file`,
 #: `mesh.latitude_override` and `radiation.view_factor_file`, and going from
 #: one to the other used to carry the crater mesh, its lunar latitude and a
 #: view-factor matrix built for a different mesh into a Europa run.

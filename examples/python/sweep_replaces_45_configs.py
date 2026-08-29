@@ -19,7 +19,7 @@ they are worth:
    match is printed. Without step 3 this script would be a claim; with it, it
    is a measurement.
 
-Nothing is deleted and nothing is run. The runs themselves need the Sutton
+Nothing is deleted and nothing is run. The runs themselves need the Europa
 DEMs, which are not distributed with the repository -- ``--dry-run`` prints the
 engine command for each point without launching any.
 """

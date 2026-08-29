@@ -272,7 +272,7 @@ def test_the_property_translation_is_inert():
     """Two Europa runs, the shipped block against the card's, byte-compared.
 
     This is the check that makes difference (3) a fact rather than a reading of
-    the source. It uses the procedural icosphere, because the Sutton elevation
+    the source. It uses the procedural icosphere, because the Europa elevation
     models are not distributed with PTM3D -- the property translation is not a
     property of the mesh, so a sphere settles it.
     """

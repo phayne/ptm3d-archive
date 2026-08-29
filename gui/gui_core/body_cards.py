@@ -281,7 +281,7 @@ RUN_TYPES = (
         sets={"output.skip_time_series": False,
               "thermal.compute_statistics": True},
         produces=("one output directory per grid point, under a common root. "
-                  "For Europa the grid is every Sutton terrain crossed with "
+                  "For Europa the grid is every DEM terrain crossed with "
                   "every latitude the shipped configurations use"),
     ),
 )
@@ -293,10 +293,10 @@ def run_types_for(body_key, mode_key):
     """Which run types this body and mode may offer.
 
     `sweep` is offered ONLY where a grid is actually backed by something: today
-    that is the Europa Sutton-DEM product, the one Cartesian product the
-    shipped corpus contains (5 terrains x 9 latitudes). Offering a parameter
-    grid on a body with no grid behind it would be a button the project cannot
-    honor, which is the defect this whole screen exists to close.
+    that is the Europa DEM product, the one Cartesian product the shipped
+    corpus contains (5 terrains x 9 latitudes). Offering a parameter grid on a
+    body with no grid behind it would be a button the project cannot honor,
+    which is the defect this whole screen exists to close.
     """
     keys = ["time_series", "integrated"]
     if body_key == "Europa" and mode_key == "local":
@@ -318,7 +318,7 @@ def run_type_of(config):
 # ---------------------------------------------------------------------------
 
 class DemEntry:
-    """One Sutton DEM, as the shipped configurations describe it."""
+    """One Europa DEM, as the shipped configurations describe it."""
 
     def __init__(self, key, label, posting_m, import_file, view_factor_file,
                  latitudes):
@@ -621,8 +621,8 @@ def _card_presets():
 
     europa_site = Preset(
         key="europa_dem_site",
-        title="Europa Sutton DEM site",
-        summary=("One of the five Sutton terrains, placed at one of the "
+        title="Europa DEM site",
+        summary=("One of the five Europa DEM terrains, placed at one of the "
                  "latitudes the shipped configurations use, with radiation "
                  "exchange between facets on."),
         sets={

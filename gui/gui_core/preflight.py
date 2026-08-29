@@ -269,10 +269,14 @@ def is_cloud_path(path):
     return any(marker in p for marker in CLOUD_PATH_MARKERS)
 
 
-#: Collaborator datasets that `configs/` references under `data/external/` and
-#: that PTM3D does NOT distribute (`data/external/README.md`). Keyed by the
+#: Datasets that `configs/` references under `data/external/` and that PTM3D
+#: does NOT distribute (`data/external/README.md`). Keyed by the
 #: directory name inside `data/external/`; the value is what the dataset is and
 #: the candidate source directories to look in ON THIS MACHINE.
+#:
+#: The "what" is a CITATION, not a source of supply. A dataset is credited to
+#: the people who made it; the key here is a directory name that happens to
+#: record who forwarded the files, and that is not an attribution.
 #:
 #: The candidates are PROBED, never asserted: a path appears in the refusal only
 #: when the file is really sitting there. A hard-coded "get it from <path>" that
@@ -280,9 +284,11 @@ def is_cloud_path(path):
 #: to every checkout.
 _EXTERNAL_DATA_SOURCES = {
     "sutton_DEMs": (
-        "the Europa SOCET regional terrain set (Sutton et al.) and its "
-        "view-factor caches. PTM3D does not distribute collaborator data -- "
-        "see data/external/README.md",
+        "the Europa SOCET regional terrain set and its view-factor caches -- "
+        "Bland, Michael (2022), \"Europa DEMs and Orthoimages in Support of "
+        "Bland et al. 2021 (Remote Sensing)\", figshare dataset, "
+        "doi:10.6084/m9.figshare.16904632, CC BY 4.0. It is public, but PTM3D "
+        "does not redistribute it -- see data/external/README.md",
         (
             "~/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/"
             "sutton_WorkMORE",
@@ -297,7 +303,7 @@ def missing_external_data_hint(missing_path):
     Returns "" for any path that is not under `data/external/<known set>/`, so
     an unrelated missing file gets the plain message it always got.
 
-    The point is the 2026-08-28 Europa terrain run: the five Sutton DEMs were
+    The point is the 2026-08-28 Europa terrain run: the five Europa DEMs were
     absent from the checkout, the card dropped `mesh.import_file` instead of
     saying so, and the engine ran a global icosphere. A refusal that names the
     path is half the answer; the other half is where the file comes from.
@@ -312,8 +318,8 @@ def missing_external_data_hint(missing_path):
     dataset = parts[i + 1]
     entry = _EXTERNAL_DATA_SOURCES.get(dataset)
     if entry is None:
-        return (f"{dataset} is a collaborator dataset under data/external/, "
-                f"which PTM3D does not distribute (data/external/README.md). "
+        return (f"{dataset} is a dataset under data/external/ that PTM3D does "
+                f"not distribute (data/external/README.md). "
                 f"Obtain it from its source and place it at the path above, or "
                 f"point the configuration at your own copy.")
     what, candidates = entry

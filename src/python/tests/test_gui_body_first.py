@@ -418,7 +418,7 @@ def test_the_register_check_actually_fires():
             f"the register check does not fire on {text!r}, which was a real "
             f"header before this sweep")
     # ...and the positive control: the replacements pass clean.
-    replacements = ["Global mesh", "Local mesh", "Local mesh (Sutton DEM)",
+    replacements = ["Global mesh", "Local mesh", "Local mesh (DEM)",
                     "Output", "Thermal", "Run type", "Model domain",
                     "Ephemeris", "Spin state", "Shape", "Surface properties",
                     "Body identity", "Time window", "Select a body",
@@ -467,7 +467,7 @@ def test_the_misfiled_control_check_actually_fires():
     """
     fires = [("thermal.use_gpu", "Output"),                 # the real defect
              ("thermal.integration_days", "Global mesh"),   # where it was
-             ("thermal.integration_days", "Local mesh (Sutton DEM)"),
+             ("thermal.integration_days", "Local mesh (DEM)"),
              ("thermal.equilibration_orbits", "Local mesh")]
     for key, section in fires:
         assert _misfiled(key, section), (
@@ -564,7 +564,7 @@ def test_a_grid_is_offered_only_where_a_grid_exists():
     with_sweep = [(b, m) for b, m, r in _routes() if r == "sweep"]
     assert with_sweep == [("Europa", "local")], (
         f"a grid is offered on {with_sweep}; the only Cartesian product the "
-        f"shipped corpus contains is the Europa Sutton-DEM one")
+        f"shipped corpus contains is the Europa DEM one")
     points = europa_sweep_points(REPO_ROOT)
     assert len(points) == 45, (
         f"the Europa grid derived {len(points)} points, not 45")
