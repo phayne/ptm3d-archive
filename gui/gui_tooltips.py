@@ -1795,6 +1795,54 @@ TOOLTIPS = {
         "with PTM3D; the line below says whether the file is on disk.\n"
         "Sets mesh.import_file and radiation.view_factor_file."
     ),
+    "ui.split_windows": (
+        "Run the span as several SHORT windows at different epochs instead of "
+        "one continuous integration. Each window is a complete run with its "
+        "own spin-up, so the set samples the long span at a fraction of the "
+        "cost -- and no temperature state is carried from one window to the "
+        "next, so they are samples of the span and not an integration of it.\n"
+        "Recommended for anything longer than about a hundred diurnal cycles. "
+        "That is the pattern the lunar A3GT campaign uses across the 18.6-year "
+        "nodal cycle, and it keeps each run inside the single-dispatch "
+        "envelope this machine tolerates.\n"
+        "Leave it off for a run of a few diurnal or orbital periods, where one "
+        "continuous window is both cheaper and more informative.\n"
+        "Writes no configuration key: a window series is N separate runs, each "
+        "with its own simulation.start_time and simulation.duration_days."
+    ),
+    "ui.window_count": (
+        "How many windows the span is sampled with. Each one is a separate "
+        "run and costs what one run of that length costs, so this multiplies "
+        "the wall clock directly.\n"
+        "Four is a reasonable start and is the size of the A3GT campaign's own "
+        "production year set. More windows resolve the seasonal cycle better; "
+        "fewer finish sooner.\n"
+        "The windows are placed at EQUAL intervals across the span. The A3GT "
+        "campaign instead puts its windows on the annual subsolar-latitude "
+        "extremes, found with SPICE by scripts/a3gt_v2_subsolar.py; that "
+        "script and the campaign orchestrator remain the tools for that."
+    ),
+    "ui.window_span": (
+        "The total stretch of time the windows are spread across -- not the "
+        "length of a run. The first window starts at the run's start time and "
+        "the last one ends at the end of this span.\n"
+        "For a seasonal study make it one orbital period or more, since that "
+        "is the period of the subsolar latitude. The 18.6 years the lunar "
+        "A3GT campaign spans is the Moon's nodal cycle, over which the phase "
+        "of the annual subsolar-latitude maximum drifts all the way around.\n"
+        "It must be at least the number of windows times the window length, "
+        "or the windows would overlap and count part of the span twice."
+    ),
+    "ui.window_series": (
+        "Write one configuration per window, plus a windows.json recording "
+        "the schedule, how the epochs were chosen, and the command to run "
+        "each window.\n"
+        "They are written, not launched. The commands use "
+        "scripts/run_chunked_simulation.py -- the same runner the A3GT "
+        "campaign orchestrator invokes for each of its windows -- and a "
+        "multi-hour set belongs in a detached process that survives closing "
+        "this window."
+    ),
     "ui.europa_sweep": (
         "Write one configuration per point of the terrain-by-latitude grid -- "
         "the same set of runs the shipped Europa configurations describe, "
