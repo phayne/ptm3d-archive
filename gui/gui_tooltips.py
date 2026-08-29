@@ -277,10 +277,16 @@ TOOLTIPS = {
         "YAML key: thermal.use_gpu"
     ),
     "thermal.integration_days": (
-        "Length of the window the solver actually integrates over, in days, "
-        "when it should differ from the output window.\n"
-        "-1 (the default) means integrate exactly the simulation duration, "
-        "which is what nearly every run wants.\n"
+        "Length of the window the run's minimum, mean and maximum are "
+        "collected over, in days. It is measured from the start of the output "
+        "window, so a window shorter than the run reports the first part of "
+        "it.\n"
+        "On a body card this is the run length itself, given as a count of "
+        "diurnal or orbital periods and always a real duration; the output "
+        "window is set to match, so the run integrates exactly what it "
+        "simulates.\n"
+        "-1, which this advanced view still accepts, means integrate exactly "
+        "the simulation duration.\n"
         "YAML key: thermal.integration_days"
     ),
     "thermal.integration_steps": (
@@ -1622,6 +1628,16 @@ TOOLTIPS = {
         "Units used to display the simulation duration. Changing it converts "
         "the number beside it and does not change the run."
     ),
+    "ui.window_units": (
+        "Units the run window is given in. Changing it converts the number "
+        "beside it and does not change the run.\n"
+        "A diurnal period is this body's solar day. An orbital period is one "
+        "trip around the Sun, which is also the seasonal cycle: the subsolar "
+        "latitude completes one cycle per orbit, so there is no separate "
+        "seasonal length to choose. On a moon that is the PLANET's orbit, not "
+        "the moon's orbit around its planet.\n"
+        "For this body: {}"
+    ),
     "ui.step_size_units": (
         "Units used to display the output step size. Changing it converts the "
         "number beside it and does not change the run."
@@ -2211,9 +2227,18 @@ BODY_SYNODIC_PERIODS = {
     "Ceres": 0.3781,        # ~9.074 hours
 }
 
-# Constants for Kepler's third law (matching C++ orbital_elements.h)
+# Constants for Kepler's third law, matching src/cpp/orbital/orbital_elements.h
+# TO THE DIGIT: gm::SUN and OrbitalElements::AU_TO_M.
+#
+# The AU used to be the rounded 1.496e11 here while the engine used
+# 1.495978707e11. Two spellings of one constant, 14 parts per million apart:
+# a generic body's DIURNAL period came out of this file and, once the run
+# window gained an "orbital periods" unit, its ORBITAL period came out of
+# ptm.body_capabilities -- which reads the engine's number. The two would have
+# disagreed in the same combo, on the same body, for no reason a user could
+# see. The engine's value is the one a run is actually integrated with.
 _GM_SUN = 1.32712440018e20  # m^3/s^2
-_AU_METERS = 1.496e11       # meters per AU
+_AU_METERS = 1.495978707e11  # meters per AU
 
 
 def _as_number(value, fallback):
@@ -2290,14 +2315,33 @@ def get_synodic_period_days(config_manager, body_name=None):
         config_manager.get_value("simulation.duration_days", 3.55), 3.55)
 
 
-# Orbital period (year) in Earth days for built-in bodies.
-# Matches the C++ thermal model (thermo.year).
+# HELIOCENTRIC orbital period in Earth days -- one trip around the SUN, which
+# is also the seasonal cycle (the subsolar latitude completes one cycle per
+# orbit). For a moon that is its PLANET's orbit.
+#
+# It used to say "Matches the C++ thermal model (thermo.year)", and for the
+# three moons it did: the engine sets a synchronously rotating moon's `year`
+# equal to its DAY (planetary_properties.h:189, "Same as day for synchronous
+# rotation"), so Europa read 3.55 d. That is Europa's orbit around Jupiter.
+# Meanwhile the body cards' run-window control offers a unit spelled exactly
+# "orbital periods" and resolves it from ptm.body_capabilities, which is
+# heliocentric -- so one unit name meant 3.55 d on the Thermal page and
+# 4332.589 d on the card, a factor of 1220 apart in the same application.
+#
+# The three implemented bodies are now pinned to
+# ptm.body_capabilities.HELIOCENTRIC_PERIOD_DAYS by
+# test_body_capabilities.py, which is the only thing that keeps them from
+# drifting again. The other four are not engine bodies and are here only so
+# the unit toggle still converts for a config someone typed by hand; they
+# follow the same definition so the column means one thing.
 BODY_ORBITAL_PERIODS = {
-    "Europa": 3.55,         # Orbital period around Jupiter (synchronous)
-    "Moon": 365.25,         # Earth year
+    # --- implemented; pinned to HELIOCENTRIC_PERIOD_DAYS by the parity test --
+    "Europa": 4332.589,     # Jupiter's orbit around the Sun
+    "Moon": 365.25,         # Earth year -- the Moon orbits the Sun with it
     "Mercury": 87.969,      # Mercury year
-    "Enceladus": 1.370218,  # Orbital period around Saturn (synchronous)
-    "Titan": 15.945,        # Orbital period around Saturn (synchronous)
+    # --- NOT implemented: the engine refuses these body names ---
+    "Enceladus": 10759.22,  # Saturn's orbit around the Sun
+    "Titan": 10759.22,      # Saturn's orbit around the Sun
     "Mars": 686.97,         # Martian year
     "Ceres": 1681.63,       # ~4.6 Earth years
 }

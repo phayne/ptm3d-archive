@@ -8,7 +8,7 @@ ENG-BODY-UNBACKED-RUN). The engine now refuses those names at config parse;
 this file is the drift guard that stops the two sides diverging again -- the
 same job ``test_config_parity.py`` does for configuration keys.
 
-Six things are asserted, in the order they would break:
+Seven things are asserted, in the order they would break:
 
 1. the extractor still understands ``planetary_properties.h`` (every body has
    every required field, so a parse that silently found nothing cannot pass);
@@ -18,11 +18,15 @@ Six things are asserted, in the order they would break:
 3. the committed file is byte-current with a fresh render;
 4. every OTHER copy of these numbers in Python and the GUI agrees with the
    engine -- ``gui_tooltips.BODY_SYNODIC_PERIODS``,
-   ``gui_tooltips.BODY_DEFAULTS``, ``gui_core.facet_scale._BODY_RADII_M``
-   and ``ptm.results.BODY_RADII``;
-5. the GUI's built-in body list is DERIVED from the generated table rather
+   ``gui_tooltips.BODY_ORBITAL_PERIODS``, ``gui_tooltips.BODY_DEFAULTS``,
+   ``gui_core.facet_scale._BODY_RADII_M`` and ``ptm.results.BODY_RADII``;
+5. the heliocentric orbital periods the GUI offers as a unit are real
+   heliocentric orbits -- checked against Kepler's third law on each body's own
+   engine ``rAU``, because the engine's ``year`` is NOT heliocentric on a
+   synchronously rotating moon and Europa's is 3.55 d;
+6. the GUI's built-in body list is DERIVED from the generated table rather
    than written out, so it cannot grow a body the engine refuses;
-6. the engine really does refuse an unbacked name -- asserted against the
+7. the engine really does refuse an unbacked name -- asserted against the
    header text, so it holds without a build.
 
 Check 4 needs the GUI sources on ``sys.path``; it does NOT need PyQt6, because
@@ -151,13 +155,28 @@ def test_every_other_copy_of_these_numbers_agrees():
     carried the SIDEREAL 58.646 d. Both numbers were wrong for what they
     claimed to be, and no test could see it.
     """
-    from gui_tooltips import BODY_DEFAULTS, BODY_SYNODIC_PERIODS
+    from gui_tooltips import (BODY_DEFAULTS, BODY_ORBITAL_PERIODS,
+                              BODY_SYNODIC_PERIODS)
     from gui_core.facet_scale import _BODY_RADII_M
+    from ptm.body_capabilities import HELIOCENTRIC_PERIOD_DAYS
     from ptm.results import BODY_RADII
 
     report = []
     for body in IMPLEMENTED_BODIES:
         engine = BODY_CAPABILITIES[body]
+
+        # The GUI has two "orbital periods" units -- the run window on a body
+        # card and the spin-up on the Thermal page -- reading two tables. They
+        # must be the same number, or one unit name means two spans: before
+        # this pin, Europa was 4332.589 d on the card and 3.55 d on the page.
+        if body not in BODY_ORBITAL_PERIODS:
+            report.append(f"gui_tooltips.BODY_ORBITAL_PERIODS has no {body}")
+        elif BODY_ORBITAL_PERIODS[body] != HELIOCENTRIC_PERIOD_DAYS[body]:
+            report.append(
+                f"gui_tooltips.BODY_ORBITAL_PERIODS[{body!r}] = "
+                f"{BODY_ORBITAL_PERIODS[body]} d, but the run window resolves "
+                f"one orbital period to "
+                f"{HELIOCENTRIC_PERIOD_DAYS[body]} d")
 
         if body not in BODY_SYNODIC_PERIODS:
             report.append(f"gui_tooltips.BODY_SYNODIC_PERIODS has no {body}")
@@ -196,6 +215,112 @@ def test_every_other_copy_of_these_numbers_agrees():
     assert not report, (
         "a Python or GUI copy of the engine's body properties has drifted:\n  "
         + "\n  ".join(report))
+
+
+def test_the_heliocentric_periods_agree_with_kepler_on_the_engines_own_rau():
+    """The GUI's "orbital period" is a real heliocentric orbit, on every body.
+
+    ``HELIOCENTRIC_PERIOD_DAYS`` is hand-maintained -- it cannot be generated,
+    because the engine does not carry the number: ``props.year`` is what the
+    equilibration machinery counts against, and for Europa the engine
+    deliberately sets it to the 3.55 d orbit around JUPITER
+    (``planetary_properties.h:189``). So it is tied to the engine a different
+    way, by the only heliocentric quantity the engine does carry:
+
+    1. every shipped period agrees with Kepler's third law applied to that
+       body's own engine ``rAU``, to within 1%. Europa's ``year_days`` of
+       3.55 d misses that by five orders of magnitude, which is precisely the
+       mistake this check exists to make impossible;
+    2. where the engine's own ``year_days`` ALSO passes that check -- the Moon
+       and Mercury, whose year is heliocentric -- the shipped value must equal
+       it exactly, so the two cannot drift apart;
+    3. any body where it does not must be named, with its reason, in
+       ``_ENGINE_YEAR_IS_NOT_HELIOCENTRIC``. A body added to the engine
+       therefore fails here instead of quietly inheriting Europa's exception.
+
+    The 1% band is wide on purpose. It is a wrong-number check, not a
+    measurement: the three bodies land at 0.002%, 0.033% and 0.038%, and the
+    residual is the two-body approximation (the engine's own ``orbitalPeriod``
+    ignores the planet's mass) plus the engine's rounded ``rAU``.
+    """
+    from ptm.body_capabilities import (HELIOCENTRIC_PERIOD_DAYS,
+                                       _ENGINE_YEAR_IS_NOT_HELIOCENTRIC,
+                                       kepler_period_days)
+
+    tolerance = 0.01
+    report = []
+    rows = []
+    for body in IMPLEMENTED_BODIES:
+        engine = BODY_CAPABILITIES[body]
+        if body not in HELIOCENTRIC_PERIOD_DAYS:
+            report.append(
+                f"HELIOCENTRIC_PERIOD_DAYS has no {body}; a card offering "
+                f"'orbital periods' on it would have no period to offer")
+            continue
+        shipped = HELIOCENTRIC_PERIOD_DAYS[body]
+        kepler = kepler_period_days(engine["rAU"])
+        assert kepler, f"{body}: engine rAU {engine['rAU']!r} gives no period"
+
+        error = abs(shipped - kepler) / kepler
+        if error > tolerance:
+            report.append(
+                f"{body}: shipped heliocentric period {shipped} d is "
+                f"{error * 100:.1f}% from Kepler's {kepler:.3f} d at the "
+                f"engine's own rAU = {engine['rAU']}")
+
+        year = engine["year_days"]
+        year_is_heliocentric = abs(year - kepler) / kepler <= tolerance
+        if year_is_heliocentric and shipped != year:
+            report.append(
+                f"{body}: the engine's year_days {year} d IS the heliocentric "
+                f"period, but the shipped value is {shipped} d. They must be "
+                f"the same number, not two spellings of it")
+        if not year_is_heliocentric \
+                and body not in _ENGINE_YEAR_IS_NOT_HELIOCENTRIC:
+            report.append(
+                f"{body}: the engine's year_days {year} d is not a "
+                f"heliocentric orbit (Kepler says {kepler:.3f} d) and {body} "
+                f"is not listed in _ENGINE_YEAR_IS_NOT_HELIOCENTRIC. Say why "
+                f"there rather than leaving the difference unexplained")
+        rows.append(f"{body} {shipped:g} d "
+                    f"(engine year {year:g} d, Kepler {kepler:.1f} d, "
+                    f"{error * 100:.3f}%)")
+
+    for body in _ENGINE_YEAR_IS_NOT_HELIOCENTRIC:
+        if body not in IMPLEMENTED_BODIES:
+            report.append(
+                f"_ENGINE_YEAR_IS_NOT_HELIOCENTRIC names {body}, which the "
+                f"engine no longer implements; drop the exception")
+
+    assert not report, (
+        "the GUI's heliocentric orbital periods have drifted from the "
+        "engine:\n  " + "\n  ".join(report))
+    print(f"    [orbit] {'; '.join(rows)}")
+
+
+def test_kepler_refuses_a_semi_major_axis_it_cannot_use():
+    """No period, no exception, for anything a configuration can hold.
+
+    ``a`` is read straight from ``generic_body.orbit.semi_major_axis_au`` and
+    reaches this from a Qt slot, where an escaping exception is a process
+    abort rather than a message. ``float ** 3`` RAISES ``OverflowError`` above
+    about 1e102 instead of returning an infinity -- the same class as the
+    ``resolution: 1e5`` abort the GUI already guards against -- and YAML hands
+    back a str for ordinary spellings like ``2.5e0``.
+    """
+    from ptm.body_capabilities import kepler_period_days
+
+    for bad in (0, -1.0, None, "", "not a number", float("nan"),
+                float("inf"), 1e300, 10 ** 400):
+        assert kepler_period_days(bad) is None, (
+            f"kepler_period_days({bad!r}) returned a period")
+    # ...and the ordinary cases still work, including YAML's string spellings.
+    assert abs(kepler_period_days("1.0") - 365.2568983840419) < 1e-6, (
+        kepler_period_days("1.0"))
+    assert abs(kepler_period_days(4.0) / kepler_period_days(1.0) - 8.0) < 1e-9, (
+        "a -> 4a is not P -> 8P; this is not Kepler's third law")
+    print("    [kepler] 9 unusable semi-major axes refused, none raising; "
+          "a -> 4a gives exactly P -> 8P")
 
 
 def test_gui_offers_no_unpinned_unbacked_body():
@@ -281,6 +406,8 @@ TESTS = [
     test_committed_table_matches_cxx_sources,
     test_generated_module_is_byte_current,
     test_every_other_copy_of_these_numbers_agrees,
+    test_the_heliocentric_periods_agree_with_kepler_on_the_engines_own_rau,
+    test_kepler_refuses_a_semi_major_axis_it_cannot_use,
     test_gui_offers_no_unpinned_unbacked_body,
     test_the_engine_refuses_unbacked_names,
 ]
