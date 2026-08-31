@@ -68,6 +68,16 @@ LABELS = {
         "Depth subsamples between nodes:",
     # -- depth grid ---------------------------------------------------------
     "thermal.thermal_n": "Layer growth factor n:",
+    # -- flux cubes ---------------------------------------------------------
+    "flux_cubes.enabled": "Record irradiance at virtual measurement cubes",
+    "flux_cubes.mode": "Cube placement:",
+    "flux_cubes.spacing_m": "Distance between cubes (m):",
+    "flux_cubes.radius_m": "Grid radius around the mesh center (m):",
+    "flux_cubes.cache_file": "Cube layout file:",
+    "flux_cubes.write_binary": "Write the single binary flux file",
+    "flux_cubes.write_csv": "Write one spreadsheet file per cube",
+    "flux_cubes.write_csv_max_cubes": "Spreadsheet files, at most:",
+    "flux_cubes.shadow_probe_rays": "Sun-visibility test:",
 }
 
 TOOLTIPS = {
@@ -2112,6 +2122,148 @@ TOOLTIPS = {
         "Around 2.7 for lunar regolith. Set it to zero to model conduction "
         "alone, which is what a constant thermal inertia means.\n"
         "Sets generic_body.surface.chi."
+    ),
+
+    # =========================================================================
+    # FLUX CUBES  (docs/flux-cubes.md)
+    # =========================================================================
+    "flux_cubes.enabled": (
+        "Stands small virtual cubes on the terrain and records the sunlight "
+        "and infrared arriving on each of their six faces -- up, down, north, "
+        "south, east and west -- at every output step. It is what a lander leg "
+        "or a radiator would see, split into direct sunlight, sunlight "
+        "scattered off the surrounding ground, infrared from that ground, and "
+        "the two the primary body contributes.\n"
+        "The cubes only watch. They cast no shadow, emit nothing, and are not "
+        "part of the surface the model solves, so every temperature and every "
+        "flux on the mesh comes out the same whether this is on or off. The "
+        "cost is about one percent of the run.\n"
+        "Needs facet-to-facet infrared exchange on, and an imported terrain "
+        "mesh. Sets flux_cubes.enabled."
+    ),
+    "flux_cubes.mode": (
+        "How the cubes are laid out on the ground.\n"
+        "grid: a regular pattern of cubes covering a circle around the center "
+        "of the mesh. Use it to map how the local sky and ground vary across a "
+        "site.\n"
+        "named locations: a cube at each latitude and longitude you list, and "
+        "no grid. Use it for specific points -- a candidate landing pad, an "
+        "instrument site -- where the results are keyed by the name you gave.\n"
+        "grid and named locations: both in one layout, the named points added "
+        "after the grid.\n"
+        "The cubes are placed by the layout tool, not by this file. This "
+        "control decides what the tool is asked to build, and which points the "
+        "run checks the layout for."
+    ),
+    "flux_cubes.spacing_m": (
+        "How far apart neighboring cubes stand, in meters, on the grid.\n"
+        "25 m is the value the published site products used. The cube count "
+        "grows as the inverse square, so halving this quadruples both the "
+        "layout time and the size of the result.\n"
+        "Used when the layout is built. The layout file records it, and the "
+        "run reads it back from there."
+    ),
+    "flux_cubes.radius_m": (
+        "How far the grid reaches from the center of the mesh, in meters. "
+        "Every grid point inside this distance gets a cube.\n"
+        "500 m is the value the published site products used, giving 1,257 "
+        "cubes at 25 m spacing. Keep it inside the detailed part of the mesh: "
+        "cubes that reach the coarse surrounding terrain see a sky that is not "
+        "resolved there.\n"
+        "Used when the layout is built. The layout file records it, and the "
+        "run reads it back from there."
+    ),
+    "flux_cubes.cache_file": (
+        "The file holding where every cube stands and what each of its faces "
+        "can see. It is built once by the layout tool -- use the button below "
+        "-- and read by the run.\n"
+        "It belongs to one mesh. The run compares the layout against its own "
+        "mesh and stops if they differ, rather than reporting results for "
+        "somewhere else, so rebuild this whenever the terrain mesh changes.\n"
+        "Sets flux_cubes.cache_file."
+    ),
+    "flux_cubes.write_binary": (
+        "Writes flux_cubes/flux_cubes.fcb: every cube, face, component and "
+        "time step in one file, at full precision.\n"
+        "Leave it on. It is the complete result, and the conversion script "
+        "that produces the shareable HDF5 file reads it. The spreadsheet "
+        "files below are a convenience on top of it.\n"
+        "Sets flux_cubes.write_binary."
+    ),
+    "flux_cubes.write_csv": (
+        "Also writes one spreadsheet file per cube, under flux_cubes/csv, with "
+        "a row per output step and a column per face and component.\n"
+        "Convenient for a handful of cubes and unwieldy for a full grid, which "
+        "is what the limit below is for. Named locations are keyed by their "
+        "name rather than by a number.\n"
+        "Sets flux_cubes.write_csv."
+    ),
+    "flux_cubes.write_csv_max_cubes": (
+        "Caps how many grid cubes get their own spreadsheet file. Zero means "
+        "all of them, which on a full grid is over a thousand files per run.\n"
+        "The cap never drops a named location: those were asked for by name, "
+        "so they are always written, and a layout containing any of them "
+        "writes every file regardless of this number.\n"
+        "Sets flux_cubes.write_csv_max_cubes."
+    ),
+    "flux_cubes.shadow_probe_rays": (
+        "How the run decides whether the sun reaches a cube. Two values, "
+        "because the engine reads nothing between them -- anything under five "
+        "is treated as one.\n"
+        "1: one ray from the center of the cube. Cheapest, and it reports a "
+        "cube straddling a shadow edge as fully lit or fully dark.\n"
+        "5: the center plus the four horizontal face centers. When those "
+        "disagree the step is marked as partly shadowed, which is the flag to "
+        "look for near a shadow edge. This is the recommended setting and the "
+        "one the published products used.\n"
+        "Sets flux_cubes.shadow_probe_rays."
+    ),
+    "ui.flux_cubes.height": (
+        "How high the cube center stands above the ground, and how wide the "
+        "cube is. Both are set to a tenth of the local facet size, so the "
+        "downward face reads the ground immediately beneath it rather than an "
+        "average over a wide patch.\n"
+        "This is not a setting: the layout tool measures the mesh and records "
+        "what it used. The number here is this window's estimate of what the "
+        "tool will find, taken over the whole mesh rather than over the grid "
+        "area, so expect it to move by a few percent. Once a layout file "
+        "exists, the value shown is the one the tool measured."
+    ),
+    "ui.flux_cubes.locations": (
+        "The named points to put a cube at: a name, a latitude and a longitude "
+        "for each, and optionally a height and cube size in meters to override "
+        "the automatic ones.\n"
+        "Names become the file names in the result, so keep them short and "
+        "distinct -- at most 31 characters, and no repeats. Latitude and "
+        "longitude are in the body-fixed frame, the same convention the mesh "
+        "placement fields above use.\n"
+        "Written into the configuration as flux_cubes.locations, where the run "
+        "checks that the layout file really contains every name."
+    ),
+    "ui.flux_cubes.import_csv": (
+        "Loads a list of named points from a comma-separated file with the "
+        "columns name, latitude, longitude, and optionally height and cube "
+        "size in meters. Blank lines and lines beginning with # are skipped, "
+        "and a header row is recognized.\n"
+        "It replaces whatever is in the table. Any line that cannot be read is "
+        "reported rather than skipped, because a point dropped on import is a "
+        "cube you would believe was in the result and is not."
+    ),
+    "ui.flux_cubes.build": (
+        "Runs the layout tool on the terrain mesh above and writes the layout "
+        "file, using the placement settings shown here. It measures the mesh, "
+        "places the cubes, and casts rays from each cube face to record what "
+        "that face can see.\n"
+        "It uses the processor only -- no graphics card -- and takes tens of "
+        "seconds on a site-scale mesh. Placing cubes is this tool's job alone, "
+        "which is why editing the settings here does not move a cube until the "
+        "layout is rebuilt."
+    ),
+    "ui.flux_cubes.status": (
+        "What the current layout file contains: how many cubes, how they are "
+        "arranged, how high they stand, and which mesh they were built for. "
+        "Read back from the file itself rather than from the settings above, "
+        "so it describes the layout the run will actually use."
     ),
 }
 

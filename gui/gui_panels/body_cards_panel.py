@@ -43,8 +43,9 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QRadioButton, QScrollArea, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QStackedWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from gui_core.body_cards import (GENERIC_MESH_SHAPE, WINDOW_UNIT_DAYS,
@@ -72,6 +73,19 @@ logger = logging.getLogger(__name__)
 #: shown: the real number depends on the mesh, the view factors and whether the
 #: GPU pool is available, none of which this screen can know before the run.
 _MINUTES_PER_RUN_GUESS = 25.0
+
+
+def _flux_mode_aliases():
+    """`gui_core.flux_cubes.MODE_ALIASES`, resolved at class-body time.
+
+    A function rather than a module-level import so this file keeps its
+    existing import graph: `gui_core.flux_cubes` reaches back into
+    `gui_core.preflight` and `gui_core.simulation_runner`, and importing it at
+    the top of a panel that `gui_core` itself pulls in is a cycle waiting to
+    be discovered by whoever adds the next import.
+    """
+    from gui_core.flux_cubes import MODE_ALIASES
+    return dict(MODE_ALIASES)
 
 
 def _muted(text, color="gray", size=10):
@@ -1519,6 +1533,582 @@ class BodyCard(BaseConfigTab):
         else:
             note.setText(policy.reason)
 
+    # -- flux cubes ----------------------------------------------------------
+
+    #: Columns of the named-locations table, in order, as (heading, row key).
+    #: Height and cube size are optional per point; blank means "use the
+    #: automatic value", which is what a negative number means in the layout
+    #: file and what leaving the field out of the configuration means.
+    LOCATION_COLUMNS = (("Name", "name"), ("Latitude", "lat_deg"),
+                        ("Longitude", "lon_deg"), ("Height (m)", "height_m"),
+                        ("Cube size (m)", "edge_m"))
+
+    def flux_cube_group(self, title="Flux cubes"):
+        """Virtual six-face irradiance probes on the terrain.
+
+        VISIBLE WHEN ENABLED, not hidden behind the Advanced tier, and that is
+        a decision with a reason. Everything except the one switch lives inside
+        a container that is shown only while the switch is on, so the Basic
+        tier gains exactly one checkbox. Putting the whole group behind the
+        tier would mean an opened configuration with `flux_cubes.enabled: true`
+        showed nothing at all -- which is the same argument `radiation_group`
+        makes for keeping the radiation switch on every card, and it is how a
+        setting stays on without anybody seeing it.
+
+        The group is offered on the LOCAL-MESH mode only. The layout tool takes
+        a mesh file and a global run generates its sphere in memory, so there
+        is no file to build a layout against; `flux_cubes.engine_support` says
+        the same thing, and the pre-flight repeats it for a configuration that
+        arrives some other way.
+        """
+        from gui_core import flux_cubes as fc
+
+        group = QGroupBox(title)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 8, 8, 8)
+
+        head = QGridLayout()
+        head.setColumnStretch(1, 1)
+        self.add_bool_field(head, 0, "Record irradiance at virtual "
+                                     "measurement cubes", "flux_cubes.enabled")
+        self.flux_note = _muted("")
+        head.addWidget(self.flux_note, 1, 0, 1, 2)
+        outer.addLayout(head)
+
+        # -- everything below is shown only while the switch is on -----------
+        self.flux_body = QWidget()
+        grid = QGridLayout(self.flux_body)
+        grid.setContentsMargins(0, 4, 0, 0)
+        grid.setColumnStretch(1, 1)
+        row = 0
+
+        self.add_combo_field(grid, row, "Cube placement:",
+                             "flux_cubes.mode", list(fc.MODES))
+        row += 1
+
+        # Grid placement -------------------------------------------------
+        self.flux_lattice = QWidget()
+        lattice = QGridLayout(self.flux_lattice)
+        lattice.setContentsMargins(0, 0, 0, 0)
+        lattice.setColumnStretch(1, 1)
+        self.add_double_field(lattice, 0, "Distance between cubes (m):",
+                              "flux_cubes.spacing_m", 0.5, 10000.0,
+                              decimals=2)
+        # RANGES, not decoration. The cube count is counted, not approximated,
+        # so the work is proportional to radius/spacing; these two bounds cap
+        # that at about a hundred thousand columns, which is milliseconds. They
+        # are also the range a site mesh lives in -- a 50 km grid on a 3 km
+        # core would put most of its cubes outside the mesh, and the tool
+        # aborts on a lattice point with no terrain under it.
+        self.add_double_field(lattice, 1,
+                              "Grid radius around the mesh center (m):",
+                              "flux_cubes.radius_m", 0.0, 50000.0,
+                              decimals=2)
+        grid.addWidget(self.flux_lattice, row, 0, 1, 2)
+        row += 1
+
+        # Named locations -------------------------------------------------
+        self.flux_named = QWidget()
+        named = QVBoxLayout(self.flux_named)
+        named.setContentsMargins(0, 0, 0, 0)
+        self.flux_table = QTableWidget(0, len(self.LOCATION_COLUMNS))
+        self.flux_table.setHorizontalHeaderLabels(
+            [heading for heading, _key in self.LOCATION_COLUMNS])
+        self.flux_table.setToolTip(get_tooltip("ui.flux_cubes.locations"))
+        self.flux_table.verticalHeader().setVisible(False)
+        self.flux_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.flux_table.setMinimumHeight(120)
+        self.flux_table.itemChanged.connect(self._on_location_edited)
+        named.addWidget(self.flux_table)
+        buttons = QHBoxLayout()
+        add_row = QPushButton("Add point")
+        add_row.setToolTip(get_tooltip("ui.flux_cubes.locations"))
+        add_row.clicked.connect(self._on_add_location)
+        remove_row = QPushButton("Remove selected")
+        remove_row.setToolTip(get_tooltip("ui.flux_cubes.locations"))
+        remove_row.clicked.connect(self._on_remove_location)
+        import_csv = QPushButton("Import from file...")
+        import_csv.setToolTip(get_tooltip("ui.flux_cubes.import_csv"))
+        import_csv.clicked.connect(self._on_import_locations)
+        for button in (add_row, remove_row, import_csv):
+            buttons.addWidget(button)
+        buttons.addStretch()
+        named.addLayout(buttons)
+        grid.addWidget(self.flux_named, row, 0, 1, 2)
+        row += 1
+
+        # Height, read only -----------------------------------------------
+        height_label = QLabel("Cube height and size:")
+        height_label.setToolTip(get_tooltip("ui.flux_cubes.height"))
+        self.flux_height = _muted("")
+        self.flux_height.setToolTip(get_tooltip("ui.flux_cubes.height"))
+        grid.addWidget(height_label, row, 0)
+        grid.addWidget(self.flux_height, row, 1)
+        row += 1
+
+        # The layout file, and the tool that writes it ---------------------
+        self.add_file_field(grid, row, "Cube layout file:",
+                            "flux_cubes.cache_file",
+                            "Cube layouts (*.fcg);;All Files (*)")
+        row += 1
+        self.flux_build = QPushButton("Build cube layout")
+        self.flux_build.setToolTip(get_tooltip("ui.flux_cubes.build"))
+        self.flux_build.clicked.connect(self._on_build_layout)
+        grid.addWidget(self.flux_build, row, 1)
+        row += 1
+        self.flux_status = _muted("")
+        self.flux_status.setToolTip(get_tooltip("ui.flux_cubes.status"))
+        grid.addWidget(self.flux_status, row, 0, 1, 2)
+        row += 1
+
+        # Products ----------------------------------------------------------
+        self.add_bool_field(grid, row, "Write the single binary flux file",
+                            "flux_cubes.write_binary")
+        row += 1
+        self.add_bool_field(grid, row, "Write one spreadsheet file per cube",
+                            "flux_cubes.write_csv")
+        row += 1
+        self.add_int_field(grid, row, "Spreadsheet files, at most:",
+                           "flux_cubes.write_csv_max_cubes", 0, 1000000)
+        row += 1
+        # A COMBO, not a spin box. The engine branches on `>= 5` and records
+        # `rays >= 5 ? 5 : 1`, so 2, 3 and 4 are silently collapsed to one ray
+        # -- a spin box offering them would be three settings that are not.
+        # An opened file carrying one of them still shows it, because
+        # `set_enum` adds the foreign value and warns rather than displaying
+        # something else.
+        self.add_combo_field(grid, row, "Sun-visibility test:",
+                             "flux_cubes.shadow_probe_rays",
+                             [str(n) for n in fc.SHADOW_PROBE_CHOICES])
+        row += 1
+        self.flux_estimate = _muted("")
+        grid.addWidget(self.flux_estimate, row, 0, 1, 2)
+
+        outer.addWidget(self.flux_body)
+        group.setLayout(outer)
+
+        # ONE table, so a control added above without a signal is a missing
+        # ROW here rather than an omission nobody can see: everything in this
+        # group is described from the live configuration, and a control that
+        # changes an answer and does not re-ask for it leaves the previous
+        # answer on screen.
+        for key, signal in (("flux_cubes.enabled", "toggled"),
+                            ("flux_cubes.mode", "currentTextChanged"),
+                            ("flux_cubes.cache_file", "textChanged"),
+                            ("flux_cubes.spacing_m", "valueChanged"),
+                            ("flux_cubes.radius_m", "valueChanged"),
+                            ("flux_cubes.write_binary", "toggled"),
+                            ("flux_cubes.write_csv", "toggled"),
+                            ("flux_cubes.write_csv_max_cubes", "valueChanged"),
+                            ("flux_cubes.shadow_probe_rays",
+                             "currentTextChanged")):
+            getattr(self.widgets[key], signal).connect(
+                lambda _v: self.refresh_flux_cubes())
+        return group
+
+    def refresh_flux_cubes(self):
+        """Re-gate and re-describe the whole group. Cheap and idempotent.
+
+        Called on load and on every edit that can change an answer, so the
+        three lines on screen -- what the engine will accept, how big the cube
+        is, and what the run will write -- are computed from the live
+        configuration rather than left over from the last one.
+
+        It NEVER writes a configuration key. The switch is left exactly as the
+        file set it even when the rules refuse it; the group says the rules
+        disagree and the control is disabled, the same way the beaming gate
+        does, because opening a file is not an edit to it.
+        """
+        from gui_core import flux_cubes as fc
+        switch = self.widgets.get("flux_cubes.enabled")
+        note = getattr(self, "flux_note", None)
+        if switch is None or note is None:
+            return
+        config = self.config_manager.get_config()
+        policy = fc.engine_support(config)
+        enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
+                                                     False))
+        switch.setEnabled(bool(policy.allowed))
+        body = getattr(self, "flux_body", None)
+        if body is not None:
+            body.setVisible(enabled)
+
+        if not policy.allowed and enabled:
+            note.setText(
+                "THIS CONFIGURATION ASKS FOR FLUX CUBES AND THE RUN CANNOT "
+                "PRODUCE THEM. " + policy.reason
+                + " The setting has NOT been changed -- it is your file's. "
+                  "Fix what it names, or turn the cubes off yourself.")
+            logger.warning(
+                "[card] this configuration enables flux_cubes and the engine "
+                "would refuse the pass: %s. The setting is left alone; opening "
+                "a file is not an edit to it.", policy.reason)
+        else:
+            note.setText(policy.reason)
+
+        if not enabled:
+            return
+        self._refresh_flux_placement()
+        self._refresh_flux_height()
+        self._refresh_flux_cache()
+        self._refresh_flux_estimate()
+
+    def _flux_mode(self):
+        from gui_core import flux_cubes as fc
+        return fc.normalize_mode(
+            self.config_manager.get_value("flux_cubes.mode", fc.MODE_LATTICE))
+
+    def _refresh_flux_placement(self):
+        from gui_core import flux_cubes as fc
+        mode = self._flux_mode()
+        if getattr(self, "flux_lattice", None) is not None:
+            self.flux_lattice.setVisible(fc.mode_builds_lattice(mode))
+        if getattr(self, "flux_named", None) is not None:
+            self.flux_named.setVisible(fc.mode_uses_locations(mode))
+
+    def _refresh_flux_height(self):
+        """The cube height, from the cache when there is one and from a
+        measurement of the mesh when there is not -- and it says which."""
+        from gui_core import flux_cubes as fc
+        label = getattr(self, "flux_height", None)
+        if label is None:
+            return
+        header = self._flux_cache_header()
+        if header is not None and header.ok:
+            label.setText(
+                f"{fc._fmt_length(header.height_m)} above the ground, "
+                f"{fc._fmt_length(header.edge_m)} on a side -- measured by the "
+                f"layout tool on this mesh (a tenth of its "
+                f"{fc._fmt_length(header.local_median_edge_m)} median facet "
+                f"edge) and recorded in the layout file.")
+            return
+        geometry = fc.auto_geometry(self.config_manager.get_config(),
+                                    self._project_root())
+        if geometry.height_m is None:
+            label.setText(
+                f"not known yet: {geometry.detail}. The layout tool measures "
+                f"the mesh and records what it used.")
+            return
+        label.setText(
+            f"about {fc._fmt_length(geometry.height_m)} above the ground and "
+            f"the same on a side -- an estimate for this mesh, taken over the "
+            f"whole of it. The layout tool measures the grid area instead, so "
+            f"expect a few percent; its number is recorded in the layout file "
+            f"and is the one that runs.")
+
+    def _flux_cache_header(self):
+        """The current layout file's header, or None when no file is named.
+
+        Cached on the resolved path so that re-describing the group on every
+        keystroke does not re-read a 50 MB file. The header is 256 bytes plus
+        the name block, so the read itself is small, but the path is resolved
+        and stat'd and that is worth doing once.
+        """
+        from gui_core import flux_cubes as fc
+        from gui_core.preflight import resolve_path
+        raw = str(self.config_manager.get_value("flux_cubes.cache_file", "")
+                  or "").strip()
+        if not raw:
+            self._flux_header_cache = None
+            return None
+        try:
+            path = str(resolve_path(raw, self._project_root()))
+        except Exception:                                    # noqa: BLE001
+            path = raw
+        cached = getattr(self, "_flux_header_cache", None)
+        if cached is not None and cached[0] == path:
+            return cached[1]
+        header = fc.read_cache_header(path)
+        self._flux_header_cache = (path, header)
+        return header
+
+    def _refresh_flux_cache(self):
+        label = getattr(self, "flux_status", None)
+        if label is None:
+            return
+        header = self._flux_cache_header()
+        if header is None:
+            label.setText(
+                "No layout file yet. Set the placement above and use "
+                "Build cube layout; the run stops rather than starting without "
+                "one.")
+            return
+        if not header.ok:
+            label.setText(header.error)
+            return
+        from gui_core import flux_cubes as fc
+        text = header.describe()
+        # Only the names this run will actually ASK for. In a grid-only mode
+        # the table's rows are not emitted, so the run never checks them and a
+        # complaint about them here would be about a list nobody sends.
+        names = (self._flux_location_rows()
+                 if fc.mode_uses_locations(self._flux_mode()) else [])
+        if names:
+            missing = [row["name"] for row in names
+                       if row["name"] not in header.names]
+            if missing:
+                text += (" This layout does not contain "
+                         + ", ".join(sorted(missing))
+                         + ". The run checks the names and stops, because "
+                           "editing the table does not move a cube -- rebuild "
+                           "the layout.")
+        label.setText(text)
+
+    def _refresh_flux_estimate(self):
+        """Cubes, files and bytes -- the size of what this run will write."""
+        from gui_core import flux_cubes as fc
+        label = getattr(self, "flux_estimate", None)
+        if label is None:
+            return
+        header = self._flux_cache_header()
+        named = self._flux_location_rows()
+        if header is not None and header.ok:
+            n_cubes = header.n_cubes
+            n_named = header.n_named
+            source = "the layout file"
+        else:
+            mode = self._flux_mode()
+            n_named = len(named) if fc.mode_uses_locations(mode) else 0
+            n_cubes = n_named + (
+                fc.lattice_cube_count(
+                    self._number("flux_cubes.spacing_m", fc.DEFAULT_SPACING_M),
+                    self._number("flux_cubes.radius_m", fc.DEFAULT_RADIUS_M))
+                if fc.mode_builds_lattice(mode) else 0)
+            source = "the placement above"
+        steps = int(self._number("simulation.timesteps", 0))
+        parts = [f"{n_cubes:,} cubes from {source}"]
+        if steps > 0 and n_cubes > 0:
+            if self.config_manager.get_value("flux_cubes.write_binary", True):
+                size = fc.product_bytes(n_cubes, steps, has_names=n_named > 0)
+                parts.append(f"about {fc.fmt_bytes(size)} of binary flux "
+                             f"({n_cubes:,} x 6 faces x 6 components x "
+                             f"{steps:,} steps, eight bytes each)")
+            if self.config_manager.get_value("flux_cubes.write_csv", True):
+                files = fc.csv_files_written(
+                    n_cubes, n_named,
+                    self._number("flux_cubes.write_csv_max_cubes", 0))
+                parts.append(f"{files:,} spreadsheet file(s), roughly "
+                             f"{fc.fmt_bytes(fc.csv_bytes(files, steps))}")
+        label.setText("Estimated output: " + "; ".join(parts)
+                      + ". Sizes are estimates and exclude a short provenance "
+                        "record in each file.")
+
+    # -- the named-locations table -------------------------------------------
+
+    def _flux_location_rows(self):
+        from gui_core import flux_cubes as fc
+        return fc.config_locations(self.config_manager.get_config())
+
+    def load_flux_locations(self):
+        """Mirror `flux_cubes.locations` into the table. Never writes back."""
+        table = getattr(self, "flux_table", None)
+        if table is None:
+            return
+        rows = self._flux_location_rows()
+        blocked = table.signalsBlocked()
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                for c, (_heading, key) in enumerate(self.LOCATION_COLUMNS):
+                    value = row.get(key)
+                    text = "" if value is None else (
+                        value if key == "name" else f"{float(value):g}")
+                    table.setItem(r, c, QTableWidgetItem(str(text)))
+        finally:
+            table.blockSignals(blocked)
+
+    def _table_locations(self):
+        """The table's contents as rows, plus the lines that did not parse."""
+        from gui_core import flux_cubes as fc
+        table = getattr(self, "flux_table", None)
+        if table is None:
+            return [], []
+        lines = []
+        for r in range(table.rowCount()):
+            fields = []
+            for c in range(len(self.LOCATION_COLUMNS)):
+                item = table.item(r, c)
+                fields.append("" if item is None else item.text().strip())
+            if not any(fields):
+                continue
+            lines.append(",".join(fields))
+        # `allow_header=False`: a table has no header row, and the file rule --
+        # a first field of exactly `name` is a header -- would silently drop a
+        # point somebody typed there.
+        return fc.parse_locations_csv("\n".join(lines), allow_header=False)
+
+    def _write_flux_locations(self):
+        """Store the table, and say so when a row could not be read.
+
+        A row that does not parse is NOT written and NOT silently dropped: the
+        status line names it. A point that vanished on the way into the
+        configuration is a cube the user believes is in the product.
+        """
+        if self._loading:
+            return
+        rows, errors = self._table_locations()
+        self.config_manager.set_value("flux_cubes.locations", rows)
+        label = getattr(self, "flux_status", None)
+        if errors and label is not None:
+            label.setText("These rows were not stored: " + "; ".join(errors))
+        else:
+            self._refresh_flux_cache()
+        self._refresh_flux_estimate()
+        self.value_changed.emit()
+
+    def _on_location_edited(self, _item):
+        self._write_flux_locations()
+
+    def _on_add_location(self):
+        table = getattr(self, "flux_table", None)
+        if table is None:
+            return
+        table.insertRow(table.rowCount())
+
+    def _on_remove_location(self):
+        table = getattr(self, "flux_table", None)
+        if table is None:
+            return
+        for index in sorted({i.row() for i in table.selectedIndexes()},
+                            reverse=True):
+            table.removeRow(index)
+        self._write_flux_locations()
+
+    def _on_import_locations(self):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import cube locations", str(self._project_root()),
+            "Comma-separated values (*.csv *.txt);;All Files (*)")
+        if not path:
+            return
+        from gui_core import flux_cubes as fc
+        try:
+            text = Path(path).read_text()
+        except OSError as exc:
+            QMessageBox.warning(self, "Import cube locations",
+                                f"{path} could not be read: {exc}")
+            return
+        rows, errors = fc.parse_locations_csv(text)
+        if errors:
+            QMessageBox.warning(
+                self, "Import cube locations",
+                f"{len(rows)} point(s) read and "
+                f"{len(errors)} line(s) refused:\n\n" + "\n".join(errors)
+                + "\n\nNothing was imported. Fix the file and try again.")
+            return
+        if not rows:
+            QMessageBox.warning(self, "Import cube locations",
+                                f"{path} contains no points.")
+            return
+        self.config_manager.set_value("flux_cubes.locations", rows)
+        self.load_flux_locations()
+        self.refresh_flux_cubes()
+        self.value_changed.emit()
+
+    # -- building the layout -------------------------------------------------
+
+    def _on_build_layout(self):
+        """Run the layout tool on this mesh, in a worker thread.
+
+        Placement is the tool's job and only the tool's: it measures the mesh,
+        drops each cube onto the terrain and casts the rays that record what
+        every cube face can see. Nothing in this window moves a cube, which is
+        why editing the fields above changes no result until the layout is
+        rebuilt -- and why the run compares the layout against its own mesh and
+        stops on a mismatch.
+        """
+        from gui_core import flux_cubes as fc
+        config = self.config_manager.get_config()
+        mesh = str((config.get("mesh") or {}).get("import_file", "")
+                   or "").strip()
+        if not mesh:
+            QMessageBox.warning(
+                self, "Build cube layout",
+                "Choose a terrain mesh first: the layout is built against the "
+                "mesh the run will use.")
+            return
+        executable = fc.find_geom_executable(self._project_root())
+        if executable is None:
+            QMessageBox.warning(
+                self, "Build cube layout",
+                f"{fc.GEOM_EXECUTABLE} was not found beside the simulation "
+                f"program. Build it first, from the project directory:\n\n"
+                f"    cmake --build build --target {fc.GEOM_EXECUTABLE}")
+            return
+        from gui_core.preflight import resolve_data_path, resolve_path
+        root = self._project_root()
+        target = str(self.config_manager.get_value("flux_cubes.cache_file", "")
+                     or "").strip()
+        if not target:
+            target = fc.default_cache_path(config, root)
+        target, _filter = QFileDialog.getSaveFileName(
+            self, "Save cube layout as", str(target),
+            "Cube layouts (*.fcg);;All Files (*)")
+        if not target:
+            return
+
+        locations_file = ""
+        mode = self._flux_mode()
+        rows, errors = self._table_locations()
+        if fc.mode_uses_locations(mode):
+            if errors or not rows:
+                QMessageBox.warning(
+                    self, "Build cube layout",
+                    "The point list has to be readable before a layout can be "
+                    "built.\n\n" + ("\n".join(errors) if errors
+                                    else "The table is empty."))
+                return
+            locations_file = str(Path(target).with_suffix(".locations.csv"))
+            try:
+                Path(locations_file).write_text(fc.locations_to_csv(rows))
+            except OSError as exc:
+                QMessageBox.warning(self, "Build cube layout",
+                                    f"{locations_file} could not be "
+                                    f"written: {exc}")
+                return
+
+        occluder = str((config.get("mesh") or {}).get("occluder_file", "")
+                       or "").strip()
+        argv = fc.geom_command(
+            executable,
+            resolve_data_path(mesh, root),
+            resolve_path(target, root),
+            mode=mode,
+            spacing_m=self._number("flux_cubes.spacing_m",
+                                   fc.DEFAULT_SPACING_M),
+            radius_m=self._number("flux_cubes.radius_m", fc.DEFAULT_RADIUS_M),
+            occluder_mesh=(str(resolve_data_path(occluder, root))
+                           if occluder else ""),
+            locations_csv=locations_file)
+
+        self.flux_build.setEnabled(False)
+        self.flux_status.setText(
+            "Building the cube layout. It measures the mesh and casts rays "
+            "from every cube face, which takes tens of seconds on a "
+            "site-scale mesh.")
+        self._flux_worker = _GeomWorker(argv, str(root))
+        self._flux_worker.done.connect(
+            lambda ok, log, out=target: self._on_layout_built(ok, log, out))
+        self._flux_worker.finished.connect(self._flux_worker.deleteLater)
+        self._flux_worker.start()
+
+    def _on_layout_built(self, ok, log, target):
+        self.flux_build.setEnabled(True)
+        # Drop any cached header for this path: the file just changed.
+        self._flux_header_cache = None
+        if not ok:
+            self.flux_status.setText(
+                "The layout was not built, and nothing was changed. " + log)
+            logger.warning("[card] %s failed: %s", "cube layout build", log)
+            return
+        self.config_manager.set_value("flux_cubes.cache_file", target)
+        widget = self.widgets.get("flux_cubes.cache_file")
+        if widget is not None:
+            widget.setText(str(target))
+        self.refresh_flux_cubes()
+        self.value_changed.emit()
+
     def _on_beaming_toggled(self, checked):
         """A USER toggle also sets the slope; a load does not reach here.
 
@@ -1584,6 +2174,17 @@ class BodyCard(BaseConfigTab):
                                     "custom_mesh": "custom_mesh",
                                     "mesh": "custom_mesh",
                                     "": "spherical"},
+        # GUI-only, and normalized the same way for the same reason: an older
+        # project or a hand-edited file can carry "lattice" or "locations", and
+        # a combo left showing "grid" for a configuration that says "locations"
+        # would build the wrong layout. The table is the module's own
+        # `MODE_ALIASES`, so the combo and every reader agree by construction.
+        "flux_cubes.mode": _flux_mode_aliases(),
+        # The two the engine distinguishes. A file carrying 2, 3 or 4 is NOT
+        # mapped onto either: `set_enum` adds it as a foreign entry and warns,
+        # so the card shows what the file says while the tooltip states that
+        # the engine reads anything under five as one ray.
+        "flux_cubes.shadow_probe_rays": {"1": "1", "5": "5"},
     }
 
     #: Widgets whose loading a subclass handles itself.
@@ -1740,6 +2341,15 @@ class MoonCard(BodyCard):
         # -- radiation exchange (EVERY mode; see BodyCard.radiation_group) -----
         layout.addWidget(self.radiation_group(beaming=True))
 
+        # -- flux cubes (LOCAL MESH ONLY; see BodyCard.flux_cube_group) -------
+        # Below radiation on purpose: the cubes report what the surrounding
+        # terrain sends, which the run only computes when the switch above is
+        # on, and the group says so when it is not.
+        self.flux_group = self.flux_cube_group()
+        layout.addWidget(self.flux_group)
+        self.widgets["radiation.enabled"].toggled.connect(
+            lambda _c: self.refresh_flux_cubes())
+
         layout.addWidget(self.builtin_surface_group("Moon"))
         layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
@@ -1751,10 +2361,19 @@ class MoonCard(BodyCard):
         local = self._mode == "local"
         self.global_group.setVisible(not local)
         self.local_group.setVisible(local)
+        # Local mesh only. A global run generates its sphere in memory, so
+        # there is no mesh file for the layout tool to build against and every
+        # control in the group would be an offer the tool cannot keep.
+        self.flux_group.setVisible(local)
 
     def load_card(self):
         super().load_card()
         self._refresh_surface()
+        # The table is not in `self.widgets`, so the generic mirror does not
+        # reach it; loaded here, inside the `_loading` guard the caller holds,
+        # so mirroring the list does not write it back.
+        self.load_flux_locations()
+        self.refresh_flux_cubes()
 
     # -- the auto-albedo and beaming rules, narrated ------------------------
 
@@ -1787,6 +2406,11 @@ class MoonCard(BodyCard):
             if imported else
             f"Bundled map for ico{resolution}, matched by face count.")
         self.refresh_radiation()
+        # The mesh decides the cube height and whether a layout can be built at
+        # all, so a mesh change re-measures rather than leaving the previous
+        # mesh's number on screen.
+        self._flux_header_cache = None
+        self.refresh_flux_cubes()
 
     def extra_exposed_keys(self):
         """Keys a control on this card WRITES without being bound to it.
@@ -1804,6 +2428,9 @@ class MoonCard(BodyCard):
             # at save time (_config_for_yaml)
             "illumination.use_albedo_map", "illumination.albedo_map",
             "illumination.albedo_maps_directory",
+            # written by the named-locations table, which is not a single
+            # widget and so is not in `self.widgets`
+            "flux_cubes.locations",
         }
 
 
@@ -2368,6 +2995,56 @@ class MercuryCard(BodyCard):
 # ===========================================================================
 # Generic bodies: asteroid, and anything else
 # ===========================================================================
+
+class _GeomWorker(QThread):
+    """One `ptm_flux_cube_geom` run, off the GUI thread, emitting exactly once.
+
+    Same contract as the two workers below: a blocking subprocess on the GUI
+    thread is a frozen window, and an exception crossing a thread boundary into
+    nothing leaves the card on "Building..." forever, so everything is caught
+    here and turned into a result the card can show.
+
+    `argv` is a LIST and the subprocess runs without a shell, so a path with a
+    space or a quote in it is an argument and not syntax.
+
+    The tool's own diagnostics are the message on failure, trimmed to the tail:
+    it prints its measurements first and its refusal last, and the refusal is
+    what the user has to read. A refusal is a refusal -- the tool aborts on a
+    lattice point that misses the terrain, on a site at the pole, and on an
+    unreadable occluder mesh, rather than dropping cubes -- so a non-zero exit
+    means no layout was written and the card says exactly that.
+    """
+
+    done = pyqtSignal(bool, str)
+
+    #: Wall-clock ceiling. The measured full-grid sweep on a 2.4 M-face site
+    #: mesh was 66 s at 65,536 rays per patch; this leaves room for a mesh
+    #: several times larger and still ends rather than hanging the card's
+    #: button forever.
+    TIMEOUT_S = 1800.0
+
+    def __init__(self, argv, cwd):
+        super().__init__()
+        self._argv = list(argv)
+        self._cwd = cwd
+
+    def run(self):
+        import subprocess
+        try:
+            proc = subprocess.run(self._argv, cwd=self._cwd,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  timeout=self.TIMEOUT_S)
+            log = proc.stdout.decode("utf-8", errors="replace")
+            tail = "\n".join(log.strip().splitlines()[-8:])
+            self.done.emit(proc.returncode == 0, tail)
+        except subprocess.TimeoutExpired:
+            self.done.emit(
+                False, f"The layout tool did not finish within "
+                       f"{self.TIMEOUT_S / 60:.0f} minutes and was stopped.")
+        except Exception as exc:                             # noqa: BLE001
+            self.done.emit(False, f"{type(exc).__name__}: {exc}")
+
 
 class _LookupWorker(QThread):
     """One HORIZONS request, off the GUI thread.
