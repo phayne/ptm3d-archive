@@ -52,6 +52,7 @@ from gui_core.body_cards import (GENERIC_MESH_SHAPE, WINDOW_UNIT_DAYS,
                                  WINDOW_UNIT_DIURNAL, WINDOW_UNIT_ORBITAL,
                                  WINDOW_UNITS, window_unit_days)
 from gui_core.config_manager import ConfigManager
+from gui_core.curated_sites import curated_site, curated_sites_for_body
 from gui_panels.config_panel import (BaseConfigTab, CollapsibleSection,
                                      get_tooltip)
 
@@ -87,6 +88,26 @@ def _flux_mode_aliases():
     """
     from gui_core.flux_cubes import MODE_ALIASES
     return dict(MODE_ALIASES)
+
+
+def _same_setting(current, wanted):
+    """Do these two configuration values mean the same thing?
+
+    Not ``str(a) == str(b)``. YAML reads ``latitude_override: -999`` as an int
+    and ``enabled: yes`` as a bool, so the string forms of two IDENTICAL
+    settings differ (``'-999'`` against ``'-999.0'``) and a card comparing them
+    that way shouts that a configuration disagrees with a set it matches
+    exactly. Booleans compare by truth, numbers by value, everything else by
+    its string form -- which for the paths this is used on is the right test.
+    """
+    if isinstance(wanted, bool) or isinstance(current, bool):
+        return bool(current) == bool(wanted)
+    if isinstance(wanted, (int, float)):
+        try:
+            return float(current) == float(wanted)
+        except (TypeError, ValueError):
+            return False
+    return str(current) == str(wanted)
 
 
 def _muted(text, color="gray", size=10):
@@ -1449,10 +1470,210 @@ class BodyCard(BaseConfigTab):
         self.add_file_field(grid, row, "View-factor cache:",
                             "radiation.view_factor_file",
                             "View factors (*.vf *.csr *.hmat);;All Files (*)")
+        row += 1
+        row = self._build_vf_discovery_rows(grid, row)
         group.setLayout(grid)
         self.widgets["radiation.enabled"].toggled.connect(
             self._on_radiation_toggled)
         return group
+
+    # -- finding a matrix that is already here -------------------------------
+
+    def _build_vf_discovery_rows(self, grid, row):
+        """The "there may already be one of these next to your mesh" row.
+
+        OFFER, NEVER IMPOSE. Nothing here writes a key until the user presses
+        Use. The reason is not caution for its own sake: a view-factor matrix
+        does not carry the mesh it was built for, so "the one in this folder"
+        is a guess, and a wrong guess produces a run that completes. The only
+        thing that runs automatically is a COUNT.
+        """
+        self.vf_find_button = QPushButton("Look for matching view factors")
+        self.vf_find_button.setToolTip(get_tooltip("ui.vf_discovery"))
+        self.vf_find_button.clicked.connect(self._on_find_view_factors)
+        self.vf_candidate_combo = QComboBox()
+        self.vf_candidate_combo.setToolTip(get_tooltip("ui.vf_discovery"))
+        self.vf_candidate_combo.setEnabled(False)
+        self.vf_candidate_combo.currentIndexChanged.connect(
+            lambda _i: self._describe_vf_candidate())
+        self.vf_use_button = QPushButton("Use this file")
+        self.vf_use_button.setEnabled(False)
+        self.vf_use_button.clicked.connect(self._on_use_view_factor)
+
+        strip = QWidget()
+        strip_layout = QHBoxLayout(strip)
+        strip_layout.setContentsMargins(0, 0, 0, 0)
+        strip_layout.addWidget(self.vf_find_button)
+        strip_layout.addWidget(self.vf_candidate_combo, 1)
+        strip_layout.addWidget(self.vf_use_button)
+        grid.addWidget(strip, row, 0, 1, 2)
+        row += 1
+        self.vf_discovery_note = _muted("")
+        grid.addWidget(self.vf_discovery_note, row, 0, 1, 2)
+        row += 1
+        #: The last scan's candidates, in combo order after its "choose one"
+        #: row, and the scan's own summary + refusals, which stay on screen
+        #: while a candidate is highlighted rather than being replaced by it.
+        self._vf_candidates = []
+        self._vf_scan_lines = []
+        return row
+
+    def _mesh_for_discovery(self):
+        return str((self.config_manager.get_config().get("mesh") or {})
+                   .get("import_file", "") or "").strip()
+
+    def refresh_vf_discovery(self, scan=False):
+        """Re-state what is next to the mesh. Cheap unless ``scan`` is set.
+
+        The automatic pass says only HOW MANY files were found and does not
+        rank or offer them, because it runs whenever the mesh path changes --
+        including on every keystroke of a half-typed path. The ranking, which
+        reads headers, happens when the user asks for it.
+        """
+        combo = getattr(self, "vf_candidate_combo", None)
+        note = getattr(self, "vf_discovery_note", None)
+        if combo is None or note is None:
+            return
+        mesh = self._mesh_for_discovery()
+        if not scan:
+            self._vf_candidates = []
+            self._vf_scan_lines = []
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+            combo.setEnabled(False)
+            self.vf_use_button.setEnabled(False)
+            note.setText(
+                "" if not mesh else
+                "A view-factor matrix for this mesh may already be on disk "
+                "beside it. Nothing is chosen for you: press the button to "
+                "list what is there and what each file actually is.")
+            return
+        if not mesh:
+            note.setText("Choose a terrain mesh first — the search looks in "
+                         "the mesh's own folder.")
+            return
+        try:
+            from gui_core.vf_discovery import discover_view_factors
+            result = discover_view_factors(
+                mesh,
+                view_factor_file=str(self.config_manager.get_value(
+                    "radiation.view_factor_file", "") or ""),
+                project_root=self._project_root())
+        except Exception as exc:                             # noqa: BLE001
+            # This runs from a Qt slot. An exception out of a slot is qFatal
+            # and the loss of unsaved edits, and "the search failed" is not a
+            # reason to lose a configuration.
+            logger.warning("[card] the view-factor search failed: %s", exc,
+                           exc_info=True)
+            note.setText(f"The search could not run ({type(exc).__name__}: "
+                         f"{exc}). Nothing was changed.")
+            return
+        self._vf_candidates = list(result.matches)
+        combo.blockSignals(True)
+        combo.clear()
+        # NOTHING IS PRE-SELECTED. A combo whose first row is already chosen
+        # makes "Use this file" a one-click wiring of whatever happened to sort
+        # first, and sort order is not evidence -- measured in the real
+        # A03MP026 directory, where two matrices reach the same tier and the
+        # superseded one has the alphabetically earlier name.
+        combo.addItem(f"({len(self._vf_candidates)} found — choose one)"
+                      if self._vf_candidates else "(none found)", None)
+        for candidate in self._vf_candidates:
+            combo.addItem(candidate.headline())
+        combo.blockSignals(False)
+        combo.setEnabled(bool(self._vf_candidates))
+        self.vf_use_button.setEnabled(False)
+        self._vf_scan_lines = [result.summary()]
+        # BOUNDED. Pointing the cache field at a directory of per-site base
+        # stubs produces 58 refusals and 12,000 characters, and that is the
+        # ordinary case after a curated site is chosen, not a pathological one.
+        # The count is always exact; the list is what gets cut.
+        shown = result.refusals[:self.VF_REFUSALS_SHOWN]
+        for candidate in shown:
+            self._vf_scan_lines.append(f"REFUSED — {candidate.path.name}: "
+                                       f"{candidate.refusal}")
+        hidden = len(result.refusals) - len(shown)
+        if hidden > 0:
+            self._vf_scan_lines.append(
+                f"...and {hidden} more refused, not listed here. The console "
+                f"log carries every one.")
+            for candidate in result.refusals[len(shown):]:
+                logger.info("[card] view-factor candidate refused — %s: %s",
+                            candidate.path, candidate.refusal)
+        self._describe_vf_candidate()
+
+    #: How many refusals go on the card before the rest go to the log only.
+    VF_REFUSALS_SHOWN = 6
+
+    def _on_find_view_factors(self):
+        self.refresh_vf_discovery(scan=True)
+
+    def _current_vf_candidate(self):
+        """The chosen candidate, or None. Index 0 is the 'choose one' row."""
+        index = self.vf_candidate_combo.currentIndex() - 1
+        if 0 <= index < len(self._vf_candidates):
+            return self._vf_candidates[index]
+        return None
+
+    def _describe_vf_candidate(self):
+        """Show the scan's own result AND whatever is highlighted, together.
+
+        The two used to be written to the same label in sequence, so the scan
+        summary and every refusal were overwritten by the selected candidate's
+        notes the moment there was one. That silenced the refusals in the
+        common case -- which is the case they exist for.
+        """
+        note = getattr(self, "vf_discovery_note", None)
+        if note is None:
+            return
+        lines = list(getattr(self, "_vf_scan_lines", []))
+        candidate = self._current_vf_candidate()
+        self.vf_use_button.setEnabled(candidate is not None)
+        if candidate is not None:
+            lines.append("")
+            lines.append(candidate.headline())
+            lines.extend(candidate.notes)
+        note.setText("\n".join(lines))
+
+    def _on_use_view_factor(self):
+        """Wire the highlighted candidate, and say exactly what was written."""
+        candidate = self._current_vf_candidate()
+        if candidate is None:
+            return
+        from gui_core.vf_discovery import FORMAT_CSR, candidate_wiring
+        wiring = candidate_wiring(candidate)
+        if not wiring:
+            self.vf_discovery_note.setText(
+                f"{candidate.path.name} was not wired: {candidate.refusal}")
+            return
+        for key, value in wiring:
+            self.config_manager.set_value(key, value)
+        written = "; ".join(f"{k} = {v}" for k, v in wiring)
+        lines = [f"Wired: {written}"]
+        if candidate.fmt == FORMAT_CSR:
+            lines.append(
+                "A replacement CSR is loaded through the environment, not "
+                "through the cache field, and the run ALSO needs a "
+                "correctly-dimensioned base file in View-factor cache or the "
+                "engine will rebuild the matrix it was just handed. This "
+                "wiring did not invent one; set it yourself, or choose a "
+                "curated site, which brings its own.")
+        if candidate.superseded:
+            lines.append("THIS FILE IS SUPERSEDED and you chose it anyway, "
+                         "which is a legitimate thing to do — reproducing an "
+                         "older run needs the older matrix. " +
+                         candidate.superseded)
+        lines.extend(candidate.notes)
+        # BEFORE the note, not after. `load_from_config` reaches
+        # `BodyCard.load_card`, which resets this label to the idle text --
+        # measured: the whole confirmation, INCLUDING the missing-base-file
+        # warning above, vanished the instant it was written, and nothing else
+        # in this project warns about a replacement CSR with no base.
+        self.load_from_config()
+        self._vf_scan_lines = lines
+        self.vf_discovery_note.setText("\n".join(lines))
+        self.value_changed.emit()
 
     def _on_radiation_toggled(self, _checked):
         """The parent switch moved: re-gate the child and re-describe both."""
@@ -2303,6 +2524,10 @@ class BodyCard(BaseConfigTab):
                 self.set_text(key, value)
         if self._override_state():
             self.load_overrides()
+        # The offer, reset. A configuration just loaded describes a different
+        # mesh from the one the last scan ranked against, and a stale candidate
+        # list is a list of matrices for somebody else's terrain.
+        self.refresh_vf_discovery()
 
 
 # ===========================================================================
@@ -2345,20 +2570,35 @@ class MoonCard(BodyCard):
         self.local_group = QGroupBox("Local mesh")
         grid = QGridLayout()
         grid.setColumnStretch(1, 1)
-        self.add_file_field(grid, 0, "Terrain mesh:", "mesh.import_file",
+
+        site_label = QLabel("Curated site:")
+        site_label.setToolTip(get_tooltip("ui.curated_site"))
+        self._apply_tooltip(site_label, "ui.curated_site")
+        grid.addWidget(site_label, 0, 0)
+        self.site_combo = QComboBox()
+        self.site_combo.setToolTip(get_tooltip("ui.curated_site"))
+        self.site_combo.addItem("(none — choose the files yourself)", "")
+        for entry in curated_sites_for_body("Moon"):
+            self.site_combo.addItem(entry.display(), entry.key)
+        self.site_combo.currentIndexChanged.connect(self._on_curated_site)
+        grid.addWidget(self.site_combo, 0, 1)
+        self.site_note = _muted("")
+        grid.addWidget(self.site_note, 1, 0, 1, 2)
+
+        self.add_file_field(grid, 2, "Terrain mesh:", "mesh.import_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
         # The label argument is DEAD for this key: `_resolve_text` prefers
         # `gui_tooltips.LABELS`, which spells it "Shadow-only surrounding
         # mesh:". Kept identical to the rendered text so the call site cannot
         # be read as a second, disagreeing answer (BUGS.md
         # GUI-CARD-LABEL-LITERAL-DEAD).
-        self.add_file_field(grid, 1, "Shadow-only surrounding mesh:",
+        self.add_file_field(grid, 3, "Shadow-only surrounding mesh:",
                             "mesh.occluder_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
-        self.add_double_field(grid, 2, "Latitude (deg):",
+        self.add_double_field(grid, 4, "Latitude (deg):",
                               "mesh.latitude_override", -999.0, 90.0,
                               decimals=4)
-        self.add_double_field(grid, 3, "Longitude (deg):",
+        self.add_double_field(grid, 5, "Longitude (deg):",
                               "mesh.longitude_override", -999.0, 360.0,
                               decimals=4)
         self.local_group.setLayout(grid)
@@ -2439,12 +2679,123 @@ class MoonCard(BodyCard):
 
     def load_card(self):
         super().load_card()
+        self._mirror_curated_site()
         self._refresh_surface()
         # The table is not in `self.widgets`, so the generic mirror does not
         # reach it; loaded here, inside the `_loading` guard the caller holds,
         # so mirroring the list does not write it back.
         self.load_flux_locations()
         self.refresh_flux_cubes()
+
+    # -- the curated A3GT lunar sites ---------------------------------------
+
+    def _current_site(self):
+        key = self.site_combo.currentData()
+        return curated_site(key, body="Moon") if key else None
+
+    def _mirror_curated_site(self):
+        """Show the site whose mesh this configuration already names.
+
+        Matching is on the MESH PATH, not on the occluder or the matrix: the
+        core mesh is what identifies a site, and a configuration that has the
+        right terrain with a different ring is still that site -- shown, and
+        then described by `_describe_curated_site`, which compares every key
+        and names the ones that differ rather than quietly resetting them.
+        """
+        current = str(self.config_manager.get_value("mesh.import_file", "")
+                      or "").strip()
+        index = 0
+        if current:
+            for position in range(1, self.site_combo.count()):
+                entry = curated_site(self.site_combo.itemData(position),
+                                     body="Moon")
+                if entry is not None and entry.mesh.path == current:
+                    index = position
+                    break
+        self.site_combo.blockSignals(True)
+        self.site_combo.setCurrentIndex(index)
+        self.site_combo.blockSignals(False)
+        self._describe_curated_site()
+
+    def _describe_curated_site(self, applied=()):
+        """Say what this site IS, and where the configuration disagrees.
+
+        Never rewrites anything on its own. A file the user opened that names
+        a curated site's terrain with some other ring or matrix keeps what it
+        has and is told which keys differ -- opening a file is not an edit to
+        it, and this card is not the place that decides somebody's ring was a
+        mistake.
+        """
+        note = getattr(self, "site_note", None)
+        if note is None:
+            return
+        entry = self._current_site()
+        if entry is None:
+            note.setText(
+                "No curated site: the terrain, the surrounding ring and the "
+                "view-factor cache below are yours to set. A curated site "
+                "fills all three from a set that has run to completion.")
+            return
+        from gui_core.curated_sites import (site_status, site_wiring,
+                                            wiring_provenance)
+        status = site_status(entry)
+        lines = []
+        if applied:
+            lines.append("Wrote: " + "; ".join(f"{k} = {v}"
+                                               for k, v in applied))
+        lines.append(status.summary())
+        # Only worth computing when the card is DESCRIBING a configuration
+        # somebody else wrote. Straight after `applied`, every key is by
+        # construction the value just written.
+        if status.ready and not applied:
+            differing = []
+            for key, value in site_wiring(entry):
+                if key.startswith("engine_env."):
+                    current = (self.config_manager.get_value("engine_env", {})
+                               or {}).get(key.split(".", 1)[1])
+                else:
+                    current = self.config_manager.get_value(key)
+                if not _same_setting(current, value):
+                    differing.append(f"{key} is {current!r}, the curated set "
+                                     f"uses {value!r}")
+            if differing:
+                lines.append("THIS CONFIGURATION DIFFERS FROM THE CURATED SET "
+                             "AND HAS NOT BEEN CHANGED: " + "; ".join(differing))
+        lines.extend(wiring_provenance(entry))
+        note.setText("\n".join(lines))
+
+    def _on_curated_site(self, _index):
+        """Apply a whole set, or refuse it — and say which, every time.
+
+        A curated site is the one place in this card where selecting something
+        writes several keys at once, and that is the user's explicit choice.
+        What it must never do is write a PARTIAL set: a terrain with no
+        matrix, or a matrix whose file is a cloud placeholder, is a run that
+        starts and is wrong. `site_status` decides, and a refusal writes
+        nothing at all.
+        """
+        entry = self._current_site()
+        if entry is None:
+            self._describe_curated_site()
+            return
+        from gui_core.curated_sites import site_status, site_wiring
+        status = site_status(entry)
+        if not status.ready:
+            logger.warning("[card] the curated site %s was not wired: %s",
+                           entry.key, status.summary())
+            self.site_combo.blockSignals(True)
+            self.site_combo.setCurrentIndex(0)
+            self.site_combo.blockSignals(False)
+            self.site_note.setText(
+                status.summary() + " Nothing was written; the site is left "
+                "unselected so the configuration cannot half-describe it.")
+            return
+        wiring = site_wiring(entry)
+        for key, value in wiring:
+            self.config_manager.set_value(key, value)
+        self.load_from_config()
+        self._describe_curated_site(applied=wiring)
+        self.value_changed.emit()
 
     # -- the auto-albedo and beaming rules, narrated ------------------------
 
@@ -2477,6 +2828,11 @@ class MoonCard(BodyCard):
             if imported else
             f"Bundled map for ico{resolution}, matched by face count.")
         self.refresh_radiation()
+        # A ranked candidate list belongs to ONE mesh. Reset it here rather
+        # than leaving matrices ranked against the previous terrain on screen
+        # beside a new one -- the wrong-mesh case this whole search exists to
+        # make visible.
+        self.refresh_vf_discovery()
         # The mesh decides the cube height and whether a layout can be built at
         # all, so a mesh change re-measures rather than leaving the previous
         # mesh's number on screen.
@@ -2502,6 +2858,11 @@ class MoonCard(BodyCard):
             # written by the named-locations table, which is not a single
             # widget and so is not in `self.widgets`
             "flux_cubes.locations",
+            # written by the curated-site picker, which sets a whole set at
+            # once. The mesh, ring, placement sentinels, radiation switch and
+            # cache field are bound controls and are already covered by
+            # `self.widgets`; these three are not.
+            "simulation.body", "radiation.use_gpu", "engine_env",
         }
 
 

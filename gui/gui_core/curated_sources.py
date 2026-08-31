@@ -59,6 +59,16 @@ kernel it wired, over what coverage, and from what -- and when the body cache
 holds a DIFFERENT kernel that the curated one supersedes, it says so rather
 than leaving two ephemerides on disk and no statement about which ran.
 
+The other tier
+--------------
+
+``gui_core.curated_sites`` is the same idea one level down: curated SITES on a
+body, whose terrain mesh, occluder ring and view-factor matrix are a set that
+only means anything together. Same three rules, same local-first status, same
+"say what was superseded and not used". The two tables are independent -- a
+body's ephemeris and a site's geometry have nothing to do with each other --
+and they are kept in separate modules for that reason.
+
 Adding a body
 -------------
 
