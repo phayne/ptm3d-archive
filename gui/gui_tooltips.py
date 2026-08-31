@@ -2275,6 +2275,36 @@ TOOLTIPS = {
         "stand, and which mesh they were built for -- read back from the file "
         "rather than from the settings above."
     ),
+    "ui.curated_site": (
+        "A lunar landing-site study area whose terrain, surrounding ring and "
+        "view-factor matrix are a set that has already been run to "
+        "completion, checked, and recorded.\n"
+        "Choosing one fills in all three at once, plus the switch that loads "
+        "the matrix, and prints where every file came from. The three parts "
+        "only mean anything together: a terrain with the wrong ring is "
+        "shadowed by the wrong hills, and a view-factor matrix built for a "
+        "different terrain describes a different surface. Both mistakes "
+        "produce a run that finishes.\n"
+        "These study areas are large local data sets that are not shipped "
+        "with PTM3D. On a computer that does not have them the entry is still "
+        "listed, says so, and writes nothing. Leave this on none to choose "
+        "the files yourself."
+    ),
+    "ui.vf_discovery": (
+        "Looks for view-factor files already sitting next to the terrain "
+        "mesh, and next to whatever the cache field points at, then lists "
+        "them best evidence first.\n"
+        "Nothing is chosen for you. A view-factor file does not record which "
+        "surface it was built for unless it came with a provenance record, so "
+        "the ranking says what was actually checked: a provenance record "
+        "naming this mesh is the strongest, a matching face count is weaker, "
+        "and a file whose face count disagrees is refused outright with the "
+        "two numbers. Files in the older format say that their surface "
+        "detail came from a method that was replaced.\n"
+        "Reusing a matrix that is already on disk is also the fast path: "
+        "building one for a site-scale surface takes hours and tens of "
+        "gigabytes."
+    ),
 }
 
 

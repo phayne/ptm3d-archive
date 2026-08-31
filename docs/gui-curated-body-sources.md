@@ -1,5 +1,11 @@
 # Curated body sources: bodies the live services correctly refuse
 
+> There is a second tier of this registry, one level down: curated **sites** on
+> a body, whose terrain mesh, occluder ring and view-factor matrix are only
+> meaningful together — plus the search that finds a view-factor matrix already
+> sitting beside a mesh. See
+> [`gui-curated-lunar-sites.md`](gui-curated-lunar-sites.md).
+
 ## The problem this solves
 
 The Asteroid card fetches an ephemeris from JPL HORIZONS and a shape model from
