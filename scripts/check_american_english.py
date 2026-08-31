@@ -39,9 +39,14 @@ Usage::
     python3 scripts/check_american_english.py PATH ...   # specific paths
     python3 scripts/check_american_english.py --exclude docs/tutorials/notebooks/
 
-Exits 1 if any un-allowed British spelling is found.
+Exits 1 if any un-allowed British spelling is found, and 2 on a usage error --
+including an unrecognized flag. The argument parser is deliberately STRICT: a
+hand-rolled loop used to treat anything that was not ``--exclude`` as a PATH, so
+``--help`` was opened as a file, found missing, skipped, and reported
+``check_american_english: clean`` with exit 0. Every typo'd flag "passed".
 """
 
+import argparse
 import json
 import os
 import re
@@ -358,17 +363,38 @@ def check(path):
     return found
 
 
+def _parser():
+    p = argparse.ArgumentParser(
+        prog="check_american_english.py",
+        description="Report British spellings in prose, comments and UI text.",
+        epilog="Exit status: 0 clean, 1 British spelling(s) found, 2 usage "
+               "error. A path that begins with '-' must be given after '--'.")
+    p.add_argument("paths", nargs="*", metavar="PATH",
+                   help="files or directories to check "
+                        "(default: every git-tracked file)")
+    p.add_argument("--exclude", action="append", default=[], metavar="PREFIX",
+                   help="skip ARGUMENTS whose path starts with PREFIX; "
+                        "repeatable. Applied to the argument list, NOT to the "
+                        "files found inside a directory argument -- so it "
+                        "filters the default whole-tracked-tree scan, and it "
+                        "cannot exclude a subdirectory of a PATH you name")
+    return p
+
+
 def main(argv):
-    args, excludes = [], []
-    it = iter(argv[1:])
-    for a in it:
-        if a == "--exclude":
-            excludes.append(next(it, ""))
-        elif a.startswith("--exclude="):
-            excludes.append(a.split("=", 1)[1])
-        else:
-            args.append(a)
-    paths = args or tracked_files()
+    # STRICT. argparse exits 2 with a usage message on an unrecognized flag and
+    # 0 on --help; the loop this replaced silently filed both under "a path to
+    # check" and then printed "clean". A gate that cannot be misinvoked loudly
+    # is a gate that reports success for arguments it never understood.
+    #
+    # `parse_intermixed_args`, not `parse_args`: the hand-rolled loop accepted
+    # flags and paths in any order, and callers use that
+    # (`... a.py --exclude docs/ b.py`). Plain `parse_args` rejects the trailing
+    # path with the SAME exit code as a typo, which would turn this from a
+    # strictness fix into a broken CI gate.
+    args = _parser().parse_intermixed_args(argv[1:])
+    excludes = args.exclude
+    paths = args.paths or tracked_files()
     if excludes:
         paths = [p for p in paths
                  if not any(p.replace(os.sep, "/").startswith(x)

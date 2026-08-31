@@ -1335,6 +1335,16 @@ def test_showing_a_card_does_not_rewrite_the_configuration():
     import copy
     with tempfile.TemporaryDirectory() as scratch:
         manager, panel = _panel(scratch)
+        # The precondition is SET here, not inherited from whichever check ran
+        # before this one. In-suite the engine arm above happens to leave a
+        # generic-body card active, which is how the PTM-444 rewrite was found;
+        # run alone, this file used to land on whatever card the panel started
+        # on and the bug could not reproduce, so the check passed on the broken
+        # code. An asteroid card left open is a thing a user does, and it is the
+        # state this property has to hold in.
+        panel.tabs["start"].open_card("asteroid", "body", "time_series",
+                                      apply_defaults=True)
+        manager.set_value("generic_body.name", "probe_asteroid")
         path = Path(scratch) / "beaming.yaml"
         # A lunar crater with beaming ON at a NON-default slope, on a mesh path
         # that does not exist -- so the facet-scale rule cannot measure it and
@@ -1351,7 +1361,18 @@ def test_showing_a_card_does_not_rewrite_the_configuration():
         panel.load_from_config()
         before = copy.deepcopy(manager._config_for_yaml())
         route = panel.land_on_loaded_config()
-        assert route.ok and route.body_key == "Moon" and route.mode_key == "local"
+        # Spelled out, because a bare `assert a and b and c` reported this as
+        # an EMPTY failure for as long as it was red: the active asteroid card
+        # rewrote simulation.body on the `panel.load_from_config()` two lines
+        # up, and the file was then refused -- with nothing on screen saying so.
+        assert route.ok and route.body_key == "Moon" \
+            and route.mode_key == "local", (
+                f"the opened Moon file did not route to its own card: "
+                f"ok={route.ok!r} body_key={route.body_key!r} "
+                f"mode_key={route.mode_key!r}; simulation.body is now "
+                f"{manager.get_value('simulation.body')!r} "
+                f"(the file on disk says 'Moon'). "
+                f"Refusal: {route.refusal!r}")
         after = manager._config_for_yaml()
         assert after == before, (
             "landing on a card changed the configuration. Differences:\n  "
@@ -1374,6 +1395,85 @@ def test_showing_a_card_does_not_rewrite_the_configuration():
         assert "COULD NOT BE MEASURED" in note, (
             f"the card reported an unmeasurable mesh as checked: {note!r}")
         assert "nothing here has checked this setting for you" in note, note
+
+
+def test_a_file_naming_two_bodies_keeps_its_generic_body_block():
+    """The other side of "opening a file is not an edit to it".
+
+    A file that sets a BUILT-IN ``simulation.body`` and also carries a
+    ``generic_body:`` section names two bodies, and the engine resolves that in
+    one direction only: ``isConfigured()`` wins and ``simulation.body`` is never
+    read (``ptm_thermal_sim.cpp:14626``). The GUI's ``_config_for_yaml``
+    resolves it in the OTHER direction -- it DROPS the ``generic_body:`` block
+    when the body name is built-in -- so a card that leaves such a file
+    untouched emits a Moon run from a screen describing an asteroid.
+
+    This is the boundary of the PTM-444 guard, and it is here because the first
+    draft of that guard crossed it: gating the repair on ``_seeding_defaults``
+    alone fixed the Moon-file case and broke this one (measured 2026-08-30).
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        path = Path(scratch) / "two_bodies.yaml"
+        path.write_text(
+            "simulation:\n  body: Moon\n  start_time: '2026-01-01T00:00:00'\n"
+            "  duration_days: 1.0\n  timesteps: 48\n"
+            "generic_body:\n  name: bennu\n"
+            "  shape:\n    type: spherical\n    radius_km: 0.25\n"
+            "  orbit:\n    semi_major_axis_au: 1.126\n    eccentricity: 0.2\n"
+            "  spin:\n    period_hours: 4.3\n")
+        manager.load_from_yaml(str(path))
+        panel.load_from_config()
+        route = panel.land_on_loaded_config()
+        assert route.ok and route.body_key == "asteroid", (
+            f"a generic-body file did not route to a generic-body card: "
+            f"ok={route.ok!r} body_key={route.body_key!r} "
+            f"refusal={route.refusal!r}")
+        emitted = manager._config_for_yaml()
+        assert emitted.get("generic_body"), (
+            "the generic_body: block was dropped from the configuration this "
+            "file would RUN. simulation.body is "
+            f"{(emitted.get('simulation') or {}).get('body')!r}, which the "
+            "engine would run as that built-in body -- not as the asteroid "
+            "the card is showing.")
+        assert not manager.body_identity_conflict(), (
+            "the card left the configuration naming two bodies: "
+            + manager.body_identity_conflict())
+
+
+def test_a_second_body_lookup_moves_simulation_body_with_it():
+    """`simulation.body` follows the body the card is describing.
+
+    Before 2026-08-30 the sync was a side effect of `_repair_body_name` running
+    from `load_card`, and that method only writes over a BUILT-IN name or the
+    `Custom` placeholder -- so looking up a second body left the first one in
+    `simulation.body`. Measured on `origin/main` 2baf6bb: a cache lookup of
+    "23871 Ousha" straight after "623 Chimaera" left `simulation.body:
+    623 Chimaera` beside `generic_body.name: 23871 Ousha`. The write is now
+    explicit in `_apply_lookup`, and this is what holds it there.
+    """
+    from gui_core.body_lookup import BodyLookupResult
+    with tempfile.TemporaryDirectory() as scratch:
+        manager, panel = _panel(scratch)
+        manager.reset_to_defaults()
+        panel.load_from_config()
+        start = panel.tabs["start"]
+        start.choose_body("asteroid")
+        start._choose_mode("body")
+        card = start.open_card("asteroid", "body", "time_series",
+                               apply_defaults=True)
+        seen = []
+        for want in ("623 Chimaera", "23871 Ousha"):
+            card._apply_lookup(BodyLookupResult(
+                found=True, source="cache", name=want,
+                values={"generic_body.name": want},
+                message=f"selftest {want}"))
+            seen.append(str(manager.get_value("simulation.body", "")))
+            assert seen[-1] == want, (
+                f"after looking up {want!r} the configuration still says "
+                f"simulation.body = {seen[-1]!r}; the run would be recorded "
+                f"under the wrong body's name")
+        print(f"    [lookup] simulation.body tracked both lookups: {seen}")
 
 
 def test_a_card_mirrors_its_combo_controls():
@@ -1535,6 +1635,8 @@ TESTS = [
     test_every_card_emits_a_configuration_the_engine_accepts,
     test_a_surface_value_too_small_to_survive_is_refused,
     test_showing_a_card_does_not_rewrite_the_configuration,
+    test_a_file_naming_two_bodies_keeps_its_generic_body_block,
+    test_a_second_body_lookup_moves_simulation_body_with_it,
     test_a_card_mirrors_its_combo_controls,
     test_the_landing_screen_says_why_a_file_has_no_card,
     test_a_generic_body_value_below_the_floor_blocks_the_launch,

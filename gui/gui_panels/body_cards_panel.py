@@ -2789,25 +2789,68 @@ class GenericBodyCard(BodyCard):
         """Fix `simulation.body` when it names a body this card is not.
 
         Runs from `load_card`, so it is deliberately narrow: it writes ONLY
-        when the stored body is a body the engine has built-in properties for,
-        or the unnamed placeholder while a real name exists. Both are
-        configurations that would run as something other than what they say --
+        over a body the engine has built-in properties for BESIDE an active
+        `generic_body:` section, or over the unnamed placeholder while this
+        card is being opened for a new run. Both are configurations that would
+        run as something other than what they say --
         a built-in name beside a `generic_body:` section is the contradiction
         `ConfigManager.body_identity_conflict` reports, and letting a card
         display it unchanged would hand the user a run that silently drops
         either the body or its definition.
 
         Anything else the user or their file chose is left exactly as it is.
+
+        WHY EACH BRANCH IS SCOPED THE WAY IT IS (PTM-444). `load_card` runs on
+        BOTH paths: ``ConfigurationPanel.load_from_config`` mirrors whichever
+        card is ACTIVE, and ``ptm3d_gui.open_project`` calls that
+        (``ptm3d_gui.py:597``) BEFORE ``land_on_loaded_config``
+        (``ptm3d_gui.py:607``) has had any chance to route the opened file to
+        its own card. Unscoped, that made displaying a file an edit to it.
+
+        * The **built-in-name** branch fires only when the configuration also
+          carries an ACTIVE ``generic_body:`` section -- i.e. only when the
+          file really does name two bodies. Without that condition, an asteroid
+          or custom card left open rewrote an ordinary lunar file's
+          ``simulation.body`` from ``Moon`` to ``Custom`` on open, and
+          ``land_on_loaded_config`` then refused the file it had just edited
+          (measured on ``origin/main`` 2baf6bb: ``route.ok`` False,
+          ``body_key`` None). With the condition, a plain Moon file is left
+          alone and the two-bodies file is still repaired -- which matters,
+          because ``_config_for_yaml`` DROPS the ``generic_body:`` block when
+          ``simulation.body`` names a built-in body, so leaving that file
+          unrepaired emits a Moon run from a card describing an asteroid
+          (measured, same day, on the first draft of this guard).
+        * The **placeholder** branch is cross-card residue from a NEW run --
+          the route defaults write ``Custom`` (``presets.py:315``) and this
+          puts the body's real name in its place -- so it is gated on
+          ``_seeding_defaults``, the same flag, for the same reason, as
+          ``EuropaCard._ensure_terrain_emitted``. It protects nothing on an
+          opened file: ``Custom`` is not a built-in name, so the block survives.
+
+        The other caller that legitimately needs the name written -- a HORIZONS
+        or cache lookup -- asks for it explicitly in ``_apply_lookup``, because
+        a lookup IS an edit.
         """
         from gui_core.config_manager import BUILTIN_BODY_NAMES
         current = str(self.config_manager.get_value(
             "simulation.body", "") or "").strip()
         name = str(self.config_manager.get_value(
             "generic_body.name", "") or "").strip()
-        contradicts = current.lower() in BUILTIN_BODY_NAMES
-        placeholder = (current == self.UNNAMED_BODY and bool(name))
+        contradicts = (current.lower() in BUILTIN_BODY_NAMES
+                       and self.config_manager.generic_body_active())
+        placeholder = (self._seeding_defaults
+                       and current == self.UNNAMED_BODY and bool(name))
         if not (contradicts or placeholder):
             return
+        if contradicts:
+            # Never silent: this is the card resolving a contradiction in
+            # somebody's file, and which way it went has to be visible.
+            logger.warning(
+                "[body-card] %s names both simulation.body=%r and an active "
+                "generic_body: section (%r); the engine reads the generic body "
+                "and ignores simulation.body, so simulation.body is being set "
+                "to %r to keep the two in agreement.",
+                type(self).__name__, current, name, name or self.UNNAMED_BODY)
         self._write_body_name(name)
 
     def load_card(self):
@@ -2986,6 +3029,26 @@ class GenericBodyCard(BodyCard):
         """Write what the lookup found, and report every key of it."""
         for key, value in result.values.items():
             self.config_manager.set_value(key, value)
+        # `simulation.body` follows the name the lookup just found. EXPLICIT
+        # here rather than as a side effect of the `load_from_config` below,
+        # for two measured reasons:
+        #   * that door is also the one an OPENED FILE comes through, and it is
+        #     now shut (`_repair_body_name`, PTM-444);
+        #   * it never covered this case properly anyway. `_repair_body_name`
+        #     writes only over a built-in name or the `Custom` placeholder, so
+        #     looking up a SECOND body left the FIRST one in `simulation.body`:
+        #     measured on `origin/main` 2baf6bb, a cache lookup of "23871
+        #     Ousha" straight after "623 Chimaera" left `simulation.body:
+        #     623 Chimaera` beside `generic_body.name: 23871 Ousha`.
+        # `_write_body_name` keeps its own two guards -- it leaves a `[H] `
+        # prefixed name alone and writes nothing when the value already agrees.
+        # NOT CLOSED BY THIS, and left as it was found: after
+        # `ConfigurationPanel.add_horizons_body` (`config_panel.py:1185`) has
+        # written `simulation.body: '[H] <body>'`, a later lookup of a
+        # DIFFERENT body still leaves the prefixed name in place, because that
+        # early return fires. The prefix is load-bearing GUI state and removing
+        # it here is a separate change; it is a ledger row, not a silent tweak.
+        self._write_body_name()
         # One source label per field, so the per-field lines say where these
         # came from too and are not blank until somebody presses a second
         # button. The cache and HORIZONS are different sources and are named
