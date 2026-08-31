@@ -71,6 +71,15 @@ CLAUDE.md
 output/
 results/
 
+# Flux-cube layouts and products. The layout is built from the placement and
+# stored BESIDE THE TERRAIN MESH, so a run on a mesh that ships with the
+# repository (data/meshes/) drops a generated binary into a tracked directory.
+# It is reproducible from the placement it is named after and is never a
+# source file.
+*.fcg
+*_flux_cubes_*.locations.csv
+*.fcb
+
 # Large data — dataset CONTENTS are ignored (distributed via
 # scripts/fetch_data.py + data/data_manifest.json), but the per-dataset
 # provenance README.md files are tracked (hence the ** / !**/ / !README.md

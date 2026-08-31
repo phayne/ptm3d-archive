@@ -629,10 +629,51 @@ def test_the_group_is_offered_on_the_local_mesh_and_not_on_the_global_one():
     assert not _hidden(card.flux_group), (
         "the flux-cube group is hidden on the local-mesh card, where the "
         "layout tool has a mesh to work with")
+    manager.set_value("flux_cubes.enabled", False)
     card.activate("global", "time_series")
     assert _hidden(card.flux_group), (
-        "the flux-cube group is offered on a global run, where there is no "
-        "mesh file for the layout tool to build against")
+        "the flux-cube group is offered on a global run with the cubes off, "
+        "where there is no mesh file for the layout tool to build against")
+
+
+def test_a_live_setting_is_never_hidden_by_the_mode():
+    """PAUL'S DEFECT, 2026-08-31, and the arm that would have caught it.
+
+    Turn the cubes on with the local mesh, then move the card to the global
+    mode. The group used to disappear WHOLE -- and nothing cleared
+    `flux_cubes.enabled`, and `mesh.import_file` survives the mode switch, so
+    `engine_support` still passed and the launch check refused with
+
+        flux cubes: no cube layout file is set. ... Build it from the card
+
+    against a card that was showing no such thing, and no control anywhere in
+    the window could set it, build it or turn it off. Reported as "there's no
+    option to set the layout file", and it is exactly that.
+
+    ⛔ `isVisibleTo`, NOT `isHidden`. `isHidden()` is the widget's OWN explicit
+    flag and was False for every one of these controls the whole time they were
+    off screen -- their ANCESTOR was hidden. That is why the 36 arms already in
+    this file all passed on the broken build, and it is why `_hidden` is not
+    used here.
+    """
+    manager, card = _card()
+    manager.set_value("flux_cubes.enabled", True)
+    card.refresh_flux_cubes()
+    switch = card.widgets["flux_cubes.enabled"]
+    assert switch.isVisibleTo(card)
+
+    card.activate("global", "time_series")
+    assert manager.get_value("flux_cubes.enabled") is True, (
+        "the mode switch changed the setting; opening a mode is not an edit")
+    assert switch.isVisibleTo(card), (
+        "flux_cubes.enabled is on and its switch is off screen: the setting "
+        "cannot be seen or cleared, and the launch check refuses over it")
+    assert card.flux_advanced.isVisibleTo(card), (
+        "the layout-file section is off screen while the setting that needs "
+        "it is on")
+    # And the launch check still refuses this run -- but now over something
+    # the window can show, rather than over a control that is not there.
+    assert switch.isVisibleTo(card) and not _hidden(card.flux_group)
 
 
 def test_the_settings_appear_only_once_the_switch_is_on():
@@ -744,7 +785,13 @@ def test_the_card_says_what_the_layout_file_contains():
     manager, card = _card()
     manager.set_value("flux_cubes.enabled", True)
     card.refresh_flux_cubes()
-    assert "No layout file yet" in card.flux_status.text()
+    # With no layout file named -- the ordinary case -- the line says what the
+    # run will DO, and names the file it will do it to. It does not ask for a
+    # step the flow no longer has.
+    status = card.flux_status.text()
+    assert "built for you when the run starts" in status or \
+           "already on disk" in status, status
+    assert ".fcg" in status, status
     with tempfile.TemporaryDirectory() as tmp:
         cache = _build_cache(tmp, ("--spacing", "100", "--radius", "300"))
         card.widgets["flux_cubes.cache_file"].setText(str(cache))
@@ -906,23 +953,52 @@ def _preflight_report(config, tmp):
 
 
 def _launchable_config(tmp):
+    """A runnable config whose mesh is a COPY in `tmp`.
+
+    The copy is not tidiness. The layout now lands beside the mesh, so a
+    configuration pointed at the checkout's own `data/meshes/` would have the
+    tests writing `.fcg` files into the repository.
+    """
     manager, _panel_ = _panel()
     manager.reset_to_defaults()
-    manager.set_value("mesh.import_file", str(CRATER))
+    mesh = Path(tmp) / CRATER.name
+    if not mesh.exists():
+        shutil.copy(CRATER, mesh)
+    manager.set_value("mesh.import_file", str(mesh))
     manager.set_value("radiation.enabled", True)
     manager.set_value("output.directory", str(Path(tmp) / "out"))
     manager.set_value("flux_cubes.enabled", True)
     return manager
 
 
-def test_preflight_blocks_a_run_that_would_stop_after_the_solve():
+def test_preflight_prepares_a_layout_instead_of_blocking():
+    """A missing layout is a job to do, not a refusal.
+
+    The placement is the specification. A run with the cubes on and no layout
+    file used to be blocked -- "Build it from the card" -- which made a file
+    name a step in the flow. It now comes back with a PLAN: where the layout
+    belongs, how many cubes it holds, and the command that writes it. What is
+    still a refusal is a placement that cannot be built AT ALL.
+    """
+    from gui_core import flux_cubes as fc
     with tempfile.TemporaryDirectory() as tmp:
         manager = _launchable_config(tmp)
         report = _preflight_report(manager.get_config(), tmp)
-        assert any("no cube layout file" in e for e in report.errors), (
-            f"a run with cubes on and no layout was not blocked: "
-            f"{report.errors}")
+        flux_errors = [e for e in report.errors if e.startswith("flux cubes")]
+        assert not flux_errors, (
+            f"a run whose layout can be built was blocked: {flux_errors}")
+        plan = report.flux_cube_plan
+        assert plan is not None and plan.action == fc.PLAN_BUILD, plan
+        assert plan.n_cubes == fc.lattice_cube_count(
+            fc.DEFAULT_SPACING_M, fc.DEFAULT_RADIUS_M), plan.n_cubes
+        assert Path(plan.path).parent == Path(tmp), (
+            f"the layout was planned for {plan.path}, not beside the mesh")
+        assert plan.argv and Path(plan.argv[0]).name == fc.GEOM_EXECUTABLE
+        assert report.flux_cube_line, "no size line before the build"
 
+        # A layout file that IS named and is not there stays an error: the
+        # engine will not build one during a run, and this configuration asked
+        # for that exact file rather than for a placement.
         manager.set_value("flux_cubes.cache_file", str(Path(tmp) / "gone.fcg"))
         report = _preflight_report(manager.get_config(), tmp)
         assert any("was not found" in e for e in report.errors), report.errors
@@ -931,6 +1007,52 @@ def test_preflight_blocks_a_run_that_would_stop_after_the_solve():
         report = _preflight_report(manager.get_config(), tmp)
         assert any("infrared exchange is off" in e for e in report.errors), (
             report.errors)
+
+
+def test_a_placement_that_cannot_be_built_is_still_refused_before_the_run():
+    """The refusals that survive, each decidable before the solve."""
+    from gui_core import flux_cubes as fc
+    from gui_core.preflight import _ply_face_count, resolve_data_path
+    with tempfile.TemporaryDirectory() as tmp:
+        manager = _launchable_config(tmp)
+        exe = _geom_exe()
+        base = manager.get_config()
+
+        # A mesh that is not on disk. The layout is built AGAINST it, so this
+        # is decidable here rather than by the tool half a minute in.
+        gone = dict(base, mesh={"import_file": str(Path(tmp) / "nope.ply")})
+        plan = fc.layout_plan(gone, tmp, resolve_data_path, _ply_face_count,
+                              executable=exe)
+        assert plan.action == fc.PLAN_REFUSE and "not on disk" in plan.reason
+
+        # No geometry tool. Names the target to build, rather than failing at
+        # the moment of launch with a FileNotFoundError.
+        plan = fc.layout_plan(base, tmp, resolve_data_path, _ply_face_count,
+                              executable=None)
+        assert plan.action == fc.PLAN_REFUSE
+        assert fc.GEOM_EXECUTABLE in plan.reason and "cmake" in plan.reason
+
+        # A placement with nothing in it: the named-locations mode with an
+        # empty table. The tool disables the lattice (`--radius -1`) and is
+        # then asked for no points at all, so the run would produce a product
+        # with no cubes in it. Refused with what to do about it.
+        empty = dict(base, flux_cubes=dict(base["flux_cubes"],
+                                           mode=fc.MODE_LOCATIONS,
+                                           locations=[]))
+        plan = fc.layout_plan(empty, tmp, resolve_data_path, _ply_face_count,
+                              executable=exe)
+        assert plan.action == fc.PLAN_REFUSE and "no cubes" in plan.reason, (
+            f"{plan.action}: {plan.reason}")
+
+        # ...but a grid so tight it holds only the origin cube is a real, if
+        # unusual, request. The count is the tool's own rule, not an estimate
+        # of the disk's area, so this is one cube and not zero.
+        single = dict(base, flux_cubes=dict(base["flux_cubes"],
+                                            spacing_m=100.0, radius_m=1.0))
+        plan = fc.layout_plan(single, tmp, resolve_data_path, _ply_face_count,
+                              executable=exe)
+        assert plan.action == fc.PLAN_BUILD and plan.n_cubes == 1, (
+            f"{plan.action}: {plan.n_cubes} cubes")
 
 
 def test_preflight_reports_the_product_size_for_a_launchable_run():
@@ -1029,6 +1151,435 @@ def test_every_control_in_the_group_explains_itself():
     assert not bare, "\n  ".join(["flux-cube controls without help:"] + bare)
 
 
+# ==========================================================================
+# 7. The layout builds itself: the key, the reuse, and the stale control
+# ==========================================================================
+
+def _geom_exe():
+    from ptm import paths
+    from gui_core import flux_cubes as fc
+    exe = paths.find_engine_executable(fc.GEOM_EXECUTABLE,
+                                       search_roots=[REPO_ROOT])
+    if exe is None:
+        raise Skip(f"no {fc.GEOM_EXECUTABLE} in build/bin; build it with: "
+                   f"cmake --build build --target {fc.GEOM_EXECUTABLE}")
+    return exe
+
+
+def _request(**over):
+    from gui_core import flux_cubes as fc
+    base = dict(mesh="/m/site.ply", occluder="", mode=fc.MODE_LATTICE,
+                spacing_m=25.0, radius_m=500.0, n_faces_core=12800,
+                locations=())
+    base.update(over)
+    return fc.LayoutRequest(**base)
+
+
+def test_the_layout_key_moves_with_every_input_that_changes_the_layout():
+    """One digest per specification, and a different one for each difference.
+
+    This is the guard that keeps two placements off one path. Everything below
+    changes what the tool would write, so every one of them has to change the
+    key; anything that does NOT change the file must not change it, or a run
+    rebuilds a layout it already has.
+    """
+    from gui_core import flux_cubes as fc
+    base = _request()
+    key = fc.request_key(base)
+    assert len(key) == fc.LAYOUT_KEY_CHARS and key.isalnum()
+
+    differ = {
+        "spacing": _request(spacing_m=12.5),
+        "radius": _request(radius_m=250.0),
+        "mesh": _request(mesh="/m/other.ply"),
+        "face count": _request(n_faces_core=12801),
+        "occluder ring": _request(occluder="/m/ring.ply"),
+        "mode": _request(mode=fc.MODE_LOCATIONS),
+        "height factor": _request(height_factor=0.2),
+        "edge factor": _request(edge_factor=0.2),
+        "a named point": _request(mode=fc.MODE_BOTH,
+                                  locations=(("pad", 80.0, 0.0, -1.0, -1.0),)),
+    }
+    for what, other in differ.items():
+        assert fc.request_key(other) != key, (
+            f"changing the {what} left the layout key unchanged, so the old "
+            f"layout would be found on the new request's own path")
+
+    # A named point that MOVES is a different layout, not the same one.
+    a = _request(mode=fc.MODE_BOTH,
+                 locations=(("pad", 80.0, 0.0, -1.0, -1.0),))
+    b = _request(mode=fc.MODE_BOTH,
+                 locations=(("pad", 80.5, 0.0, -1.0, -1.0),))
+    assert fc.request_key(a) != fc.request_key(b)
+
+    # ...and the same request spelled two ways is ONE key: 25 and 25.0 are the
+    # same number to the tool, and a rebuild per keystroke is not a feature.
+    assert fc.request_key(_request(spacing_m=25)) == key
+    assert fc.request_key(_request(mesh="/m/./site.ply")) == key
+
+    # In the named-locations mode the grid numbers are not sent to the tool at
+    # all (`--radius -1`), so they must not split one layout into two.
+    named = _request(mode=fc.MODE_LOCATIONS,
+                     locations=(("pad", 80.0, 0.0, -1.0, -1.0),))
+    assert fc.request_key(named) == fc.request_key(
+        _request(mode=fc.MODE_LOCATIONS, spacing_m=7.0, radius_m=99.0,
+                 locations=(("pad", 80.0, 0.0, -1.0, -1.0),)))
+
+
+def test_a_changed_placement_never_reuses_the_old_layout():
+    """THE STALE-LAYOUT NEGATIVE CONTROL, against a real built layout.
+
+    Build a 50 m grid, then ask for a 25 m one. The 50 m file is still on disk
+    and must not be picked up -- checked on BOTH guards independently, because
+    either alone is thin: the request key keeps them on two paths, and the
+    header check would refuse the old one even if something put it on the new
+    path (a copy, a rename, a hand-edit).
+
+    A layout silently reused across a changed spacing is not a crash. It is a
+    delivered product whose cubes are somewhere else than the settings say,
+    and nothing downstream would ever say so -- the engine reads the spacing
+    OUT of the cache and has nothing to compare it with.
+    """
+    from gui_core import flux_cubes as fc
+    from gui_core.preflight import _ply_face_count, resolve_data_path
+    exe = _geom_exe()
+    with tempfile.TemporaryDirectory() as tmp:
+        mesh = Path(tmp) / CRATER.name
+        shutil.copy(CRATER, mesh)
+        cfg = {"mesh": {"import_file": str(mesh)},
+               "radiation": {"enabled": True, "band_separated": True},
+               "simulation": {"timesteps": 24},
+               "flux_cubes": {"enabled": True, "mode": "grid",
+                              "spacing_m": 50.0, "radius_m": 150.0}}
+
+        first = fc.layout_plan(cfg, tmp, resolve_data_path, _ply_face_count,
+                               executable=exe)
+        assert first.action == fc.PLAN_BUILD, first.reason
+        ok, message = _build_through_the_worker(first, tmp)
+        assert ok, message
+        assert Path(first.path).exists()
+
+        # Same placement -> reused, not rebuilt.
+        again = fc.layout_plan(cfg, tmp, resolve_data_path, _ply_face_count,
+                               executable=exe)
+        assert again.action == fc.PLAN_REUSE, again.reason
+        assert again.path == first.path
+
+        # Changed placement -> a different file, and the old one refused.
+        cfg["flux_cubes"]["spacing_m"] = 25.0
+        changed = fc.layout_plan(cfg, tmp, resolve_data_path, _ply_face_count,
+                                 executable=exe)
+        assert changed.action == fc.PLAN_BUILD, changed.reason
+        assert changed.path != first.path, (
+            f"a 25 m grid was planned onto the 50 m grid's own file "
+            f"({changed.path}); the old layout would be found and reused")
+        old_header = fc.read_cache_header(first.path)
+        satisfied, why = fc.cache_satisfies(old_header, changed.request)
+        assert not satisfied, (
+            f"the 50 m layout was accepted for a 25 m request: {why}")
+        assert "50" in why and "25" in why, why
+        # The old layout is left alone, not overwritten: it still answers its
+        # own request, and another project may be using it.
+        assert Path(first.path).exists()
+        assert fc.cache_satisfies(old_header, first.request)[0]
+
+
+def test_a_layout_built_for_another_mesh_is_refused_on_its_header():
+    """The second guard on its own, with the file name taken out of it."""
+    from gui_core import flux_cubes as fc
+    exe = _geom_exe()
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = _build_cache(tmp, ("--spacing", "100", "--radius", "300"))
+        header = fc.read_cache_header(cache)
+        assert header.ok, header.error
+        request = _request(spacing_m=100.0, radius_m=300.0,
+                           n_faces_core=header.n_faces_core)
+        assert fc.cache_satisfies(header, request)[0]
+        # The A3GT trap: a core mesh regenerated under its own name. Same path,
+        # different face count -- and this is caught before the solve rather
+        # than by the engine's geometry hash after it.
+        stale = _request(spacing_m=100.0, radius_m=300.0,
+                         n_faces_core=header.n_faces_core + 1)
+        ok, why = fc.cache_satisfies(header, stale)
+        assert not ok and "face mesh" in why, why
+        assert fc.request_key(stale) != fc.request_key(request)
+        assert exe  # the arm needs a real layout, so the tool is required
+
+
+def _build_through_the_worker(plan, cwd):
+    """Run `plan` through the SHIPPED worker, not through subprocess.run.
+
+    The worker is what the launch path uses, and it does three things the raw
+    call does not: it streams the tool's output as progress, it removes a
+    partial layout on failure, and it refuses a zero exit code that left no
+    file. An arm that called the tool directly would test none of them.
+    """
+    from PyQt6.QtCore import QEventLoop
+    _panel()                                   # a QApplication has to exist
+    from gui_core.flux_cube_build import LayoutBuildWorker
+    loop, outcome, seen = QEventLoop(), {}, []
+    worker = LayoutBuildWorker(plan, str(cwd))
+    worker.progress.connect(seen.append)
+    worker.done.connect(
+        lambda ok, msg: (outcome.update(ok=ok, msg=msg, lines=len(seen)),
+                         loop.quit()))
+    worker.start()
+    loop.exec()
+    worker.wait(5000)
+    return bool(outcome.get("ok")), str(outcome.get("msg", ""))
+
+
+def test_pauls_sequence_reaches_the_engine_with_a_layout():
+    """enable -> grid, 25 m -> Run. No file step anywhere in it.
+
+    The reported flow, end to end: tick the switch, leave the placement on the
+    grid at its 25 m default, and launch. What this asserts is that the run
+    YAML the engine reads names a layout that EXISTS and answers that
+    placement -- which is the only thing the engine will accept.
+    """
+    from gui_core import flux_cubes as fc
+    exe = _geom_exe()
+    with tempfile.TemporaryDirectory() as tmp:
+        manager = _launchable_config(tmp)
+        _manager, card = _panel()[0], None
+        manager.set_value("flux_cubes.spacing_m", 25.0)
+        # A radius the shipped crater can hold, so the arm is seconds. The
+        # 500 m default is the same code path with more cubes in it.
+        manager.set_value("flux_cubes.radius_m", 150.0)
+        manager.set_value("simulation.timesteps", 24)
+
+        report = _preflight_report(manager.get_config(), tmp)
+        assert not [e for e in report.errors if "flux" in e], report.errors
+        plan = report.flux_cube_plan
+        assert plan is not None and plan.action == fc.PLAN_BUILD
+
+        ok, message = _build_through_the_worker(plan, tmp)
+        assert ok, f"the layout was not built: {message}"
+
+        # This is what `_prepare_flux_cube_layout` does next, and it is the
+        # step that puts the layout into the run's record. PROVENANCE: the
+        # engine-facing YAML has to name the layout that ran, or the file that
+        # documents the run documents a different one.
+        manager.set_value("flux_cubes.cache_file", plan.path)
+        import yaml as _yaml
+        run_yaml = Path(tmp) / "out" / "config.yaml"
+        run_yaml.parent.mkdir(parents=True, exist_ok=True)
+        manager.save_run_yaml(str(run_yaml), Path(tmp))
+        written = _yaml.safe_load(run_yaml.read_text())
+        assert written["flux_cubes"]["cache_file"] == plan.path, (
+            f"the run YAML names {written['flux_cubes'].get('cache_file')!r} "
+            f"and the run used {plan.path!r}")
+
+        # ...and the engine's own preconditions are all met now.
+        final = _preflight_report(manager.get_config(), tmp)
+        assert not [e for e in final.errors if "flux" in e], final.errors
+        header = fc.read_cache_header(plan.path)
+        assert header.ok and header.n_cubes == plan.n_cubes, header.describe()
+        assert header.n_faces_core == 12800, header.n_faces_core
+        assert exe
+
+
+def test_a_build_that_fails_leaves_no_layout_behind():
+    """A partial layout on the request's own path is the next run's input.
+
+    The tool writes as it goes, so a build that dies leaves a truncated `.fcg`
+    exactly where the next plan will look. `cache_satisfies` would refuse it on
+    its length, but relying on a reader to catch a writer's mess is one check
+    away from a silent reuse -- the worker removes it instead.
+    """
+    from gui_core import flux_cubes as fc
+    exe = _geom_exe()
+    with tempfile.TemporaryDirectory() as tmp:
+        mesh = Path(tmp) / CRATER.name
+        shutil.copy(CRATER, mesh)
+        out = Path(tmp) / "doomed.fcg"
+        # A radius far larger than the mesh: the tool REFUSES a lattice point
+        # with no terrain under it rather than dropping cubes, which is a real
+        # non-zero exit from the real tool rather than a simulated one.
+        plan = fc.LayoutPlan(
+            action=fc.PLAN_BUILD, path=str(out),
+            request=_request(mesh=str(mesh), radius_m=50000.0),
+            argv=fc.geom_command(exe, mesh, out, spacing_m=25.0,
+                                 radius_m=50000.0))
+        ok, message = _build_through_the_worker(plan, tmp)
+        assert not ok, "a grid that runs off the mesh was reported as built"
+        assert message.strip(), "the refusal came back with no message"
+        assert not out.exists(), (
+            f"{out} was left on disk after a failed build; the next plan would "
+            f"find it on this request's own path")
+
+
+def test_named_locations_build_themselves_too():
+    """The table IS the specification -- no file, and no CSV to hand-write."""
+    from gui_core import flux_cubes as fc
+    from gui_core.preflight import _ply_face_count, resolve_data_path
+    exe = _geom_exe()
+    with tempfile.TemporaryDirectory() as tmp:
+        mesh = Path(tmp) / CRATER.name
+        shutil.copy(CRATER, mesh)
+        cfg = {"mesh": {"import_file": str(mesh)},
+               "radiation": {"enabled": True, "band_separated": True},
+               "simulation": {"timesteps": 24},
+               "flux_cubes": {"enabled": True, "mode": fc.MODE_LOCATIONS,
+                              "spacing_m": 25.0, "radius_m": 500.0,
+                              "locations": [
+                                  {"name": "pad_alpha", "lat_deg": 80.0,
+                                   "lon_deg": 0.0}]}}
+        plan = fc.layout_plan(cfg, tmp, resolve_data_path, _ply_face_count,
+                              executable=exe)
+        assert plan.action == fc.PLAN_BUILD, plan.reason
+        assert plan.n_cubes == 1, plan.n_cubes
+        assert "--radius" in plan.argv and "-1" in plan.argv, plan.argv
+        assert plan.locations_csv and "pad_alpha" in plan.locations_csv
+        # The point list is written by the WORKER, beside the layout, so the
+        # two travel together -- nobody types a CSV path.
+        assert "--locations" in plan.argv
+        ok, message = _build_through_the_worker(plan, tmp)
+        assert ok, message
+        header = fc.read_cache_header(plan.path)
+        assert header.ok and header.names == ("pad_alpha",), header.names
+        assert fc.cache_satisfies(header, plan.request)[0]
+        # Add a second pad and the old layout is not reused.
+        cfg["flux_cubes"]["locations"].append(
+            {"name": "pad_bravo", "lat_deg": 80.01, "lon_deg": 0.0})
+        second = fc.layout_plan(cfg, tmp, resolve_data_path, _ply_face_count,
+                                executable=exe)
+        assert second.action == fc.PLAN_BUILD and second.path != plan.path
+        assert not fc.cache_satisfies(header, second.request)[0]
+
+
+def test_every_launcher_carries_out_the_plan():
+    """Two launchers, one step -- and a source check, because there is no other.
+
+    `run_preflight` no longer refuses a run with the cubes on and no layout: it
+    hands back a PLAN. A launcher that ignores it starts the run anyway, the
+    solve completes, and the flux-cube pass refuses at the very end -- which is
+    the entire cost this feature exists to avoid, arrived at from the other
+    direction. There is no runtime signal for "a launcher forgot", so the
+    contract is checked here, at the two places that call `run_preflight` and
+    then start the engine.
+    """
+    launchers = {
+        "the main window": REPO_ROOT / "gui" / "ptm3d_gui.py",
+        "the dashboard's thermal module":
+            REPO_ROOT / "gui" / "module_adapters" / "thermal_adapter.py",
+    }
+    for what, path in launchers.items():
+        source = path.read_text()
+        assert "run_preflight(" in source, (
+            f"{what} no longer calls run_preflight; this arm is looking at "
+            f"the wrong file")
+        assert "prepare_from_report" in source, (
+            f"{what} calls run_preflight and starts the engine without "
+            f"carrying out report.flux_cube_plan. A run with the cubes on and "
+            f"no layout would solve to the end and then refuse.")
+
+
+def test_the_shared_prepare_step_names_the_layout_it_built():
+    """`flux_cubes.cache_file` after the step, which is what the run YAML reads."""
+    from gui_core import flux_cubes as fc
+    from gui_core.flux_cube_build import prepare_from_report
+    from gui_core.preflight import _ply_face_count, resolve_data_path
+    exe = _geom_exe()
+    _panel()                                   # a QApplication has to exist
+    with tempfile.TemporaryDirectory() as tmp:
+        manager = _launchable_config(tmp)
+        manager.set_value("flux_cubes.radius_m", 150.0)
+        manager.set_value("flux_cubes.spacing_m", 50.0)
+
+        class _Report:
+            flux_cube_plan = None
+        report = _Report()
+        report.flux_cube_plan = fc.layout_plan(
+            manager.get_config(), tmp, resolve_data_path, _ply_face_count,
+            executable=exe)
+        assert report.flux_cube_plan.action == fc.PLAN_BUILD
+        said = []
+        assert prepare_from_report(None, report, manager, tmp,
+                                   info=said.append, error=said.append)
+        assert manager.get_value("flux_cubes.cache_file") == \
+            report.flux_cube_plan.path, (
+                "the step built a layout and did not name it; the run YAML "
+                "would carry the empty field it started from")
+        assert Path(report.flux_cube_plan.path).exists()
+        assert said, "the step built a layout and said nothing about it"
+
+        # ...and a second pass reuses rather than rebuilding, still naming it.
+        manager.set_value("flux_cubes.cache_file", "")
+        report.flux_cube_plan = fc.layout_plan(
+            manager.get_config(), tmp, resolve_data_path, _ply_face_count,
+            executable=exe)
+        assert report.flux_cube_plan.action == fc.PLAN_REUSE
+        assert prepare_from_report(None, report, manager, tmp,
+                                   info=said.append, error=said.append)
+        assert manager.get_value("flux_cubes.cache_file") == \
+            report.flux_cube_plan.path
+
+        # A report with no plan is not an error: most runs have no cubes.
+        report.flux_cube_plan = None
+        assert prepare_from_report(None, report, manager, tmp,
+                                   info=said.append, error=said.append)
+
+
+def test_the_card_button_builds_the_same_layout_the_launch_would():
+    """The button moves the wait earlier; it must not move the file."""
+    from gui_core import flux_cubes as fc
+    exe = _geom_exe()
+    manager, card = _card()
+    with tempfile.TemporaryDirectory() as tmp:
+        mesh = Path(tmp) / CRATER.name
+        shutil.copy(CRATER, mesh)
+        manager.set_value("mesh.import_file", str(mesh))
+        manager.set_value("flux_cubes.enabled", True)
+        manager.set_value("flux_cubes.spacing_m", 50.0)
+        manager.set_value("flux_cubes.radius_m", 150.0)
+        card.refresh_flux_cubes()
+        planned = card._flux_layout_plan()
+        assert planned.action == fc.PLAN_BUILD
+
+        card._on_build_layout()
+        assert manager.get_value("flux_cubes.cache_file") == planned.path, (
+            f"the button wrote {manager.get_value('flux_cubes.cache_file')!r} "
+            f"and the launch check would have used {planned.path!r}; the "
+            f"layout's name is what keeps two placements apart")
+        assert Path(planned.path).exists()
+        # ...and the launch check now finds it and reuses it rather than
+        # building it a second time.
+        again = card._flux_layout_plan()
+        assert again.action == fc.PLAN_NONE, again.reason
+        manager.set_value("flux_cubes.cache_file", "")
+        assert card._flux_layout_plan().action == fc.PLAN_REUSE
+        assert exe
+
+
+def test_the_layout_file_field_is_advanced_and_the_placement_is_not():
+    """What the flow asks for, and what it merely allows.
+
+    The placement controls are in front of the user; the layout file is behind
+    a disclosure that starts closed. If this inverts, the flow is a file-naming
+    exercise again.
+    """
+    manager, card = _card()
+    manager.set_value("flux_cubes.enabled", True)
+    card.refresh_flux_cubes()
+    for key in ("flux_cubes.mode", "flux_cubes.spacing_m",
+                "flux_cubes.radius_m"):
+        assert card.widgets[key].isVisibleTo(card.flux_group), (
+            f"{key} is not on screen; it is the specification")
+    assert card.flux_advanced.isVisibleTo(card.flux_group), (
+        "the advanced section's own header is not reachable")
+    assert card.flux_advanced._collapsed, (
+        "the layout-file section starts open, which puts a file name back in "
+        "front of the placement")
+    assert not card.widgets["flux_cubes.cache_file"].isVisibleTo(card), (
+        "the layout-file field is in front of the user before it is asked for")
+    card.flux_advanced.toggle()
+    assert card.widgets["flux_cubes.cache_file"].isVisibleTo(card.flux_group), (
+        "opening the advanced section does not reveal the layout-file field")
+    assert card.flux_build.isVisibleTo(card.flux_group)
+    card.flux_advanced.toggle()
+
+
 TESTS = [
     test_the_cube_count_is_the_tools_own_rule,
     test_the_fast_count_agrees_with_the_tools_double_loop_everywhere,
@@ -1061,11 +1612,24 @@ TESTS = [
     test_a_point_list_refuses_rather_than_dropping_a_line,
     test_the_header_rule_is_the_layout_tools_header_rule,
     test_a_layout_command_is_a_list_and_says_which_lattice,
-    test_preflight_blocks_a_run_that_would_stop_after_the_solve,
+    test_preflight_prepares_a_layout_instead_of_blocking,
+    test_a_placement_that_cannot_be_built_is_still_refused_before_the_run,
     test_preflight_reports_the_product_size_for_a_launchable_run,
     test_preflight_says_nothing_about_a_layout_a_run_never_opens,
     test_no_spelling_of_a_flux_cube_key_aborts_the_card,
     test_every_control_in_the_group_explains_itself,
+    # -- the layout builds itself -----------------------------------------
+    test_a_live_setting_is_never_hidden_by_the_mode,
+    test_the_layout_key_moves_with_every_input_that_changes_the_layout,
+    test_a_changed_placement_never_reuses_the_old_layout,
+    test_a_layout_built_for_another_mesh_is_refused_on_its_header,
+    test_pauls_sequence_reaches_the_engine_with_a_layout,
+    test_a_build_that_fails_leaves_no_layout_behind,
+    test_named_locations_build_themselves_too,
+    test_every_launcher_carries_out_the_plan,
+    test_the_shared_prepare_step_names_the_layout_it_built,
+    test_the_card_button_builds_the_same_layout_the_launch_would,
+    test_the_layout_file_field_is_advanced_and_the_placement_is_not,
 ]
 
 

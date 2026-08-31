@@ -52,7 +52,8 @@ from gui_core.body_cards import (GENERIC_MESH_SHAPE, WINDOW_UNIT_DAYS,
                                  WINDOW_UNIT_DIURNAL, WINDOW_UNIT_ORBITAL,
                                  WINDOW_UNITS, window_unit_days)
 from gui_core.config_manager import ConfigManager
-from gui_panels.config_panel import BaseConfigTab, get_tooltip
+from gui_panels.config_panel import (BaseConfigTab, CollapsibleSection,
+                                     get_tooltip)
 
 # The engine's own generic-body surface defaults. Same two-step import as
 # `gui_core.body_cards`: `ptm` is on the path in an installed tree and needs
@@ -1555,11 +1556,19 @@ class BodyCard(BaseConfigTab):
         makes for keeping the radiation switch on every card, and it is how a
         setting stays on without anybody seeing it.
 
-        The group is offered on the LOCAL-MESH mode only. The layout tool takes
-        a mesh file and a global run generates its sphere in memory, so there
-        is no file to build a layout against; `flux_cubes.engine_support` says
-        the same thing, and the pre-flight repeats it for a configuration that
-        arrives some other way.
+        The group is offered on the LOCAL-MESH mode -- the layout tool takes a
+        mesh file and a global run generates its sphere in memory, so there is
+        no file to build a layout against; `flux_cubes.engine_support` says the
+        same thing, and the pre-flight repeats it for a configuration that
+        arrives some other way. It is nevertheless kept on screen whenever the
+        setting is ON, whatever the mode: see `MoonCard.apply_mode`.
+
+        THE PLACEMENT IS THE SPECIFICATION. Nothing in the flow asks for a file
+        name: the launch check turns "a 25 m grid out to 500 m" into a
+        deterministic path beside the mesh, reuses a layout that answers exactly
+        that placement, and otherwise builds one before the run starts. The
+        layout-file field is an ADVANCED escape hatch for a layout somebody
+        else built, and it is collapsed.
         """
         from gui_core import flux_cubes as fc
 
@@ -1647,19 +1656,47 @@ class BodyCard(BaseConfigTab):
         grid.addWidget(self.flux_height, row, 1)
         row += 1
 
-        # The layout file, and the tool that writes it ---------------------
-        self.add_file_field(grid, row, "Cube layout file:",
-                            "flux_cubes.cache_file",
-                            "Cube layouts (*.fcg);;All Files (*)")
-        row += 1
-        self.flux_build = QPushButton("Build cube layout")
-        self.flux_build.setToolTip(get_tooltip("ui.flux_cubes.build"))
-        self.flux_build.clicked.connect(self._on_build_layout)
-        grid.addWidget(self.flux_build, row, 1)
-        row += 1
+        # What will happen to the layout when this run starts --------------
+        # THE PLACEMENT ABOVE IS THE SPECIFICATION. The `.fcg` the geometry
+        # tool writes is the file it gets stored in, and nothing above this
+        # line asks anybody to name one: the launch check works out where the
+        # layout belongs, reuses one that answers this exact placement, and
+        # otherwise builds it before the run starts. This label says which of
+        # those three is about to happen, by name.
         self.flux_status = _muted("")
         self.flux_status.setToolTip(get_tooltip("ui.flux_cubes.status"))
         grid.addWidget(self.flux_status, row, 0, 1, 2)
+        row += 1
+
+        # The layout file, for a layout somebody else built ----------------
+        # ADVANCED, and collapsed, because naming a file is no longer part of
+        # the flow: it is the escape hatch for a pre-built or hand-made layout.
+        # It is a COLLAPSIBLE SECTION rather than a tier-gated one, so it is
+        # visible on the card whatever the tier, and an opened project that
+        # names a layout file is one click from showing which -- the same
+        # argument the group's own switch makes for staying out of the tier.
+        self.flux_advanced = CollapsibleSection("Advanced: use a layout file "
+                                                "somebody else built",
+                                                collapsed=True)
+        advanced_body = QWidget()
+        advanced = QGridLayout(advanced_body)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        advanced.setColumnStretch(1, 1)
+        self.add_file_field(advanced, 0, "Cube layout file:",
+                            "flux_cubes.cache_file",
+                            "Cube layouts (*.fcg);;All Files (*)")
+        self.flux_build = QPushButton("Build a layout now from the placement "
+                                      "above")
+        self.flux_build.setToolTip(get_tooltip("ui.flux_cubes.build"))
+        self.flux_build.clicked.connect(self._on_build_layout)
+        advanced.addWidget(self.flux_build, 1, 1)
+        self.flux_advanced_note = _muted(
+            "Leave this empty and the layout is built for you when the run "
+            "starts, from the placement above. Set it and this exact file is "
+            "used instead -- the run stops if it does not match the mesh.")
+        advanced.addWidget(self.flux_advanced_note, 2, 0, 1, 2)
+        self.flux_advanced.content_layout.addWidget(advanced_body)
+        grid.addWidget(self.flux_advanced, row, 0, 1, 2)
         row += 1
 
         # Products ----------------------------------------------------------
@@ -1823,21 +1860,58 @@ class BodyCard(BaseConfigTab):
         self._flux_header_cache = (path, header)
         return header
 
+    def _flux_layout_plan(self):
+        """What the launch check would do about the layout, asked here.
+
+        THE SAME FUNCTION the launch check calls, not a second opinion: the
+        card's line and the pre-flight's line are one rule, so a card that says
+        "it will be built" cannot sit in front of a launch that refuses.
+        """
+        from gui_core import flux_cubes as fc
+        from gui_core.preflight import _ply_face_count, resolve_data_path
+        root = self._project_root()
+        return fc.layout_plan(
+            self.config_manager.get_config(), root, resolve_data_path,
+            _ply_face_count, executable=fc.find_geom_executable(root))
+
     def _refresh_flux_cache(self):
         label = getattr(self, "flux_status", None)
         if label is None:
             return
+        from gui_core import flux_cubes as fc
         header = self._flux_cache_header()
         if header is None:
-            label.setText(
-                "No layout file yet. Set the placement above and use "
-                "Build cube layout; the run stops rather than starting without "
-                "one.")
+            # No layout file named, which is the ordinary case now: say what
+            # the run will do, and name the file it will do it to. "Set the
+            # placement and press Build" was an instruction to perform a step
+            # that no longer exists.
+            try:
+                plan = self._flux_layout_plan()
+            except Exception as exc:                         # noqa: BLE001
+                label.setText(
+                    f"The cube layout could not be planned here ({exc}). The "
+                    f"launch check asks the same question again before the "
+                    f"run starts.")
+                return
+            if plan.action == fc.PLAN_REFUSE:
+                label.setText(f"No cube layout can be prepared for this run: "
+                              f"{plan.reason}.")
+            elif plan.action == fc.PLAN_REUSE:
+                label.setText(f"Ready: {plan.reason}. It is checked against "
+                              f"this placement and this mesh, and reused "
+                              f"rather than rebuilt.")
+            elif plan.action == fc.PLAN_BUILD:
+                label.setText(
+                    f"The layout is built for you when the run starts -- "
+                    f"{plan.request.describe()}, written to {plan.path}. It "
+                    f"takes tens of seconds on a site-scale mesh and can be "
+                    f"stopped. Nothing here needs a file name.")
+            else:
+                label.setText(plan.reason)
             return
         if not header.ok:
             label.setText(header.error)
             return
-        from gui_core import flux_cubes as fc
         text = header.describe()
         # Only the names this run will actually ASK for. In a grid-only mode
         # the table's rows are not emitted, so the run never checks them and a
@@ -2009,7 +2083,14 @@ class BodyCard(BaseConfigTab):
     # -- building the layout -------------------------------------------------
 
     def _on_build_layout(self):
-        """Run the layout tool on this mesh, in a worker thread.
+        """Build the layout NOW, instead of when the run starts.
+
+        THE SAME PLAN AND THE SAME WORKER the launch path uses -- this button
+        only moves the wait earlier. It deliberately does NOT offer a save
+        dialog any more: the layout's name carries a digest of the placement it
+        was built for, which is what stops a 25 m grid being reused for a 50 m
+        one, and a name chosen by hand carries nothing. To use a layout that
+        already exists, put it in the field above instead.
 
         Placement is the tool's job and only the tool's: it measures the mesh,
         drops each cube onto the terrain and casts the rays that record what
@@ -2019,82 +2100,48 @@ class BodyCard(BaseConfigTab):
         stops on a mismatch.
         """
         from gui_core import flux_cubes as fc
-        config = self.config_manager.get_config()
-        mesh = str((config.get("mesh") or {}).get("import_file", "")
-                   or "").strip()
-        if not mesh:
-            QMessageBox.warning(
-                self, "Build cube layout",
-                "Choose a terrain mesh first: the layout is built against the "
-                "mesh the run will use.")
-            return
-        executable = fc.find_geom_executable(self._project_root())
-        if executable is None:
-            QMessageBox.warning(
-                self, "Build cube layout",
-                f"{fc.GEOM_EXECUTABLE} was not found beside the simulation "
-                f"program. Build it first, from the project directory:\n\n"
-                f"    cmake --build build --target {fc.GEOM_EXECUTABLE}")
-            return
-        from gui_core.preflight import resolve_data_path, resolve_path
-        root = self._project_root()
-        target = str(self.config_manager.get_value("flux_cubes.cache_file", "")
-                     or "").strip()
-        if not target:
-            target = fc.default_cache_path(config, root)
-        target, _filter = QFileDialog.getSaveFileName(
-            self, "Save cube layout as", str(target),
-            "Cube layouts (*.fcg);;All Files (*)")
-        if not target:
-            return
+        from gui_core.flux_cube_build import build_layout
 
-        locations_file = ""
-        mode = self._flux_mode()
         rows, errors = self._table_locations()
-        if fc.mode_uses_locations(mode):
-            if errors or not rows:
-                QMessageBox.warning(
-                    self, "Build cube layout",
-                    "The point list has to be readable before a layout can be "
-                    "built.\n\n" + ("\n".join(errors) if errors
-                                    else "The table is empty."))
-                return
-            locations_file = str(Path(target).with_suffix(".locations.csv"))
-            try:
-                Path(locations_file).write_text(fc.locations_to_csv(rows))
-            except OSError as exc:
-                QMessageBox.warning(self, "Build cube layout",
-                                    f"{locations_file} could not be "
-                                    f"written: {exc}")
-                return
-
-        occluder = str((config.get("mesh") or {}).get("occluder_file", "")
-                       or "").strip()
-        argv = fc.geom_command(
-            executable,
-            resolve_data_path(mesh, root),
-            resolve_path(target, root),
-            mode=mode,
-            spacing_m=self._number("flux_cubes.spacing_m",
-                                   fc.DEFAULT_SPACING_M),
-            radius_m=self._number("flux_cubes.radius_m", fc.DEFAULT_RADIUS_M),
-            occluder_mesh=(str(resolve_data_path(occluder, root))
-                           if occluder else ""),
-            locations_csv=locations_file)
+        if fc.mode_uses_locations(self._flux_mode()) and errors:
+            # Refused BEFORE the plan is built, because `config_locations`
+            # reads the stored list and a row that never parsed is not in it --
+            # so a layout built now would quietly be missing the point the
+            # table is showing.
+            QMessageBox.warning(
+                self, "Build cube layout",
+                "The point list has to be readable before a layout can be "
+                "built.\n\n" + "\n".join(errors))
+            return
+        try:
+            plan = self._flux_layout_plan()
+        except Exception as exc:                             # noqa: BLE001
+            QMessageBox.warning(self, "Build cube layout",
+                                f"The layout could not be planned: {exc}")
+            return
+        if plan.action == fc.PLAN_NONE:
+            QMessageBox.information(
+                self, "Build cube layout",
+                "This configuration names its own layout file, so nothing is "
+                "built from the placement. Clear the field above to have the "
+                "layout built from the placement instead.")
+            return
+        if plan.action == fc.PLAN_REFUSE:
+            QMessageBox.warning(self, "Build cube layout",
+                                f"No layout can be built: {plan.reason}.")
+            return
 
         self.flux_build.setEnabled(False)
-        self.flux_status.setText(
-            "Building the cube layout. It measures the mesh and casts rays "
-            "from every cube face, which takes tens of seconds on a "
-            "site-scale mesh.")
-        self._flux_worker = _GeomWorker(argv, str(root))
-        self._flux_worker.done.connect(
-            lambda ok, log, out=target: self._on_layout_built(ok, log, out))
-        self._flux_worker.finished.connect(self._flux_worker.deleteLater)
-        self._flux_worker.start()
+        try:
+            if plan.action == fc.PLAN_REUSE:
+                ok, log = True, plan.reason
+            else:
+                ok, log = build_layout(self, plan, str(self._project_root()))
+        finally:
+            self.flux_build.setEnabled(True)
+        self._on_layout_built(ok, log, plan.path)
 
     def _on_layout_built(self, ok, log, target):
-        self.flux_build.setEnabled(True)
         # Drop any cached header for this path: the file just changed.
         self._flux_header_cache = None
         if not ok:
@@ -2361,10 +2408,34 @@ class MoonCard(BodyCard):
         local = self._mode == "local"
         self.global_group.setVisible(not local)
         self.local_group.setVisible(local)
-        # Local mesh only. A global run generates its sphere in memory, so
-        # there is no mesh file for the layout tool to build against and every
-        # control in the group would be an offer the tool cannot keep.
-        self.flux_group.setVisible(local)
+        # Offered on the local mesh, because a global run generates its sphere
+        # in memory and the layout tool has no file to build against.
+        #
+        # ⛔ BUT NEVER HIDDEN WHILE THE SETTING IS ON. Hiding the whole group
+        # on the mode alone left `flux_cubes.enabled: true` live in a window
+        # with no control anywhere that could see it, clear it, or give it a
+        # layout -- and `mesh.import_file` survives the mode switch, so
+        # `engine_support` still passed and the launch check refused with
+        # "no cube layout file is set... Build it from the card" against a card
+        # that was showing no such thing. That is the defect Paul hit
+        # (2026-08-31), and it is the same failure this group's own docstring
+        # refuses for the Advanced tier: a setting that stays on with nobody
+        # able to see it. The group therefore stays visible whenever it is on,
+        # and says why the mode cannot produce cubes.
+        enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
+                                                     False))
+        self.flux_group.setVisible(local or enabled)
+        if not local and enabled:
+            logger.warning(
+                "[card] this configuration has flux_cubes.enabled on and the "
+                "card is on the global mode, which builds its sphere in memory "
+                "and has no mesh file to place cubes against. The group is "
+                "kept on screen so the setting can be seen and cleared; it is "
+                "NOT changed here -- opening a file is not an edit to it.")
+        # The gate depends on the mode (a global run has no imported mesh), so
+        # the group has to be re-described whenever the mode moves. Without
+        # this it kept the previous mode's answer.
+        self.refresh_flux_cubes()
 
     def load_card(self):
         super().load_card()
@@ -2996,54 +3067,12 @@ class MercuryCard(BodyCard):
 # Generic bodies: asteroid, and anything else
 # ===========================================================================
 
-class _GeomWorker(QThread):
-    """One `ptm_flux_cube_geom` run, off the GUI thread, emitting exactly once.
-
-    Same contract as the two workers below: a blocking subprocess on the GUI
-    thread is a frozen window, and an exception crossing a thread boundary into
-    nothing leaves the card on "Building..." forever, so everything is caught
-    here and turned into a result the card can show.
-
-    `argv` is a LIST and the subprocess runs without a shell, so a path with a
-    space or a quote in it is an argument and not syntax.
-
-    The tool's own diagnostics are the message on failure, trimmed to the tail:
-    it prints its measurements first and its refusal last, and the refusal is
-    what the user has to read. A refusal is a refusal -- the tool aborts on a
-    lattice point that misses the terrain, on a site at the pole, and on an
-    unreadable occluder mesh, rather than dropping cubes -- so a non-zero exit
-    means no layout was written and the card says exactly that.
-    """
-
-    done = pyqtSignal(bool, str)
-
-    #: Wall-clock ceiling. The measured full-grid sweep on a 2.4 M-face site
-    #: mesh was 66 s at 65,536 rays per patch; this leaves room for a mesh
-    #: several times larger and still ends rather than hanging the card's
-    #: button forever.
-    TIMEOUT_S = 1800.0
-
-    def __init__(self, argv, cwd):
-        super().__init__()
-        self._argv = list(argv)
-        self._cwd = cwd
-
-    def run(self):
-        import subprocess
-        try:
-            proc = subprocess.run(self._argv, cwd=self._cwd,
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT,
-                                  timeout=self.TIMEOUT_S)
-            log = proc.stdout.decode("utf-8", errors="replace")
-            tail = "\n".join(log.strip().splitlines()[-8:])
-            self.done.emit(proc.returncode == 0, tail)
-        except subprocess.TimeoutExpired:
-            self.done.emit(
-                False, f"The layout tool did not finish within "
-                       f"{self.TIMEOUT_S / 60:.0f} minutes and was stopped.")
-        except Exception as exc:                             # noqa: BLE001
-            self.done.emit(False, f"{type(exc).__name__}: {exc}")
+# `_GeomWorker` used to live here: a second `ptm_flux_cube_geom` runner
+# beside `gui_core.flux_cube_build.LayoutBuildWorker`. It is gone, and the
+# card's build button goes through the shared worker the launch path uses --
+# which, unlike this one, removes a partial layout when a build fails and
+# refuses a zero exit code that wrote no file. Two runners meant the button
+# and the launch had different guarantees for one job.
 
 
 class _LookupWorker(QThread):
