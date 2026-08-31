@@ -188,6 +188,75 @@ class PyVistaWidget(QWidget):
             label.setStyleSheet("color: #ff9800; font-size: 14px;")
             layout.addWidget(label)
 
+    # -- terrain preview ---------------------------------------------------
+    #
+    # THIS METHOD IS NOT COVERED BY ANY TEST AND CANNOT BE. Constructing this
+    # widget headless takes the process down with a `qFatal` from VTK, so the
+    # only verification of what follows is a click test in the running
+    # application. Everything that DECIDES anything -- which reader, which
+    # elevation rule, which datum, whether the mesh is too big for a surface --
+    # was moved into `gui_core.mesh_preview`, which imports no Qt and is
+    # measured by `src/python/tests/test_gui_mesh_preview.py`. What is left
+    # here is the pyvista call, and every part of it is guarded: this method
+    # RETURNS a message and never raises, because an exception out of a Qt slot
+    # is an application abort.
+
+    #: Colormap for elevation. `terrain` is the one in AVAILABLE_COLORMAPS
+    #: whose name says what it is being used for.
+    PREVIEW_CMAP = "terrain"
+
+    def show_mesh_preview(self, preview):
+        """Draw a `mesh_preview.MeshPreview`, colored by elevation.
+
+        Returns "" on success or a sentence describing what stopped it. It
+        does not raise, and it does not touch `self.mesh` / `self.mesh_data`:
+        those belong to a loaded RESULTS directory, and a preview that quietly
+        replaced them would make the field selector describe a mesh that is no
+        longer on screen.
+        """
+        if not PYVISTA_AVAILABLE:
+            return ("PyVista is not installed, so no mesh can be drawn. "
+                    "Install it with: pip install pyvista pyvistaqt")
+        plotter = getattr(self, "plotter", None)
+        if plotter is None:
+            return "The 3D view is not available, so no mesh was drawn."
+        if preview is None or preview.refusal or preview.vertices is None:
+            return preview.refusal if preview is not None else \
+                "No mesh was read, so nothing was drawn."
+        try:
+            points = np.asarray(preview.vertices, dtype=np.float64)
+            if preview.mode == "surface" and preview.faces is not None \
+                    and len(preview.faces):
+                faces = np.asarray(preview.faces, dtype=np.int64)
+                cells = np.column_stack(
+                    [np.full(len(faces), 3, dtype=np.int64), faces]).ravel()
+                poly = pv.PolyData(points, cells)
+            else:
+                poly = pv.PolyData(points)
+            unit = {"meters": "m", "kilometers": "km"}.get(preview.units, "")
+            title = f"Elevation ({unit})" if unit else "Elevation"
+            if preview.elevation is not None \
+                    and len(preview.elevation) == len(points):
+                poly[title] = np.asarray(preview.elevation, dtype=np.float64)
+            plotter.clear()
+            kwargs = {"cmap": self.PREVIEW_CMAP, "show_edges": False}
+            if title in poly.array_names:
+                kwargs["scalars"] = title
+                kwargs["scalar_bar_args"] = {"title": title}
+            if preview.mode != "surface":
+                kwargs["render_points_as_spheres"] = False
+                kwargs["point_size"] = 2.0
+            plotter.add_mesh(poly, **kwargs)
+            plotter.reset_camera()
+            return ""
+        except Exception as exc:                             # noqa: BLE001
+            # Anything at all: a VTK allocation failure, a pyvista API change,
+            # a mesh whose indices do not address its own vertices. The pane
+            # says so and the application stays up.
+            return (f"The terrain preview could not be drawn "
+                    f"({type(exc).__name__}: {exc}). The configuration is "
+                    f"unaffected.")
+
     def load_results(self, results_dir):
         """Load simulation results from directory"""
         self.results_dir = Path(results_dir)
@@ -2743,6 +2812,20 @@ class VisualizationPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # What the terrain preview is showing, and every reservation about it:
+        # the datum the elevation is measured from, an assumed length unit, and
+        # whether the mesh was thinned to be drawn at all. PLAIN TEXT, and
+        # above the view rather than in a tooltip -- a preview whose caveats
+        # are only discoverable by hovering is a preview whose caveats nobody
+        # reads.
+        self.preview_note = QLabel("")
+        self.preview_note.setWordWrap(True)
+        self.preview_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.preview_note.setStyleSheet(
+            "color: #90caf9; font-size: 11px; padding: 4px;")
+        self.preview_note.setVisible(False)
+        layout.addWidget(self.preview_note)
+
         # Create tab widget for 3D/2D views
         self.tab_widget = QTabWidget()
 
@@ -2924,9 +3007,59 @@ class VisualizationPanel(QWidget):
         export_data_btn.clicked.connect(self.show_export_data_dialog)
         layout.addWidget(export_data_btn)
 
+    # -- terrain preview ----------------------------------------------------
+    #
+    # NOT COVERED BY ANY TEST. See PyVistaWidget.show_mesh_preview: this widget
+    # cannot be constructed headless. The decisions are in
+    # `gui_core.mesh_preview` and are tested there; this is the wiring.
+
+    def preview_terrain(self, config, project_root=None):
+        """Show the mesh a configuration would run on, colored by elevation.
+
+        Returns the sentence it put in the pane, so a caller can log it. Never
+        raises: it is reached from a configuration-changed slot.
+
+        A loaded RESULTS directory wins. Drawing a bare terrain over a
+        temperature field would leave the field selector, the timestep slider
+        and the color bar all describing a mesh that is no longer on screen --
+        so the preview declines and says why, rather than silently replacing
+        what the user is looking at.
+        """
+        try:
+            from gui_core.mesh_preview import mesh_preview_for_config
+            if self.results_dir:
+                message = (
+                    "A results directory is loaded, so the terrain preview was "
+                    "not drawn over it. Close or reload results to preview a "
+                    "mesh.")
+                self._set_preview_note(message)
+                return message
+            preview = mesh_preview_for_config(config, project_root)
+            message = self.view_3d.show_mesh_preview(preview)
+            self._set_preview_note(message or preview.summary())
+            if not message:
+                self.tab_widget.setCurrentWidget(self.view_3d)
+            return message or preview.summary()
+        except Exception as exc:                             # noqa: BLE001
+            message = (f"The terrain preview failed ({type(exc).__name__}: "
+                       f"{exc}). The configuration is unaffected.")
+            try:
+                self._set_preview_note(message)
+            except Exception:                                # noqa: BLE001
+                pass
+            return message
+
+    def _set_preview_note(self, text):
+        note = getattr(self, "preview_note", None)
+        if note is None:
+            return
+        note.setText(str(text or ""))
+        note.setVisible(bool(text))
+
     def load_results(self, results_dir):
         """Load simulation results"""
         self.results_dir = results_dir
+        self._set_preview_note("")
 
         # Detect available fields
         self._populate_field_combo(results_dir)

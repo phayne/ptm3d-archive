@@ -601,6 +601,10 @@ class BodyCard(BaseConfigTab):
         self.config_manager.set_value(
             "simulation.timesteps",
             samples_for_window(window, self._synodic_days()))
+        # The window length is also what a window SERIES is made of, so the
+        # series plan and its refusals are re-derived here rather than going
+        # on describing the previous window.
+        self.refresh_window_series()
 
     def time_group(self, title="Time window"):
         """The time controls, which depend on WHAT THE RUN PRODUCES.
@@ -653,8 +657,305 @@ class BodyCard(BaseConfigTab):
         #: unit stands for is the whole content of the choice.
         self.window_note = _muted("")
         grid.addWidget(self.window_note, 4, 0, 1, 2)
+        self._build_window_series_rows(grid, 5)
         group.setLayout(grid)
         return group
+
+    # -- a long run, broken into windows (the A3GT pattern) ------------------
+
+    #: Windows a new series starts with. A3GT's own production year set is 4
+    #: years x 2 seasons; four is a set somebody would actually look at.
+    DEFAULT_WINDOW_COUNT = 4
+
+    def _build_window_series_rows(self, grid, row):
+        """The split-into-windows controls, under the integration window.
+
+        THE SPAN IS NOT A CONFIGURATION KEY, and that is deliberate. The engine
+        has no "span" -- a window series is N separate runs, each with its own
+        `simulation.start_time` and `simulation.duration_days` -- so binding a
+        span control to a dotted key would write a key into the emitted YAML
+        that nothing reads, which is the defect PTM-67 names. It lives on the
+        card, in days, and is converted for display through the SAME
+        `_unit_days` every other duration on this card converts through.
+        """
+        self.split_check = QCheckBox("Split the run into windows")
+        self.split_check.setToolTip(get_tooltip("ui.split_windows"))
+        self.split_check.toggled.connect(self._on_split_toggled)
+        grid.addWidget(self.split_check, row, 0, 1, 2)
+
+        count_label = QLabel("Number of windows:")
+        count_label.setToolTip(get_tooltip("ui.window_count"))
+        grid.addWidget(count_label, row + 1, 0)
+        self.window_count = QSpinBox()
+        self.window_count.setRange(1, 64)
+        self.window_count.setValue(self.DEFAULT_WINDOW_COUNT)
+        self.window_count.setToolTip(get_tooltip("ui.window_count"))
+        self.window_count.valueChanged.connect(
+            lambda _v: self.refresh_window_series())
+        grid.addWidget(self.window_count, row + 1, 1)
+
+        span_label = QLabel("Total span:")
+        span_label.setToolTip(get_tooltip("ui.window_span"))
+        grid.addWidget(span_label, row + 2, 0)
+        span_box = QWidget()
+        span_layout = QHBoxLayout(span_box)
+        span_layout.setContentsMargins(0, 0, 0, 0)
+        span_layout.setSpacing(4)
+        self.span_spin = QDoubleSpinBox()
+        self.span_spin.setDecimals(self.DURATION_DECIMALS)
+        self.span_spin.setRange(0.001, 365000.0)
+        self.span_spin.setToolTip(get_tooltip("ui.window_span"))
+        self.span_spin.valueChanged.connect(self._on_span_edited)
+        span_layout.addWidget(self.span_spin, stretch=1)
+        self.span_unit_combo = QComboBox()
+        self.span_unit_combo.addItems(WINDOW_UNITS)
+        self.span_unit_combo.setMaximumWidth(140)
+        self.span_unit_combo.setToolTip(get_tooltip("ui.window_units"))
+        self.span_unit_combo.currentTextChanged.connect(
+            self._on_span_unit_changed)
+        span_layout.addWidget(self.span_unit_combo)
+        grid.addWidget(span_box, row + 2, 1)
+
+        self.series_note = _muted("", color="#64b5f6", size=11)
+        grid.addWidget(self.series_note, row + 3, 0, 1, 2)
+
+        self.series_button = QPushButton("Write window configurations…")
+        self.series_button.setToolTip(get_tooltip("ui.window_series"))
+        self.series_button.clicked.connect(self._on_prepare_window_series)
+        grid.addWidget(self.series_button, row + 4, 1)
+
+        #: The span, IN DAYS, which is the canonical unit here as everywhere
+        #: else on this card. 0 means "not chosen yet"; the first activation
+        #: proposes one.
+        self._span_days = 0.0
+        self._window_series_rows = (
+            self.split_check, count_label, self.window_count, span_label,
+            span_box, self.series_note, self.series_button)
+
+    def _span_unit_days(self):
+        """Days per span unit, or 1.0 when the body has no such period.
+
+        The 1.0 is a LAST RESORT and never a silent reading of a period as
+        days -- the same rule and the same wording as :meth:`_per_unit`. Both
+        paths that can act on an unresolvable unit, the edit and the unit
+        change, refuse first, so what reaches here is a control already on
+        days.
+        """
+        per_unit, why = self._unit_days(self.span_unit_combo.currentText())
+        return (per_unit or 1.0), why
+
+    def _on_span_edited(self, value):
+        if self._loading or getattr(self, "_span_syncing", False):
+            return
+        per_unit, _why = self._span_unit_days()
+        self._span_days = float(value) * per_unit
+        self.refresh_window_series()
+
+    def _on_span_unit_changed(self, unit):
+        """Re-display the span in a new unit. Refuses one this body has not.
+
+        The same rule the duration rows follow, and for the same reason: the
+        quiet alternative -- reading the number in the box as days when the
+        user asked for orbits -- is wrong by the ratio of the two periods,
+        which on Europa is a factor of 1220.
+        """
+        if getattr(self, "_span_syncing", False):
+            return
+        per_unit, why = self._unit_days(unit)
+        if not per_unit:
+            self._span_syncing = True
+            try:
+                self.span_unit_combo.setCurrentText(WINDOW_UNIT_DAYS)
+            finally:
+                self._span_syncing = False
+            self.series_note.setText(
+                f"Total span: {unit} cannot be used here — {why}. The span is "
+                f"shown in days instead.")
+            per_unit = 1.0
+        self._show_span()
+        self.refresh_window_series()
+
+    def _show_span(self):
+        """Put the stored span in the box without treating that as an edit."""
+        per_unit, _why = self._span_unit_days()
+        self._span_syncing = True
+        try:
+            blocked = self.span_spin.blockSignals(True)
+            try:
+                self.span_spin.setValue(self._span_days / per_unit)
+            finally:
+                self.span_spin.blockSignals(blocked)
+        finally:
+            self._span_syncing = False
+
+    def _on_split_toggled(self, _checked):
+        self.refresh_window_series()
+
+    def apply_window_series_mode(self):
+        """Show the series controls on the integrated run type only.
+
+        A window series IS an integration: each window produces the summary
+        maps and no per-sample files, which is what the integrated run type
+        means. Offering it on a time series would write N configurations whose
+        per-sample output nothing here merges.
+        """
+        rows = getattr(self, "_window_series_rows", None)
+        if not rows:
+            return
+        integrated = self._run_type == "integrated"
+        self.split_check.setVisible(integrated)
+        split = integrated and self.split_check.isChecked()
+        for widget in rows[1:]:
+            widget.setVisible(split)
+        if integrated and not self._span_days > 0:
+            self._propose_span()
+        self._show_span()
+        self.refresh_window_series()
+
+    def _propose_span(self):
+        """A first span: the windows laid end to end, so nothing overlaps.
+
+        Deliberately the SHORTEST span the chosen count fits in rather than a
+        body-specific number. A card that proposed "18.6 years" would be
+        proposing the Moon's nodal cycle on Mercury and on every asteroid.
+        """
+        window = self._number(self.WINDOW_KEY, 0.0)
+        if window > 0:
+            self._span_days = window * max(1, self.window_count.value())
+
+    def refresh_window_series(self):
+        """Plan the series and say what it is, or why there is none.
+
+        Recomputed from the live configuration on every change, so the note
+        under the controls always describes the set the button would write.
+        """
+        if not getattr(self, "_window_series_rows", None):
+            return
+        if self._run_type != "integrated" or not self.split_check.isChecked():
+            note = getattr(self, "series_note", None)
+            # `isHidden`, not `isVisible`. A widget in a window that has not
+            # been shown yet is not VISIBLE but is not HIDDEN either, and this
+            # runs during activation, before the card is on screen -- so
+            # `isVisible` would suppress the advice on exactly the path that
+            # produces it. The card tests use `isHidden` for the same reason.
+            if note is not None and not self.split_check.isHidden():
+                from gui_core.window_series import split_advice
+                note.setText(split_advice(self._number(self.WINDOW_KEY, 0.0),
+                                          self._synodic_days()))
+                note.setVisible(bool(note.text()))
+            return
+        plan = self.window_series_plan()
+        hours = len(plan) * _MINUTES_PER_RUN_GUESS / 60.0
+        if plan.refusal:
+            self.series_note.setText(plan.refusal)
+            self.series_button.setEnabled(False)
+        else:
+            first, last = plan.windows[0], plan.windows[-1]
+            self.series_note.setText(
+                f"{len(plan)} windows of {plan.window_days:g} days across "
+                f"{plan.span_days:g} days, {first.start_iso} to "
+                f"{last.end_iso()}. Each is a complete, independent run with "
+                f"its own spin-up — they sample the span, they do not continue "
+                f"one another. Rough estimate {hours:.0f} h in series on this "
+                f"machine. " + " ".join(plan.notes))
+            self.series_button.setEnabled(True)
+        self.series_note.setVisible(True)
+
+    def window_series_plan(self):
+        """The `window_series.WindowPlan` this card's controls describe."""
+        from gui_core.window_series import plan_windows
+        return plan_windows(
+            self.config_manager.get_value("simulation.start_time", ""),
+            self._span_days,
+            self.window_count.value(),
+            self._number(self.WINDOW_KEY, 0.0),
+            synodic_days=self._synodic_days())
+
+    def _on_prepare_window_series(self):
+        from gui_core.window_series import confirmation_text
+        plan = self.window_series_plan()
+        if plan.refusal:
+            self.show_report(plan.refusal)
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self, "Output directory for the window series", "",
+            QFileDialog.Option.ShowDirsOnly)
+        if not directory:
+            return
+        answer = QMessageBox.question(
+            self, "Write window configurations?",
+            confirmation_text(plan, directory, _MINUTES_PER_RUN_GUESS),
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Ok:
+            self.show_report("Window series canceled. Nothing was written.")
+            return
+        try:
+            written, commands = self.write_window_series(directory)
+        except Exception as exc:                             # noqa: BLE001
+            self.show_report(f"The window series could not be written: {exc}")
+            return
+        lines = [
+            f"Wrote {len(written)} window configurations under {directory},",
+            "one per window, plus windows.json recording the schedule and how",
+            "its epochs were chosen. Nothing has been launched. Run them",
+            "detached, so the series survives closing this window:",
+            "",
+        ]
+        lines.extend("    " + " ".join(command) for command in commands[:3])
+        if len(commands) > 3:
+            lines.append(f"    ... and {len(commands) - 3} more, one per "
+                         f"window; every command is in windows.json.")
+        self.show_report("\n".join(lines))
+
+    def write_window_series(self, outdir):
+        """Write the series. Returns ``(config paths, runner commands)``.
+
+        The configurations go through ``ConfigManager.save_run_yaml``, which is
+        the SAME writer every other emitted run YAML uses -- including the path
+        absolutization the engine needs when a configuration is written
+        somewhere other than the project directory. A second serializer here is
+        how two files that should be identical stop being identical.
+        """
+        import json
+
+        from gui_core import window_series
+
+        plan = self.window_series_plan()
+        if plan.refusal:
+            raise ValueError(plan.refusal)
+        root = self._project_root()
+        base = self.config_manager.get_config()
+
+        def save(config, path):
+            """Serialize one window through ConfigManager's own run writer.
+
+            The manager's configuration is SWAPPED for the window's and put
+            back, rather than a second serializer being written here.
+            `save_run_yaml` is not just a yaml.dump: it absolutizes every path
+            field (the engine resolves a relative view-factor path against the
+            YAML's own directory, so a configuration that moves must carry
+            absolute ones) and it applies `_config_for_yaml`'s albedo-source
+            translation. A window written any other way would be a different
+            run from the one the card shows.
+            """
+            manager = self.config_manager
+            previous = manager.config
+            try:
+                manager.config = config
+                manager.save_run_yaml(str(path), root)
+            finally:
+                manager.config = previous
+
+        written = window_series.write_window_series(
+            base, plan, outdir, project_root=root, save=save)
+        commands = window_series.runner_commands(plan, outdir,
+                                                 config_dir=outdir)
+        schedule = Path(outdir) / "windows.json"
+        document = json.loads(schedule.read_text())
+        document["commands"] = [" ".join(command) for command in commands]
+        schedule.write_text(json.dumps(document, indent=2) + "\n")
+        return written, commands
 
     def apply_time_mode(self):
         """Show the duration controls this run type actually uses."""
@@ -673,6 +974,7 @@ class BodyCard(BaseConfigTab):
             self._start_window_in_its_own_unit()
         self._revalidate_duration_units()
         self.refresh_window_units()
+        self.apply_window_series_mode()
 
     def _revalidate_duration_units(self):
         """Drop any selected unit whose period has gone away, out loud.
@@ -1079,6 +1381,159 @@ class BodyCard(BaseConfigTab):
         group.setLayout(grid)
         return group
 
+    # -- radiation exchange, on EVERY card and in every run type -------------
+
+    def radiation_group(self, title="Radiation exchange", beaming=False):
+        """The `radiation.enabled` switch, its cache, and optionally beaming.
+
+        ONE SECTION, BUILT ONCE, USED BY EVERY CARD. It was previously written
+        out by hand on two of the five cards and only in their LOCAL mode, so
+        `radiation.enabled` -- the switch that decides whether a shadowed
+        crater floor is warmed by its walls at all -- was unreachable on
+        Mercury, on every generic body (which is every asteroid), and on both
+        global modes, in every run type. A key the engine reads on every body
+        that no screen offers is the same defect as a control the engine
+        ignores, arrived at from the other side.
+
+        IT IS OFFERED IN GLOBAL MODE TOO, and that is deliberate. On a smooth
+        procedural icosphere the switch is a no-op that costs minutes and
+        gigabytes -- measured on 2026-08-28, a 1.13M-block H-matrix in which
+        every block was Zero. The answer to that is the pre-flight warning
+        already in `gui_core.preflight` (see "Radiation exchange on a convex
+        mesh"), which names the cost and the fix and does NOT switch anything
+        off. Hiding the control instead would mean an opened configuration
+        with `enabled: true` on a global mesh showed nothing at all, which is
+        how it stays on.
+
+        `beaming` adds the sub-facet roughness switch. Only the Moon card
+        passes it: `facet_scale.BEAMING_BODIES` is lunar-only, and a control
+        whose rule refuses it on every configuration a card can produce is a
+        control that should not be on that card.
+        """
+        group = QGroupBox(title)
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+        row = 0
+        self.add_bool_field(grid, row, "Facet-to-facet infrared exchange",
+                            "radiation.enabled")
+        row += 1
+        self.radiation_note = _muted("")
+        grid.addWidget(self.radiation_note, row, 0, 1, 2)
+        row += 1
+        if beaming:
+            # Label from `gui_tooltips.LABELS`, which wins over any literal.
+            self.add_bool_field(grid, row,
+                                "Beam infrared from sub-facet roughness",
+                                "radiation.beaming")
+            row += 1
+            self.beaming_note = _muted("")
+            grid.addWidget(self.beaming_note, row, 0, 1, 2)
+            row += 1
+            self.widgets["radiation.beaming"].toggled.connect(
+                self._on_beaming_toggled)
+        self.add_file_field(grid, row, "View-factor cache:",
+                            "radiation.view_factor_file",
+                            "View factors (*.vf *.csr *.hmat);;All Files (*)")
+        group.setLayout(grid)
+        self.widgets["radiation.enabled"].toggled.connect(
+            self._on_radiation_toggled)
+        return group
+
+    def _on_radiation_toggled(self, _checked):
+        """The parent switch moved: re-gate the child and re-describe both."""
+        self.refresh_radiation()
+
+    def refresh_radiation(self):
+        """Re-run the beaming gate and re-write both notes. Cheap and idempotent.
+
+        Called on every load and on every toggle of either switch, so the two
+        lines on screen are always computed from the live configuration rather
+        than left over from the last one.
+        """
+        enabled = bool(self.config_manager.get_value("radiation.enabled",
+                                                    False))
+        note = getattr(self, "radiation_note", None)
+        if note is not None:
+            note.setText(
+                "Faces exchange infrared and reflected sunlight with each "
+                "other. The launch check reports what this will cost, and "
+                "says so when the surface is a smooth sphere on which it "
+                "computes nothing."
+                if enabled else
+                "Off: every face radiates only to space. A shadowed crater "
+                "floor then has no source of warmth but the geothermal flux.")
+        self._update_beaming_gating()
+
+    def _update_beaming_gating(self):
+        """Gate the beaming switch -- WITHOUT editing the file.
+
+        The control is disabled and the reason is shown. What it deliberately
+        does NOT do is turn an inherited `beaming: true` off: that would be an
+        edit to the user's own configuration performed on OPEN, which is the
+        class the correctness stage spent fourteen items removing and which the
+        Radiation page already refuses to do for the same reason. An opened
+        configuration whose beaming the rule would refuse gets a loud line
+        saying the rule disagrees with it, and keeps its value.
+
+        The rule is `facet_scale.beaming_gate`, which is the PARENT SWITCH and
+        then the facet scale. It used to be `beaming_policy` alone, so beaming
+        stayed offerable on a run with radiation off -- where it changes no
+        temperature and can still abort the run at startup.
+        """
+        from gui_core.facet_scale import beaming_gate
+        widget = self.widgets.get("radiation.beaming")
+        note = getattr(self, "beaming_note", None)
+        if widget is None or note is None:
+            return
+        try:
+            policy = beaming_gate(self.config_manager.get_config(),
+                                  self._project_root())
+        except Exception as exc:                             # noqa: BLE001
+            widget.setEnabled(False)
+            note.setText(
+                f"The facet-scale check could not run ({exc}), so this control "
+                f"is disabled. Refusing is the safe direction. Any value "
+                f"already in the configuration is left as it is.")
+            return
+        widget.setEnabled(bool(policy.allowed))
+        if not policy.allowed and widget.isChecked():
+            note.setText(
+                "THIS CONFIGURATION HAS SUB-FACET ROUGHNESS ON, AND THE RULE "
+                "DISAGREES WITH IT. " + policy.reason
+                + " The value has NOT been changed -- it is your file's. Turn "
+                  "it off yourself if you agree, or run it as it is.")
+            logger.warning(
+                "[card] this configuration enables radiation.beaming and the "
+                "beaming gate would refuse it: %s. The setting is left alone; "
+                "opening a file is not an edit to it.", policy.reason)
+        elif policy.needs_acknowledgment:
+            # A THIRD state, and it is not "fine". The rule could not MEASURE
+            # this mesh, which is a different statement from "this mesh is too
+            # fine" -- and reporting the first as the second would lock beaming
+            # out of every format the reader does not parse but the engine
+            # loads. The card says which of the two it is, and leaves the
+            # judgment where it belongs.
+            note.setText(
+                "THE FACET SCALE COULD NOT BE MEASURED, so nothing here has "
+                "checked this setting for you. " + policy.reason)
+        else:
+            note.setText(policy.reason)
+
+    def _on_beaming_toggled(self, checked):
+        """A USER toggle also sets the slope; a load does not reach here.
+
+        `beaming: true` with `rms_slope_deg: 0` is a startup FATAL, so ticking
+        the box without the slope would hand the user a configuration the
+        engine refuses.
+        """
+        if self._loading:
+            return
+        from gui_core.presets import LUNAR_RMS_SLOPE_DEG
+        self.config_manager.set_value(
+            "radiation.rms_slope_deg",
+            LUNAR_RMS_SLOPE_DEG if checked else 0.0)
+        self.value_changed.emit()
+
     # -- load ---------------------------------------------------------------
 
     def load_from_config(self):
@@ -1282,24 +1737,8 @@ class MoonCard(BodyCard):
         surface.setLayout(grid)
         layout.addWidget(surface)
 
-        # -- radiation exchange (local only) ----------------------------------
-        self.radiation_group = QGroupBox("Radiation exchange")
-        grid = QGridLayout()
-        grid.setColumnStretch(1, 1)
-        self.add_bool_field(grid, 0, "Facet-to-facet infrared exchange",
-                            "radiation.enabled")
-        # Label from `gui_tooltips.LABELS`, which wins over any literal here.
-        self.add_bool_field(grid, 1, "Beam infrared from sub-facet roughness",
-                            "radiation.beaming")
-        self.beaming_note = _muted("")
-        grid.addWidget(self.beaming_note, 2, 0, 1, 2)
-        self.add_file_field(grid, 3, "View-factor cache:",
-                            "radiation.view_factor_file",
-                            "View factors (*.vf *.csr *.hmat);;All Files (*)")
-        self.radiation_group.setLayout(grid)
-        layout.addWidget(self.radiation_group)
-        self.widgets["radiation.beaming"].toggled.connect(
-            self._on_beaming_toggled)
+        # -- radiation exchange (EVERY mode; see BodyCard.radiation_group) -----
+        layout.addWidget(self.radiation_group(beaming=True))
 
         layout.addWidget(self.builtin_surface_group("Moon"))
         layout.addWidget(self.thermal_group())
@@ -1312,7 +1751,6 @@ class MoonCard(BodyCard):
         local = self._mode == "local"
         self.global_group.setVisible(not local)
         self.local_group.setVisible(local)
-        self.radiation_group.setVisible(local)
 
     def load_card(self):
         super().load_card()
@@ -1348,69 +1786,7 @@ class MoonCard(BodyCard):
             "for; an imported mesh uses the single H value from Properties."
             if imported else
             f"Bundled map for ico{resolution}, matched by face count.")
-        self._update_beaming_gating()
-
-    def _update_beaming_gating(self):
-        """Gate the switch on the facet-scale rule -- WITHOUT editing the file.
-
-        The control is disabled and the reason is shown. What it deliberately
-        does NOT do is turn an inherited `beaming: true` off: that would be an
-        edit to the user's own configuration performed on OPEN, which is the
-        class the correctness stage spent fourteen items removing and which the
-        Radiation page already refuses to do for the same reason. An opened
-        configuration whose beaming the rule would refuse gets a loud line
-        saying the rule disagrees with it, and keeps its value.
-        """
-        from gui_core.facet_scale import beaming_policy
-        widget = self.widgets["radiation.beaming"]
-        try:
-            policy = beaming_policy(self.config_manager.get_config(),
-                                    self._project_root())
-        except Exception as exc:                             # noqa: BLE001
-            widget.setEnabled(False)
-            self.beaming_note.setText(
-                f"The facet-scale check could not run ({exc}), so this control "
-                f"is disabled. Refusing is the safe direction. Any value "
-                f"already in the configuration is left as it is.")
-            return
-        widget.setEnabled(bool(policy.allowed))
-        if not policy.allowed and widget.isChecked():
-            self.beaming_note.setText(
-                "THIS CONFIGURATION HAS SUB-FACET ROUGHNESS ON, AND THE "
-                "FACET-SCALE RULE DISAGREES WITH IT. " + policy.reason
-                + " The value has NOT been changed -- it is your file's. Turn "
-                  "it off yourself if you agree, or run it as it is.")
-            logger.warning(
-                "[card] this configuration enables radiation.beaming and the "
-                "facet-scale rule would refuse it: %s. The setting is left "
-                "alone; opening a file is not an edit to it.", policy.reason)
-        elif policy.needs_acknowledgment:
-            # A THIRD state, and it is not "fine". The rule could not MEASURE
-            # this mesh, which is a different statement from "this mesh is too
-            # fine" -- and reporting the first as the second would lock beaming
-            # out of every format the reader does not parse but the engine
-            # loads. The card says which of the two it is, and leaves the
-            # judgment where it belongs.
-            self.beaming_note.setText(
-                "THE FACET SCALE COULD NOT BE MEASURED, so nothing here has "
-                "checked this setting for you. " + policy.reason)
-        else:
-            self.beaming_note.setText(policy.reason)
-
-    def _on_beaming_toggled(self, checked):
-        """A USER toggle also sets the slope; a load does not reach here.
-
-        `beaming: true` with `rms_slope_deg: 0` is a startup FATAL, so ticking
-        the box without the slope would hand the user a configuration the
-        engine refuses.
-        """
-        if self._loading:
-            return
-        from gui_core.presets import LUNAR_RMS_SLOPE_DEG
-        self.config_manager.set_value(
-            "radiation.rms_slope_deg",
-            LUNAR_RMS_SLOPE_DEG if checked else 0.0)
-        self.value_changed.emit()
+        self.refresh_radiation()
 
     def extra_exposed_keys(self):
         """Keys a control on this card WRITES without being bound to it.
@@ -1513,12 +1889,21 @@ class EuropaCard(BodyCard):
         grid.addWidget(self.latitude_combo, 2, 1)
         self.widgets["mesh.latitude_override"] = self.latitude_combo
 
-        self.add_bool_field(grid, 3, "Facet-to-facet infrared exchange",
-                            "radiation.enabled")
+        # `radiation.enabled` used to sit HERE, inside the local-mesh section,
+        # so it existed only in the DEM mode of this one card. It is now the
+        # shared `BodyCard.radiation_group` below, on every mode and every run
+        # type. What stays in this section is the view-factor NOTE, because it
+        # describes the cache the TERRAIN picker fills in and belongs with the
+        # terrain that decides it.
         self.vf_note = _muted("")
-        grid.addWidget(self.vf_note, 4, 0, 1, 2)
+        grid.addWidget(self.vf_note, 3, 0, 1, 2)
         self.local_group.setLayout(grid)
         layout.addWidget(self.local_group)
+
+        # -- radiation exchange (EVERY mode; see BodyCard.radiation_group) -----
+        # No beaming switch: `facet_scale.BEAMING_BODIES` is lunar-only and the
+        # Smith slope distribution has no measured value for ice.
+        layout.addWidget(self.radiation_group())
 
         # -- the grid (run type "sweep") --------------------------------------
         self.sweep_group = QGroupBox("Parameter grid")
@@ -1780,6 +2165,7 @@ class EuropaCard(BodyCard):
             f"{terrains} terrains x {latitudes} latitudes = {len(points)} runs."
             f" Rough estimate {minutes / 60.0:.0f} h in series on this machine;"
             f" the real figure depends on the mesh and the view factors.")
+        self.refresh_radiation()
 
     # -- preparing the grid --------------------------------------------------
 
@@ -1948,6 +2334,13 @@ class MercuryCard(BodyCard):
         surface.setLayout(grid)
         layout.addWidget(surface)
 
+        # -- radiation exchange -----------------------------------------------
+        # This card had NO radiation control at all, on any run type, while
+        # `radiation.enabled` is a key the engine reads on every body. The
+        # Mercury preset writes it (`False`), so a Mercury configuration
+        # carried the switch and no screen showed it.
+        layout.addWidget(self.radiation_group())
+
         layout.addWidget(self.builtin_surface_group("Mercury"))
         layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
@@ -1961,6 +2354,7 @@ class MercuryCard(BodyCard):
 
     def _refresh(self):
         from ptm.body_table import BODY_CAPABILITIES
+        self.refresh_radiation()
         row = BODY_CAPABILITIES["Mercury"]
         self.face_count.setText(self.icosphere_note(fallback=4))
         self.properties_note.setText(
@@ -2324,6 +2718,17 @@ class GenericBodyCard(BodyCard):
                 lambda _v: self._refresh_surface())
 
         layout.addWidget(self.time_group())
+
+        # -- radiation exchange -----------------------------------------------
+        # This card had NO radiation control either, and it is the route EVERY
+        # asteroid takes: a concave shape model is exactly the geometry where
+        # facet-to-facet exchange matters, and `radiation.enabled` was
+        # unreachable for all of them. No beaming switch -- the Smith slope
+        # distribution is a lunar regolith calibration and
+        # `docs/radiation-exchange.md` section 8.4 declines to carry it to
+        # small bodies.
+        layout.addWidget(self.radiation_group())
+
         layout.addWidget(self.thermal_group())
         layout.addWidget(self.output_group())
         self._make_report(layout)
@@ -2420,6 +2825,7 @@ class GenericBodyCard(BodyCard):
         self._refresh_shape()
         self._refresh_surface()
         self._refresh_provenance()
+        self.refresh_radiation()
 
     # -- the curated tier -----------------------------------------------------
 

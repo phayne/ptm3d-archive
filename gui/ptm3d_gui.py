@@ -8,9 +8,12 @@ Two primary capabilities:
 2. Visualize results in 3D (mesh) and 2D (plots/graphs)
 """
 
+import logging
 import sys
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _setup_qt_plugin_path():
@@ -1246,10 +1249,81 @@ class PTM3DMainWindow(QMainWindow):
             f"project file -- Save will ask for a new location, and the "
             f"baseline's own record is left untouched.")
 
+    #: Milliseconds a mesh path must hold still before it is previewed. A path
+    #: field emits on every KEYSTROKE, and reading a mesh is not free -- the
+    #: A3GT production core is 77 MB and 1.8 million faces. `facet_scale`
+    #: already carries this lesson from the other direction (it checks the body
+    #: before it decodes a single vertex).
+    PREVIEW_DEBOUNCE_MS = 400
+
     def on_config_changed(self):
         """Handle configuration changes"""
         self.unsaved_changes = True
         self.update_window_title()
+        self._maybe_preview_terrain()
+
+    def _maybe_preview_terrain(self):
+        """Preview the mesh when, and only when, the MESH changed.
+
+        Keyed on the path itself rather than on the change signal, which fires
+        for every field on every screen: a terrain picked on the Europa card, a
+        shape model imported on a generic-body card and a terrain typed on the
+        Moon card all move the same two keys, and nothing else here should cost
+        a file read. Debounced so a path being typed is read once, at the end.
+
+        Never raises. It is a slot.
+        """
+        try:
+            from gui_core.mesh_preview import preview_mesh_path
+            config = self.config_manager.get_config()
+            path, _why = preview_mesh_path(config, self._preview_root())
+            key = str(path or "")
+            if key == getattr(self, "_previewed_mesh", None):
+                return
+            self._previewed_mesh = key
+            if not key:
+                return
+            timer = getattr(self, "_preview_timer", None)
+            if timer is None:
+                timer = self._preview_timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._run_terrain_preview)
+            timer.start(self.PREVIEW_DEBOUNCE_MS)
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("terrain preview could not be scheduled: %s", exc)
+
+    def _preview_root(self):
+        """The repository root a relative mesh path resolves against.
+
+        CACHED. This is reached from a configuration-changed slot, which fires
+        on every keystroke in every field, and finding the engine binary walks
+        several candidate build directories on disk each time. The root cannot
+        move while the window is open.
+        """
+        root = getattr(self, "_preview_root_cache", None)
+        if root is not None:
+            return root
+        from gui_core.preflight import find_project_root
+        try:
+            exe = SimulationRunner.find_ptm_executable()
+        except Exception:                                    # noqa: BLE001
+            exe = None
+        try:
+            root = find_project_root(exe) if exe else Path.cwd()
+        except Exception:                                    # noqa: BLE001
+            root = Path.cwd()
+        self._preview_root_cache = root
+        return root
+
+    def _run_terrain_preview(self):
+        try:
+            message = self.viz_panel.preview_terrain(
+                self.config_manager.get_config(), self._preview_root())
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning("terrain preview failed: %s", exc)
+            return
+        if message:
+            logger.info("[terrain preview] %s", message)
 
     def on_results_selected(self, results_dir):
         """Handle results directory selection"""

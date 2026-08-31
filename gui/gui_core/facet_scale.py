@@ -664,3 +664,49 @@ def beaming_policy(config, project_root=None):
 
     return BeamingPolicy(allowed=True, scale=scale,
                          reason=f"{scale.describe()}.")
+
+
+def beaming_gate(config, project_root=None):
+    """The WHOLE rule the beaming control is gated on: parent, then scale.
+
+    `radiation.beaming` is a setting INSIDE the radiation package.
+    `radiation.enabled` is its parent, and with the parent off the child is two
+    things at once, both of which the card has to act on:
+
+    * **Inert.** `rad_beaming` reaches the solver only through
+      `early_rad_config` and `rad_config`, and both of those are built inside
+      `if (enable_radiation_exchange ...)` blocks
+      (`ptm_thermal_sim.cpp:15663` and `:17977`). With radiation off, beaming
+      changes no temperature anywhere.
+    * **Still able to STOP the run.** The facet-scale check at
+      `ptm_thermal_sim.cpp:15372` is behind `if (rad_beaming)` and NOT behind
+      `enable_radiation_exchange`, so `beaming: true` on a fine mesh is a
+      startup FATAL even in a run where beaming would have done nothing. So is
+      the `rms_slope_deg > 0` check at `:13763`.
+
+    A control that is inert and can still refuse to launch is exactly a control
+    that should not be reachable. This gate disables it and says which of the
+    two facts is the reason -- and, like `beaming_policy`, it does NOT rewrite
+    an inherited `beaming: true`. Showing a configuration is not editing it.
+
+    Kept SEPARATE from `beaming_policy` rather than folded into it: that
+    function answers "is this mesh too fine", it is what
+    `test_gui_beaming_scale_rule.py` pins, and a question about the parent
+    switch has no business changing its answers.
+    """
+    radiation = (config or {}).get("radiation") or {}
+    enabled = radiation.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("true", "yes", "on", "1")
+    if not enabled:
+        return BeamingPolicy(
+            allowed=False,
+            scale=FacetScale(detail="not measured: radiation exchange is off"),
+            reason=("Radiation exchange is off, so sub-facet beaming has "
+                    "nothing to act on: it reaches the solver only through the "
+                    "radiation package, which this run does not build. It can "
+                    "still STOP the run -- the engine's facet-scale check and "
+                    "its zero-slope check both fire on 'beaming: true' whether "
+                    "or not radiation is enabled. Turn radiation exchange on "
+                    "above to use it."))
+    return beaming_policy(config, project_root)
