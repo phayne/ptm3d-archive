@@ -1,0 +1,19 @@
+{
+  "source": "DERIVED",
+  "derived_from": "shape.obj",
+  "derived_from_md5": "f3fbeb01a9ebbe4f9f71535c46848aa8",
+  "derivation": "Loop subdivision, 2 passes (1144 -> 4576 -> 18304 faces), then renormalized to the same mean vertex radius as the parent. Stated by the file's own header; measured mean vertex radius 22.044999999956 km, which agrees with the parent's 22.045 km.",
+  "generator": "NOT IN THIS REPOSITORY. No Loop-subdivision tool exists under scripts/, src/python/ or gui/ as of 2026-08-31 (grepped). This file therefore CANNOT be regenerated from tracked source, which is the reason it is tracked rather than treated as a rebuildable intermediate. Anyone reproducing it must write the subdivider, and should not assume bit-for-bit agreement with this file.",
+  "created": "2026-07-01",
+  "md5": "a17fe60812a836bf63a519794eed4e36",
+  "sha256": "f8d719b51c10b7168c8972d12b3cd3d481c879c2dc186f2302b8de2ea9af62f3",
+  "bytes": 650498,
+  "vertices": 9154,
+  "faces": 18304,
+  "units": "km",
+  "mean_radius_km": 22.045,
+  "used_by": "data/horizons_cache/bodies/623_Chimaera_(A907_BC)/body_config.yaml (generic_body.shape.mesh_file) -- this refined mesh, not the 1144-face parent, is what the Chimaera body config loads.",
+  "tracked": true,
+  "gitignore_note": "*.obj is ignored by this repository (.gitignore, a rule written for C object files -- PTM-303). This file is TRACKED anyway, through a named '!' exception on this exact path.",
+  "not_covered": "The subdivision was not re-validated here. Face count, mean radius and the parent's identity were checked on 2026-08-31; mesh topology (boundary edges, non-manifold edges, winding) was NOT re-measured, and no thermal comparison between the 1144-face parent and this mesh was run."
+}

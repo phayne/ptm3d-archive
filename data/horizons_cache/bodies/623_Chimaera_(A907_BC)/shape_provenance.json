@@ -1,0 +1,29 @@
+{
+  "source": "DAMIT",
+  "damit_id": 9110,
+  "damit_asteroid_number": 623,
+  "damit_asteroid_name": "Chimaera",
+  "model_url": "https://astro.troja.mff.cuni.cz/projects/damit/asteroids/view/9110",
+  "archive": "DAMIT (Database of Asteroid Models from Inversion Techniques), Astronomical Institute, Charles University, Prague",
+  "archive_reference": "Durech, J., Sidorin, V., Kaasalainen, M. (2010), DAMIT: a database of asteroid models, Astronomy & Astrophysics 513, A46, doi:10.1051/0004-6361/200912693",
+  "fetched": "2026-06-30",
+  "verified": "2026-08-31",
+  "verification": "Re-downloaded from DAMIT model 9110 on 2026-08-31 through gui_core.body_fetch.fetch_damit_shape at the same radius_km = 22.045 and compared: BYTE-IDENTICAL, md5 f3fbeb01a9ebbe4f9f71535c46848aa8 both times. This file is the DAMIT original as this project's converter writes it, unmodified.",
+  "md5": "f3fbeb01a9ebbe4f9f71535c46848aa8",
+  "sha256": "1e3789b94f627e6cf049b380094afee3a4f4a5eef7080b9c3524e6685d44eea1",
+  "bytes": 37163,
+  "vertices": 574,
+  "faces": 1144,
+  "units": "km",
+  "spin_pole_ecliptic_lon_deg": 139.0,
+  "spin_pole_ecliptic_lat_deg": 5.0,
+  "spin_pole_ra_deg": 143.077,
+  "spin_pole_dec_deg": 19.873,
+  "spin_period_hours": 14.6241,
+  "scaled_to_radius_km": 22.045,
+  "tracked": true,
+  "gitignore_note": "*.obj is ignored by this repository (.gitignore, a rule written for C object files -- PTM-303). This file is TRACKED anyway, through a named '!' exception on this exact path, so a fresh clone contains it and no force-add is needed.",
+  "derived_products": [
+    "shape_refined.obj -- Loop subdivision, 2 passes; see shape_refined_provenance.json"
+  ]
+}

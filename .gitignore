@@ -25,9 +25,30 @@ Makefile
 # -wide negation would offer those to the next `git add -A`. Adding a curated
 # body is already a multi-file act (see gui/gui_core/curated_sources.py,
 # "Adding a body"); this is one more line of it.
+#
+# THE POLICY these lines implement: a shape model that a committed configuration
+# loads is a production input, so it is TRACKED, it carries a named exception
+# here, and it carries a provenance sidecar next to it (source, version, URL,
+# md5, date) plus a PROVENANCE.md in its body directory. The exception is by
+# EXACT FILENAME so that removing a shape and leaving the rule behind is
+# visible. See data/horizons_cache/README.md, "Shape-model policy", and PTM-303.
 *.obj
+# (101955) Bennu -- OSIRIS-REx OLA v21 global model, and the superseded Nolan
+# 2013 radar model kept because a shipped notebook reads it by name.
 !data/horizons_cache/bodies/**/bennu_radar_shape.obj
 !data/horizons_cache/bodies/**/g_06370mm_alt_obj_0000n00000_v021.obj
+# (269) Justitia -- DAMIT model 2858, the original (PTM-303), plus the
+# 2026-07-04 hand reconstruction it replaced. The reconstruction is retained for
+# the same reason Bennu's radar model is: it is the shape behind every Justitia
+# product made before 2026-08-31. The two are geometrically identical (max
+# vertex deviation 0.000000000 km); see this body's PROVENANCE.md.
+!data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
+!data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape_reconstructed_20260704.obj
+# (623) Chimaera -- DAMIT model 9110, plus the 2-pass Loop-subdivided mesh that
+# this body's body_config.yaml actually loads. The subdivider is NOT in this
+# repository, so the refined mesh cannot be regenerated from tracked source.
+!data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape.obj
+!data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape_refined.obj
 *.so
 *.dll
 *.dylib
