@@ -861,6 +861,20 @@ class PTM3DMainWindow(QMainWindow):
             self.console_panel.append_warning("Launch canceled by pre-flight check")
             return
 
+        # -- the cube layout, if this run needs one -------------------------
+        # The placement on the card IS the specification; the `.fcg` is the
+        # file it gets written into, and the engine will not write it during a
+        # run. So it is prepared HERE: after the gate (a run that is not going
+        # ahead should not spend a minute sweeping rays) and BEFORE the run
+        # YAML is written, so the record of what ran names the layout that ran.
+        if report.flux_cube_plan is not None:
+            if not self._prepare_flux_cube_layout(report, root):
+                return
+            # The plan changed a configuration key, so the dictionary the run
+            # YAML is written from has to be re-read. Taking the stale one is
+            # how the layout would be built and then not named.
+            config_dict = self.config_manager.get_config()
+
         # The run YAML is written only once the launch is going ahead. Writing
         # it before the gate left a config.yaml in the output directory after a
         # blocked or canceled launch -- overwriting the previous run's record
@@ -912,6 +926,32 @@ class PTM3DMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start simulation:\n{str(e)}")
             self.reset_simulation_ui()
+
+    def _prepare_flux_cube_layout(self, report, root):
+        """Make this run's cube layout exist, and name it. True to go ahead.
+
+        The shared step, not a copy of it: `prepare_from_report` is what the
+        dashboard's thermal module calls too. All this adds is the console
+        prefix and putting the card back in step with the configuration.
+        """
+        from gui_core.flux_cube_build import prepare_from_report
+
+        if not prepare_from_report(
+                self, report, self.config_manager, root,
+                info=lambda t: self.console_panel.append_info(
+                    f"[flux cubes] {t}"),
+                error=lambda t: self.console_panel.append_error(
+                    f"[flux cubes] {t}")):
+            return False
+        try:
+            self.config_panel.load_from_config()
+        except Exception as exc:                             # noqa: BLE001
+            # Never fatal: the configuration is already correct, and this only
+            # refreshes what is on screen.
+            logger.warning("[flux cubes] the card could not be refreshed after "
+                           "the layout was prepared (%s); the run still uses "
+                           "the layout named in the configuration.", exc)
+        return True
 
     def stop_simulation(self):
         """Stop the running simulation"""

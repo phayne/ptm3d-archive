@@ -40,6 +40,7 @@ them: `test_config_parity.test_gui_written_yaml_uses_only_engine_keys` would
 fail on them, correctly, because they would read as settings and are not.
 """
 
+import hashlib
 import math
 import os
 import struct
@@ -667,6 +668,344 @@ def geom_command(executable, core_mesh, out_cache, mode=MODE_LATTICE,
     return argv
 
 
+# ---------------------------------------------------------------------------
+# 5. The layout is an implementation detail: the placement IS the request
+# ---------------------------------------------------------------------------
+#
+# A user asks for "a 25 m grid out to 500 m". That is the whole specification,
+# and the `.fcg` is the file the tool happens to write it into. Everything
+# below turns the specification into a deterministic path and decides whether
+# a file already on disk answers it -- so nobody has to name a file, and so a
+# file that answers a DIFFERENT question is never silently reused.
+#
+# ⛔ TWO INDEPENDENT GUARDS, deliberately, because either alone is thin:
+#
+#  1. The request is hashed into the FILE NAME. Two different specifications
+#     therefore cannot land on one path, so "change the spacing and the old
+#     layout is picked up" cannot happen by name collision.
+#  2. The candidate's own HEADER is checked against the request before it is
+#     reused (`cache_satisfies`). The name is only a name -- a file can be
+#     copied, renamed, or written by a different version of the tool -- and the
+#     header carries what the tool MEASURED.
+#
+# Guard 1 without guard 2 trusts a file name. Guard 2 without guard 1 makes
+# every spec fight over one path and rebuild constantly. The stale-layout
+# negative control in `test_gui_flux_cubes.py` exercises both.
+
+#: Bumped when anything that changes the CONTENT of a layout for a fixed
+#: request changes -- the argument list `geom_command` builds, or a default
+#: above. Old caches then miss on the name and are rebuilt rather than reused
+#: under a rule that no longer describes them.
+LAYOUT_KEY_VERSION = 1
+
+#: Characters of the digest in the file name. 12 hex characters is 48 bits;
+#: these are per-mesh-directory, so a collision needs two specifications for
+#: ONE mesh, and the header check would still refuse the wrong one.
+LAYOUT_KEY_CHARS = 12
+
+
+@dataclass(frozen=True)
+class LayoutRequest:
+    """A cube placement, as the user specified it. No file name in here.
+
+    `mesh` and `occluder` are RESOLVED absolute paths -- the same mesh named
+    two ways is one request -- and `n_faces_core` is the mesh's face count when
+    it could be read, which is what the layout's header records and the engine
+    compares against.
+    """
+    mesh: str = ""
+    occluder: str = ""
+    mode: str = MODE_LATTICE
+    spacing_m: float = DEFAULT_SPACING_M
+    radius_m: float = DEFAULT_RADIUS_M
+    height_factor: float = HEIGHT_FACTOR
+    edge_factor: float = EDGE_FACTOR
+    n_faces_core: int = 0
+    #: Named points, as a tuple of tuples so the request stays hashable and its
+    #: key does not depend on dict ordering.
+    locations: tuple = ()
+
+    @property
+    def named_names(self):
+        return tuple(row[0] for row in self.locations)
+
+    def describe(self):
+        parts = []
+        if mode_builds_lattice(self.mode):
+            parts.append(f"a {self.spacing_m:g} m grid out to "
+                         f"{self.radius_m:g} m "
+                         f"({lattice_cube_count(self.spacing_m, self.radius_m):,}"
+                         f" cubes)")
+        if mode_uses_locations(self.mode) and self.locations:
+            parts.append(f"{len(self.locations)} named location(s)")
+        return " plus ".join(parts) if parts else "no cubes"
+
+
+def request_from_config(config, project_root=None, resolve=None,
+                        face_count=None):
+    """The `LayoutRequest` a configuration plus the card's state describes.
+
+    `resolve` and `face_count` are handed in for the same reason the pre-flight
+    helpers are: this module is imported BY `gui_core.preflight`, so importing
+    it back at module level would be a cycle. Both default to no-ops so the
+    request can be built without touching the disk, which is what the key tests
+    do.
+    """
+    flux = _section(config, "flux_cubes")
+    mesh_cfg = _section(config, "mesh")
+    resolve = resolve or (lambda value, root: value)
+    raw_mesh = str(mesh_cfg.get("import_file", "") or "").strip()
+    raw_ring = str(mesh_cfg.get("occluder_file", "") or "").strip()
+    mesh = str(resolve(raw_mesh, project_root)) if raw_mesh else ""
+    ring = str(resolve(raw_ring, project_root)) if raw_ring else ""
+    mode = normalize_mode(flux.get("mode"))
+    rows = config_locations(config) if mode_uses_locations(mode) else []
+    faces = 0
+    if mesh and face_count is not None:
+        try:
+            faces = int(face_count(mesh) or 0)
+        except Exception:                                    # noqa: BLE001
+            faces = 0
+    return LayoutRequest(
+        mesh=mesh, occluder=ring, mode=mode,
+        spacing_m=_as_float(flux.get("spacing_m"), DEFAULT_SPACING_M),
+        radius_m=_as_float(flux.get("radius_m"), DEFAULT_RADIUS_M),
+        n_faces_core=faces,
+        locations=tuple(
+            (str(r.get("name", "")), _as_float(r.get("lat_deg"), 0.0),
+             _as_float(r.get("lon_deg"), 0.0),
+             _as_float(r.get("height_m"), -1.0),
+             _as_float(r.get("edge_m"), -1.0))
+            for r in rows))
+
+
+def request_key(request):
+    """A short, stable digest of everything that changes the layout's content.
+
+    `repr(float(...))` is the same round-trippable spelling `geom_command`
+    passes on the command line, so the key is keyed on the number the TOOL
+    receives and 25 and 25.0 are one request rather than two.
+
+    The mesh's face count is in the key as well as its path: an A3GT core mesh
+    has been regenerated under its own name after the artifacts built against
+    it (project map, "A3GT DEM meshes can be silently regenerated"), and a key
+    made of the path alone would hand that run the old layout. The engine also
+    refuses on the geometry hash, but by then the whole solve has run.
+    """
+    fields = [
+        f"v{LAYOUT_KEY_VERSION}",
+        f"mesh={os.path.abspath(request.mesh) if request.mesh else ''}",
+        f"faces={int(request.n_faces_core)}",
+        f"ring={os.path.abspath(request.occluder) if request.occluder else ''}",
+        f"mode={normalize_mode(request.mode)}",
+        f"hf={repr(float(request.height_factor))}",
+        f"ef={repr(float(request.edge_factor))}",
+    ]
+    if mode_builds_lattice(request.mode):
+        fields.append(f"spacing={repr(float(request.spacing_m))}")
+        fields.append(f"radius={repr(float(request.radius_m))}")
+    else:
+        # What `geom_command` actually sends. A named-locations layout does not
+        # depend on the grid numbers, so two runs that differ only in a spin
+        # box the tool never sees must share one layout rather than rebuild.
+        fields.append("radius=-1")
+    for name, lat, lon, height, edge in request.locations:
+        fields.append(f"loc={name}|{repr(float(lat))}|{repr(float(lon))}|"
+                      f"{repr(float(height))}|{repr(float(edge))}")
+    blob = "\n".join(fields).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:LAYOUT_KEY_CHARS]
+
+
+def auto_cache_path(request, fallback_dir=None):
+    """Where a layout for this request lives: beside the mesh, keyed by request.
+
+    BESIDE THE MESH, for `default_cache_path`'s reason -- a layout belongs to
+    one mesh and the engine refuses it against any other, while an output
+    directory belongs to one run and the next run overwrites it.
+
+    The key is in the STEM, so changing the spacing changes the file and the
+    old one is neither overwritten nor picked up. `fallback_dir` is used only
+    when the mesh's own directory cannot be written to; the caller says so out
+    loud, because a layout that quietly moved is a layout somebody will look
+    for where it is not.
+    """
+    if not request.mesh:
+        base = Path(fallback_dir or ".")
+        return str(base / f"flux_cubes_{request_key(request)}.fcg")
+    mesh = Path(request.mesh)
+    name = f"{mesh.stem}_flux_cubes_{request_key(request)}.fcg"
+    directory = mesh.parent
+    if not os.access(directory, os.W_OK) and fallback_dir:
+        directory = Path(fallback_dir)
+    return str(directory / name)
+
+
+def _close(a, b, tol=1e-9):
+    a, b = float(a), float(b)
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+def cache_satisfies(header, request):
+    """Does this layout answer this request? Returns (ok, reason).
+
+    THE HEADER, not the file name. `auto_cache_path` already keeps two
+    specifications on two paths, but a file can be copied, renamed or written
+    by a different build of the tool, and the header carries what the tool
+    MEASURED. A layout that disagrees is refused here rather than handed to a
+    run that would discover it after the solve -- or, for the grid numbers,
+    would not discover it at all, because the engine reads spacing and radius
+    OUT of the cache and has nothing to compare them with.
+    """
+    if header is None or not header.ok:
+        return False, (header.error if header is not None
+                       else "there is no layout to check")
+    if request.n_faces_core and header.n_faces_core != request.n_faces_core:
+        return False, (f"it was built for a {header.n_faces_core:,}-face mesh "
+                       f"and this run uses a {request.n_faces_core:,}-face one")
+    if mode_builds_lattice(request.mode):
+        if header.radius_m < 0:
+            return False, ("it carries no grid and this run asks for one")
+        if not _close(header.spacing_m, request.spacing_m):
+            return False, (f"its grid spacing is {header.spacing_m:g} m and "
+                           f"this run asks for {float(request.spacing_m):g} m")
+        if not _close(header.radius_m, request.radius_m):
+            return False, (f"its grid radius is {header.radius_m:g} m and this "
+                           f"run asks for {float(request.radius_m):g} m")
+    elif header.radius_m >= 0:
+        return False, ("it carries a grid and this run asks for named "
+                       "locations only")
+    if not _close(header.height_factor, request.height_factor):
+        return False, (f"its cubes stand at {header.height_factor:g} x the "
+                       f"facet edge and this run asks for "
+                       f"{float(request.height_factor):g} x")
+    wanted = set(request.named_names)
+    missing = sorted(wanted - set(header.names))
+    if missing:
+        return False, (f"it does not contain {len(missing)} named location(s): "
+                       f"{', '.join(missing)}")
+    if mode_uses_locations(request.mode) and header.n_named != len(wanted):
+        return False, (f"it carries {header.n_named} named location(s) and "
+                       f"this run asks for {len(wanted)}")
+    if not mode_uses_locations(request.mode) and header.n_named:
+        return False, (f"it carries {header.n_named} named location(s) and "
+                       f"this run asks for a grid only")
+    return True, "it matches this placement"
+
+
+#: What `layout_plan` decided to do. One of these, never a bare string.
+PLAN_NONE = "none"          # cubes are off, or the configuration names a file
+PLAN_REUSE = "reuse"        # a layout for exactly this request is on disk
+PLAN_BUILD = "build"        # one has to be built before the run starts
+PLAN_REFUSE = "refuse"      # it cannot be built here, and why
+
+
+@dataclass
+class LayoutPlan:
+    """How this run gets its layout, decided before anything is launched."""
+    action: str = PLAN_NONE
+    path: str = ""
+    reason: str = ""
+    argv: list = field(default_factory=list)
+    locations_csv: str = ""     # written beside the layout before the build
+    n_cubes: int = 0
+    request: LayoutRequest = None
+    #: Set when the layout landed somewhere other than beside the mesh.
+    relocated: str = ""
+
+    @property
+    def builds(self):
+        return self.action == PLAN_BUILD
+
+
+def layout_plan(config, project_root, resolve_data_path, face_count,
+                executable=None, fallback_dir=None, threads=8):
+    """Decide where this run's layout comes from, without building anything.
+
+    Called by the launch check, so every refusal here is one the user reads
+    BEFORE the solve rather than after it. The caller does the building; this
+    function only decides, which is what makes it testable without a subprocess
+    and without Qt.
+    """
+    flux = _section(config, "flux_cubes")
+    if not _truthy(flux.get("enabled"), False):
+        return LayoutPlan(reason="flux cubes are off")
+    if str(flux.get("cache_file", "") or "").strip():
+        return LayoutPlan(
+            reason="this configuration names its own layout file")
+
+    request = request_from_config(config, project_root,
+                                  resolve=resolve_data_path,
+                                  face_count=face_count)
+    plan = LayoutPlan(request=request)
+    if not request.mesh:
+        plan.action = PLAN_REFUSE
+        plan.reason = ("there is no terrain mesh to build a cube layout "
+                       "against")
+        return plan
+    mesh = Path(request.mesh)
+    if not mesh.exists():
+        plan.action = PLAN_REFUSE
+        plan.reason = (f"the terrain mesh {mesh} is not on disk, and the cube "
+                       f"layout is built against it")
+        return plan
+
+    plan.n_cubes = (lattice_cube_count(request.spacing_m, request.radius_m)
+                    if mode_builds_lattice(request.mode) else 0)
+    if mode_uses_locations(request.mode):
+        plan.n_cubes += len(request.locations)
+    if plan.n_cubes <= 0:
+        plan.action = PLAN_REFUSE
+        plan.reason = ("this placement contains no cubes at all -- widen the "
+                       "grid radius, or add a named location")
+        return plan
+
+    plan.path = auto_cache_path(request, fallback_dir)
+    if fallback_dir and Path(plan.path).parent != mesh.parent:
+        plan.relocated = (f"{mesh.parent} cannot be written to, so the layout "
+                          f"goes to {Path(plan.path).parent} instead")
+
+    existing = Path(plan.path)
+    if existing.exists():
+        ok, why = cache_satisfies(read_cache_header(existing), request)
+        if ok:
+            plan.action = PLAN_REUSE
+            plan.reason = (f"a cube layout for exactly this placement is "
+                           f"already on disk ({existing.name})")
+            return plan
+        # A file sitting on the request's own path that does NOT answer it is
+        # never quietly reused and never quietly overwritten in silence: the
+        # rebuild is announced with the reason, so "why did that take a
+        # minute" has an answer.
+        plan.reason = (f"{existing.name} is on this request's path and does "
+                       f"not answer it ({why}), so it is rebuilt")
+
+    if executable is None:
+        plan.action = PLAN_REFUSE
+        plan.reason = (f"{GEOM_EXECUTABLE} was not found beside the simulation "
+                       f"program, so the cube layout cannot be built. Build it "
+                       f"with: cmake --build build --target {GEOM_EXECUTABLE}")
+        return plan
+
+    plan.action = PLAN_BUILD
+    if not plan.reason:
+        plan.reason = (f"no cube layout for this placement exists yet, so one "
+                       f"is built before the run starts")
+    if mode_uses_locations(request.mode):
+        plan.locations_csv = locations_to_csv(
+            [{"name": n, "lat_deg": lat, "lon_deg": lon,
+              **({"height_m": h} if h >= 0 else {}),
+              **({"edge_m": e} if e >= 0 else {})}
+             for n, lat, lon, h, e in request.locations])
+    plan.argv = geom_command(
+        executable, request.mesh, plan.path, mode=request.mode,
+        spacing_m=request.spacing_m, radius_m=request.radius_m,
+        occluder_mesh=request.occluder,
+        locations_csv=(str(Path(plan.path).with_suffix(".locations.csv"))
+                       if plan.locations_csv else ""),
+        threads=threads)
+    return plan
+
+
 @dataclass
 class PreflightFindings:
     """What a launch check has to say about the flux-cube block.
@@ -681,6 +1020,10 @@ class PreflightFindings:
     dataless: list = field(default_factory=list)     # (field, path)
     cloud_paths: list = field(default_factory=list)  # (field, path)
     line: str = ""                                   # the size headline
+    #: The `LayoutPlan` the launcher must carry out before it starts the run,
+    #: or None. Only ever a PLAN_BUILD plan: a reuse needs no action beyond
+    #: writing the path into the run's YAML, which the launcher also does.
+    build_plan: object = None
 
     @property
     def ok(self):
@@ -692,7 +1035,8 @@ CACHE_KEY = "flux_cubes.cache_file"
 
 
 def preflight_findings(config, project_root, resolve_path, resolve_data_path,
-                       is_dataless, is_cloud_path, ply_face_count):
+                       is_dataless, is_cloud_path, ply_face_count,
+                       geom_executable=None, fallback_dir=None):
     """Everything a launch check can settle about flux cubes, before the run.
 
     EVERY refusal the flux-cube pass makes fires AFTER the thermal solve --
@@ -704,6 +1048,15 @@ def preflight_findings(config, project_root, resolve_path, resolve_data_path,
     imported BY `gui_core.preflight` at call time, and reaching back into it at
     import time would be a cycle. They are that module's own functions, so
     there is one resolver, not a second copy of the resolution rules.
+
+    ⛔ A MISSING LAYOUT IS NOT AN ERROR ANY MORE. The placement -- a grid at a
+    spacing, out to a radius, plus any named points -- IS the specification, and
+    the `.fcg` is the file it gets written into. When the configuration does not
+    name one, `layout_plan` works out where it belongs, whether one already on
+    disk answers this exact placement, and otherwise hands the launcher the
+    command that builds it. What stays an error is a placement that CANNOT be
+    built here: no mesh, a mesh that is not on disk, a mesh that is a cloud
+    placeholder, no geometry tool, or a placement with no cubes in it.
 
     Returns `PreflightFindings`; the caller merges it into its report.
     """
@@ -717,11 +1070,50 @@ def preflight_findings(config, project_root, resolve_path, resolve_data_path,
 
     cache = str(flux.get("cache_file", "") or "").strip()
     if not cache:
-        findings.errors.append(
-            "flux cubes: no cube layout file is set. The engine needs one and "
-            "will not build it during a run, so this run would stop after the "
-            "solve. Build it from the card, or clear flux_cubes.enabled.")
-        return findings
+        # No file named: the placement is the request, and the layout is built
+        # (or reused) before the run starts.
+        plan = layout_plan(config, project_root, resolve_data_path,
+                           ply_face_count, executable=geom_executable,
+                           fallback_dir=fallback_dir)
+        if plan.action == PLAN_REFUSE:
+            findings.errors.append(
+                f"flux cubes: the cube layout cannot be prepared for this run "
+                f"-- {plan.reason}.")
+            return findings
+        if plan.action == PLAN_NONE:
+            return findings
+        # The mesh is read by the layout tool, so it gets the same cloud
+        # treatment every other input path gets -- a placeholder would hang the
+        # BUILD rather than the run, which is the same freeze in a different
+        # place.
+        mesh_path = Path(plan.request.mesh)
+        if is_dataless(mesh_path):
+            findings.dataless.append(("mesh.import_file", str(mesh_path)))
+            return findings
+        if is_cloud_path(mesh_path):
+            findings.cloud_paths.append(("mesh.import_file", str(mesh_path)))
+        if plan.relocated:
+            findings.info.append("flux cubes: " + plan.relocated + ".")
+        if plan.action == PLAN_BUILD:
+            findings.build_plan = plan
+            findings.info.append(
+                f"flux cubes: {plan.reason}. "
+                f"{plan.request.describe().capitalize()}, written to "
+                f"{plan.path}. The run starts when it is finished.")
+            # The size headline is worth having before the build, not after:
+            # it is the one number that decides whether this run wants a
+            # 500 m grid at all.
+            findings.line = _size_line(flux, plan.n_cubes,
+                                       len(plan.request.locations), config)
+            findings.info.append("flux cubes: " + findings.line)
+            findings.info.append(_PASSIVE_NOTE)
+            return findings
+        # PLAN_REUSE: nothing to build, but the run still has to be told which
+        # file it used, and the size line still applies.
+        findings.info.append(f"flux cubes: {plan.reason}, so it is reused "
+                             f"rather than rebuilt.")
+        findings.build_plan = plan
+        cache = plan.path
 
     # The same three checks every other path field gets. They are applied here
     # rather than by adding the key to the pre-flight's own file list because
@@ -732,9 +1124,11 @@ def preflight_findings(config, project_root, resolve_path, resolve_data_path,
     cache_path = resolve_path(cache, project_root)
     if not cache_path.exists():
         findings.errors.append(
-            f"flux cubes: the cube layout file was not found: {cache_path}. "
-            f"Build it from the card; the engine will not build one during a "
-            f"run.")
+            f"flux cubes: the cube layout file this configuration names was "
+            f"not found: {cache_path}. The engine will not build one during a "
+            f"run. Clear the layout file on the card's advanced options and "
+            f"the placement above it is built for you, or point at a layout "
+            f"that exists.")
         return findings
     if is_dataless(cache_path):
         findings.dataless.append((CACHE_KEY, str(cache_path)))
@@ -765,6 +1159,28 @@ def preflight_findings(config, project_root, resolve_path, resolve_data_path,
             f"location(s): {', '.join(missing)}. Editing the list does not "
             f"move a cube -- rebuild the layout, or remove the entries.")
 
+    findings.line = _size_line(flux, header.n_cubes, header.n_named, config)
+    findings.info.append("flux cubes: " + findings.line)
+    findings.info.append(_PASSIVE_NOTE)
+    return findings
+
+
+#: Said once, in one place, so the launch check and the card cannot drift into
+#: two wordings of the one property that matters about this feature.
+_PASSIVE_NOTE = (
+    "flux cubes: passive -- the probes read the finished solution, so every "
+    "mesh temperature and flux is the same as the identical run without them.")
+
+
+def _size_line(flux, n_cubes, n_named, config):
+    """The cubes x faces x components x steps headline, and the bytes.
+
+    Shared by the layout-file branch (where the counts are the layout's own,
+    measured) and the about-to-build branch (where they are the placement's,
+    computed by `lattice_cube_count`, which is the tool's own rule rather than
+    an approximation of it). One function, so the number a user sees before the
+    build and the number they see after it are formatted the same way.
+    """
     # int(float(...)): a configuration may spell its step count `1e2`, which
     # yaml.safe_load hands back as a STRING and int() refuses.
     try:
@@ -772,27 +1188,20 @@ def preflight_findings(config, project_root, resolve_path, resolve_data_path,
                           or 0))
     except (TypeError, ValueError):
         steps = 0
-    line = (f"{header.n_cubes:,} cubes x {N_CUBE_FACES} faces x "
+    line = (f"{n_cubes:,} cubes x {N_CUBE_FACES} faces x "
             f"{N_COMPONENTS} components x {steps:,} steps")
     if steps > 0:
         line += (f" = about "
-                 f"{fmt_bytes(product_bytes(header.n_cubes, steps, header.n_named > 0))}"
+                 f"{fmt_bytes(product_bytes(n_cubes, steps, n_named > 0))}"
                  f" of binary flux")
         if flux.get("write_csv", True):
-            files = csv_files_written(header.n_cubes, header.n_named,
+            files = csv_files_written(n_cubes, n_named,
                                       flux.get("write_csv_max_cubes", 0))
             line += (f", plus {files:,} spreadsheet file(s) at roughly "
                      f"{fmt_bytes(csv_bytes(files, steps))}")
-    line += (". Estimated from the layout file and the step count; each "
-             "product also carries a short provenance record not counted "
-             "here.")
-    findings.line = line
-    findings.info.append("flux cubes: " + line)
-    findings.info.append(
-        "flux cubes: passive -- the probes read the finished solution, so "
-        "every mesh temperature and flux is the same as the identical run "
-        "without them.")
-    return findings
+    line += (". Estimated from the placement and the step count; each product "
+             "also carries a short provenance record not counted here.")
+    return line
 
 
 def default_cache_path(config, project_root=None):

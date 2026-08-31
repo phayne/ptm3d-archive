@@ -2175,11 +2175,15 @@ TOOLTIPS = {
     ),
     "flux_cubes.cache_file": (
         "The file holding where every cube stands and what each of its faces "
-        "can see. It is built once by the layout tool -- use the button below "
-        "-- and read by the run.\n"
-        "It belongs to one mesh. The run compares the layout against its own "
-        "mesh and stops if they differ, rather than reporting results for "
-        "somewhere else, so rebuild this whenever the terrain mesh changes.\n"
+        "can see.\n"
+        "LEAVE IT EMPTY unless you have one already. The placement above is "
+        "the whole specification, and the layout is built from it when the run "
+        "starts, stored beside the terrain mesh under a name that records the "
+        "placement it was built for, and reused whenever the same placement "
+        "comes round again.\n"
+        "Naming a file here uses that exact file instead. It belongs to one "
+        "mesh: the run compares the layout against its own mesh and stops if "
+        "they differ, rather than reporting results for somewhere else.\n"
         "Sets flux_cubes.cache_file."
     ),
     "flux_cubes.write_binary": (
@@ -2250,20 +2254,26 @@ TOOLTIPS = {
         "cube you would believe was in the result and is not."
     ),
     "ui.flux_cubes.build": (
-        "Runs the layout tool on the terrain mesh above and writes the layout "
-        "file, using the placement settings shown here. It measures the mesh, "
-        "places the cubes, and casts rays from each cube face to record what "
-        "that face can see.\n"
+        "Builds the layout NOW rather than when the run starts. The result is "
+        "identical either way, and it goes to the same place -- this is here "
+        "so the wait can be taken before a launch instead of during one.\n"
+        "It runs the layout tool on the terrain mesh above, using the "
+        "placement settings shown here: it measures the mesh, places the "
+        "cubes, and casts rays from each cube face to record what that face "
+        "can see.\n"
         "It uses the processor only -- no graphics card -- and takes tens of "
         "seconds on a site-scale mesh. Placing cubes is this tool's job alone, "
         "which is why editing the settings here does not move a cube until the "
         "layout is rebuilt."
     ),
     "ui.flux_cubes.status": (
-        "What the current layout file contains: how many cubes, how they are "
-        "arranged, how high they stand, and which mesh they were built for. "
-        "Read back from the file itself rather than from the settings above, "
-        "so it describes the layout the run will actually use."
+        "What this run will use for its cube layout: a file already on disk "
+        "that matches this placement, or one that will be built when the run "
+        "starts, named here before it exists.\n"
+        "When a layout file is set, this describes what the file itself "
+        "contains -- how many cubes, how they are arranged, how high they "
+        "stand, and which mesh they were built for -- read back from the file "
+        "rather than from the settings above."
     ),
 }
 

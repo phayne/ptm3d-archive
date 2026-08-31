@@ -240,6 +240,12 @@ class PreflightReport:
     beaming_warning: str = ""                        # facet-scale rule text, if triggered
     vf_cost_line: str = ""                           # advisory VF cost headline
     flux_cube_line: str = ""                         # cube count and product size
+    #: `gui_core.flux_cubes.LayoutPlan` when the run needs its cube layout
+    #: prepared before launch, else None. The launcher CARRIES IT OUT -- it
+    #: builds the layout if the plan says build, and either way writes the
+    #: path it used into `flux_cubes.cache_file` before the run YAML is
+    #: written, so the record of what ran names the layout that ran.
+    flux_cube_plan: object = None
     executable: Path = None
     project_root: Path = None
 
@@ -1577,14 +1583,23 @@ def run_preflight(config, find_executable, project_root=None,
     # imported there, so there is one resolver and not a second copy of the
     # resolution rules.
     from gui_core import flux_cubes as _fc
+    # The geometry tool is resolved HERE, from the executable this check
+    # already found, so the layout is built by the same build that will read
+    # it -- which is the mismatch the engine refuses on. Passing None simply
+    # makes the plan refuse and say which cmake target to build.
     flux_findings = _fc.preflight_findings(
         config, project_root, resolve_path, resolve_data_path, is_dataless,
-        is_cloud_path, _ply_face_count)
+        is_cloud_path, _ply_face_count,
+        geom_executable=_fc.find_geom_executable(project_root),
+        fallback_dir=str(resolve_path(
+            (config.get("output") or {}).get("directory", "") or ".",
+            project_root)))
     report.errors.extend(flux_findings.errors)
     report.info.extend(flux_findings.info)
     report.dataless.extend(flux_findings.dataless)
     report.cloud_paths.extend(flux_findings.cloud_paths)
     report.flux_cube_line = flux_findings.line
+    report.flux_cube_plan = flux_findings.build_plan
 
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)

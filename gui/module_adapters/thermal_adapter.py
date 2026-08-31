@@ -181,6 +181,24 @@ class ThermalModule(AbstractModule):
                 "[THERMAL] Launch canceled by pre-flight check")
             return
 
+        # The cube layout, if this run needs one. THE SAME STEP the main
+        # window performs, from the same shared function: a launcher that
+        # skipped it would start a run with the cubes on and no layout, which
+        # the launch check now passes by design, and the engine's refusal
+        # fires only after the whole thermal solve.
+        if report.flux_cube_plan is not None:
+            from gui_core.flux_cube_build import prepare_from_report
+            if not prepare_from_report(
+                    self._widget, report, self._cm, report.project_root,
+                    info=lambda t: self._console.append_info(
+                        f"[THERMAL][flux cubes] {t}"),
+                    error=lambda t: self._console.append_error(
+                        f"[THERMAL][flux cubes] {t}")):
+                return
+            # The plan wrote a configuration key, so the dictionary the run
+            # YAML is built from has to be re-read.
+            config_dict = self._cm.get_config()
+
         # Write the run config BESIDE the output directory, never a temp
         # file: the engine resolves a relative radiation.view_factor_file
         # against the YAML's own directory, so a config in /var/folders/...
