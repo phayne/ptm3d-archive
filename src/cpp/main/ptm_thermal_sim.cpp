@@ -4970,11 +4970,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "  Every per-layer array in ThermalBatchSoA is a fixed-size stack "
                      "buffer; a taller\n"
                      "  column would overflow it rather than silently truncate.\n"
-                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or "
-                     "raise\n"
-                     "  MAX_THERMAL_LAYERS in thermal_model.h if this column genuinely "
-                     "needs more\n"
-                     "  depth resolution." << std::endl;
+                     "  Three ways out, cheapest first:\n"
+                     "    * run the SCALAR solver (--no-simd-batch). It allocates the "
+                     "depth grid on the\n"
+                     "      heap (thermal::Profile) and has NO layer ceiling, so it "
+                     "handles this column\n"
+                     "      as configured -- at the cost of the 8-face SIMD batching.\n"
+                     "    * lower thermal.thermal_m (layers per skin depth) or "
+                     "thermal.thermal_b (skin\n"
+                     "      depths to the bottom layer) so the grid fits.\n"
+                     "    * raise MAX_THERMAL_LAYERS in thermal_model.h if this column "
+                     "genuinely needs\n"
+                     "      more depth resolution on the SIMD path (it is a stack "
+                     "footprint, not a knob:\n"
+                     "      each ThermalBatchSoA is ~"
+                  << (thermal::MAX_THERMAL_LAYERS * 8 * 10 * sizeof(double)) / 1024
+                  << " KiB per thread today).\n"
+                     "  BUGS.md PTM-302." << std::endl;
         return false;
     }
 
