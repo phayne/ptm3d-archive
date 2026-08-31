@@ -575,17 +575,23 @@ def radiation_coupling_albedo_map(config, illum, project_root):
 
     Returns ``(Path, face_count)`` or ``(None, None)``.
 
-    This load (``ptm_thermal_sim.cpp:18086-18130``) is a SECOND, independent
-    read of the albedo map, and it does not honor ``illumination.use_albedo_map``
-    -- the engine says so itself in the warning at ``:18180``. It also does not
-    honor ``illumination.albedo_maps_directory`` being cleared: an empty
-    directory falls back to the literal ``data/albedo_maps`` (``:18110``). So
-    there is NO configuration key that turns it off, and the only things that
-    stop it are a missing file, a face-count mismatch, or a generic body.
+    This load is a SECOND, independent read of the albedo map, separate from
+    the absorbed-flux composer's.
 
-    Reproduced here so the GUI can say which file that is before the run, not
-    after. Search order and the acceptance test (``loaded.size() == num_faces``)
-    are transcribed from that block.
+    It now HONORS ``illumination.use_albedo_map`` (BUGS.md PTM-454, fixed
+    2026-08-30): with the switch off the coupling keeps the uniform body albedo
+    and no file is searched for at all. Before that fix no configuration key
+    stopped it, which is why this helper and its caller used to warn about two
+    albedo fields in one run -- that warning is gone with the behavior.
+
+    What it still does not honor is ``illumination.albedo_maps_directory``
+    being cleared: an empty directory falls back to the literal
+    ``data/albedo_maps``. With the switch ON, the things that stop the load are
+    a missing file, a face-count mismatch, or a generic body.
+
+    Reproduced here so the GUI can say which file will be read before the run,
+    not after. Search order and the acceptance test
+    (``loaded.size() == num_faces``) are transcribed from that block.
     """
     # A generic body never gets a `target_body_name`, so this load cannot
     # resolve a file name at all. The test is whether one is CONFIGURED, not
@@ -1479,30 +1485,31 @@ def run_preflight(config, find_executable, project_root=None,
             "imported mesh) for it to have something to exchange with.")
 
     # -- Two albedo fields in one run ----------------------------------------
-    # The thermal surface boundary condition honors illumination.use_albedo_map.
-    # The radiation-coupling albedo load does NOT (ptm_thermal_sim.cpp:18180
-    # says so in a warning the engine prints only after the run has started),
-    # and no configuration key turns it off. With the map disabled and a
-    # res-matched per-face map on disk, the absorbed-flux albedo and the
-    # two-band radiosity source albedo are DIFFERENT FIELDS.
+    # RETIRED 2026-08-30 with the engine fix it described (BUGS.md PTM-454).
+    # This block used to warn that the radiation-coupling albedo load ignored
+    # illumination.use_albedo_map, and it advised turning the map ON so both
+    # paths would use it -- advice that CHANGES THE PHYSICS of the run. The
+    # engine now honors the switch at that call site, so the warning would be
+    # false and the advice actively harmful. Removing the rule, not softening
+    # it: there is no longer a mixed state to warn about.
     #
-    # Said here, before the run, naming the file. Warning rather than error: it
-    # is the engine's behavior, not a broken configuration, and refusing to
-    # launch would block re-running an archived config exactly as it ran.
-    if rad.get("enabled", False) and illum.get("use_albedo_map") is False:
-        map_path, n_map = radiation_coupling_albedo_map(
-            config, illum, project_root)
-        if map_path is not None:
-            report.warnings.append(
-                f"albedo: this run asks for a UNIFORM albedo "
-                f"(illumination.use_albedo_map is off), but radiation exchange "
-                f"is on and the radiation-coupling albedo load ignores that "
-                f"switch -- it will load {map_path} ({n_map} faces, matching "
-                f"this mesh) anyway. The absorbed-flux albedo and the two-band "
-                f"radiosity source albedo would then be two different fields "
-                f"in one run. Either turn the albedo map on so both use it, or "
-                f"turn radiation exchange off, or move the map out of the "
-                f"albedo directory.")
+    # The one mixed state that survives is an EXPLICIT illumination.albedo_map
+    # (a FITS file) with use_albedo_map off: the absorbed-flux composer tests
+    # the explicit key first and honors it regardless of the switch, while the
+    # coupling has no FITS reader and stays uniform. That is pre-existing
+    # behavior on a different key; the engine discloses it at launch.
+    if (rad.get("enabled", False)
+            and illum.get("use_albedo_map") is False
+            and str(illum.get("albedo_map", "") or "").strip()):
+        report.warnings.append(
+            f"albedo: illumination.use_albedo_map is off, so radiation "
+            f"coupling will use the uniform body albedo -- but "
+            f"illumination.albedo_map names an explicit map "
+            f"({illum.get('albedo_map')}), which the absorbed-flux path honors "
+            f"regardless of that switch. The surface boundary condition and "
+            f"the two-band radiosity source albedo would then be two different "
+            f"fields in one run. Either clear illumination.albedo_map, or turn "
+            f"illumination.use_albedo_map on so the intent is explicit.")
 
     # -- View-factor cost estimate (advisory: warns, never blocks) -----------
     if rad.get("enabled", False):

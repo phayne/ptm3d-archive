@@ -18130,15 +18130,99 @@ int main(int argc, char** argv) {
                     "data/albedo_maps/" + albedo_filename
                 };
 
+                // BUGS.md PTM-454. Until this gate existed, NO config key stopped
+                // this load: the search below ran unconditionally and accepted any
+                // <Body>_Albedo_res<N>.bin whose length matched the face count, so
+                // `illumination.use_albedo_map: false` produced a run whose thermal
+                // surface boundary condition used the uniform body albedo while the
+                // two-band radiosity source albedo came off the map -- two different
+                // albedo fields in one simulation, disclosed only by a warning
+                // (below) that said the mixed state was being left as it was.
+                //
+                // Honor the switch here, the same way the CPU absorbed-flux composer
+                // (the `albedo_map_disabled` branch) and the GPU thermal path
+                // (`!albedo_map_disabled && ...`) already do. `false` now means the
+                // coupling keeps face_albedos_rad at the uniform body albedo, which
+                // is the SAME field the surface BC is using -- one physics, and the
+                // mixed state is unreachable rather than merely announced.
+                //
+                // Folded in: BUGS.md PTM-369. The three bare "File does not exist:"
+                // lines this probe printed on a disabled run came from the search
+                // loop; not searching is what silences them.
+                const bool rad_albedo_map_disabled =
+                    (thermal_config.getProperty("use_albedo_map") == "0");
+
+                // Format albedo explicitly: std::cout is left in `fixed` with
+                // precision 1 at this point in the run, which renders 0.12 as "0.1"
+                // and has already been mistaken for a real albedo bug once.
+                auto fmt_albedo = [](double a) {
+                    std::ostringstream os;
+                    os << std::fixed << std::setprecision(4) << a;
+                    return os.str();
+                };
+
+                // An EXPLICIT illumination.albedo_map (a FITS file) is opened by
+                // the caller on every path, and the absorbed-flux composer tests
+                // that key BEFORE use_albedo_map -- so with both set, the surface
+                // BC runs the explicit per-face map while the switch is off. The
+                // coupling has no FITS reader here, so it stays uniform. That
+                // mixed state is PRE-EXISTING and not what this gate is about,
+                // but the "same field" sentence below would be a lie in that
+                // case, so it is not printed there.
+                const bool rad_explicit_albedo_map =
+                    !thermal_config.getProperty("albedo_map").empty();
+
                 std::string albedo_source_rad;
-                for (const auto& apath : albedo_search_paths) {
-                    auto loaded = importAlbedoMapFromFile(apath);
-                    if (!loaded.empty() && loaded.size() == num_faces) {
-                        face_albedos_rad = std::move(loaded);
-                        albedo_source_rad = apath;
-                        std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
-                        break;
+                if (rad_albedo_map_disabled) {
+                    if (rad_explicit_albedo_map) {
+                        std::cout << "  WARNING: use_albedo_map is false, so radiation coupling"
+                                     " uses the uniform albedo "
+                                  << fmt_albedo(planet.albedo)
+                                  << ", but illumination.albedo_map names an EXPLICIT map ("
+                                  << thermal_config.getProperty("albedo_map")
+                                  << "). The absorbed-flux path tests that key BEFORE the"
+                                     " switch, so IF that file loaded (see the"
+                                     " 'Using provided albedo map' / 'Failed to load explicit"
+                                     " albedo_map' line above), the surface boundary condition"
+                                     " and the radiosity source albedo are DIFFERENT fields in"
+                                     " this run. See BUGS.md PTM-454." << std::endl;
+                    } else {
+                        std::cout << "  Albedo map loading disabled (use_albedo_map: false):"
+                                     " radiation coupling uses the uniform albedo "
+                                  << fmt_albedo(planet.albedo)
+                                  << " -- the same field as the thermal surface boundary"
+                                     " condition. No per-face map is searched for or read."
+                                  << std::endl;
                     }
+                } else {
+                    for (const auto& apath : albedo_search_paths) {
+                        auto loaded = importAlbedoMapFromFile(apath);
+                        if (!loaded.empty() && loaded.size() == num_faces) {
+                            face_albedos_rad = std::move(loaded);
+                            albedo_source_rad = apath;
+                            std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
+                            break;
+                        }
+                    }
+                }
+
+                // The uniform fallback above is planet.albedo; the surface BC builds
+                // face_albedos from default_visible_albedo. Those are forced equal
+                // where default_visible_albedo is resolved, but only to within 1e-3
+                // (a larger disagreement warns and takes the planet value), so a
+                // sub-1e-3 difference could survive silently into two different
+                // uniform albedos. Say so rather than let it. Only meaningful when
+                // the coupling actually IS running uniform -- with a map loaded,
+                // face_albedos_rad is per-face and planet.albedo is not its value.
+                if (albedo_source_rad.empty() &&
+                    std::abs(planet.albedo - default_visible_albedo) > 1e-12) {
+                    std::cout << "  WARNING: the radiation-coupling uniform albedo "
+                              << fmt_albedo(planet.albedo)
+                              << " differs from the surface boundary condition's operative albedo "
+                              << fmt_albedo(default_visible_albedo)
+                              << " (difference " << std::scientific << std::setprecision(3)
+                              << std::abs(planet.albedo - default_visible_albedo)
+                              << std::defaultfloat << "). See BUGS.md PTM-55." << std::endl;
                 }
 
                 // Never substitute silently: if no per-face map resolved, this path is
@@ -18150,8 +18234,6 @@ int main(int argc, char** argv) {
                 // DEM mesh can never match a global icosphere bin's face count, and
                 // use_albedo_map:false is an explicit request for a uniform albedo.
                 // Mirrors the GPU path's gate (see the albedo_map_disabled branches).
-                const bool rad_albedo_map_disabled =
-                    (thermal_config.getProperty("use_albedo_map") == "0");
                 bool rad_is_custom_mesh = false;
                 {
                     auto it = thermal_config.custom_properties.find("is_custom_mesh");
@@ -18164,15 +18246,6 @@ int main(int argc, char** argv) {
                     !body_name_rad.empty() &&
                     thermal_config.getProperty("using_generic_body") != "true";
 
-                // Format albedo explicitly: std::cout is left in `fixed` with
-                // precision 1 at this point in the run, which renders 0.12 as "0.1"
-                // and has already been mistaken for a real albedo bug once.
-                auto fmt_albedo = [](double a) {
-                    std::ostringstream os;
-                    os << std::fixed << std::setprecision(4) << a;
-                    return os.str();
-                };
-
                 if (albedo_source_rad.empty() && rad_map_expected) {
                     std::cout << "  WARNING: no per-face albedo map found for "
                               << body_name_rad << " res" << mesh_res_rad
@@ -18182,21 +18255,21 @@ int main(int argc, char** argv) {
                               << fmt_albedo(planet.albedo) << " instead." << std::endl;
                 }
 
-                // The reverse divergence, and the more dangerous one: the thermal
-                // surface BC honors use_albedo_map, this radiation-coupling load never
-                // has. With use_albedo_map:false the BC runs a uniform albedo while the
-                // two-band radiosity source albedo is per-face off the map -- two
-                // different albedo fields in one run. Behavior is left AS IS here (that
-                // is a physics decision, not a disclosure one), but it is no longer
-                // silent. See BUGS.md.
+                // BUGS.md PTM-454, the state this fix removes. Until the gate above,
+                // `use_albedo_map: false` gave a run whose surface BC used a uniform
+                // albedo while the radiosity source albedo came off the map, and the
+                // engine only ANNOUNCED it. The gate makes that unreachable; this is
+                // the assertion that keeps it unreachable if the gate is ever moved.
                 if (!albedo_source_rad.empty() && rad_albedo_map_disabled) {
-                    std::cout << "  WARNING: use_albedo_map is FALSE, so the thermal"
-                                 " surface boundary condition is using the uniform albedo "
-                              << fmt_albedo(planet.albedo) << ", but radiation coupling has loaded the"
-                                 " per-face map " << albedo_source_rad
-                              << " anyway. The two-band radiosity source albedo and the"
-                                 " absorbed-flux albedo are therefore DIFFERENT fields in"
-                                 " this run." << std::endl;
+                    std::cerr << "\n[radiation] FATAL: use_albedo_map is FALSE but the"
+                                 " radiation coupling still loaded the per-face map "
+                              << albedo_source_rad << ".\n"
+                                 "  That is the mixed-albedo state BUGS.md PTM-454 removed;"
+                                 " reaching it means the\n"
+                                 "  gate on the map search above was bypassed. Refusing"
+                                 " rather than running two\n"
+                                 "  different albedo fields in one simulation." << std::endl;
+                    return 1;
                 }
 
                 // PTM-34 tripwire (radiation-coupling path). See the CPU absorbed-flux
