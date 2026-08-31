@@ -219,6 +219,43 @@ out = subprocess.run([sys.executable, TARGET, dirty], capture_output=True)
 check(b"colour" in out.stdout and out.returncode == 1,
       "the run that PRINTS a hit also FAILS (prints and returns 0 is the bug)")
 
+# --- 9. the argument parser is strict --------------------------------------
+# An unrecognized flag used to be filed as a PATH: the file did not exist, was
+# skipped, and the run printed "check_american_english: clean" and returned 0.
+# `--help` "passed" the gate. Measured on origin/main 2baf6bb before this was
+# argparse: `--help` and `--bogus` both rc=0, both printing "clean".
+out = subprocess.run([sys.executable, TARGET, "--help"], capture_output=True)
+check(out.returncode == 0 and b"usage:" in out.stdout,
+      f"--help prints usage and exits 0 (got {out.returncode})")
+check(b"check_american_english: clean" not in out.stdout,
+      "--help does not report a verdict on a file called '--help'")
+
+out = subprocess.run([sys.executable, TARGET, "--bogus"], capture_output=True)
+check(out.returncode == 2,
+      f"an unrecognized flag exits 2, not 0 (got {out.returncode})")
+check(b"usage:" in out.stderr and b"--bogus" in out.stderr,
+      "an unrecognized flag prints usage naming the flag")
+check(b"check_american_english: clean" not in out.stdout,
+      "an unrecognized flag never reports a clean tree")
+
+# ...and the negative controls: the ordinary invocations are unchanged.
+rc = subprocess.run([sys.executable, TARGET, "--exclude", os.path.dirname(dirty),
+                     clean, dirty], capture_output=True).returncode
+check(rc == 0, f"--exclude <dir> still excludes (got {rc})")
+rc = subprocess.run([sys.executable, TARGET,
+                     "--exclude=" + os.path.dirname(dirty), clean, dirty],
+                    capture_output=True).returncode
+check(rc == 0, f"--exclude=<dir> still excludes (got {rc})")
+
+# Flags and paths INTERLEAVED, which the hand-rolled loop accepted and plain
+# `parse_args` rejects with the same exit code as a typo. This is why the
+# parser uses `parse_intermixed_args`.
+out = subprocess.run([sys.executable, TARGET, clean, "--exclude", "nowhere/",
+                      dirty], capture_output=True)
+check(out.returncode == 1 and b"colour" in out.stdout,
+      f"a PATH after --exclude's value is still a path, not a usage error "
+      f"(got {out.returncode})")
+
 if _fail == 0:
     print("\nALL AMERICAN-ENGLISH CHECKER TESTS PASSED")
 else:
