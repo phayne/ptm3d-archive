@@ -1185,9 +1185,20 @@ def test_a_cards_exposed_keys_are_keys_the_engine_reads():
     """A card that shows a control for a key nothing reads is a card that lies."""
     from ptm.engine_config import known_keys
     known = set(known_keys())
-    # GUI-synthetic keys that stand for real ones, and are translated at save
-    # time by ConfigManager._config_for_yaml.
-    synthetic = {"illumination.albedo_source", "mesh.topo_source"}
+    # GUI-synthetic keys that stand for real ones, and are translated or
+    # dropped at save time by ConfigManager._config_for_yaml.
+    #
+    # The three flux-cube entries are inputs to `ptm_flux_cube_geom`, not to
+    # the engine: the tool bakes them into the layout file's header, and the
+    # engine reads them back OUT of that header and refuses a layout whose
+    # values do not match the run. `config_parser.cpp` accepts them under
+    # `flux_cubes:` and reports them as ignored, which is the same statement
+    # from the other side. `_flux_cube_section_for_yaml` builds the emitted
+    # block from a fixed list of the seven keys the engine reads, so none of
+    # these three can reach a written configuration.
+    synthetic = {"illumination.albedo_source", "mesh.topo_source",
+                 "flux_cubes.mode", "flux_cubes.spacing_m",
+                 "flux_cubes.radius_m"}
     with tempfile.TemporaryDirectory() as scratch:
         _, panel = _panel(scratch)
         stray = []

@@ -782,6 +782,10 @@ _POLICY_ENUMS = [
     "generic_body.ephemeris_source",
     "thermal.property_map_mode",
     "thermal.property_map_kind",
+    # Which of two placement workflows the flux-cube group offers. Picking one
+    # decides what the layout tool is asked to build -- a lattice or a set of
+    # named points -- so each choice has to be explained by name.
+    "flux_cubes.mode",
 ]
 
 
