@@ -249,6 +249,68 @@ public:
     double convertTimeToET(const std::string& time_str);
     std::array<double, 3> getSunPosition(double et);
     std::array<double, 3> getPrimaryPosition(double et);
+
+    // ----------------------------------------------------------------------
+    // Ephemeris provenance (BUGS.md PTM-301)
+    // ----------------------------------------------------------------------
+    // getSunPosition() falls back to Keplerian propagation whenever spkpos_c
+    // fails -- typically an epoch outside the loaded SPK's coverage. That
+    // fallback used to emit nothing at all: a run could be 100 % Keplerian,
+    // exit 0, write non-degenerate temperatures and record
+    // `ephemeris_source: spice` in its provenance, with the startup banner's
+    // "Keplerian fallback: enabled" (a statement of AVAILABILITY) the only
+    // related line in the log. 14 of 15 Justitia SPICE runs were exactly that
+    // (PTM-300), and on Bennu the cost was measured at up to 24 K.
+    //
+    // Two halves, because neither alone is sufficient: the counter catches a
+    // run whose window is only PARTLY covered, the pre-check catches a config
+    // before it burns the wall clock.
+    struct EphemerisFallbackReport {
+        bool        spice_mode      = false;  // false = configured Keplerian; the
+                                              // rest of this struct is then moot
+        long long   sun_queries     = 0;      // getSunPosition() calls in SPICE mode
+        long long   sun_fallbacks   = 0;      // ...of which the fallback served
+        // ET span actually served by Kepler. Seeded to the empty interval so
+        // the accumulator needs no first-time branch; `sun_fallbacks > 0` is
+        // the only "is this span real?" test, rather than a second flag that
+        // could disagree with the count.
+        double      fallback_et_min =  std::numeric_limits<double>::infinity();
+        double      fallback_et_max = -std::numeric_limits<double>::infinity();
+        bool        have_coverage   = false;  // spkcov_c succeeded for this body
+        double      coverage_et_min = 0.0;
+        double      coverage_et_max = 0.0;
+        bool        have_window     = false;  // run window as pre-checked
+        double      window_et_min   = 0.0;
+        double      window_et_max   = 0.0;
+        bool        coverage_checked = false; // checkSpkCoverage() was called
+        bool        window_covered   = false;
+    };
+    const EphemerisFallbackReport& ephemerisFallbackReport() const {
+        return ephemeris_report_;
+    }
+
+    // Compare the loaded SPK coverage for the target body against the run
+    // window [et_start, et_end] (which must already INCLUDE the equilibration
+    // prefix -- spin-up integrates before start_time, and that is precisely
+    // where PTM-437 found every epoch falling outside a forward-only kernel).
+    //
+    // Returns true when the run may proceed. Warns and returns true when the
+    // window is not covered and `strict` is false; prints the same coverage
+    // line and returns FALSE when `strict` is true. A configured-Keplerian run
+    // returns true without printing: there is no SPK to check.
+    bool checkSpkCoverage(double et_start, double et_end, bool strict);
+
+    // One line at end of run: how many epochs the fallback actually served.
+    // Silent for a configured-Keplerian run (nothing was substituted) and for
+    // a SPICE run with zero engagements it prints the clean verdict, because
+    // "the log said nothing" is what made PTM-300 invisible.
+    void reportEphemerisFallback() const;
+
+    // `key=value` lines for provenance.txt, in the same shape the file already
+    // uses. Built here rather than in the caller so the UTC formatting stays in
+    // the one translation unit that links CSPICE.
+    std::string ephemerisProvenanceBlock() const;
+
     static std::array<double, 3> cartesianFromLatLon(double lat, double lon, double radius = 1.0);
     static std::pair<double, double> latLonFromCartesian(double x, double y, double z);
 
@@ -624,6 +686,13 @@ private:
     std::unique_ptr<orbital::KeplerianPropagator> keplerian_propagator_;
     std::unique_ptr<orbital::BodyFixedFrame> body_fixed_frame_;
     double keplerian_epoch_et_ = 0.0;  // ET offset for Keplerian epoch
+
+    // BUGS.md PTM-301. Plain (non-atomic) counters on purpose: every
+    // getSunPosition() call site in this file is a serial `for (t...)` loop
+    // (the epoch grid is built once, before the parallel face work), and
+    // CSPICE is not reentrant, so a parallel caller would be a defect in its
+    // own right rather than a reason to make these atomic.
+    EphemerisFallbackReport ephemeris_report_;
 
     // Embree ray tracing methods
     bool initializeEmbree();

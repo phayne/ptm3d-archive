@@ -374,6 +374,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.time.duration_days = getWithDefault(sim, "duration_days", config.time.duration_days);
             config.time.timesteps = getWithDefault(sim, "timesteps", config.time.timesteps);
             config.time.body = getWithDefault(sim, "body", config.time.body);
+            config.time.spice_coverage_strict = getWithDefault(sim, "spice_coverage_strict", config.time.spice_coverage_strict);
         }
         
         // Parse Mesh section
@@ -917,6 +918,10 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "duration_days" << YAML::Value << config.time.duration_days;
         out << YAML::Key << "timesteps" << YAML::Value << config.time.timesteps;
         out << YAML::Key << "body" << YAML::Value << config.time.body;
+        // Emitted only when set, so a save round-trip does not add a key to
+        // every config in the corpus just because a new default exists.
+        if (config.time.spice_coverage_strict)
+            out << YAML::Key << "spice_coverage_strict" << YAML::Value << config.time.spice_coverage_strict;
         out << YAML::EndMap;
         
         // Mesh section
@@ -1278,7 +1283,10 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "                                      # boundary is exact in ET, not in UTC)\n";
     out << "  duration_days: 3.55                # Simulation duration\n";
     out << "  timesteps: 72                       # Number of output timesteps\n";
-    out << "  body: \"Europa\"                      # Target body (Europa, Moon, Mercury, etc.)\n\n";
+    out << "  body: \"Europa\"                      # Target body (Europa, Moon, Mercury, etc.)\n";
+    out << "  spice_coverage_strict: false        # true = REFUSE when the loaded SPK does not span\n";
+    out << "                                      # the run window (spin-up included); false = warn\n";
+    out << "                                      # and run on the Keplerian fallback (BUGS.md PTM-301)\n\n";
     
     out << "# ========== Mesh Configuration ==========\n";
     out << "mesh:\n";

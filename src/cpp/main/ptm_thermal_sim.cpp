@@ -1460,6 +1460,11 @@ static inline bool legacyRadiosityStaticAlbedo() {
 }
 
 // ---- Tri-state env gate --------------------------------------------------
+// Named for the radiation gates it was written for, but nothing about it is
+// radiation-specific, so it is the shared spelling rule for every boolean
+// environment override in this file (BUGS.md PTM-301's
+// PTM_SPICE_COVERAGE_STRICT is the second user).
+//
 // A gate that ships default ON keeps its environment variable as a KILL
 // SWITCH, and the three states are not interchangeable: "unset" means the
 // engine chose this, "=1" means the operator asked for it, and only the second
@@ -1474,7 +1479,7 @@ static inline bool legacyRadiosityStaticAlbedo() {
 // PTM_RAD_SKIP_EQ_STEPS=false as "the operator demands the skip" would abort a
 // run whose author was trying to disable it. Only the documented falsey and
 // truthy spellings are accepted; anything else is FATAL rather than guessed at.
-static inline int radGateEnvState(const char* name) {
+static inline int envTristateFlag(const char* name) {
     const char* e = std::getenv(name);
     if (!e || e[0] == '\0') return 0;
     std::string v(e);
@@ -1518,11 +1523,11 @@ static inline int radGateEnvState(const char* name) {
 // request that cannot be honored must fail, not be downgraded) while the
 // default-on gate stands down with a printed reason.
 static inline bool radSkipEqStepsEnabled() {
-    static bool on = (radGateEnvState("PTM_RAD_SKIP_EQ_STEPS") >= 0);
+    static bool on = (envTristateFlag("PTM_RAD_SKIP_EQ_STEPS") >= 0);
     return on;
 }
 static inline bool radSkipEqStepsForced() {
-    static bool forced = (radGateEnvState("PTM_RAD_SKIP_EQ_STEPS") > 0);
+    static bool forced = (envTristateFlag("PTM_RAD_SKIP_EQ_STEPS") > 0);
     return forced;
 }
 
@@ -1543,7 +1548,7 @@ static inline bool radSkipEqStepsForced() {
 // not a knob. It IS a results change -- it re-thermals faces the pre-2026-08-15
 // selector froze -- and it costs nothing measurable.
 static inline bool radSelectOutputWindowEnabled() {
-    static bool on = (radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW") >= 0);
+    static bool on = (envTristateFlag("PTM_RAD_SELECT_OUTPUT_WINDOW") >= 0);
     return on;
 }
 
@@ -14356,13 +14361,13 @@ int main(int argc, char** argv) {
         }
         // Same reasoning, same place: parse the three radiation gate variables
         // NOW so an unrecognized spelling costs nothing, instead of aborting
-        // after minutes to hours of ray tracing. radGateEnvState() exits on a
+        // after minutes to hours of ray tracing. envTristateFlag() exits on a
         // value it cannot classify; calling it here just moves that to t=0.
         // (Each is a function-local static in its accessor, so this also fixes
         // the value before any later read can see a different environment.)
-        (void)radGateEnvState("PTM_RAD_SKIP_EQ_STEPS");
-        (void)radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW");
-        (void)radGateEnvState("PTM_RHO_ADVISORY");
+        (void)envTristateFlag("PTM_RAD_SKIP_EQ_STEPS");
+        (void)envTristateFlag("PTM_RAD_SELECT_OUTPUT_WINDOW");
+        (void)envTristateFlag("PTM_RHO_ADVISORY");
     }
 
     // ----------------------------------------------------------------------
@@ -14605,7 +14610,11 @@ int main(int argc, char** argv) {
                   << "[validate-config]   NOT checked: anything that needs the "
                      "mesh, the body or SPICE --\n"
                   << "[validate-config]            mesh loading and units, "
-                     "generic-body construction, SPICE kernels,\n"
+                     "generic-body construction, SPICE kernels\n"
+                  << "[validate-config]            (including whether the SPK "
+                     "spans the run window: that check needs\n"
+                  << "[validate-config]            furnsh'd kernels and the "
+                     "resolved epoch grid, so it runs at launch),\n"
                   << "[validate-config]            property-map face counts, the "
                      "martinez2021 density guard, view\n"
                   << "[validate-config]            factors, and the spin-up seed "
@@ -16413,6 +16422,43 @@ int main(int argc, char** argv) {
         return 1;
     }
     illumination_model->setExternalTimeGrid(external_ets);
+
+    // ----------------------------------------------------------------------
+    // SPK coverage pre-check (BUGS.md PTM-301, second half)
+    // ----------------------------------------------------------------------
+    // Run HERE, not in --validate-config: the check needs furnsh'd kernels and
+    // the resolved epoch grid, neither of which exists at the config-only exit.
+    // But it is still before the illumination ray tracing and the thermal
+    // solve, so a config whose window sits outside its kernel fails in seconds
+    // rather than after a full run that reports rc=0 and Keplerian physics.
+    //
+    // external_ets is the whole grid INCLUDING the equilibration prefix, which
+    // is the span that matters: spin-up integrates before start_time, and a
+    // forward-only kernel fetch is exactly how PTM-437 put every spin-up epoch
+    // outside coverage.
+    if (!external_ets.empty()) {
+        // Spelling rule shared with the radiation gates (envTristateFlag):
+        // 1/true/on/yes, 0/false/off/no, case-insensitive, and FATAL on
+        // anything else rather than guessed at. The env var may only
+        // STRENGTHEN the config -- this is an opt-in safety switch, and one a
+        // stray value can turn OFF is not one.
+        bool coverage_strict = sim_config.time.spice_coverage_strict;
+        const int env_strict = envTristateFlag("PTM_SPICE_COVERAGE_STRICT");
+        if (env_strict > 0 && !coverage_strict) {
+            std::cout << "[ephemeris] PTM_SPICE_COVERAGE_STRICT turns SPK-coverage"
+                         " strictness ON (the config left it off)." << std::endl;
+            coverage_strict = true;
+        } else if (env_strict < 0 && coverage_strict) {
+            std::cout << "[ephemeris] PTM_SPICE_COVERAGE_STRICT does NOT relax"
+                         " simulation.spice_coverage_strict: true. Strictness stays ON;"
+                         " clear the config key instead." << std::endl;
+        }
+        const auto ets_minmax = std::minmax_element(external_ets.begin(), external_ets.end());
+        if (!illumination_model->checkSpkCoverage(*ets_minmax.first, *ets_minmax.second,
+                                                  coverage_strict)) {
+            return 1;
+        }
+    }
 
     // Occluder-only geometry: a coarse ring/annulus (e.g. LOLA out to the
     // physics horizon) added to the shadow-ray BVH so distant topography
@@ -18839,7 +18885,7 @@ int main(int argc, char** argv) {
                     && rad_eq_audit_hi > 0
                     && rethermalTwoPhase(times, equilibration_steps, total_time_steps);
                 const bool rad_select_forced =
-                    (radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW") > 0);
+                    (envTristateFlag("PTM_RAD_SELECT_OUTPUT_WINDOW") > 0);
                 const bool rad_select_output_window =
                     radSelectOutputWindowEnabled() && rad_eq_audit_hi > 0
                     && (rad_eq_span_is_artifact || rad_select_forced);
@@ -18916,7 +18962,7 @@ int main(int argc, char** argv) {
                 // than tuned away because an advisory that errs toward "more
                 // sweeps" is the safe direction, and because the alternative --
                 // a measured count -- is not available until the loop has run.
-                if (radGateEnvState("PTM_RHO_ADVISORY") < 0) {
+                if (envTristateFlag("PTM_RHO_ADVISORY") < 0) {
                     std::cout << "  [rho-advisory] PTM_RHO_ADVISORY=0: skipped. The coupling"
                                  " loop's sweep count is NOT being checked against rho(F)"
                                  " on this run." << std::endl;
@@ -20773,6 +20819,26 @@ int main(int argc, char** argv) {
     // "which solver produced this?" without its log -- see
     // tools/solver_disclosure.h for why that question had no answer before.
     ptm::appendThermalSolverProvenance(output_dir);
+
+    // ========================================================================
+    // Which ephemeris actually served this run (BUGS.md PTM-301)
+    // ========================================================================
+    // The counter half of PTM-301. `ephemeris_source: spice` in a config is a
+    // REQUEST; this is the answer. Printed to the log AND written into the run
+    // directory, because the whole failure mode was a run that looked like
+    // SPICE from every artifact it left behind.
+    illumination_model->reportEphemerisFallback();
+    {
+        const std::string prov_path = output_dir + "/provenance.txt";
+        std::ofstream prov_out(prov_path, std::ios::app);
+        if (prov_out) {
+            prov_out << illumination_model->ephemerisProvenanceBlock();
+        } else {
+            std::cerr << "[ephemeris] WARNING: cannot append the ephemeris record to "
+                      << prov_path << "; this run's directory will not say whether the"
+                         " SPK or the Keplerian fallback served it." << std::endl;
+        }
+    }
 
     // Full arrays exist iff not streaming or we explicitly extracted
     bool have_full_illum_arrays =
