@@ -477,10 +477,45 @@ def cmd_figure(args):
 
 
 # ------------------------------------------------------------------ precommit (P11)
+GIT = "/Library/Developer/CommandLineTools/usr/bin/git"
+
+
+def _git_env():
+    """The environment every git call here runs in, with `GIT_*` removed.
+
+    Measured: with `GIT_DIR`/`GIT_WORK_TREE` exported -- which is the ordinary
+    state inside a hook, `git rebase -x` or `git bisect run` --
+    `rev-parse --show-toplevel` returns the INHERITED repository no matter what
+    cwd it is given. The repo cross-check below then compares that answer with
+    itself, agrees, and diffs a tree nobody asked about. Stripping the
+    variables makes cwd mean what this tool assumes it means.
+    """
+    env = dict(os.environ)
+    for k in [k for k in env if k.startswith("GIT_")]:
+        del env[k]
+    return env
+
+
+def _git(argv, cwd):
+    """Run git and RAISE on failure, instead of returning an empty answer.
+
+    `_hunks` used to read `.stdout` and ignore the return code, so every way git
+    could fail -- not a repository, no HEAD, a bad ref -- came back as "no
+    hunks", which `--verify` then reported as a PASS. A tool that cannot tell
+    "nothing changed" from "I could not look" is a tool that cannot fail.
+    """
+    out = subprocess.run([GIT] + argv, cwd=cwd, capture_output=True, text=True,
+                         env=_git_env(), timeout=600)
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(argv)} failed in {cwd} (exit {out.returncode}): "
+            + (out.stderr.strip() or "<no stderr>"))
+    return out.stdout
+
+
 def _hunks(argv, repo):
     """Return {file: [hunk_md5, ...]} from a `git diff` invocation, at -U0 for stability."""
-    git = "/Library/Developer/CommandLineTools/usr/bin/git"
-    out = subprocess.run([git] + argv, cwd=repo, capture_output=True, text=True, timeout=600).stdout
+    out = _git(argv, repo)
     files, cur, buf = {}, None, []
 
     def flush():
@@ -503,6 +538,79 @@ def _hunks(argv, repo):
     return files
 
 
+def _toplevel(path):
+    """`git rev-parse --show-toplevel` for `path`, or None if it is not a repo.
+
+    Two measured facts about the answer, both of which decide how it is used:
+
+    * git replies in the FILESYSTEM's own spelling. Asked about
+      `/Users/paha3326/projects/ptm-x` on this case-insensitive volume it says
+      `/Users/paha3326/Projects/ptm-x`, and it resolves symlinks (`/tmp` ->
+      `/private/tmp`) on the way. `os.path.abspath` and `os.path.realpath` do
+      NEITHER on macOS -- they hand back the case they were given -- so the raw
+      `$PTM` string and this answer routinely differ while naming one directory.
+    * because BOTH sides of the comparison in `_resolve_repo` come from here,
+      they arrive already canonical, and `==` would agree with `samefile` on
+      every case built so far. `samefile` is kept because it is the CORRECT
+      question ("is this the same directory") and cannot be wrong where `==`
+      can; the selftest's case arm is therefore a do-no-harm arm, not a proof
+      that `samefile` is load-bearing, and it says so.
+    """
+    if not path or not os.path.isdir(path):
+        return None
+    try:
+        out = subprocess.run([GIT, "rev-parse", "--show-toplevel"], cwd=path,
+                             capture_output=True, text=True,
+                             env=_git_env(), timeout=60)
+    except Exception:                                        # noqa: BLE001
+        return None
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
+def _resolve_repo():
+    """`(repo, note)` -- the checkout precommit will diff, or `(None, refusal)`.
+
+    PTM-287: the repo was taken from `$PTM`, or from the script's own parent
+    directory, and NEVER cross-checked against where the command was actually
+    run. From a worktree that silently snapshotted and diffed a DIFFERENT
+    checkout and printed a PASS about a tree it never looked at -- three
+    independent hits in one week. The fix is not to change which source wins;
+    it is to REFUSE when the two disagree, and to say which is which.
+    """
+    env = os.environ.get("PTM")
+    asked = env or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    source = "$PTM" if env else "the script's own parent directory"
+    asked_top = _toplevel(asked)
+    if asked_top is None:
+        return None, (f"REFUSED: {asked!r} (from {source}) is not a git "
+                      f"checkout, so there is nothing to verify. Point $PTM at "
+                      f"the working tree you mean.")
+    here_top = _toplevel(os.getcwd())
+    if here_top is None:
+        # Not run from inside any checkout. Nothing to cross-check against, so
+        # this is disclosed rather than refused -- but it is never silent.
+        return asked_top, (f"NOTE: the current directory {os.getcwd()!r} is not "
+                           f"inside a git checkout, so the repository below "
+                           f"could not be cross-checked. Verifying {asked_top} "
+                           f"(from {source}).")
+    try:
+        same = os.path.samefile(asked_top, here_top)
+    except OSError as exc:                                   # pragma: no cover
+        return None, (f"REFUSED: {asked_top} and {here_top} could not be "
+                      f"compared ({exc}). Not proceeding on a repository this "
+                      f"tool cannot identify.")
+    if not same:
+        return None, (
+            f"REFUSED: this command would verify a DIFFERENT checkout than the "
+            f"one you are in.\n"
+            f"  {source} resolves to : {asked_top}\n"
+            f"  the current directory: {here_top}\n"
+            f"A diff of the first tree says nothing about the second, and that "
+            f"silence is what shipped false PASSes (PTM-287). Re-run with "
+            f"PTM={here_top} , or cd into the tree you meant.")
+    return asked_top, ""
+
+
 def _git_path(repo, rel):
     """Resolve a path inside the REAL git dir, worktree-safe.
 
@@ -513,10 +621,13 @@ def _git_path(repo, rel):
     (`<main>/.git/worktrees/<name>/<rel>`). Falls back to the naive join only if git is
     unavailable (not a repo at all), preserving the prior behavior there.
     """
-    git = "/Library/Developer/CommandLineTools/usr/bin/git"
     try:
-        out = subprocess.run([git, "rev-parse", "--git-path", rel], cwd=repo,
-                             capture_output=True, text=True, timeout=60)
+        # `env=_git_env()` for the same reason as everywhere else here: under an
+        # exported GIT_DIR this would site the snapshot inside the INHERITED
+        # repository's git dir rather than this checkout's.
+        out = subprocess.run([GIT, "rev-parse", "--git-path", rel], cwd=repo,
+                             capture_output=True, text=True,
+                             env=_git_env(), timeout=60)
         p = out.stdout.strip()
         if out.returncode == 0 and p:
             return p if os.path.isabs(p) else os.path.join(repo, p)
@@ -535,42 +646,269 @@ def cmd_precommit(args):
 
     Usage:  precommit --snapshot     (at the START of a session, before you edit anything)
             precommit --verify       (after `git add`, before `git commit`)
+
+    Two ways this could not fail, both closed here and both exercised by
+    `precommit-selftest`:
+
+    * **An empty index passed.** With nothing staged, `git diff --cached`
+      returns nothing, no hunk could be foreign, and the tool printed
+      `"staged_files": 0` and PASS. That is a verdict about a commit that does
+      not exist -- and it is indistinguishable, in the output, from a real one.
+    * **The wrong checkout passed.** See `_resolve_repo`.
+
+    Exit status: 0 PASS, 1 the gate ran and the answer is no (foreign hunks, no
+    snapshot, an empty index), 2 the gate could not run at all (the repository
+    could not be identified, or git failed).
     """
-    repo = os.environ.get("PTM", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    repo, note = _resolve_repo()
+    if repo is None:
+        print(note, file=sys.stderr)
+        return 2
+    if note:
+        print(note, file=sys.stderr)
     snap = args.snapshot_file or _git_path(repo, "ptm_precommit_snapshot.json")
 
-    if args.snapshot:
-        pre = _hunks(["diff", "HEAD", "-U0"], repo)
-        with open(snap, "w") as fh:
-            json.dump({"utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                       "pre_existing": pre}, fh, indent=2)
-        n = sum(len(v) for v in pre.values())
-        print(f"snapshot: {n} pre-existing hunks across {len(pre)} files -> {snap}")
-        return 0
+    def verdict(**kw):
+        """One JSON shape on EVERY path, so no consumer branches on a KeyError."""
+        d = {"repo": repo, "snapshot": snap, "staged_files": 0,
+             "staged_paths": [], "staged_path_count": 0,
+             "your_hunks": 0, "pre_existing_hunks_staged": {}}
+        d.update(kw)
+        print(json.dumps(d, indent=2))
 
-    if not os.path.exists(snap):
-        print("FAIL: no snapshot. Run `precommit --snapshot` before you start editing, so the "
-              "tool can tell your hunks from ones that were already there.", file=sys.stderr)
+    try:
+        if args.snapshot:
+            pre = _hunks(["diff", "HEAD", "-U0"], repo)
+            with open(snap, "w") as fh:
+                json.dump({"utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                           "repo": repo, "pre_existing": pre}, fh, indent=2)
+            n = sum(len(v) for v in pre.values())
+            print(f"snapshot: {n} pre-existing hunks across {len(pre)} files "
+                  f"in {repo} -> {snap}")
+            return 0
+
+        if not os.path.exists(snap):
+            print("FAIL: no snapshot. Run `precommit --snapshot` before you start editing, so the "
+                  "tool can tell your hunks from ones that were already there.", file=sys.stderr)
+            return 1
+        with open(snap) as fh:
+            recorded = json.load(fh)
+        pre = recorded["pre_existing"]
+        # A snapshot belongs to ONE checkout. Without this, `--snapshot-file`
+        # -- the one flag that moves the file out of the per-repo git dir --
+        # let a baseline taken in tree A score tree B's staged hunks, which is
+        # the wrong-repo failure the resolver above exists to stop, one level
+        # down. Older snapshots carry no `repo` key and are accepted as before.
+        snap_repo = recorded.get("repo")
+        if snap_repo and not (os.path.isdir(snap_repo)
+                              and os.path.samefile(snap_repo, repo)):
+            print(f"REFUSED: the snapshot {snap} was taken in {snap_repo}, not "
+                  f"{repo}. Scoring one tree's staged hunks against another "
+                  f"tree's baseline says nothing about either. Take a snapshot "
+                  f"in this checkout.", file=sys.stderr)
+            return 2
+        # The INDEX first, and by name. `_hunks` sees only content hunks, so a
+        # stage that is purely a rename or a mode change is invisible to it and
+        # would read as an empty one.
+        names = [n for n in _git(["diff", "--cached", "--name-only"], repo).split("\n") if n]
+        staged = _hunks(["diff", "--cached", "-U0"], repo)
+    except (RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"REFUSED: git could not be consulted: {exc}", file=sys.stderr)
+        return 2
+    except (ValueError, KeyError, OSError) as exc:
+        # ValueError covers json.JSONDecodeError. A snapshot that cannot be
+        # read is "the gate could not look", not "your diff is clean".
+        print(f"REFUSED: the snapshot {snap} could not be read "
+              f"({type(exc).__name__}: {exc}). Take a fresh one.", file=sys.stderr)
+        return 2
+
+    if not names:
+        verdict()
+        print("\nREFUSED: nothing staged -- nothing verified.\n"
+              "         `git diff --cached` is empty in this checkout, so there is no\n"
+              "         commit here for this gate to have an opinion about. Stage the\n"
+              "         files you mean to commit and run this again.", file=sys.stderr)
         return 1
-    pre = json.load(open(snap))["pre_existing"]
-    staged = _hunks(["diff", "--cached", "-U0"], repo)
 
     bad, mine = {}, 0
     for f, hs in staged.items():
-        carried = [h for h in hs if h in set(pre.get(f, []))]
+        already = set(pre.get(f, []))
+        carried = [h for h in hs if h in already]
         mine += len(hs) - len(carried)
         if carried:
             bad[f] = len(carried)
 
-    print(json.dumps({"staged_files": len(staged), "your_hunks": mine,
-                      "pre_existing_hunks_staged": bad}, indent=2))
+    # `staged_files` keeps its original meaning -- files carrying content hunks
+    # -- so a number quoted in an older report is still comparable. The index's
+    # own count is the NEW key beside it.
+    verdict(staged_files=len(staged), staged_paths=names,
+            staged_path_count=len(names), your_hunks=mine,
+            pre_existing_hunks_staged=bad)
     if bad:
         print("\nFAIL: the staged diff contains hunks that existed BEFORE this session.\n"
               "      They are not yours. Unstage them (`git restore --staged <file>`), or\n"
               "      disclose them explicitly in the commit message.", file=sys.stderr)
         return 1
+    if not staged:
+        # Staged, but nothing `git diff -U0` can hash: a pure rename, a mode
+        # change, or an empty file. Said out loud rather than counted as a
+        # verified diff.
+        print(f"\nPASS with a caveat: {len(names)} path(s) are staged but none carries a\n"
+              f"      content hunk (a rename, a mode change or an empty file). Nothing\n"
+              f"      pre-existing rode along, and nothing was line-by-line verified.")
+        return 0
     print("\nPASS: every staged hunk was authored after the snapshot.")
     return 0
+
+
+# ------------------------------------------------- precommit selftest (hermetic)
+def _pc_run(tool, argv, cwd, ptm=None):
+    """One `precommit` invocation against `tool`, in a throwaway checkout."""
+    env = _git_env()          # GIT_DIR/GIT_WORK_TREE would point every child
+    env.pop("PTM", None)      # at the caller's real repository
+    if ptm is not None:
+        env["PTM"] = ptm
+    out = subprocess.run([sys.executable, tool, "precommit"] + argv, cwd=cwd,
+                         env=env, capture_output=True, text=True, timeout=600)
+    return out.returncode, (out.stdout + out.stderr)
+
+
+def _pc_git(argv, cwd):
+    """git inside a throwaway repo, insulated from the developer's setup.
+
+    Without `env=_git_env()` an exported `GIT_DIR`/`GIT_WORK_TREE` -- the
+    ordinary state inside a hook or `git rebase -x` -- makes these `add` and
+    `commit` calls operate on the USER'S REAL repository. The two `-c` flags
+    remove the global settings that make a scratch commit fail on other
+    machines (a signing key that is not present, a hooks path that rejects).
+    """
+    subprocess.run([GIT, "-c", "commit.gpgsign=false",
+                    "-c", "core.hooksPath=/dev/null"] + argv,
+                   cwd=cwd, env=_git_env(), check=True,
+                   capture_output=True, text=True)
+
+
+def _pc_repo(root, name):
+    """A one-commit git repository at `root/name`."""
+    path = os.path.join(root, name)
+    os.makedirs(path)
+    _pc_git(["init", "-q"], path)
+    _pc_git(["config", "user.email", "selftest@example.invalid"], path)
+    _pc_git(["config", "user.name", "ptm_qa selftest"], path)
+    with open(os.path.join(path, "tracked.txt"), "w") as fh:
+        fh.write("original\n")
+    _pc_git(["add", "tracked.txt"], path)
+    _pc_git(["commit", "-qm", "base"], path)
+    return path
+
+
+def cmd_precommit_selftest(args):
+    """Exercise `precommit` against throwaway repositories.
+
+    Hermetic on purpose: no fixture, no network, no PTM3D output. It answers
+    the only question that matters about a gate -- can it fail? Point `--tool`
+    at another checkout's `ptm_qa.py` to measure that one instead, which is how
+    the pre-fix behavior in these cases was recorded rather than asserted.
+
+    Every case asserts an exit code AND a substring of the message. Exit codes
+    alone are ambiguous here: 1 is both "foreign hunks" and "no snapshot", so a
+    `--snapshot` that quietly failed would satisfy case 1 for the wrong reason.
+    The `--snapshot` calls are checked too, for the same reason.
+    """
+    import shutil
+    import tempfile
+    tool = os.path.abspath(args.tool or __file__)
+    root = tempfile.mkdtemp(prefix="ptm_qa_pc_")
+    cases, bad = [], 0
+
+    def snapshot(path):
+        rc, out = _pc_run(tool, ["--snapshot"], path, ptm=path)
+        if rc != 0:
+            raise RuntimeError(f"--snapshot failed in {path} (exit {rc}): {out}")
+
+    try:
+        def stage_a_new_hunk(path, text):
+            with open(os.path.join(path, "tracked.txt"), "w") as fh:
+                fh.write("original\n" + text + "\n")
+            _pc_git(["add", "tracked.txt"], path)
+
+        # -- 1. nothing staged: a verdict about a commit that does not exist ---
+        # The snapshot is taken in the SAME repo the verify resolves, so that a
+        # "no snapshot" short circuit cannot stand in for the answer -- and the
+        # expected message is asserted, so it cannot stand in silently either.
+        a = _pc_repo(root, "empty_index")
+        snapshot(a)
+        rc, out = _pc_run(tool, ["--verify"], a, ptm=a)
+        cases.append(("empty index must be REFUSED, not passed", rc, 1,
+                      "nothing staged", out))
+
+        # -- 2. the wrong checkout: a PASS about a tree it never looked at ----
+        # BOTH trees get a snapshot -- which is the real situation, since the
+        # main checkout named by $PTM carries one from an earlier session.
+        b = _pc_repo(root, "the_tree_you_are_in")
+        c = _pc_repo(root, "the_other_tree")
+        snapshot(b)
+        snapshot(c)
+        stage_a_new_hunk(b, "a hunk in the tree you are actually in")
+        rc, out = _pc_run(tool, ["--verify"], b, ptm=c)
+        cases.append(("a repo that disagrees with the cwd must be REFUSED",
+                      rc, 2, "DIFFERENT checkout", out))
+
+        # -- 3. DO-NO-HARM: the same tree, spelled in another case, still passes
+        # NOT a proof that `samefile` is required. `git rev-parse
+        # --show-toplevel` canonicalizes through the child's own getcwd, so both
+        # sides of the comparison arrive in the filesystem's spelling and `==`
+        # would agree here too (measured). This arm exists so that the refusal
+        # added above cannot start firing on a legitimate run.
+        cs = _pc_repo(root, "Case_Spelling")
+        other_case = os.path.join(root, "case_spelling")
+        if os.path.isdir(other_case) and os.path.samefile(other_case, cs):
+            snapshot(cs)
+            stage_a_new_hunk(cs, "mine, written after the snapshot")
+            rc, out = _pc_run(tool, ["--verify"], cs, ptm=other_case)
+            cases.append(("do-no-harm: the same tree spelled in another case "
+                          "must PASS", rc, 0, "PASS: every staged hunk", out))
+        else:
+            print("  [skip] this filesystem is case-SENSITIVE; the case arm "
+                  "cannot be built here")
+
+        # -- 4. a genuine verify still passes ---------------------------------
+        d = _pc_repo(root, "genuine")
+        snapshot(d)
+        stage_a_new_hunk(d, "mine, written after the snapshot")
+        rc, out = _pc_run(tool, ["--verify"], d, ptm=d)
+        cases.append(("a genuine staged edit must PASS", rc, 0,
+                      "PASS: every staged hunk", out))
+
+        # -- 5. the tool's actual job: a pre-existing hunk is caught ----------
+        e = _pc_repo(root, "foreign_hunk")
+        with open(os.path.join(e, "tracked.txt"), "w") as fh:
+            fh.write("someone else's held edit\n")
+        snapshot(e)                                 # snapshot AFTER their edit
+        _pc_git(["add", "tracked.txt"], e)
+        rc, out = _pc_run(tool, ["--verify"], e, ptm=e)
+        cases.append(("a hunk that predates the snapshot must FAIL", rc, 1,
+                      "existed BEFORE this session", out))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        # A scenario that could not be BUILT is reported as a failed selftest,
+        # not as a traceback that says nothing about the five cases.
+        print(f"[ FAIL ] the selftest could not build its fixtures: "
+              f"{type(exc).__name__}: {exc}")
+        bad += 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    for title, rc, want, needle, out in cases:
+        ok = (rc == want) and (needle in out)
+        bad += not ok
+        print(f"[{'  ok  ' if ok else ' FAIL '}] {title}\n"
+              f"         exit {rc} (expected {want}), message "
+              f"{'carries' if needle in out else 'MISSING'} {needle!r}")
+        if not ok:
+            print("         " + "\n         ".join(out.strip().split("\n")[-6:]))
+    print(f"\nprecommit-selftest: {len(cases)-bad}/{len(cases)} cases behave as "
+          f"specified  [tool: {tool}]")
+    return 1 if bad else 0
 
 
 # ------------------------------------------------------------------ selftest
@@ -663,8 +1001,16 @@ def main(argv=None):
     fg.add_argument("--check", action="store_true"); fg.set_defaults(fn=cmd_figure)
 
     pc = sub.add_parser("precommit")
-    pc.add_argument("--snapshot", action="store_true"); pc.add_argument("--verify", action="store_true")
+    # Exactly one, and REQUIRED. A bare `precommit` used to fall through to
+    # verify, so a mistyped flag silently ran the other mode.
+    mode = pc.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--snapshot", action="store_true")
+    mode.add_argument("--verify", action="store_true")
     pc.add_argument("--snapshot-file"); pc.set_defaults(fn=cmd_precommit)
+
+    ps = sub.add_parser("precommit-selftest")
+    ps.add_argument("--tool", help="the ptm_qa.py to measure (default: this one)")
+    ps.set_defaults(fn=cmd_precommit_selftest)
 
     st = sub.add_parser("selftest"); st.set_defaults(fn=cmd_selftest)
 
