@@ -880,21 +880,24 @@ def test_the_terrain_card_writes_its_dem_only_into_a_europa_run():
 # --------------------------------------------------------------------------
 
 def test_the_europa_cards_never_emit_two_albedo_fields():
-    """`use_albedo_map: false` does not stop radiation coupling loading a map.
+    """`use_albedo_map: false` now DOES stop radiation coupling loading a map.
 
-    The thermal surface boundary condition honors the switch; the
-    radiation-coupling albedo load at ``ptm_thermal_sim.cpp:18086`` never has,
-    and no configuration key turns it off -- an empty
-    ``albedo_maps_directory`` falls back to the literal ``data/albedo_maps``
-    (``:18110``). The engine prints a warning about it at ``:18180``, AFTER the
-    run has started. The 2026-08-28 europa_test run printed exactly that.
+    UPDATED 2026-08-30 with the engine fix (BUGS.md PTM-454). Until then the
+    radiation-coupling albedo load honored no configuration key at all, so a
+    `use_albedo_map: false` run could still take its radiosity source albedo
+    off the map -- two albedo fields in one simulation -- and the engine only
+    warned about it after the run had started. The 2026-08-28 europa_test run
+    printed exactly that. The engine now honors the switch at that call site,
+    so the pre-flight rule that warned about it is retired with it, and this
+    check is inverted: the detector must be SILENT on the plain switch-off
+    case, and must still fire on the one mixed state that survives (an
+    explicit `illumination.albedo_map`, which the absorbed-flux composer
+    honors ahead of the switch while the coupling has no FITS reader).
 
-    So the rule the cards follow is: a GLOBAL Europa run uses the map (both
-    fields are the map), and a LOCAL Europa run uses a constant albedo on an
-    IMPORTED mesh, where the per-face map cannot load at all because it is
-    matched to an icosphere by face count. This checks both halves on the
-    emitted file, and then checks that the pre-flight names the mixed state
-    when a configuration does reach it.
+    The rule the cards follow is unchanged: a GLOBAL Europa run uses the map,
+    and a LOCAL Europa run uses a constant albedo on an IMPORTED mesh, where
+    the per-face map cannot load at all because it is matched to an icosphere
+    by face count.
     """
     from gui_core.preflight import radiation_coupling_albedo_map
     from gui_core.config_manager import illumination_for_engine
@@ -927,8 +930,10 @@ def test_the_europa_cards_never_emit_two_albedo_fields():
             f"radiation coupling would still load {found}, so the run would "
             f"carry two different albedo fields")
 
-    # The measured 2026-08-28 configuration, and the detector that must fire
-    # on it. Without this the check above proves only that today's cards are
+    # The measured 2026-08-28 configuration, on which the detector must now be
+    # SILENT -- the engine honors the switch, so there is no mixed state left
+    # to report -- and the explicit-map configuration, on which it must still
+    # fire. Without this the check above proves only that today's cards are
     # clean, not that anything would notice if they stopped being.
     #
     # Driven through a REAL ConfigManager and handed `get_config()` -- the raw
@@ -969,30 +974,82 @@ def test_the_europa_cards_never_emit_two_albedo_fields():
                                    config_manager=manager)
             return [w for w in report.warnings if w.startswith("albedo:")]
 
-        mixed = albedo_warnings()
-        assert mixed, (
-            "a uniform-albedo radiation run with a res-matched per-face map on "
-            "disk was not reported as carrying two albedo fields")
-        assert "Europa_Albedo_res5.bin" in mixed[0], mixed[0]
+        assert not albedo_warnings(), (
+            "the retired mixed-albedo warning still fires on a uniform-albedo "
+            "radiation run with a res-matched per-face map on disk. The engine "
+            "honors illumination.use_albedo_map at that call site since "
+            "BUGS.md PTM-454, so this warning is now false -- and its advice "
+            "('turn the albedo map on so both use it') would change the "
+            "physics of the run")
+
+        # ...but the load itself is still correctly IDENTIFIED, so a future
+        # regression that stops honoring the switch has something to find.
+        # Silence must come from the engine's behavior, not from the GUI
+        # losing the ability to see the file.
+        found, n_found = radiation_coupling_albedo_map(
+            manager.get_config(),
+            illumination_for_engine(
+                (manager.get_config().get("illumination") or {})),
+            REPO_ROOT)
+        assert found is not None and "Europa_Albedo_res5.bin" in str(found), (
+            "the pre-flight can no longer resolve the res-matched per-face "
+            "map at all, so this check would pass even if the engine went "
+            "back to loading it regardless of the switch")
+
+        # The one mixed state that survives the engine fix: an EXPLICIT
+        # illumination.albedo_map with the switch off. The absorbed-flux
+        # composer tests that key BEFORE use_albedo_map and honors it; the
+        # radiation coupling has no FITS reader and stays uniform.
+        #
+        # The GUI cannot reach it -- albedo_source "none" clears albedo_map --
+        # and that is the first thing asserted, because "the pre-flight would
+        # catch it" is a weaker guarantee than "the emitter cannot write it".
+        assert illumination_for_engine(
+            {"albedo_source": "none", "albedo_map": "x.fits"}
+        )["albedo_map"] == "", (
+            "the GUI's albedo-source translation no longer clears an explicit "
+            "albedo_map when the source is None, so a card could now emit the "
+            "one mixed-albedo state the engine fix does not remove")
+
+        # ...but a configuration read back from disk has no albedo_source, so
+        # it CAN carry that pair, and then the pre-flight is the only detector.
+        # Raw dict on purpose: that is the already-emitted shape.
+        explicit_cfg = {
+            "simulation": {"body": "Europa"},
+            "mesh": {"resolution": 5, "import_file": "", "occluder_file": "",
+                     "use_topographic": True},
+            "radiation": {"enabled": True, "view_factor_file": ""},
+            "illumination": {"use_albedo_map": False,
+                             "albedo_map": str(maps / "explicit.fits"),
+                             "albedo_maps_directory": ""},
+            "output": {"directory": str(root / "out2")},
+        }
+        explicit_report = run_preflight(explicit_cfg, lambda: str(exe),
+                                        project_root=REPO_ROOT)
+        explicit = [w for w in explicit_report.warnings if w.startswith("albedo:")]
+        assert explicit and "albedo_map" in explicit[0], (
+            "an explicit illumination.albedo_map with use_albedo_map off was "
+            "not reported; the surface boundary condition would use that map "
+            "and the radiosity source albedo would not")
 
         # negative control 1: the map ON -- both fields are the map.
         manager.set_value("illumination.albedo_source", "builtin")
         assert not albedo_warnings(), (
-            "the mixed-albedo warning fired on a run that uses the map for "
+            "an albedo warning fired on a run that uses the map for "
             "both fields")
 
         # negative control 2: radiation off -- there is no second field.
         manager.set_value("illumination.albedo_source", "none")
         manager.set_value("radiation.enabled", False)
         assert not albedo_warnings(), (
-            "the mixed-albedo warning fired with radiation exchange off")
+            "an albedo warning fired with radiation exchange off")
 
         # negative control 3: a real generic body has no published map, and
         # `target_body_name` never reaches that loader at all.
         manager.set_value("radiation.enabled", True)
         manager.set_value("generic_body.name", "623 Chimaera (A907 BC)")
         assert not albedo_warnings(), (
-            "the mixed-albedo warning fired on a generic body, whose "
+            "an albedo warning fired on a generic body, whose "
             "radiation-coupling load cannot resolve a map name at all")
         manager.set_value("generic_body.name", "")
 
@@ -1009,7 +1066,8 @@ def test_the_europa_cards_never_emit_two_albedo_fields():
             "defaulting the absent albedo_source to 'builtin' turned a "
             "uniform-albedo run back into a map run")
         print("    [albedo] Europa Global uses the map, Europa Local cannot, "
-              "and the mixed state is named when it happens")
+              "the switch is honored, and the surviving explicit-map mixed "
+              "state is named when it happens")
 
 
 # --------------------------------------------------------------------------

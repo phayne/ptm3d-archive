@@ -3106,9 +3106,10 @@ void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, co
                      "hold " << MAX_THERMAL_LAYERS << " (MAX_THERMAL_LAYERS).\n"
                      "  Every per-layer array in this struct is a fixed-size stack buffer; a\n"
                      "  taller column would overflow it rather than silently truncate.\n"
-                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or raise\n"
-                     "  MAX_THERMAL_LAYERS in thermal_model.h if this column genuinely needs\n"
-                     "  more depth resolution." << std::endl;
+                     "  Run the SCALAR solver instead (--no-simd-batch): it allocates the depth\n"
+                     "  grid on the heap (thermal::Profile) and has NO layer ceiling. Otherwise\n"
+                     "  lower thermal.thermal_m / thermal.thermal_b, or raise MAX_THERMAL_LAYERS\n"
+                     "  in thermal_model.h. BUGS.md PTM-302." << std::endl;
         std::exit(1);
     }
     n_layers = layers;
@@ -3169,8 +3170,13 @@ void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile,
                   << " (MAX_THERMAL_LAYERS).\n"
                      "  Refusing rather than overflowing the fixed-size z/dz/g1/g2/"
                      "kc/rho/T stack arrays.\n"
-                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or "
-                     "raise MAX_THERMAL_LAYERS in thermal_model.h." << std::endl;
+                     "  Run the SCALAR solver instead (--no-simd-batch): it allocates "
+                     "the depth grid on\n"
+                     "  the heap (thermal::Profile) and has NO layer ceiling. Otherwise "
+                     "lower\n"
+                     "  thermal.thermal_m / thermal.thermal_b, or raise "
+                     "MAX_THERMAL_LAYERS in\n"
+                     "  thermal_model.h. BUGS.md PTM-302." << std::endl;
         std::exit(1);
     }
     n_layers = ref_profile.nlayers;

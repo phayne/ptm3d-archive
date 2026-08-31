@@ -2809,6 +2809,9 @@ std::array<double, 3> IlluminationModel::getSunPosition(double et) {
     double position[3];
     double lt;
 
+    ephemeris_report_.spice_mode = true;
+    ephemeris_report_.sun_queries++;
+
     // Use the configurable target body and frame
     spkpos_c("SUN", et, target_body_frame_.c_str(), "LT+S",
              target_body_name_.c_str(), position, &lt);
@@ -2817,6 +2820,17 @@ std::array<double, 3> IlluminationModel::getSunPosition(double et) {
     // Fall back to Keplerian propagation for out-of-range times.
     if (failed_c()) {
         reset_c();
+        // BUGS.md PTM-301: reset_c() clears the SPICE error and emits nothing,
+        // so before this counter existed a substituted epoch left no trace
+        // anywhere. Count it and remember the span; reportEphemerisFallback()
+        // prints the one summary line at end of run. Deliberately NOT a
+        // per-epoch message: a fully-uncovered run would print one line per
+        // timestep and be scrolled past exactly like the noise it would be.
+        ephemeris_report_.fallback_et_min =
+            std::min(ephemeris_report_.fallback_et_min, et);
+        ephemeris_report_.fallback_et_max =
+            std::max(ephemeris_report_.fallback_et_max, et);
+        ephemeris_report_.sun_fallbacks++;
         if (keplerian_propagator_ && body_fixed_frame_) {
             double t_sec = keplerian_propagator_->etToSecondsFromEpoch(et);
             auto body_pos = keplerian_propagator_->getPosition(t_sec);
@@ -2842,6 +2856,367 @@ std::array<double, 3> IlluminationModel::getSunPosition(double et) {
     }
 
     return {{position[0], position[1], position[2]}};
+}
+
+// ---------------------------------------------------------------------------
+// Ephemeris provenance (BUGS.md PTM-301)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// ET -> "YYYY-MM-DDTHH:MM:SS" for a human-readable coverage line. Whole
+// seconds: this is a diagnostic span, not an epoch grid.
+std::string etToUtcString(double et) {
+    char buf[64];
+    et2utc_c(et, "ISOC", 0, static_cast<SpiceInt>(sizeof(buf)), buf);
+    if (failed_c()) {
+        reset_c();
+        std::ostringstream os;
+        os << "ET " << std::fixed << std::setprecision(1) << et;
+        return os.str();
+    }
+    return std::string(buf);
+}
+
+// Name a SPICE call that failed, clear the latched error, and say what the
+// caller lost by it. The caller has already tested failed_c(), so unlike
+// IlluminationModel::checkSpiceError this does not re-test -- and unlike it,
+// the "what is missing because of this" half is the load-bearing part.
+void reportSpiceError(const char* what, const char* which) {
+    SpiceChar short_msg[81] = {0};
+    getmsg_c("SHORT", sizeof(short_msg), short_msg);
+    reset_c();
+    std::cerr << "[ephemeris] WARNING: " << what << " failed for " << which
+              << " (" << short_msg << "). Its contribution to the coverage"
+                 " reported below is MISSING." << std::endl;
+}
+
+}  // namespace
+
+bool IlluminationModel::checkSpkCoverage(double et_start, double et_end, bool strict) {
+    // A configured-Keplerian run has no SPK and nothing to check. Say nothing:
+    // it did not ask for SPICE, so there is no substitution to disclose.
+    if (use_keplerian_) {
+        return true;
+    }
+
+    ephemeris_report_.spice_mode    = true;
+    ephemeris_report_.have_window   = true;
+    ephemeris_report_.window_et_min = std::min(et_start, et_end);
+    ephemeris_report_.window_et_max = std::max(et_start, et_end);
+
+    // Resolve the target to a NAIF integer code. bods2c_c accepts both a name
+    // ("MOON") and an integer string ("20000269"), which is what the generic
+    // body path stores in target_body_name_.
+    SpiceInt    body_id = 0;
+    SpiceBoolean found  = SPICEFALSE;
+    bods2c_c(target_body_name_.c_str(), &body_id, &found);
+    if (failed_c()) { reset_c(); found = SPICEFALSE; }
+    if (!found) {
+        // NOT a pass. `coverage_checked` stays false so provenance.txt records
+        // "unresolved" rather than a measured verdict, and `strict` is honored
+        // here as everywhere else -- this branch is REACHABLE on exactly the
+        // configs the check exists for. setGenericBody() only substitutes the
+        // NAIF ID into target_body_name_ when generic_body.naif_id is set, and
+        // that key is optional and empty by default, so a small-body SPICE
+        // config without it keeps a human-readable name that SPICE cannot
+        // resolve -- then spkpos_c fails at every epoch and the whole run is
+        // Keplerian. Returning true here would have made strict mode degrade
+        // to permissive on precisely the PTM-300 scenario.
+        std::cerr << "\n[ephemeris] WARNING: cannot resolve '" << target_body_name_
+                  << "' to a NAIF body code, so the SPK coverage of this run's window"
+                     " could not be checked.\n"
+                     "  For a generic body this usually means generic_body.naif_id is"
+                     " unset: SPICE does not\n"
+                     "  recognize human-readable small-body names from an SPK. Every"
+                     " epoch would then be\n"
+                     "  served silently by the Keplerian fallback (BUGS.md PTM-301);"
+                     " the end-of-run fallback\n"
+                     "  summary is the only remaining detector."
+                  << std::endl;
+        if (strict) {
+            std::cerr << "[ephemeris] FATAL: simulation.spice_coverage_strict is set,"
+                         " and coverage could not be checked at all.\n"
+                         "  Refusing rather than proceeding unverified. Set"
+                         " generic_body.naif_id, or clear the strict flag."
+                      << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    ephemeris_report_.coverage_checked = true;
+
+    // Union the coverage of every loaded SPK for this body. spkcov_c ADDS to
+    // the window, so one cell accumulates across kernels -- which is what a
+    // metakernel naming several SPKs needs. 10,000 intervals of headroom: a
+    // planetary or small-body SPK normally has one, and overflowing the cell
+    // signals SPICE(WINDOWEXCESS) rather than truncating, which the loop below
+    // reports instead of swallowing.
+    SPICEDOUBLE_CELL(cover, 20000);
+    SPICEDOUBLE_CELL(one, 20000);      // one kernel's coverage, reused per kernel
+    scard_c(0, &cover);
+
+    SpiceInt spk_count = 0;
+    ktotal_c("SPK", &spk_count);
+    if (failed_c()) { reset_c(); spk_count = 0; }
+
+    // A kernel this loop cannot read is a HOLE in the coverage it reports, and
+    // a coverage check with an unreported hole is worse than none: it would
+    // bless a window the SPK does not actually span. Name every skip.
+    int kernels_with_body = 0, kernels_unreadable = 0;
+
+    for (SpiceInt i = 0; i < spk_count; ++i) {
+        char file[1024], filtyp[64], srcfil[1024];
+        SpiceInt handle = 0;
+        SpiceBoolean kfound = SPICEFALSE;
+        kdata_c(i, "SPK", sizeof(file), sizeof(filtyp), sizeof(srcfil),
+                file, filtyp, srcfil, &handle, &kfound);
+        if (failed_c()) {
+            reportSpiceError("kdata_c", "an SPK slot in the kernel pool");
+            ++kernels_unreadable;
+            continue;
+        }
+        if (!kfound) continue;
+
+        // Whether THIS kernel carries the body is asked of a scratch cell, not
+        // inferred from the union's interval count: spkcov_c UNIONS into the
+        // cell it is given, so a second kernel overlapping the first adds no
+        // interval (and a kernel bridging two intervals removes one). Counting
+        // `wncard_c` growth reported "1 of 4" for a metakernel naming four
+        // overlapping SPKs -- which is the case the union exists to handle.
+        //
+        // Two spkcov_c calls rather than a third cell plus wnunid_c/copy_c:
+        // the accumulation is what spkcov_c already does, and reading a loaded
+        // kernel's DAF summary records twice is far cheaper than 160 KiB of
+        // stack and four more failure branches.
+        scard_c(0, &one);
+        spkcov_c(file, body_id, &one);
+        if (failed_c()) {
+            reportSpiceError("spkcov_c", file);
+            ++kernels_unreadable;
+            continue;
+        }
+        if (wncard_c(&one) > 0) {
+            ++kernels_with_body;
+            spkcov_c(file, body_id, &cover);   // union into the accumulator
+            if (failed_c()) {
+                reportSpiceError("spkcov_c (accumulate)", file);
+                ++kernels_unreadable;
+                continue;
+            }
+        }
+    }
+    if (kernels_unreadable > 0) {
+        std::cerr << "[ephemeris] WARNING: " << kernels_unreadable << " of "
+                  << spk_count << " loaded SPK kernel(s) could not be read for"
+                     " coverage. Treat the verdict below as a LOWER BOUND on"
+                     " coverage, not a measurement." << std::endl;
+    }
+
+    const SpiceInt n_intervals = wncard_c(&cover);
+    if (n_intervals <= 0) {
+        std::cerr << "\n[ephemeris] WARNING: none of the " << spk_count
+                  << " loaded SPK kernel(s) covers NAIF body " << body_id
+                  << " ('" << target_body_name_ << "') at ANY epoch.\n"
+                     "  Run window (equilibration included): "
+                  << etToUtcString(ephemeris_report_.window_et_min) << " .. "
+                  << etToUtcString(ephemeris_report_.window_et_max) << "\n"
+                     "  Every epoch of this run will be served by the Keplerian"
+                     " fallback (BUGS.md PTM-301),\n"
+                     "  which is NOT the ephemeris precision"
+                     " `ephemeris_source: spice` advertises."
+                  << std::endl;
+        ephemeris_report_.window_covered = false;
+        if (strict) {
+            std::cerr << "[ephemeris] FATAL: simulation.spice_coverage_strict is set."
+                         " Refusing to run on the fallback." << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    // erract is RETURN, so a latched SPICE error turns every LATER call into a
+    // no-op -- including the first getSunPosition, which would then take the
+    // fallback branch spuriously and mis-seed the counter. Clear it here and
+    // report the verdict as unmeasured rather than as a measurement.
+    auto unverified = [&](const char* what) {
+        reportSpiceError(what, "the accumulated coverage window");
+        std::cerr << "[ephemeris] WARNING: this run's window was NOT verified"
+                     " against the SPK coverage." << std::endl;
+        ephemeris_report_.coverage_checked = false;
+        return !strict;
+    };
+
+    double cov_lo = 0.0, cov_hi = 0.0, scratch = 0.0;
+    wnfetd_c(&cover, 0, &cov_lo, &scratch);
+    wnfetd_c(&cover, n_intervals - 1, &scratch, &cov_hi);
+    if (failed_c()) return unverified("wnfetd_c");
+    ephemeris_report_.have_coverage   = true;
+    ephemeris_report_.coverage_et_min = cov_lo;
+    ephemeris_report_.coverage_et_max = cov_hi;
+
+    const SpiceBoolean covered = wnincd_c(ephemeris_report_.window_et_min,
+                                          ephemeris_report_.window_et_max, &cover);
+    if (failed_c()) return unverified("wnincd_c");
+    ephemeris_report_.window_covered = (covered == SPICETRUE);
+
+    if (ephemeris_report_.window_covered) {
+        std::cout << "[ephemeris] SPK coverage for " << target_body_name_
+                  << " (NAIF " << body_id << ", " << kernels_with_body
+                  << " kernel(s), " << n_intervals << " interval(s)): "
+                  << etToUtcString(cov_lo) << " .. " << etToUtcString(cov_hi)
+                  << " -- contains the run window "
+                  << etToUtcString(ephemeris_report_.window_et_min) << " .. "
+                  << etToUtcString(ephemeris_report_.window_et_max) << "."
+                  << std::endl;
+        return true;
+    }
+
+    // Not covered. Same line in both polarities, so the strict and the
+    // permissive run report the identical fact and differ only in the verdict.
+    std::ostringstream msg;
+    msg << "\n[ephemeris] SPK COVERAGE DOES NOT SPAN THE RUN WINDOW for "
+        << target_body_name_ << " (NAIF " << body_id << ").\n"
+           "  SPK coverage: " << etToUtcString(cov_lo) << " .. " << etToUtcString(cov_hi)
+        << "  (" << n_intervals << " interval(s) from " << kernels_with_body
+        << " of " << spk_count << " loaded SPK kernel(s))\n"
+           "  Run window:   " << etToUtcString(ephemeris_report_.window_et_min)
+        << " .. " << etToUtcString(ephemeris_report_.window_et_max)
+        << "  (equilibration spin-up included -- it integrates BEFORE start_time)\n";
+    // With more than one interval the span above is the HULL, not the covered
+    // set, so the window can sit inside the printed span and still fall in a
+    // gap. A reader who sees a coverage line that visibly brackets the run
+    // window under a banner saying it does not span it will read a false
+    // positive and clear the flag. List the intervals rather than leave it
+    // inferable.
+    if (n_intervals > 1) {
+        msg << "  The span above is the HULL of " << n_intervals
+            << " intervals, NOT one continuous span.\n";
+        const SpiceInt to_list = (n_intervals < 8) ? n_intervals : 8;
+        for (SpiceInt k = 0; k < to_list; ++k) {
+            double lo = 0.0, hi = 0.0;
+            wnfetd_c(&cover, k, &lo, &hi);
+            if (failed_c()) { reset_c(); break; }
+            msg << "    covered: " << etToUtcString(lo) << " .. "
+                << etToUtcString(hi) << "\n";
+        }
+        if (to_list < n_intervals) {
+            msg << "    ... and " << (n_intervals - to_list) << " more interval(s)\n";
+        }
+    }
+    msg << "  Epochs outside the coverage are served by the Keplerian fallback"
+           " (BUGS.md PTM-301),\n"
+           "  which is a two-body approximation, not the SPK's precision. The"
+           " end-of-run summary\n"
+           "  reports how many epochs it actually served.";
+
+    if (strict) {
+        std::cerr << msg.str() << "\n"
+                  << "[ephemeris] FATAL: simulation.spice_coverage_strict is set."
+                     " Refusing rather than substituting.\n"
+                     "  Fetch a kernel spanning the window, or move start_time /"
+                     " shorten equilibration_orbits,\n"
+                     "  or clear simulation.spice_coverage_strict to accept the"
+                     " fallback deliberately."
+                  << std::endl;
+        return false;
+    }
+    std::cerr << msg.str() << "\n"
+              << "[ephemeris] WARNING only. Set simulation.spice_coverage_strict:"
+                 " true (or PTM_SPICE_COVERAGE_STRICT=1) to make this fatal."
+              << std::endl;
+    return true;
+}
+
+void IlluminationModel::reportEphemerisFallback() const {
+    // Nothing was substituted on a configured-Keplerian run, and nothing was
+    // asked of SPICE: silence is honest there.
+    if (!ephemeris_report_.spice_mode || ephemeris_report_.sun_queries == 0) {
+        return;
+    }
+
+    const long long n = ephemeris_report_.sun_fallbacks;
+    const long long m = ephemeris_report_.sun_queries;
+
+    if (n == 0) {
+        std::cout << "[ephemeris] Keplerian fallback: 0 of " << m
+                  << " Sun-position epochs (SPK served the whole run)." << std::endl;
+        return;
+    }
+
+    std::ostream& os = std::cerr;
+    os << "\n[ephemeris] WARNING: " << n << " of " << m
+       << " Sun-position epochs were served by the KEPLERIAN FALLBACK, not the SPK";
+    if (ephemeris_report_.sun_fallbacks > 0) {
+        os << "\n  Substituted epochs span "
+           << etToUtcString(ephemeris_report_.fallback_et_min) << " .. "
+           << etToUtcString(ephemeris_report_.fallback_et_max);
+    }
+    if (ephemeris_report_.have_coverage) {
+        os << "\n  SPK coverage " << etToUtcString(ephemeris_report_.coverage_et_min)
+           << " .. " << etToUtcString(ephemeris_report_.coverage_et_max);
+    }
+    if (ephemeris_report_.have_window) {
+        os << "\n  Run window  " << etToUtcString(ephemeris_report_.window_et_min)
+           << " .. " << etToUtcString(ephemeris_report_.window_et_max);
+    }
+    if (!keplerian_propagator_ || !body_fixed_frame_) {
+        os << "\n  ...and there is no Keplerian propagator on this body, so those"
+              " epochs received a ZERO Sun vector.";
+    }
+    os << "\n  This run's ephemeris is NOT purely `spice`. BUGS.md PTM-301."
+       << std::endl;
+}
+
+std::string IlluminationModel::ephemerisProvenanceBlock() const {
+    std::ostringstream os;
+    const auto& r = ephemeris_report_;
+
+    os << "ephemeris_mode=" << (r.spice_mode ? "spice" : "keplerian") << '\n';
+    if (!r.spice_mode) {
+        // Configured Keplerian: no SPK, no substitution, and saying so is the
+        // point -- an absent key would read as "not recorded".
+        os << "ephemeris_keplerian_fallback_epochs=0 of 0 (not applicable:"
+              " configured Keplerian)\n";
+        return os.str();
+    }
+
+    os << "ephemeris_target=" << target_body_name_ << '\n';
+    os << "ephemeris_sun_epochs=" << r.sun_queries << '\n';
+    os << "ephemeris_keplerian_fallback_epochs=" << r.sun_fallbacks << '\n';
+    os << "ephemeris_keplerian_fallback_fraction="
+       << (r.sun_queries > 0
+               ? static_cast<double>(r.sun_fallbacks) / static_cast<double>(r.sun_queries)
+               : 0.0)
+       << '\n';
+    if (r.sun_fallbacks > 0) {
+        os << "ephemeris_keplerian_fallback_span="
+           << etToUtcString(r.fallback_et_min) << " .. "
+           << etToUtcString(r.fallback_et_max) << '\n';
+    }
+    os << "ephemeris_spk_coverage_checked=" << (r.coverage_checked ? "true" : "false") << '\n';
+    if (r.have_coverage) {
+        os << "ephemeris_spk_coverage=" << etToUtcString(r.coverage_et_min) << " .. "
+           << etToUtcString(r.coverage_et_max) << '\n';
+    } else if (r.coverage_checked) {
+        os << "ephemeris_spk_coverage=none (no loaded SPK covers this body)\n";
+    } else {
+        // "Not measured" and "measured as absent" are different facts, and a
+        // provenance file that conflates them is the PTM-301 failure mode in a
+        // new place. `window_within_coverage` is omitted below for the same
+        // reason: false would read as a measurement.
+        os << "ephemeris_spk_coverage=not measured (see the [ephemeris] warning"
+              " in this run's log)\n";
+    }
+    if (r.have_window) {
+        os << "ephemeris_run_window=" << etToUtcString(r.window_et_min) << " .. "
+           << etToUtcString(r.window_et_max) << '\n';
+    }
+    if (r.coverage_checked) {
+        os << "ephemeris_window_within_coverage=" << (r.window_covered ? "true" : "false") << '\n';
+    }
+    return os.str();
 }
 
 std::array<double, 3> IlluminationModel::getPrimaryPosition(double et) {

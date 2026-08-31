@@ -34,6 +34,14 @@ struct SimulationConfig {
         double duration_days = 3.55;
         int timesteps = 72;
         std::string body = "Europa";
+        // BUGS.md PTM-301. When the loaded SPK does not span the run window
+        // (equilibration spin-up included), the engine falls back to Keplerian
+        // two-body propagation per epoch. false (default) = warn, naming both
+        // spans, and run anyway; true = refuse. Default false because it is a
+        // real, deliberately available capability -- a run may legitimately
+        // want the fallback -- but it is now an explicit choice rather than an
+        // invisible substitution. Also settable as PTM_SPICE_COVERAGE_STRICT=1.
+        bool spice_coverage_strict = false;
     } time;
     
     // Mesh Configuration

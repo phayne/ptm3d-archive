@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-184 keys across 11 sections.
+185 keys across 11 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -159,6 +159,7 @@ ENGINE_DEFAULTS = {
     'radiation.view_factor_file': '',
     'simulation.body': 'Europa',
     'simulation.duration_days': 3.55,
+    'simulation.spice_coverage_strict': False,
     'simulation.start_time': '2025-01-01T00:00:00',
     'simulation.start_time_offset_seconds': 0.0,
     'simulation.timesteps': 72,

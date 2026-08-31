@@ -1460,6 +1460,11 @@ static inline bool legacyRadiosityStaticAlbedo() {
 }
 
 // ---- Tri-state env gate --------------------------------------------------
+// Named for the radiation gates it was written for, but nothing about it is
+// radiation-specific, so it is the shared spelling rule for every boolean
+// environment override in this file (BUGS.md PTM-301's
+// PTM_SPICE_COVERAGE_STRICT is the second user).
+//
 // A gate that ships default ON keeps its environment variable as a KILL
 // SWITCH, and the three states are not interchangeable: "unset" means the
 // engine chose this, "=1" means the operator asked for it, and only the second
@@ -1474,7 +1479,7 @@ static inline bool legacyRadiosityStaticAlbedo() {
 // PTM_RAD_SKIP_EQ_STEPS=false as "the operator demands the skip" would abort a
 // run whose author was trying to disable it. Only the documented falsey and
 // truthy spellings are accepted; anything else is FATAL rather than guessed at.
-static inline int radGateEnvState(const char* name) {
+static inline int envTristateFlag(const char* name) {
     const char* e = std::getenv(name);
     if (!e || e[0] == '\0') return 0;
     std::string v(e);
@@ -1518,11 +1523,11 @@ static inline int radGateEnvState(const char* name) {
 // request that cannot be honored must fail, not be downgraded) while the
 // default-on gate stands down with a printed reason.
 static inline bool radSkipEqStepsEnabled() {
-    static bool on = (radGateEnvState("PTM_RAD_SKIP_EQ_STEPS") >= 0);
+    static bool on = (envTristateFlag("PTM_RAD_SKIP_EQ_STEPS") >= 0);
     return on;
 }
 static inline bool radSkipEqStepsForced() {
-    static bool forced = (radGateEnvState("PTM_RAD_SKIP_EQ_STEPS") > 0);
+    static bool forced = (envTristateFlag("PTM_RAD_SKIP_EQ_STEPS") > 0);
     return forced;
 }
 
@@ -1543,7 +1548,7 @@ static inline bool radSkipEqStepsForced() {
 // not a knob. It IS a results change -- it re-thermals faces the pre-2026-08-15
 // selector froze -- and it costs nothing measurable.
 static inline bool radSelectOutputWindowEnabled() {
-    static bool on = (radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW") >= 0);
+    static bool on = (envTristateFlag("PTM_RAD_SELECT_OUTPUT_WINDOW") >= 0);
     return on;
 }
 
@@ -4970,11 +4975,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "  Every per-layer array in ThermalBatchSoA is a fixed-size stack "
                      "buffer; a taller\n"
                      "  column would overflow it rather than silently truncate.\n"
-                     "  Fix by lowering thermal_m/thermal_b (fewer/coarser layers), or "
-                     "raise\n"
-                     "  MAX_THERMAL_LAYERS in thermal_model.h if this column genuinely "
-                     "needs more\n"
-                     "  depth resolution." << std::endl;
+                     "  Three ways out, cheapest first:\n"
+                     "    * run the SCALAR solver (--no-simd-batch). It allocates the "
+                     "depth grid on the\n"
+                     "      heap (thermal::Profile) and has NO layer ceiling, so it "
+                     "handles this column\n"
+                     "      as configured -- at the cost of the 8-face SIMD batching.\n"
+                     "    * lower thermal.thermal_m (layers per skin depth) or "
+                     "thermal.thermal_b (skin\n"
+                     "      depths to the bottom layer) so the grid fits.\n"
+                     "    * raise MAX_THERMAL_LAYERS in thermal_model.h if this column "
+                     "genuinely needs\n"
+                     "      more depth resolution on the SIMD path (it is a stack "
+                     "footprint, not a knob:\n"
+                     "      each ThermalBatchSoA is ~"
+                  << (thermal::MAX_THERMAL_LAYERS * 8 * 10 * sizeof(double)) / 1024
+                  << " KiB per thread today).\n"
+                     "  BUGS.md PTM-302." << std::endl;
         return false;
     }
 
@@ -14344,13 +14361,13 @@ int main(int argc, char** argv) {
         }
         // Same reasoning, same place: parse the three radiation gate variables
         // NOW so an unrecognized spelling costs nothing, instead of aborting
-        // after minutes to hours of ray tracing. radGateEnvState() exits on a
+        // after minutes to hours of ray tracing. envTristateFlag() exits on a
         // value it cannot classify; calling it here just moves that to t=0.
         // (Each is a function-local static in its accessor, so this also fixes
         // the value before any later read can see a different environment.)
-        (void)radGateEnvState("PTM_RAD_SKIP_EQ_STEPS");
-        (void)radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW");
-        (void)radGateEnvState("PTM_RHO_ADVISORY");
+        (void)envTristateFlag("PTM_RAD_SKIP_EQ_STEPS");
+        (void)envTristateFlag("PTM_RAD_SELECT_OUTPUT_WINDOW");
+        (void)envTristateFlag("PTM_RHO_ADVISORY");
     }
 
     // ----------------------------------------------------------------------
@@ -14593,7 +14610,11 @@ int main(int argc, char** argv) {
                   << "[validate-config]   NOT checked: anything that needs the "
                      "mesh, the body or SPICE --\n"
                   << "[validate-config]            mesh loading and units, "
-                     "generic-body construction, SPICE kernels,\n"
+                     "generic-body construction, SPICE kernels\n"
+                  << "[validate-config]            (including whether the SPK "
+                     "spans the run window: that check needs\n"
+                  << "[validate-config]            furnsh'd kernels and the "
+                     "resolved epoch grid, so it runs at launch),\n"
                   << "[validate-config]            property-map face counts, the "
                      "martinez2021 density guard, view\n"
                   << "[validate-config]            factors, and the spin-up seed "
@@ -16402,6 +16423,43 @@ int main(int argc, char** argv) {
     }
     illumination_model->setExternalTimeGrid(external_ets);
 
+    // ----------------------------------------------------------------------
+    // SPK coverage pre-check (BUGS.md PTM-301, second half)
+    // ----------------------------------------------------------------------
+    // Run HERE, not in --validate-config: the check needs furnsh'd kernels and
+    // the resolved epoch grid, neither of which exists at the config-only exit.
+    // But it is still before the illumination ray tracing and the thermal
+    // solve, so a config whose window sits outside its kernel fails in seconds
+    // rather than after a full run that reports rc=0 and Keplerian physics.
+    //
+    // external_ets is the whole grid INCLUDING the equilibration prefix, which
+    // is the span that matters: spin-up integrates before start_time, and a
+    // forward-only kernel fetch is exactly how PTM-437 put every spin-up epoch
+    // outside coverage.
+    if (!external_ets.empty()) {
+        // Spelling rule shared with the radiation gates (envTristateFlag):
+        // 1/true/on/yes, 0/false/off/no, case-insensitive, and FATAL on
+        // anything else rather than guessed at. The env var may only
+        // STRENGTHEN the config -- this is an opt-in safety switch, and one a
+        // stray value can turn OFF is not one.
+        bool coverage_strict = sim_config.time.spice_coverage_strict;
+        const int env_strict = envTristateFlag("PTM_SPICE_COVERAGE_STRICT");
+        if (env_strict > 0 && !coverage_strict) {
+            std::cout << "[ephemeris] PTM_SPICE_COVERAGE_STRICT turns SPK-coverage"
+                         " strictness ON (the config left it off)." << std::endl;
+            coverage_strict = true;
+        } else if (env_strict < 0 && coverage_strict) {
+            std::cout << "[ephemeris] PTM_SPICE_COVERAGE_STRICT does NOT relax"
+                         " simulation.spice_coverage_strict: true. Strictness stays ON;"
+                         " clear the config key instead." << std::endl;
+        }
+        const auto ets_minmax = std::minmax_element(external_ets.begin(), external_ets.end());
+        if (!illumination_model->checkSpkCoverage(*ets_minmax.first, *ets_minmax.second,
+                                                  coverage_strict)) {
+            return 1;
+        }
+    }
+
     // Occluder-only geometry: a coarse ring/annulus (e.g. LOLA out to the
     // physics horizon) added to the shadow-ray BVH so distant topography
     // shadows the SfS core. NOT thermally solved / radiosity-coupled /
@@ -18118,15 +18176,99 @@ int main(int argc, char** argv) {
                     "data/albedo_maps/" + albedo_filename
                 };
 
+                // BUGS.md PTM-454. Until this gate existed, NO config key stopped
+                // this load: the search below ran unconditionally and accepted any
+                // <Body>_Albedo_res<N>.bin whose length matched the face count, so
+                // `illumination.use_albedo_map: false` produced a run whose thermal
+                // surface boundary condition used the uniform body albedo while the
+                // two-band radiosity source albedo came off the map -- two different
+                // albedo fields in one simulation, disclosed only by a warning
+                // (below) that said the mixed state was being left as it was.
+                //
+                // Honor the switch here, the same way the CPU absorbed-flux composer
+                // (the `albedo_map_disabled` branch) and the GPU thermal path
+                // (`!albedo_map_disabled && ...`) already do. `false` now means the
+                // coupling keeps face_albedos_rad at the uniform body albedo, which
+                // is the SAME field the surface BC is using -- one physics, and the
+                // mixed state is unreachable rather than merely announced.
+                //
+                // Folded in: BUGS.md PTM-369. The three bare "File does not exist:"
+                // lines this probe printed on a disabled run came from the search
+                // loop; not searching is what silences them.
+                const bool rad_albedo_map_disabled =
+                    (thermal_config.getProperty("use_albedo_map") == "0");
+
+                // Format albedo explicitly: std::cout is left in `fixed` with
+                // precision 1 at this point in the run, which renders 0.12 as "0.1"
+                // and has already been mistaken for a real albedo bug once.
+                auto fmt_albedo = [](double a) {
+                    std::ostringstream os;
+                    os << std::fixed << std::setprecision(4) << a;
+                    return os.str();
+                };
+
+                // An EXPLICIT illumination.albedo_map (a FITS file) is opened by
+                // the caller on every path, and the absorbed-flux composer tests
+                // that key BEFORE use_albedo_map -- so with both set, the surface
+                // BC runs the explicit per-face map while the switch is off. The
+                // coupling has no FITS reader here, so it stays uniform. That
+                // mixed state is PRE-EXISTING and not what this gate is about,
+                // but the "same field" sentence below would be a lie in that
+                // case, so it is not printed there.
+                const bool rad_explicit_albedo_map =
+                    !thermal_config.getProperty("albedo_map").empty();
+
                 std::string albedo_source_rad;
-                for (const auto& apath : albedo_search_paths) {
-                    auto loaded = importAlbedoMapFromFile(apath);
-                    if (!loaded.empty() && loaded.size() == num_faces) {
-                        face_albedos_rad = std::move(loaded);
-                        albedo_source_rad = apath;
-                        std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
-                        break;
+                if (rad_albedo_map_disabled) {
+                    if (rad_explicit_albedo_map) {
+                        std::cout << "  WARNING: use_albedo_map is false, so radiation coupling"
+                                     " uses the uniform albedo "
+                                  << fmt_albedo(planet.albedo)
+                                  << ", but illumination.albedo_map names an EXPLICIT map ("
+                                  << thermal_config.getProperty("albedo_map")
+                                  << "). The absorbed-flux path tests that key BEFORE the"
+                                     " switch, so IF that file loaded (see the"
+                                     " 'Using provided albedo map' / 'Failed to load explicit"
+                                     " albedo_map' line above), the surface boundary condition"
+                                     " and the radiosity source albedo are DIFFERENT fields in"
+                                     " this run. See BUGS.md PTM-454." << std::endl;
+                    } else {
+                        std::cout << "  Albedo map loading disabled (use_albedo_map: false):"
+                                     " radiation coupling uses the uniform albedo "
+                                  << fmt_albedo(planet.albedo)
+                                  << " -- the same field as the thermal surface boundary"
+                                     " condition. No per-face map is searched for or read."
+                                  << std::endl;
                     }
+                } else {
+                    for (const auto& apath : albedo_search_paths) {
+                        auto loaded = importAlbedoMapFromFile(apath);
+                        if (!loaded.empty() && loaded.size() == num_faces) {
+                            face_albedos_rad = std::move(loaded);
+                            albedo_source_rad = apath;
+                            std::cout << "  Loaded per-face albedos for radiation coupling from: " << apath << std::endl;
+                            break;
+                        }
+                    }
+                }
+
+                // The uniform fallback above is planet.albedo; the surface BC builds
+                // face_albedos from default_visible_albedo. Those are forced equal
+                // where default_visible_albedo is resolved, but only to within 1e-3
+                // (a larger disagreement warns and takes the planet value), so a
+                // sub-1e-3 difference could survive silently into two different
+                // uniform albedos. Say so rather than let it. Only meaningful when
+                // the coupling actually IS running uniform -- with a map loaded,
+                // face_albedos_rad is per-face and planet.albedo is not its value.
+                if (albedo_source_rad.empty() &&
+                    std::abs(planet.albedo - default_visible_albedo) > 1e-12) {
+                    std::cout << "  WARNING: the radiation-coupling uniform albedo "
+                              << fmt_albedo(planet.albedo)
+                              << " differs from the surface boundary condition's operative albedo "
+                              << fmt_albedo(default_visible_albedo)
+                              << " (difference " << std::scientific << std::setprecision(3)
+                              << std::abs(planet.albedo - default_visible_albedo)
+                              << std::defaultfloat << "). See BUGS.md PTM-55." << std::endl;
                 }
 
                 // Never substitute silently: if no per-face map resolved, this path is
@@ -18138,8 +18280,6 @@ int main(int argc, char** argv) {
                 // DEM mesh can never match a global icosphere bin's face count, and
                 // use_albedo_map:false is an explicit request for a uniform albedo.
                 // Mirrors the GPU path's gate (see the albedo_map_disabled branches).
-                const bool rad_albedo_map_disabled =
-                    (thermal_config.getProperty("use_albedo_map") == "0");
                 bool rad_is_custom_mesh = false;
                 {
                     auto it = thermal_config.custom_properties.find("is_custom_mesh");
@@ -18152,15 +18292,6 @@ int main(int argc, char** argv) {
                     !body_name_rad.empty() &&
                     thermal_config.getProperty("using_generic_body") != "true";
 
-                // Format albedo explicitly: std::cout is left in `fixed` with
-                // precision 1 at this point in the run, which renders 0.12 as "0.1"
-                // and has already been mistaken for a real albedo bug once.
-                auto fmt_albedo = [](double a) {
-                    std::ostringstream os;
-                    os << std::fixed << std::setprecision(4) << a;
-                    return os.str();
-                };
-
                 if (albedo_source_rad.empty() && rad_map_expected) {
                     std::cout << "  WARNING: no per-face albedo map found for "
                               << body_name_rad << " res" << mesh_res_rad
@@ -18170,21 +18301,21 @@ int main(int argc, char** argv) {
                               << fmt_albedo(planet.albedo) << " instead." << std::endl;
                 }
 
-                // The reverse divergence, and the more dangerous one: the thermal
-                // surface BC honors use_albedo_map, this radiation-coupling load never
-                // has. With use_albedo_map:false the BC runs a uniform albedo while the
-                // two-band radiosity source albedo is per-face off the map -- two
-                // different albedo fields in one run. Behavior is left AS IS here (that
-                // is a physics decision, not a disclosure one), but it is no longer
-                // silent. See BUGS.md.
+                // BUGS.md PTM-454, the state this fix removes. Until the gate above,
+                // `use_albedo_map: false` gave a run whose surface BC used a uniform
+                // albedo while the radiosity source albedo came off the map, and the
+                // engine only ANNOUNCED it. The gate makes that unreachable; this is
+                // the assertion that keeps it unreachable if the gate is ever moved.
                 if (!albedo_source_rad.empty() && rad_albedo_map_disabled) {
-                    std::cout << "  WARNING: use_albedo_map is FALSE, so the thermal"
-                                 " surface boundary condition is using the uniform albedo "
-                              << fmt_albedo(planet.albedo) << ", but radiation coupling has loaded the"
-                                 " per-face map " << albedo_source_rad
-                              << " anyway. The two-band radiosity source albedo and the"
-                                 " absorbed-flux albedo are therefore DIFFERENT fields in"
-                                 " this run." << std::endl;
+                    std::cerr << "\n[radiation] FATAL: use_albedo_map is FALSE but the"
+                                 " radiation coupling still loaded the per-face map "
+                              << albedo_source_rad << ".\n"
+                                 "  That is the mixed-albedo state BUGS.md PTM-454 removed;"
+                                 " reaching it means the\n"
+                                 "  gate on the map search above was bypassed. Refusing"
+                                 " rather than running two\n"
+                                 "  different albedo fields in one simulation." << std::endl;
+                    return 1;
                 }
 
                 // PTM-34 tripwire (radiation-coupling path). See the CPU absorbed-flux
@@ -18754,7 +18885,7 @@ int main(int argc, char** argv) {
                     && rad_eq_audit_hi > 0
                     && rethermalTwoPhase(times, equilibration_steps, total_time_steps);
                 const bool rad_select_forced =
-                    (radGateEnvState("PTM_RAD_SELECT_OUTPUT_WINDOW") > 0);
+                    (envTristateFlag("PTM_RAD_SELECT_OUTPUT_WINDOW") > 0);
                 const bool rad_select_output_window =
                     radSelectOutputWindowEnabled() && rad_eq_audit_hi > 0
                     && (rad_eq_span_is_artifact || rad_select_forced);
@@ -18831,7 +18962,7 @@ int main(int argc, char** argv) {
                 // than tuned away because an advisory that errs toward "more
                 // sweeps" is the safe direction, and because the alternative --
                 // a measured count -- is not available until the loop has run.
-                if (radGateEnvState("PTM_RHO_ADVISORY") < 0) {
+                if (envTristateFlag("PTM_RHO_ADVISORY") < 0) {
                     std::cout << "  [rho-advisory] PTM_RHO_ADVISORY=0: skipped. The coupling"
                                  " loop's sweep count is NOT being checked against rho(F)"
                                  " on this run." << std::endl;
@@ -20688,6 +20819,26 @@ int main(int argc, char** argv) {
     // "which solver produced this?" without its log -- see
     // tools/solver_disclosure.h for why that question had no answer before.
     ptm::appendThermalSolverProvenance(output_dir);
+
+    // ========================================================================
+    // Which ephemeris actually served this run (BUGS.md PTM-301)
+    // ========================================================================
+    // The counter half of PTM-301. `ephemeris_source: spice` in a config is a
+    // REQUEST; this is the answer. Printed to the log AND written into the run
+    // directory, because the whole failure mode was a run that looked like
+    // SPICE from every artifact it left behind.
+    illumination_model->reportEphemerisFallback();
+    {
+        const std::string prov_path = output_dir + "/provenance.txt";
+        std::ofstream prov_out(prov_path, std::ios::app);
+        if (prov_out) {
+            prov_out << illumination_model->ephemerisProvenanceBlock();
+        } else {
+            std::cerr << "[ephemeris] WARNING: cannot append the ephemeris record to "
+                      << prov_path << "; this run's directory will not say whether the"
+                         " SPK or the Keplerian fallback served it." << std::endl;
+        }
+    }
 
     // Full arrays exist iff not streaming or we explicitly extracted
     bool have_full_illum_arrays =
