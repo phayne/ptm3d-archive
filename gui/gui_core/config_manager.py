@@ -521,6 +521,38 @@ class ConfigManager:
             "depths_file": "",
             "series_output": ""
         },
+        # --- Flux cubes (docs/flux-cubes.md) ------------------------------
+        # Passive six-face irradiance probes standing on the terrain. The
+        # section is TOP LEVEL in the engine, deliberately, so it stays out of
+        # the body-defaults machinery.
+        #
+        # WRITTEN SELECTIVELY, like `gpu:` and for a different reason: the
+        # engine's default is `enabled: false`, so a run without cubes is
+        # exactly a run with no `flux_cubes:` section, and emitting a
+        # seven-key block of defaults into every configuration would put a
+        # feature nobody asked for in front of every reader. See
+        # _flux_cube_section_for_yaml.
+        #
+        # `mode`, `spacing_m` and `radius_m` are GUI-synthetic and are STRIPPED
+        # at save time. They are inputs to `ptm_flux_cube_geom`, which bakes
+        # them into the cache header; the engine reads them back out of the
+        # cache and refuses a mismatch, so a YAML copy would be a second source
+        # of truth for one number. `flux_cubes.mode` is not an engine key
+        # either -- it records which of the two placement workflows the card is
+        # showing.
+        "flux_cubes": {
+            "enabled": False,
+            "cache_file": "",
+            "write_binary": True,
+            "write_csv": True,
+            "write_csv_max_cubes": 0,
+            "shadow_probe_rays": 5,
+            "locations": [],
+            # GUI-synthetic; see above.
+            "mode": "grid",
+            "spacing_m": 25.0,
+            "radius_m": 500.0,
+        },
         # The `advanced:` section held exactly two keys (verbose,
         # default_visible_albedo), both at the engine's default, both with no
         # control. Dropping the section changes no run: the engine reads it
@@ -1039,6 +1071,76 @@ class ConfigManager:
         gpu_cfg["margin_explicit"] = "min_vram_margin_gib" in loaded_gpu
         self.config["gpu"] = gpu_cfg
 
+        # The flux-cube placement mode is not in the file and cannot be: it is
+        # a property of the CACHE, which is the only thing that placed a cube.
+        # Infer it from what the file says and then, if the cache is readable,
+        # take the grid numbers from the cache header -- the values the tool
+        # MEASURED, not the ones a form last showed. Wrapped because a cache
+        # that is missing, foreign or truncated must leave the window standing;
+        # the card and the pre-flight both say so in their own words.
+        # Imported inside the method: `gui_core/__init__` imports THIS module,
+        # so a module-level import of a sibling would run against a package
+        # that is still being built.
+        from gui_core import flux_cubes as _fc
+        loaded_flux = ((loaded or {}).get("flux_cubes", {}) or {}) \
+            if isinstance(loaded, dict) else {}
+        flux_cfg = self.config.get("flux_cubes")
+        flux_cfg = flux_cfg if isinstance(flux_cfg, dict) else {}
+        has_locations = bool(loaded_flux.get("locations"))
+        flux_cfg["mode"] = (_fc.MODE_LOCATIONS if has_locations
+                            else _fc.MODE_LATTICE)
+        try:
+            cache = str(loaded_flux.get("cache_file", "") or "").strip()
+            if cache:
+                # RESOLVED, the way every other path in this application is.
+                # Shipped configurations name a project-relative path, and
+                # reading it against whatever directory the window happens to
+                # be running in fails quietly -- `read_cache_header` returns a
+                # refusal rather than raising, so the `except` below would
+                # never have fired and the placement fields would have kept
+                # showing defaults. That is the exact outcome this block exists
+                # to prevent, so it was worth resolving properly.
+                from gui_core.preflight import (find_project_root,
+                                                resolve_path)
+                from gui_core.simulation_runner import SimulationRunner
+                try:
+                    root = find_project_root(
+                        SimulationRunner.find_ptm_executable())
+                except Exception:                            # noqa: BLE001
+                    root = None
+                header = _fc.read_cache_header(
+                    resolve_path(cache, root or Path.cwd()))
+                if header.ok:
+                    # THE LAYOUT DECIDES THE MODE, not the presence of a list.
+                    # A layout can hold a grid AND named points -- the tool
+                    # appends them after the lattice in one file -- and reading
+                    # "there are names, so this is the named mode" hid the grid
+                    # fields for such a project and made a rebuild throw the
+                    # lattice away.
+                    if header.radius_m >= 0:
+                        flux_cfg["spacing_m"] = header.spacing_m
+                        flux_cfg["radius_m"] = header.radius_m
+                        flux_cfg["mode"] = (_fc.MODE_BOTH if header.n_named
+                                            else _fc.MODE_LATTICE)
+                    else:
+                        # radius < 0 is the tool's "no lattice"; the card's
+                        # spin box has no way to show that, and the mode does.
+                        flux_cfg["mode"] = _fc.MODE_LOCATIONS
+                else:
+                    logger.warning(
+                        "[config] the flux-cube layout this file names could "
+                        "not be read (%s); the placement fields show this "
+                        "application's defaults, not the layout's. The engine "
+                        "still checks the layout against the run.",
+                        header.error)
+        except Exception as exc:                             # noqa: BLE001
+            logger.warning(
+                "[config] the flux-cube layout this file names could not be "
+                "resolved (%s); the placement fields show this application's "
+                "defaults. The engine still checks the layout against the "
+                "run.", exc)
+        self.config["flux_cubes"] = flux_cfg
+
         # ---- DP-1(b): keep the file's own text, and the engine-facing view of
         # what it said, so a later save can write ONLY what changed.
         self._source_doc = yaml_roundtrip.RoundTripDoc.load(filename)
@@ -1137,6 +1239,77 @@ class ConfigManager:
             # through a real ConfigurationPanel.
             if not yaml_roundtrip.values_equal(engine_value, value):
                 out[key] = value
+        return out
+
+    #: The seven keys the engine's `flux_cubes:` branch actually reads, in the
+    #: order `config_parser.cpp` reads them. Everything else the GUI keeps
+    #: under this section is its own state and is not written -- see the
+    #: DEFAULT_CONFIG comment. Transcribed from `warnUnreadFluxCubeKeys`,
+    #: whose own comment declares itself the hand-maintained contract; if that
+    #: list grows, this one is where the GUI follows it.
+    FLUX_CUBE_ENGINE_KEYS = ("enabled", "cache_file", "write_binary",
+                             "write_csv", "write_csv_max_cubes",
+                             "shadow_probe_rays", "locations")
+
+    def _flux_cube_section_for_yaml(self, flux):
+        """The `flux_cubes:` block to write -- nothing at all when it is off.
+
+        The engine defaults `flux_cubes.enabled` to false and reads the whole
+        section under `if (root["flux_cubes"])`, so "no section" and "a section
+        saying enabled: false" are the same run. Writing the second would put
+        seven keys describing a feature this run does not use into every
+        configuration the GUI saves, and would change the emitted file for
+        every existing project for no behavioral reason.
+
+        The GUI-synthetic geometry keys are dropped here rather than filtered
+        by name at the call site: this builds the block from
+        ``FLUX_CUBE_ENGINE_KEYS`` and cannot leak a key that is not on it.
+
+        ``locations`` is written only when the placement mode asks for named
+        points AND the list has entries. Both halves matter:
+
+        * an empty list is what "no named locations" already means, and the
+          engine's verification loop skips it either way;
+        * a GRID-ONLY run is not asking for named points, and emitting a
+          table's leftover rows into it hands the engine a list of names its
+          layout does not contain. The engine refuses that -- correctly, and
+          AFTER the whole thermal solve. Found in review: add three pads,
+          switch the mode back to the grid, build, save, and the run was set up
+          to fail at the end with the table that caused it hidden.
+
+        ``shadow_probe_rays`` is coerced to an int. Its control is a combo
+        (the engine reads 5 or 1 and nothing between), and a combo stores the
+        text it shows.
+        """
+        if not flux or not flux.get("enabled"):
+            return {}
+        from gui_core import flux_cubes as _fc
+        named = _fc.mode_uses_locations(flux.get("mode"))
+        out = {}
+        for key in self.FLUX_CUBE_ENGINE_KEYS:
+            if key not in flux:
+                continue
+            value = flux[key]
+            if key == "locations":
+                rows = [dict(r) for r in (value or [])
+                        if isinstance(r, dict) and str(r.get("name", "")).strip()]
+                if rows and named:
+                    out[key] = rows
+                continue
+            if key == "shadow_probe_rays":
+                try:
+                    out[key] = int(float(value))
+                except (TypeError, ValueError):
+                    # Unreadable: leave it out and let the engine's own
+                    # default stand, rather than invent a number. The card's
+                    # combo cannot produce this; a hand-edited file can.
+                    logger.warning(
+                        "[config] flux_cubes.shadow_probe_rays is %r, which is "
+                        "not a number; it is left out of the written "
+                        "configuration and the engine's default applies.",
+                        value)
+                continue
+            out[key] = value
         return out
 
     def gpu_policy_report(self):
@@ -1355,6 +1528,15 @@ class ConfigManager:
                     v if isinstance(v, dict) else {})
                 if gpu_out:
                     out[k] = gpu_out
+                continue
+            if k == "flux_cubes":
+                # Selective, like `gpu` and for its own reason: with cubes off
+                # the section is not a setting, it is silence, and the engine
+                # reads silence as off. See _flux_cube_section_for_yaml.
+                flux_out = self._flux_cube_section_for_yaml(
+                    v if isinstance(v, dict) else {})
+                if flux_out:
+                    out[k] = flux_out
                 continue
             if k == "mesh":
                 # Translate the GUI-synthetic topo_source mode into concrete

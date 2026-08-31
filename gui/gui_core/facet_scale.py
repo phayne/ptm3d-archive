@@ -98,6 +98,23 @@ class FacetScale:
     n_faces: int = None
     source: str = "unknown"       # icosphere | ply | ply-sampled | obj | unknown
     detail: str = ""
+    #: Median EQUIVALENT EDGE, sqrt(4A/sqrt(3)) -- the edge of an equilateral
+    #: triangle of the same area. A different statistic from `meters`, and it is
+    #: here because `ptm_flux_cube_geom` sizes a flux cube from exactly this one
+    #: (docs/flux-cubes.md section 1) while the beaming rule above uses
+    #: sqrt(mean area). Measured on data/meshes/lunar_crater_80N.ply the two are
+    #: 26.86 m and 17.95 m -- a factor of 1.5, so reusing one for the other
+    #: would put the cube height 33% wrong. Nothing in the beaming rule reads
+    #: this; it is carried so the flux-cube card has ONE reader of a mesh.
+    #:
+    #: STILL NOT the geometry tool's own number: the tool takes the median over
+    #: the CORE faces inside the grid disk, this is the median over the whole
+    #: mesh (sampled above `_AREA_SAMPLE_ABOVE` faces). On the shipped 80N
+    #: crater that is 26.86 m here against the tool's measured 28.74 m inside
+    #: 500 m. So it is an ESTIMATE of what the tool will resolve, every caller
+    #: must say so, and once a cache exists the ACHIEVED height in its header
+    #: is what a card should show instead.
+    median_edge_m: float = None
 
     def describe(self):
         if self.meters is None:
@@ -122,7 +139,14 @@ class BeamingPolicy:
     scale: FacetScale = None
 
 
-def _fmt_length(m):
+def fmt_length(m):
+    """A length in the unit a reader would say it in.
+
+    PUBLIC, because the flux-cube card shows cube heights beside facet scales
+    on the same screen and two ladders would render one mesh two ways. It was
+    `_fmt_length` and reached across module boundaries by its private name,
+    which is a rename waiting to break a caller.
+    """
     if m < 0.01:
         return f"{m * 1000.0:.3g} mm"
     if m < 1.0:
@@ -132,6 +156,10 @@ def _fmt_length(m):
     return f"{m / 1000.0:.4g} km"
 
 
+#: The name every existing call site in this module uses.
+_fmt_length = fmt_length
+
+
 def _percentile(values, q):
     """Nearest-rank percentile of `values`. Small samples, so no numpy."""
     ordered = sorted(values)
@@ -139,6 +167,24 @@ def _percentile(values, q):
         return 0.0
     i = int(q * (len(ordered) - 1))
     return ordered[max(0, min(len(ordered) - 1, i))]
+
+
+def _median_equivalent_edge(areas):
+    """Median of `sqrt(4A/sqrt(3))` -- the geometry tool's own length scale.
+
+    Transcribed from `docs/flux-cubes.md` section 1 and
+    `src/cpp/fluxcubes/flux_cube_geom.cpp`, which write it as the edge of an
+    equilateral triangle with the same area. Written out here rather than
+    approximated from `sqrt(mean area)`: the two differ by a factor of 1.5 on
+    the shipped 80N crater, and a cube height is 0.1 of whichever one you pick.
+    """
+    if not areas:
+        return 0.0
+    edges = [math.sqrt(4.0 * a / math.sqrt(3.0)) for a in areas if a > 0]
+    if not edges:
+        return 0.0
+    edges.sort()
+    return edges[len(edges) // 2]
 
 
 def _clean_body(config):
@@ -552,6 +598,8 @@ def facet_scale(config, project_root=None):
         return FacetScale(meters=math.sqrt(mean_area) * abs(scale),
                           fine_meters=math.sqrt(_percentile(areas, 0.05))
                           * abs(scale),
+                          median_edge_m=_median_equivalent_edge(areas)
+                          * abs(scale),
                           n_faces=n_faces, source=source, detail=detail)
 
     body = _clean_body(config)
@@ -579,11 +627,14 @@ def facet_scale(config, project_root=None):
         return FacetScale(
             meters=math.sqrt(total_area / n_faces),
             fine_meters=math.sqrt(total_area / n_faces), n_faces=n_faces,
+            median_edge_m=_median_equivalent_edge([total_area / n_faces]),
             source="icosphere-topographic",
             detail=f"{body} topography grid, resolution {res}; area from the "
                    f"smooth sphere, so the true scale is slightly smaller")
     return FacetScale(meters=math.sqrt(total_area / n_faces),
                       fine_meters=math.sqrt(total_area / n_faces),
+                      median_edge_m=_median_equivalent_edge(
+                          [total_area / n_faces]),
                       n_faces=n_faces, source="icosphere",
                       detail=f"{body} sphere, resolution {res}")
 

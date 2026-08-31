@@ -129,6 +129,19 @@ _FILE_FIELDS = [
     "generic_body.spice_metakernel",
 ]
 
+#: ⛔ `flux_cubes.cache_file` is deliberately NOT on the list above. Every key
+#: there is existence-checked whenever it is non-empty, and `run_preflight` is
+#: handed the GUI's LIVE configuration rather than the emitted one -- which
+#: still carries a layout path from the last time cubes were on. That would
+#: block a launch over a file this run never opens. The layout gets the same
+#: existence, placeholder and cloud-path treatment in
+#: `gui_core.flux_cubes.preflight_findings`, gated on `flux_cubes.enabled`.
+#:
+#: It IS absolutized (see `absolutize_config_paths`), and NOT through
+#: `resolveDataPath`: `config_parser.cpp` leaves this key alone, so the engine
+#: reads it relative to its own working directory.
+FLUX_CUBE_CACHE_KEY = "flux_cubes.cache_file"
+
 #: The one path field with its own resolution contract. Named once so the
 #: absolutizer and the existence check cannot drift apart on it.
 METAKERNEL_KEY = "generic_body.spice_metakernel"
@@ -226,6 +239,7 @@ class PreflightReport:
     vf_rebuild_warning: str = ""                     # PTM-19 guard text, if triggered
     beaming_warning: str = ""                        # facet-scale rule text, if triggered
     vf_cost_line: str = ""                           # advisory VF cost headline
+    flux_cube_line: str = ""                         # cube count and product size
     executable: Path = None
     project_root: Path = None
 
@@ -247,6 +261,8 @@ class PreflightReport:
             out.append(f"BEAM-GUARD: {self.beaming_warning}")
         if self.vf_cost_line:
             out.append(f"VF-COST: {self.vf_cost_line}")
+        if self.flux_cube_line:
+            out.append(f"FLUX-CUBES: {self.flux_cube_line}")
         for w in self.warnings:
             out.append(f"WARNING: {w}")
         for i in self.info:
@@ -996,6 +1012,7 @@ def absolutize_config_paths(config, project_root):
     from copy import deepcopy
     cfg = deepcopy(config)
     path_fields = _FILE_FIELDS + _DATA_DIR_FIELDS + [
+        FLUX_CUBE_CACHE_KEY,
         "radiation.view_factor_file",
         # An OUTPUT path, so it is absolutized but not existence-checked: it is
         # the file this run will write, not one it must find.
@@ -1552,6 +1569,22 @@ def run_preflight(config, find_executable, project_root=None,
             report.warnings.append(
                 f"beaming: the facet-scale rule could not be evaluated ({e}); "
                 f"confirm this mesh is far coarser than the roughness scale.")
+
+    # -- Flux cubes -----------------------------------------------------------
+    # The whole rule set lives in gui_core.flux_cubes, next to the gate the
+    # card uses, so the launch check and the card cannot drift into two
+    # opinions. This function's own path resolvers are handed over rather than
+    # imported there, so there is one resolver and not a second copy of the
+    # resolution rules.
+    from gui_core import flux_cubes as _fc
+    flux_findings = _fc.preflight_findings(
+        config, project_root, resolve_path, resolve_data_path, is_dataless,
+        is_cloud_path, _ply_face_count)
+    report.errors.extend(flux_findings.errors)
+    report.info.extend(flux_findings.info)
+    report.dataless.extend(flux_findings.dataless)
+    report.cloud_paths.extend(flux_findings.cloud_paths)
+    report.flux_cube_line = flux_findings.line
 
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)
