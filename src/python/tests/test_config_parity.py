@@ -114,6 +114,62 @@ GUI_GENERIC_BODY_DEAD_KEYS = (
     "thermophysical.use_default_rhos",
 )
 
+#: ⛔ NOT a harmless dead key, and it is listed here only so the fourteen
+#: Justitia configurations can be tracked without switching this gate off for
+#: everything else. Owed as **PTM-ICE-LAYER-KEYS-UNREAD**.
+#:
+#: These seven describe a DISCRETE buried-ice layer -- the depth of the
+#: regolith/ice interface and the ice's own conductivity, density and heat
+#: capacity. Nothing in this repository reads any of them. `config_parser.cpp`
+#: parses `thermal.compute_ice_stability` and the `thermal.ice_stability.*`
+#: block (Schorghofer & Taylor stability depths, a POST-PROCESSING diagnostic,
+#: not a layer in the column) and nothing else with "ice" in the name;
+#: `generic_body.surface` parses exactly albedo/emissivity/ks/kd/rhos/rhod/H/
+#: cp0/Qb/chi. Two comments in the engine
+#: (`ptm_thermal_sim.cpp:4961`, `thermal_model.h:1056`) refer to
+#: "generic_body.surface.ice_depth" as though it were configurable; on this
+#: tree it is not, and `git log -S ice_k_a0 -- src/cpp` finds no commit that
+#: ever added the parse.
+#:
+#: So the six `justitia_ice_depth_study_*` configurations and the two `_step`
+#: proxops variants specify an ice layer the engine never sees. What they
+#: actually run is the ordinary two-layer exponential profile from
+#: `generic_body.surface` -- which is what the NON-step `justitia_proxops_
+#: ice2cm.yaml` and `..._ice10cm.yaml` do deliberately and say so in their own
+#: comments ("an APPROXIMATION of a discrete regolith-over-ice profile ...
+#: k(z) is already ~22% ice-like by z=0.5cm"). The step configurations were
+#: written to be the sharp-interface counterpart of exactly that
+#: approximation, and on this binary they are not.
+#:
+#: Do NOT quietly delete these keys to make this list shorter: whether the
+#: parse is missing or the configurations name the wrong section is a question
+#: for the engine, and deleting the values would destroy the only record of
+#: what each study intended.
+JUSTITIA_UNREAD_ICE_LAYER_KEYS = (
+    "thermal.ice_chi", "thermal.ice_cp0", "thermal.ice_cp_linear",
+    "thermal.ice_depth", "thermal.ice_k_a0", "thermal.ice_k_a1",
+    "thermal.ice_rho",
+)
+
+#: The fourteen shipped Justitia configurations. Every one carries the same
+#: raw `thermophysical:` block the GUI's generic-body path writes
+#: (GUI_GENERIC_BODY_DEAD_KEYS above), which is decorative but HARMLESS here:
+#: measured 2026-08-31, all fourteen agree with their own live
+#: `generic_body.surface` on every key the two share, so nothing is being
+#: described one way and run another. Eight of them additionally carry the ice
+#: layer above, which is not harmless -- see that note.
+_JUSTITIA_ICE_LAYER = (
+    "justitia_ice_depth_study_d0p5cm", "justitia_ice_depth_study_d10cm",
+    "justitia_ice_depth_study_d1cm", "justitia_ice_depth_study_d2cm",
+    "justitia_ice_depth_study_d5cm", "justitia_ice_depth_study_homog_ctrl",
+    "justitia_proxops_ice10cm_step", "justitia_proxops_ice2cm_step",
+)
+_JUSTITIA_SMOOTH_PROFILE = (
+    "justitia_proxops", "justitia_proxops_descent", "justitia_proxops_high",
+    "justitia_proxops_ice10cm", "justitia_proxops_ice2cm",
+    "justitia_proxops_low",
+)
+
 KNOWN_DEAD_KEYS_IN_EXAMPLES = {
     "examples/europa_high_res.yaml": (
         "output.no_maps",
@@ -132,6 +188,13 @@ KNOWN_DEAD_KEYS_IN_EXAMPLES = {
         "visualization.save_frames", "visualization.width",
     ),
 }
+KNOWN_DEAD_KEYS_IN_EXAMPLES.update({
+    f"examples/{stem}.yaml": GUI_GENERIC_BODY_DEAD_KEYS
+    for stem in _JUSTITIA_SMOOTH_PROFILE})
+KNOWN_DEAD_KEYS_IN_EXAMPLES.update({
+    f"examples/{stem}.yaml":
+        GUI_GENERIC_BODY_DEAD_KEYS + JUSTITIA_UNREAD_ICE_LAYER_KEYS
+    for stem in _JUSTITIA_ICE_LAYER})
 
 
 def _derive():
