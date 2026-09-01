@@ -256,7 +256,14 @@ class BaseConfigTab(QWidget):
                 info_key or key)
 
     def create_scroll_area(self, content_widget):
-        """Wrap content in a scroll area"""
+        """Wrap content in a scroll area.
+
+        KEEPS A HANDLE ON THE SCROLL AREA (`self._scroll`). A tab is a tall
+        form and only part of it is on screen at any moment, so "is this
+        control visible" has two halves: not hidden, AND inside the viewport
+        rectangle. Code that reveals something needs the second half, and
+        without a handle it cannot ask. See `BodyCard.scroll_into_view`.
+        """
         scroll = QScrollArea()
         scroll.setWidget(content_widget)
         scroll.setWidgetResizable(True)
@@ -265,6 +272,7 @@ class BaseConfigTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(scroll)
+        self._scroll = scroll
 
     def add_string_field(self, layout, row, label_text, key, tooltip="", info_key=None):
         """Add a string input field"""

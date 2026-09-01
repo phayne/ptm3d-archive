@@ -239,10 +239,18 @@ def engine_support(config):
             "so the engine stops. Set radiation.band_separated to true.")
 
     if not str(mesh.get("import_file", "") or "").strip():
+        # SAYS WHAT IS MISSING, NOT WHICH MODE. This used to end "and a global
+        # run generates its sphere in memory with no file to build against",
+        # which is a statement about a run this function cannot see: an empty
+        # `mesh.import_file` on a LOCAL-mesh card means the user has not
+        # imported terrain yet, and telling them their run is global is simply
+        # untrue. The card knows the mode and appends its own sentence
+        # (`BodyCard._flux_mode_note`); this one stays true of every caller,
+        # including the launch check, which has no card at all.
         policy.blockers.append(
             "Flux cubes need an imported terrain mesh. The cube grid is built "
-            "against a mesh file, and a global run generates its sphere in "
-            "memory with no file to build against.")
+            "against a mesh file, and this run has none -- either no terrain "
+            "has been imported, or the run generates its sphere in memory.")
 
     lookahead = _as_float(thermal.get("checkpoint_lookahead_steps", 0), 0.0)
     if lookahead > 0:
