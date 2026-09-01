@@ -1765,6 +1765,23 @@ class BodyCard(BaseConfigTab):
                         ("Longitude", "lon_deg"), ("Height (m)", "height_m"),
                         ("Cube size (m)", "edge_m"))
 
+    #: What the group says while the cubes are OFF AND the run could produce
+    #: them. The switch is the only control on screen then, so this line has to
+    #: say that there IS an options list and name what is in it -- in the same
+    #: words the controls use, so someone looking for "grid spacing" finds
+    #: "Distance between cubes".
+    #:
+    #: It names THE CUBES rather than saying "turn this on", and it is not
+    #: shown while a blocker stands. `engine_support`'s own text already ends
+    #: "Turn it on above" about the RADIATION switch, and the two sentences
+    #: side by side put an "it" and a "this" one clause apart pointing at
+    #: different controls -- while inviting the user into the exact state the
+    #: launch check refuses.
+    FLUX_OFF_HINT = ("Turn the cubes on for the placement options: where they "
+                     "go (a grid, named points, or both), the distance "
+                     "between them, the grid radius, the cube height measured "
+                     "from this mesh, and what the run writes.")
+
     def flux_cube_group(self, title="Flux cubes"):
         """Virtual six-face irradiance probes on the terrain.
 
@@ -1783,6 +1800,13 @@ class BodyCard(BaseConfigTab):
         same thing, and the pre-flight repeats it for a configuration that
         arrives some other way. It is nevertheless kept on screen whenever the
         setting is ON, whatever the mode: see `MoonCard.apply_mode`.
+
+        THE SWITCH ITSELF IS ALWAYS LIVE, whatever `engine_support` says --
+        see `refresh_flux_cubes`. One click always reveals the placement, from
+        any state, whether the terrain arrived from the curated-site picker or
+        from the file field and in either order. A refusal is a sentence in
+        the note and an error in the launch check, never a control that
+        discards the click.
 
         THE PLACEMENT IS THE SPECIFICATION. Nothing in the flow asks for a file
         name: the launch check turns "a 25 m grid out to 500 m" into a
@@ -1975,8 +1999,7 @@ class BodyCard(BaseConfigTab):
 
         It NEVER writes a configuration key. The switch is left exactly as the
         file set it even when the rules refuse it; the group says the rules
-        disagree and the control is disabled, the same way the beaming gate
-        does, because opening a file is not an edit to it.
+        disagree, because opening a file is not an edit to it.
         """
         from gui_core import flux_cubes as fc
         switch = self.widgets.get("flux_cubes.enabled")
@@ -1987,30 +2010,83 @@ class BodyCard(BaseConfigTab):
         policy = fc.engine_support(config)
         enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
                                                      False))
-        switch.setEnabled(bool(policy.allowed))
+        # ⛔ THE SWITCH IS NEVER DISABLED, and that is the fix for Paul's
+        # 2026-08-31 report, not a style preference. `setEnabled(policy.allowed)`
+        # made a real click a SILENT no-op: on a freshly opened Moon
+        # local-mesh card there is no terrain yet, so the switch was dead, and
+        # `QCheckBox.click()` on it changes nothing and emits nothing. The user
+        # clicks, no option appears, and the only thing that ever said why is a
+        # gray line under the box. Measured: the group is 79 px of one checkbox
+        # in that state, whichever of the four preconditions is missing.
+        #
+        # It also produced a setting that was ON and could not be turned OFF --
+        # go to another body and back and `presets.FOREIGN_MESH_CLEARS` takes
+        # the mesh away while `flux_cubes.enabled` stays true, so the group
+        # showed its own live setting behind a dead control.
+        #
+        # Nothing unsafe is reachable this way: `flux_cubes.preflight_findings`
+        # turns every one of these blockers into a launch ERROR, so a run that
+        # the engine would refuse after the whole thermal solve is refused
+        # before it starts. The card describes; the launch check enforces.
+        switch.setEnabled(True)
         body = getattr(self, "flux_body", None)
         if body is not None:
             body.setVisible(enabled)
 
         if not policy.allowed and enabled:
+            # NO PROVENANCE CLAIM. This branch used to end "the setting has NOT
+            # been changed -- it is your file's", which was safe only while the
+            # switch was dead: the ONLY way to reach it was an opened file. Now
+            # the ordinary way to reach it is the user's own click, and telling
+            # someone their file did it is a false statement about the thing
+            # they just did. It says what is wrong and what fixes it, which is
+            # true however the setting got here.
             note.setText(
-                "THIS CONFIGURATION ASKS FOR FLUX CUBES AND THE RUN CANNOT "
-                "PRODUCE THEM. " + policy.reason
-                + " The setting has NOT been changed -- it is your file's. "
-                  "Fix what it names, or turn the cubes off yourself.")
+                "THIS RUN CANNOT PRODUCE FLUX CUBES AS CONFIGURED. "
+                + policy.reason
+                + " Nothing has been changed for you: fix what is named above,"
+                  " or turn the cubes back off.")
             logger.warning(
-                "[card] this configuration enables flux_cubes and the engine "
-                "would refuse the pass: %s. The setting is left alone; opening "
-                "a file is not an edit to it.", policy.reason)
+                "[card] flux_cubes is on and the engine would refuse the pass: "
+                "%s. The setting is not changed here; the launch check refuses "
+                "the run.", policy.reason)
+        elif not enabled and policy.allowed:
+            # OFF AND RUNNABLE is the state Paul was looking at, and the note is
+            # the only thing on screen. It has to say that there IS an options
+            # list and what is in it -- "there still doesn't seem to be any
+            # options list for the flux cubes, such as grid spacing and height"
+            # is what a group showing one checkbox and a sentence about the
+            # physics reads as.
+            note.setText(policy.reason + " " + self.FLUX_OFF_HINT)
         else:
+            # Off and blocked: `policy.reason` names the blockers and already
+            # ends with what to do about each. Inviting the user to turn the
+            # cubes on here would be inviting them into the state the launch
+            # check refuses.
             note.setText(policy.reason)
 
+        # UNCONDITIONAL, and before the early return. `flux_lattice` and
+        # `flux_named` are only ever shown or hidden here, so skipping this
+        # while the group was off left their visibility to whatever Qt did when
+        # the layout reparented them -- correct by accident, and only for the
+        # mode the card happened to open on. Now the placement blocks agree
+        # with `flux_cubes.mode` in every state, and the reveal below is the
+        # single `flux_body` line rather than an ordering.
+        self._refresh_flux_placement()
+        # The mode rule reads `flux_cubes.enabled`, which the user can now
+        # change WITHOUT a mode switch -- impossible while the control was
+        # dead. Re-applied here or an emptied group is left standing on a mode
+        # that cannot produce cubes at all.
+        self._apply_flux_group_visibility()
         if not enabled:
             return
-        self._refresh_flux_placement()
         self._refresh_flux_height()
         self._refresh_flux_cache()
         self._refresh_flux_estimate()
+
+    def _apply_flux_group_visibility(self):
+        """Show or hide the whole group. Cards that offer it on one mode only
+        override this; a card that offers it always needs nothing here."""
 
     def _flux_mode(self):
         from gui_core import flux_cubes as fc
@@ -2648,20 +2724,37 @@ class MoonCard(BodyCard):
         local = self._mode == "local"
         self.global_group.setVisible(not local)
         self.local_group.setVisible(local)
-        # Offered on the local mesh, because a global run generates its sphere
-        # in memory and the layout tool has no file to build against.
-        #
-        # ⛔ BUT NEVER HIDDEN WHILE THE SETTING IS ON. Hiding the whole group
-        # on the mode alone left `flux_cubes.enabled: true` live in a window
-        # with no control anywhere that could see it, clear it, or give it a
-        # layout -- and `mesh.import_file` survives the mode switch, so
-        # `engine_support` still passed and the launch check refused with
-        # "no cube layout file is set... Build it from the card" against a card
-        # that was showing no such thing. That is the defect Paul hit
-        # (2026-08-31), and it is the same failure this group's own docstring
-        # refuses for the Advanced tier: a setting that stays on with nobody
-        # able to see it. The group therefore stays visible whenever it is on,
-        # and says why the mode cannot produce cubes.
+        # The gate depends on the mode (a global run has no imported mesh), so
+        # the group has to be re-described whenever the mode moves. Without
+        # this it kept the previous mode's answer. It re-applies
+        # `_apply_flux_group_visibility` on its way through, so the rule below
+        # runs for a mode change and for a toggle alike.
+        self.refresh_flux_cubes()
+
+    def _apply_flux_group_visibility(self):
+        """Offered on the local mesh, because a global run generates its
+        sphere in memory and the layout tool has no file to build against.
+
+        ⛔ BUT NEVER HIDDEN WHILE THE SETTING IS ON. Hiding the whole group on
+        the mode alone left `flux_cubes.enabled: true` live in a window with no
+        control anywhere that could see it, clear it, or give it a layout --
+        and `mesh.import_file` survives the mode switch, so `engine_support`
+        still passed and the launch check refused with "no cube layout file is
+        set... Build it from the card" against a card that was showing no such
+        thing. That is the first defect Paul hit (2026-08-31), and it is the
+        same failure this group's own docstring refuses for the Advanced tier:
+        a setting that stays on with nobody able to see it. The group therefore
+        stays visible whenever it is on, and says why the mode cannot produce
+        cubes.
+
+        ⛔ AND IT LIVES HERE, not inline in `apply_mode`, because the rule
+        reads `flux_cubes.enabled` and that can now change without a mode
+        change: the switch is always live (see `refresh_flux_cubes`), so
+        turning the cubes OFF on the global mode used to leave an empty group
+        standing on a run that can never produce them. Both callers use this
+        one rule.
+        """
+        local = self._mode == "local"
         enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
                                                      False))
         self.flux_group.setVisible(local or enabled)
@@ -2671,11 +2764,7 @@ class MoonCard(BodyCard):
                 "card is on the global mode, which builds its sphere in memory "
                 "and has no mesh file to place cubes against. The group is "
                 "kept on screen so the setting can be seen and cleared; it is "
-                "NOT changed here -- opening a file is not an edit to it.")
-        # The gate depends on the mode (a global run has no imported mesh), so
-        # the group has to be re-described whenever the mode moves. Without
-        # this it kept the previous mode's answer.
-        self.refresh_flux_cubes()
+                "NOT changed here.")
 
     def load_card(self):
         super().load_card()
