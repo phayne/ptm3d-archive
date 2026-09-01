@@ -39,7 +39,7 @@ what/recommended/when standard. `test_gui_body_first.py` holds that line.
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
@@ -1794,12 +1794,20 @@ class BodyCard(BaseConfigTab):
         makes for keeping the radiation switch on every card, and it is how a
         setting stays on without anybody seeing it.
 
-        The group is offered on the LOCAL-MESH mode -- the layout tool takes a
-        mesh file and a global run generates its sphere in memory, so there is
-        no file to build a layout against; `flux_cubes.engine_support` says the
-        same thing, and the pre-flight repeats it for a configuration that
-        arrives some other way. It is nevertheless kept on screen whenever the
-        setting is ON, whatever the mode: see `MoonCard.apply_mode`.
+        THE GROUP IS ON THE CARD IN EVERY MODE. Only a local-mesh run can
+        actually produce cubes -- the layout tool takes a mesh file and a
+        global run generates its sphere in memory -- but that is said in the
+        note, not enforced by taking the group off the screen. Hiding it was
+        the second half of Paul's report (2026-09-01, "we're still not getting
+        the options menu for the flux cubes"): on a Moon GLOBAL card the whole
+        group was `setVisible(False)`, so between Radiation exchange and
+        Surface properties there was no checkbox, no note and nothing naming
+        the mode as the reason -- measured, and five of the eight
+        still-existing files in his own recent-files list open exactly that
+        way. `flux_cubes.engine_support` had computed the refusal and the card
+        had put it in `flux_note`; the note was then hidden along with its
+        group. A feature that is absent without a word is indistinguishable
+        from one that was never built.
 
         THE SWITCH ITSELF IS ALWAYS LIVE, whatever `engine_support` says --
         see `refresh_flux_cubes`. One click always reveals the placement, from
@@ -1987,7 +1995,44 @@ class BodyCard(BaseConfigTab):
                              "currentTextChanged")):
             getattr(self.widgets[key], signal).connect(
                 lambda _v: self.refresh_flux_cubes())
+
+        # ⛔ AND THE REVEAL HAS TO REACH THE SCREEN. Ticking the box adds
+        # ~305 px of controls BELOW the box; on this card that lands outside
+        # the scroll viewport and the window does not move. Connected AFTER
+        # `refresh_flux_cubes` above, deliberately: Qt delivers in connection
+        # order, so the group has already been given its final size when this
+        # runs and `ensureWidgetVisible` scrolls to the right place rather
+        # than to where the group used to end. See `scroll_into_view`.
+        self.widgets["flux_cubes.enabled"].toggled.connect(
+            self._reveal_flux_cubes)
         return group
+
+    def _reveal_flux_cubes(self, on):
+        """Put the placement options on the screen when they are switched on.
+
+        Only on the USER's toggle: `_loading` is set while a file is being
+        mirrored into the controls, and scrolling a card the user has not
+        touched to a group they did not ask about would move the form under
+        them on every open.
+        """
+        if not on or self._loading:
+            return
+        # ⛔ NEXT EVENT-LOOP TURN, NOT NOW. `refresh_flux_cubes` has just
+        # called `flux_body.setVisible(True)`, and Qt does not re-lay-out
+        # inside the signal: at this instant `flux_group.height()` is still
+        # the COLLAPSED 116 px, so a scroll computed here targets the bottom
+        # the group had before it grew and lands ~300 px short. Measured: the
+        # immediate version left the grid spacing and radius outside the
+        # viewport on the curated card, which is the reported symptom with a
+        # smaller number. `singleShot(0)` runs after the layout pass, so the
+        # geometry it reads is the geometry the user is looking at.
+        #
+        # The WHOLE group, not just `flux_body`: the note above the placement
+        # says whether this run can produce cubes at all, and a reveal that
+        # scrolls the refusal off the top answers one question by hiding
+        # the other.
+        QTimer.singleShot(
+            0, lambda: self.scroll_into_view(getattr(self, "flux_group", None)))
 
     def refresh_flux_cubes(self):
         """Re-gate and re-describe the whole group. Cheap and idempotent.
@@ -2044,6 +2089,7 @@ class BodyCard(BaseConfigTab):
             note.setText(
                 "THIS RUN CANNOT PRODUCE FLUX CUBES AS CONFIGURED. "
                 + policy.reason
+                + self._flux_mode_note()
                 + " Nothing has been changed for you: fix what is named above,"
                   " or turn the cubes back off.")
             logger.warning(
@@ -2063,7 +2109,13 @@ class BodyCard(BaseConfigTab):
             # ends with what to do about each. Inviting the user to turn the
             # cubes on here would be inviting them into the state the launch
             # check refuses.
-            note.setText(policy.reason)
+            #
+            # THIS IS THE ONLY THING ON SCREEN ON A GLOBAL RUN, so it carries
+            # the mode sentence too. `engine_support` cannot know the mode --
+            # it reads a configuration, and an empty `mesh.import_file` on a
+            # local card means "no terrain imported yet", not "global run".
+            # The card knows, and says so.
+            note.setText(policy.reason + self._flux_mode_note())
 
         # UNCONDITIONAL, and before the early return. `flux_lattice` and
         # `flux_named` are only ever shown or hidden here, so skipping this
@@ -2087,6 +2139,96 @@ class BodyCard(BaseConfigTab):
     def _apply_flux_group_visibility(self):
         """Show or hide the whole group. Cards that offer it on one mode only
         override this; a card that offers it always needs nothing here."""
+
+    def _flux_mode_note(self):
+        """A card's own sentence about why THIS mode cannot produce cubes.
+
+        `flux_cubes.engine_support` reads a configuration and cannot see which
+        mode the card is on, so its mesh blocker has to describe an empty
+        `mesh.import_file` in general terms. The card knows the mode and says
+        what to do about it. Leading space, or the empty string when the mode
+        has nothing to add; it is concatenated onto `policy.reason`.
+        """
+        return ""
+
+    # -- revealing something means putting it on the screen -------------------
+
+    def scroll_into_view(self, widget):
+        """Bring `widget` inside the card's visible rectangle.
+
+        ⛔ `setVisible(True)` IS NOT A REVEAL on a scrolling form, and that is
+        Paul's 2026-09-01 report. A card is 1,500-2,100 px of content in a
+        viewport of 900-1,100, so a group can be shown, unhidden, and 300 px
+        below the bottom edge of the window. Nothing on screen changes when it
+        is switched on, and the honest description of that is "we're still not
+        getting the options menu".
+
+        Measured on `fb78c9f` at Paul's own saved window width (2559 px, from
+        `com.ptm3d.PTM3DSimulator.plist`), Moon local mesh, real `click()`:
+
+            curated A03MP026, viewport 1023 px -- the switch is at y=1000 and
+            the three placement controls the click reveals land at y=1049,
+            1078 and 1110. ALL THREE OUTSIDE THE VIEWPORT. The user ticks the
+            box and the screen does not change.
+
+            imported mesh, viewport 883 px -- the switch is at y=784 and the
+            grid radius at y=894, outside. Before the tick the group shows the
+            note that LISTS the options in prose ("where they go ... the
+            distance between them, the grid radius, the cube height ..."); the
+            tick replaces that list with one short sentence and puts the real
+            controls below the fold. Options before, none after: an inverted
+            reveal produced entirely by geometry.
+
+        ⛔ AND THIS IS THE THIRD GENERATION OF ONE BLIND SPOT. `isHidden` was
+        blind to a hidden ANCESTOR (2026-08-31a). `setChecked` was blind to a
+        DISABLED widget (2026-08-31b). `isVisibleTo` is blind to SCROLL
+        POSITION. Forty-six green arms sat in front of this one. An arm about
+        a control the user is supposed to see must assert the viewport
+        rectangle -- `src/python/tests/test_gui_flux_cubes.py` section 11.
+
+        ⛔ NOT `QScrollArea.ensureWidgetVisible`. It guarantees the widget's
+        TOP EDGE and stops: measured on the curated card it scrolled 34 px,
+        put the group's first row on screen and left the grid spacing and the
+        grid radius outside the viewport -- the same report, 34 px smaller.
+        The scroll value is computed here so that the widget's BOTTOM is
+        brought in, which is where a reveal puts its new controls, and so the
+        arms can assert a rectangle rather than a Qt heuristic.
+
+        No-op when there is no scroll area or the widget is not in it.
+        """
+        scroll = getattr(self, "_scroll", None)
+        if scroll is None or widget is None:
+            return False
+        content = scroll.widget()
+        if content is None:
+            return False
+        if not content.isAncestorOf(widget):
+            # WARNS RATHER THAN GUESSING. `mapTo` across unrelated widgets is
+            # undefined, and the quiet alternative -- scrolling somewhere
+            # plausible -- is how a reveal ends up pointing at the wrong
+            # control. A caller that lands here has passed a widget from
+            # another card.
+            logger.warning(
+                "[card] asked to scroll a widget that is not inside this "
+                "card's scroll area; nothing has been moved")
+            return False
+        bar = scroll.verticalScrollBar()
+        view_h = scroll.viewport().height()
+        top = widget.mapTo(content, QPoint(0, 0)).y()
+        height = widget.height()
+        current = bar.value()
+        if height >= view_h:
+            # Taller than the window: show as much of the END as fits, which
+            # is the part that just appeared.
+            target = top + height - view_h
+        elif top < current:
+            target = top                       # above the fold
+        elif top + height > current + view_h:
+            target = top + height - view_h     # below the fold
+        else:
+            return True                        # already whole on screen
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), target)))
+        return True
 
     def _flux_mode(self):
         from gui_core import flux_cubes as fc
@@ -2732,32 +2874,40 @@ class MoonCard(BodyCard):
         self.refresh_flux_cubes()
 
     def _apply_flux_group_visibility(self):
-        """Offered on the local mesh, because a global run generates its
-        sphere in memory and the layout tool has no file to build against.
+        """⛔ THE GROUP IS NEVER HIDDEN, ON EITHER MODE.
 
-        ⛔ BUT NEVER HIDDEN WHILE THE SETTING IS ON. Hiding the whole group on
-        the mode alone left `flux_cubes.enabled: true` live in a window with no
-        control anywhere that could see it, clear it, or give it a layout --
-        and `mesh.import_file` survives the mode switch, so `engine_support`
-        still passed and the launch check refused with "no cube layout file is
-        set... Build it from the card" against a card that was showing no such
-        thing. That is the first defect Paul hit (2026-08-31), and it is the
-        same failure this group's own docstring refuses for the Advanced tier:
-        a setting that stays on with nobody able to see it. The group therefore
-        stays visible whenever it is on, and says why the mode cannot produce
-        cubes.
+        The rule used to be `setVisible(local or enabled)`. It hid the whole
+        group -- switch, note and all -- on a Moon GLOBAL card with the cubes
+        off, which is the default state of that mode and of five of the eight
+        still-existing files in Paul's own recent-files list. He reported it
+        twice in the same words: "there still doesn't seem to be any options
+        list for the flux cubes" (2026-08-31, the local card, a dead switch)
+        and "we're still not getting the options menu for the flux cubes"
+        (2026-09-01, on the merged fix). The first report was the switch; this
+        is the second, and it is a different defect on a different mode.
 
-        ⛔ AND IT LIVES HERE, not inline in `apply_mode`, because the rule
-        reads `flux_cubes.enabled` and that can now change without a mode
-        change: the switch is always live (see `refresh_flux_cubes`), so
-        turning the cubes OFF on the global mode used to leave an empty group
-        standing on a run that can never produce them. Both callers use this
-        one rule.
+        Measured on `fb78c9f` -- Moon / Global / time series, GUI defaults,
+        nothing clicked: `flux_group.isHidden()` is True, the switch is
+        `isVisibleTo(card) == False`, and `flux_note` has already been given
+        the sentence that explains why. The explanation was computed and then
+        taken off the screen with the thing it explained. A feature that is
+        absent without a word is indistinguishable from one that was never
+        built, and the user has nowhere to look.
+
+        Visibility is therefore unconditional and the mode is a SENTENCE
+        (`_flux_mode_note`), not an absence. Nothing unsafe becomes reachable:
+        `engine_support` still refuses the global mode, the note still says so,
+        and `flux_cubes.preflight_findings` still turns it into a launch error.
+
+        ⛔ AND IT LIVES HERE, not inline in `apply_mode`, because the warning
+        below reads `flux_cubes.enabled` and that can change without a mode
+        change: the switch is always live (see `refresh_flux_cubes`). Both
+        callers use this one rule.
         """
         local = self._mode == "local"
         enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
                                                      False))
-        self.flux_group.setVisible(local or enabled)
+        self.flux_group.setVisible(True)
         if not local and enabled:
             logger.warning(
                 "[card] this configuration has flux_cubes.enabled on and the "
@@ -2765,6 +2915,19 @@ class MoonCard(BodyCard):
                 "and has no mesh file to place cubes against. The group is "
                 "kept on screen so the setting can be seen and cleared; it is "
                 "NOT changed here.")
+
+    def _flux_mode_note(self):
+        """Name the mode as the reason, and name the control that changes it.
+
+        Only reached when `engine_support` has already refused, so this never
+        appears on a run that can produce cubes.
+        """
+        if self._mode == "local":
+            return ""
+        return (" This card is set to Global, which builds its sphere in "
+                "memory and writes no mesh file. Choose Local mesh at the top "
+                "of the card, and import terrain or pick a curated site, to "
+                "record flux cubes.")
 
     def load_card(self):
         super().load_card()

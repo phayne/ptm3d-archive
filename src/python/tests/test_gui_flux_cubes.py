@@ -624,16 +624,33 @@ def test_opening_a_project_takes_the_placement_from_the_layout_file():
 # 5. The card
 # ==========================================================================
 
-def test_the_group_is_offered_on_the_local_mesh_and_not_on_the_global_one():
+def test_the_group_is_on_the_card_in_both_modes_and_says_which():
+    """⛔ REPLACES an arm that asserted the OPPOSITE, and that is the point.
+
+    It used to read `assert _hidden(card.flux_group)` on the global mode with
+    the cubes off, encoding a deliberate decision: only a local-mesh run can
+    produce cubes, so do not offer the group elsewhere. The decision was wrong
+    in the one way that matters -- it removed the explanation along with the
+    control. See `MoonCard._apply_flux_group_visibility` for the measurement.
+
+    The engine rule has NOT changed: a global run still cannot produce cubes.
+    That is asserted on the FLOW card in section 10 -- `card.activate(...)`
+    leaves `mesh.import_file` exactly where it was, deliberately (see
+    `test_a_live_setting_is_never_hidden_by_the_mode`), so a card driven this
+    way is a global mode holding a local mesh and `engine_support` allows it.
+    This arm is about the group being on screen, and nothing else.
+    """
     manager, card = _card()
     assert not _hidden(card.flux_group), (
         "the flux-cube group is hidden on the local-mesh card, where the "
         "layout tool has a mesh to work with")
     manager.set_value("flux_cubes.enabled", False)
     card.activate("global", "time_series")
-    assert _hidden(card.flux_group), (
-        "the flux-cube group is offered on a global run with the cubes off, "
-        "where there is no mesh file for the layout tool to build against")
+    assert not _hidden(card.flux_group), (
+        "the flux-cube group is off the screen on a global run with the cubes "
+        "off, so nothing on the card says the mode is the reason")
+    assert card.widgets["flux_cubes.enabled"].isVisibleTo(card), (
+        "the enable switch is off screen on the global mode")
 
 
 def test_a_live_setting_is_never_hidden_by_the_mode():
@@ -1846,14 +1863,18 @@ def test_the_named_mode_table_is_visible_on_the_curated_site():
             "the combined mode does not show both placements")
 
 
-def test_turning_the_cubes_off_puts_the_group_away_again():
-    """The mode rule is re-applied on a TOGGLE, not only on a mode change.
+def test_the_toggle_moves_the_setting_and_not_the_group():
+    """The switch is re-read on a TOGGLE, not only on a mode change.
 
-    A live switch means `flux_cubes.enabled` can now move without
-    `apply_mode` ever running -- which was impossible while the control was
-    dead. Without re-applying the rule, unticking on the global mode leaves an
-    empty "Flux cubes" box, inviting placement options, on a run that builds
-    its sphere in memory and can never produce a cube.
+    A live switch means `flux_cubes.enabled` can move without `apply_mode`
+    ever running -- impossible while the control was dead. What the toggle
+    moves is the SETTING and the placement body; the group itself stays put on
+    both modes, so unticking on a global run leaves the switch and the
+    sentence that says the mode cannot produce cubes, rather than a blank
+    where a feature used to be.
+
+    (This arm used to end `assert not card.flux_group.isVisibleTo(card)` here.
+    That was the defect, not the rule; see the round-2 arms in section 10.)
     """
     manager, card = _flow_card(mode="global")
     switch = card.widgets["flux_cubes.enabled"]
@@ -1864,8 +1885,10 @@ def test_turning_the_cubes_off_puts_the_group_away_again():
     switch.click()
     assert not switch.isChecked()
     assert manager.get_value("flux_cubes.enabled") is False
-    assert not card.flux_group.isVisibleTo(card), (
-        "the group is still on screen on the global mode with the cubes off")
+    assert card.flux_group.isVisibleTo(card), (
+        "unticking on the global mode took the whole group off the screen")
+    assert not card.flux_body.isVisibleTo(card), (
+        "the placement options are still on screen with the cubes off")
     # ...and the local mode keeps it, on or off.
     _manager, card = _flow_card(mode="local")
     assert card.flux_group.isVisibleTo(card)
@@ -1942,6 +1965,392 @@ def test_the_curated_mesh_reads_its_own_facet_scale():
         "the cube-count estimate is off screen")
 
 
+# ==========================================================================
+# 10. Round 2: the group is not on screen at all on a global run
+#
+# Paul, on the MERGED fix (`fb78c9f`): "we're still not getting the options
+# menu for the flux cubes." The merge was intact -- `fb78c9f^{tree}` is
+# byte-identical to the branch tree -- and his own checkout was at `fb78c9f`
+# with the GUI launched 16 seconds after the pull. The local-mesh curated
+# sequence he reported the first time now works: the 32-cell click sweep is
+# 32/32 on `fb78c9f` and 20/32 on its parent.
+#
+# What still shows nothing is the GLOBAL mode, and that is where his files
+# are: five of the eight still-existing entries in his recent-files list
+# (`com.ptm3d.PTM3DSimulator.plist`) are `moon_global_*`, and every one of them
+# opens on a card with no flux-cube control and no sentence anywhere saying
+# why. `flux_note` was given the explanation and then hidden with its group.
+#
+# Every arm below FAILS on `fb78c9f`.
+# ==========================================================================
+
+def _global_flow_card():
+    """The Moon card as the flow opens it on the GLOBAL mode, GUI defaults."""
+    return _flow_card(mode="global")
+
+
+def test_a_global_run_still_shows_the_flux_cube_group():
+    """PAUL'S SECOND REPORT, and the arm that would have caught it.
+
+    Moon / Global / time series, nothing clicked. Measured on `fb78c9f`:
+    `flux_group.isHidden()` True, switch `isVisibleTo(card)` False. There is
+    no checkbox between Radiation exchange and Surface properties and no text
+    naming the mode -- indistinguishable from a feature that does not exist.
+    """
+    _manager, card = _global_flow_card()
+    assert not _hidden(card.flux_group), (
+        "the Flux cubes group is hidden on a Moon global run with the cubes "
+        "off -- the state five of Paul's recent files open in")
+    assert card.flux_group.isVisibleTo(card), (
+        "the Flux cubes group has a hidden ancestor on a global run")
+    switch = card.widgets["flux_cubes.enabled"]
+    assert switch.isVisibleTo(card), (
+        "the enable switch is off screen on a global run, so there is nothing "
+        "to click and nothing to read")
+    assert not card.flux_body.isVisibleTo(card), (
+        "the placement options are on screen with the cubes off; the group "
+        "should be one checkbox and a sentence until it is ticked")
+
+
+def test_the_global_card_says_the_mode_is_the_reason():
+    """The refusal has to name the mode AND the control that changes it.
+
+    `engine_support` cannot: it reads a configuration, and an empty
+    `mesh.import_file` is "no terrain imported yet" on a local card. The card
+    knows, via `BodyCard._flux_mode_note`.
+    """
+    _manager, card = _global_flow_card()
+    text = card.flux_note.text()
+    assert text.strip(), "the group is on screen on a global run saying nothing"
+    assert "imported terrain mesh" in text, text
+    assert "Global" in text and "Local mesh" in text, (
+        "the note does not name the mode that blocks the cubes, nor the mode "
+        "that allows them: " + text)
+    assert "Turn the cubes on" not in text, (
+        "a global run advertises the placement options it cannot deliver: "
+        + text)
+
+
+def test_the_local_card_is_not_told_its_run_is_global():
+    """⛔ A FALSE STATEMENT ABOUT THE USER'S OWN RUN.
+
+    The mesh blocker used to end "and a global run generates its sphere in
+    memory with no file to build against". On a LOCAL-mesh card with no
+    terrain imported yet -- the state every local card opens in -- that tells
+    the user their run is a global one. It is not.
+    """
+    from gui_core import flux_cubes as fc
+    manager, card = _flow_card(mode="local")
+    assert not manager.get_value("mesh.import_file"), (
+        "this arm needs the freshly opened local card, with no terrain yet")
+    blocker = " ".join(fc.engine_support(manager.get_config()).blockers)
+    assert "imported terrain mesh" in blocker, blocker
+    assert "a global run generates" not in blocker, (
+        "engine_support tells a local-mesh run it is global: " + blocker)
+    text = card.flux_note.text()
+    assert "This card is set to Global" not in text, (
+        "the local card carries the global mode's sentence: " + text)
+
+
+def test_the_global_switch_is_live_and_reveals_the_options():
+    """Live control, not a dead one -- the round-1 rule, on the other mode.
+
+    Clicking on a global run gives the placement options AND the refusal. The
+    launch check still refuses the run; nothing unsafe is reachable, and the
+    setting can be seen and cleared where it could not be seen at all.
+    """
+    from gui_core import flux_cubes as fc
+    manager, card = _global_flow_card()
+    switch = card.widgets["flux_cubes.enabled"]
+    fired = []
+    switch.toggled.connect(lambda v: fired.append(v))
+    switch.click()
+    assert fired == [True], (
+        "a real click on the global card emitted nothing: the switch is dead")
+    assert switch.isChecked()
+    for key in ("flux_cubes.mode", "flux_cubes.spacing_m",
+                "flux_cubes.radius_m"):
+        assert card.widgets[key].isVisibleTo(card), (
+            f"{key} is off screen after a click on the global card")
+    text = card.flux_note.text()
+    assert "CANNOT PRODUCE" in text and "Local mesh" in text, text
+    # ...and the run is still refused, before it starts.
+    errors = fc.preflight_findings(
+        manager.get_config(), REPO_ROOT, lambda p, r: Path(p),
+        lambda p, r: Path(p), lambda p: False, lambda p: False,
+        lambda p: 0).errors
+    assert any("imported terrain mesh" in e for e in errors), (
+        "a global run with flux cubes on passes the launch check: "
+        + repr(errors))
+
+
+def test_every_moon_mode_offers_the_group_in_every_run_type():
+    """The sweep, reduced to its invariant: on the Moon card the group is
+    always there, on both modes and both run types, before any click."""
+    for mode in ("local", "global"):
+        for run_type in ("time_series", "integrated"):
+            _manager, card = _flow_card(mode=mode, run_type=run_type)
+            assert card.flux_group.isVisibleTo(card), (
+                f"no flux-cube group on Moon / {mode} / {run_type}")
+            assert card.widgets["flux_cubes.enabled"].isVisibleTo(card), (
+                f"no enable switch on Moon / {mode} / {run_type}")
+            assert card.flux_note.text().strip(), (
+                f"the group says nothing on Moon / {mode} / {run_type}")
+
+
+# ==========================================================================
+# 11. Round 2b: the reveal has to reach the SCREEN
+#
+# Paul, on a freshly relaunched GUI whose `git log` shows the merged fix:
+#
+#   (1) with the curated A03MP026 site, NO flux-cube options appear before OR
+#       after clicking the checkbox;
+#   (2) with a manually imported mesh, the options are visible BEFORE ticking
+#       the box and DISAPPEAR when it is checked.
+#
+# Neither is a logic bug and neither is a stale install -- his tree is
+# byte-identical to `origin/main` (md5 4fb63379cc311151c0802c21ea541807), and
+# the signal order is `stateChanged` (writes the configuration) BEFORE
+# `toggled` (re-describes the group), so nothing reads a pre-click value.
+#
+# It is GEOMETRY. The card is 1,558-2,078 px of content in a viewport of
+# 730-1,023, and ticking the box adds ~305 px BELOW the box. Measured on his
+# tree at his own saved window width (2559 px, from
+# `com.ptm3d.PTM3DSimulator.plist`), scroll at the top, real `click()`:
+#
+#   window   path      after the click
+#   2559x1381 curated  placement, spacing, radius OUTSIDE the viewport
+#   2559x1200 curated  the switch itself, and all three, OUTSIDE
+#   2559x1200 manual   radius OUTSIDE
+#   2559x1000 manual   the switch itself, and all three, OUTSIDE
+#
+# Symptom (2) is that table plus the note: while the cubes are OFF the note
+# LISTS the options in prose, and the tick replaces that list with one short
+# sentence and puts the real controls below the fold. Options before, none
+# after.
+#
+# ⛔ THE ARMS ASSERT A RECTANGLE. `isVisibleTo` is True for every one of those
+# controls in every row above. It is the third instrument in a row to be blind
+# to this group: `isHidden` missed a hidden ancestor, `setChecked` missed a
+# disabled widget, `isVisibleTo` misses the scroll position. Forty-six green
+# arms stood in front of this.
+#
+# Every arm below FAILS on `fb78c9f`.
+# ==========================================================================
+
+#: Paul's own window, from his saved geometry: normalGeometry 2559 x 1381 on a
+#: 3008 px screen. The heights bracket it, because the real main window spends
+#: another 80-120 px on the menu bar, tool bar and status bar that this panel
+#: does not have.
+PAUL_W = 2559
+PAUL_HEIGHTS = (1381, 1200, 1000)
+
+ON_SCREEN = [("placement", "flux_cubes.mode"),
+             ("spacing", "flux_cubes.spacing_m"),
+             ("radius", "flux_cubes.radius_m")]
+
+
+def _pump():
+    """Let Qt lay out and run the zero-timers a reveal schedules."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance()
+    for _ in range(3):
+        app.processEvents()
+
+
+def _scroll_of(card):
+    """The card's scroll area, found the way anything can find it.
+
+    ⛔ NOT `card._scroll`. That attribute is part of the fix, so an arm that
+    reads it SKIPS on the broken build instead of failing on it -- and a skip
+    is not a falsification. Everything section 11 measures is measured from Qt,
+    not from the code under test.
+    """
+    from PyQt6.QtWidgets import QScrollArea
+    areas = card.findChildren(QScrollArea)
+    if not areas:
+        raise Skip("this card has no scroll area to measure against")
+    return areas[0]
+
+
+def _on_screen(card, widget):
+    """Is `widget` inside the card's visible rectangle right now?
+
+    The question `isVisibleTo` does not answer, computed here from the
+    viewport geometry so the arms cannot inherit the defect's blind spot.
+    """
+    from PyQt6.QtCore import QPoint
+    if not widget.isVisibleTo(card):
+        return False
+    viewport = _scroll_of(card).viewport()
+    top = widget.mapTo(viewport, QPoint(0, 0)).y()
+    return (top + widget.height() > 0) and (top < viewport.height())
+
+
+def _sized_card(width, height, path):
+    """A Moon local-mesh card in a window of a given size, scrolled to the top.
+
+    `path` is "curated" (the A03MP026 picker, which writes a long provenance
+    note above the group) or "manual" (the shipped crater in the file field).
+    """
+    manager, panel = _panel()
+    panel.resize(width, height)
+    manager.reset_to_defaults()
+    start = panel.tabs["start"]
+    start.choose_body("Moon")
+    start._choose_mode("local")
+    start.choose_run_type("time_series")
+    card = start.active_card()
+    if card is not panel.tabs["card_moon"]:
+        raise Skip("the flow did not open the Moon card")
+    if path == "curated":
+        _select_curated(card)
+    else:
+        if not CRATER.exists():
+            raise Skip(f"{CRATER} is not in this checkout")
+        manager.set_value("mesh.import_file", str(CRATER))
+        manager.set_value("radiation.enabled", True)
+        card.load_from_config()
+    panel.show()
+    _pump()
+    _scroll_of(card).verticalScrollBar().setValue(0)
+    _pump()
+    return manager, card
+
+
+def _off_screen(card, names=ON_SCREEN):
+    return [label for label, key in names
+            if not _on_screen(card, card.widgets[key])]
+
+
+def test_the_instrument_can_fail():
+    """⛔ FIRST, PROVE THE RULER IS NOT PAINTED ON.
+
+    `_on_screen` has to report False for something `isVisibleTo` calls
+    visible, or every arm below is vacuous -- which is precisely how the last
+    two rounds of this defect got past a green suite. Scroll to the top of a
+    card taller than its window and the bottom of the form must read as off
+    screen while Qt still says it is not hidden.
+    """
+    _manager, card = _sized_card(PAUL_W, 1000, "curated")
+    scroll = _scroll_of(card)
+    if scroll.verticalScrollBar().maximum() <= 0:
+        raise Skip("this card fits its window; nothing can be off screen")
+    bottom = card.widgets["flux_cubes.radius_m"]
+    card.widgets["flux_cubes.enabled"].click()
+    _pump()
+    scroll.verticalScrollBar().setValue(0)
+    _pump()
+    assert bottom.isVisibleTo(card), (
+        "this arm needs a control Qt calls visible")
+    assert _on_screen(card, bottom) is False, (
+        "the viewport check says a control 300 px below the window is on "
+        "screen; it cannot detect the defect it exists for")
+
+
+def test_the_click_puts_the_options_on_the_screen_curated():
+    """PAUL'S SYMPTOM (1): the curated site, nothing before OR after.
+
+    The curated picker writes a provenance note that is 216 px tall at his
+    window width, which puts the group at y=971 in a 1,023 px viewport: the
+    switch is reachable and everything the click reveals is not.
+    """
+    for height in PAUL_HEIGHTS:
+        _manager, card = _sized_card(PAUL_W, height, "curated")
+        card.widgets["flux_cubes.enabled"].click()
+        _pump()
+        missing = _off_screen(card)
+        assert not missing, (
+            f"at {PAUL_W}x{height} on the curated site, clicking the box "
+            f"leaves these off the screen: {', '.join(missing)} -- the user "
+            f"ticks the box and nothing changes in front of them")
+
+
+def test_the_click_puts_the_options_on_the_screen_imported_mesh():
+    """PAUL'S SYMPTOM (2), second half: the reveal lands below the fold."""
+    for height in PAUL_HEIGHTS:
+        _manager, card = _sized_card(PAUL_W, height, "manual")
+        card.widgets["flux_cubes.enabled"].click()
+        _pump()
+        missing = _off_screen(card)
+        assert not missing, (
+            f"at {PAUL_W}x{height} with an imported mesh, clicking the box "
+            f"leaves these off the screen: {', '.join(missing)}")
+
+
+def test_the_written_list_is_not_withdrawn_without_showing_the_real_thing():
+    """PAUL'S SYMPTOM (2), stated as the mechanism it actually is.
+
+    "The options are visible BEFORE ticking the box and DISAPPEAR when it is
+    checked." Nothing literally disappears -- what is on screen before the
+    tick is `FLUX_OFF_HINT`, a sentence that LISTS the options in words ("the
+    distance between them, the grid radius, the cube height ..."). Ticking the
+    box replaces that list with one short line and puts the real controls
+    below the fold, so the card takes the written list away and puts nothing
+    in its place. Read as "the options disappeared", correctly.
+
+    ⛔ A COUNT OF VISIBLE CONTROLS DOES NOT CATCH THIS, and the first version
+    of this arm was that count. Before the click the three placement controls
+    are `isVisibleTo == False` and count zero; after it they are visible but
+    outside the viewport and still count zero. The count never drops and the
+    arm passed on the broken build. The invariant has to name the trade: the
+    list may only be withdrawn in exchange for the controls it described.
+    """
+    for path in ("curated", "manual"):
+        for height in PAUL_HEIGHTS:
+            _manager, card = _sized_card(PAUL_W, height, path)
+            phrase = "the distance between them"
+            listed_before = phrase in card.flux_note.text()
+            card.widgets["flux_cubes.enabled"].click()
+            _pump()
+            listed_after = phrase in card.flux_note.text()
+            if not (listed_before and not listed_after):
+                continue                # the list was never on offer here
+            missing = _off_screen(card)
+            assert not missing, (
+                f"at {PAUL_W}x{height} ({path}) ticking the box withdrew the "
+                f"written list of options and left these off the screen: "
+                f"{', '.join(missing)} -- the card showed the user a list of "
+                f"options, then neither the list nor the options")
+
+
+def test_the_reveal_does_not_scroll_a_card_nobody_touched():
+    """DO-NO-HARM. Passes on `fb78c9f` too, and is meant to: `fb78c9f` never
+    scrolls anything. It guards the behavior this branch ADDS, not the defect
+    it fixes -- do not read it as a falsifier.
+
+    A file that arrives with the cubes on must not move the form.
+
+    `_reveal_flux_cubes` is guarded on `_loading` for this: `set_bool` calls
+    `setChecked` while a configuration is being mirrored into the controls,
+    which emits `toggled` exactly as a click does. Without the guard, opening
+    any project with `flux_cubes.enabled: true` would scroll the card to the
+    middle before the user has looked at it.
+    """
+    manager, panel = _panel()
+    panel.resize(PAUL_W, 1000)
+    manager.reset_to_defaults()
+    start = panel.tabs["start"]
+    start.choose_body("Moon")
+    start._choose_mode("local")
+    start.choose_run_type("time_series")
+    card = start.active_card()
+    if not CRATER.exists():
+        raise Skip(f"{CRATER} is not in this checkout")
+    manager.set_value("mesh.import_file", str(CRATER))
+    manager.set_value("radiation.enabled", True)
+    manager.set_value("flux_cubes.enabled", True)
+    panel.show()
+    _pump()
+    _scroll_of(card).verticalScrollBar().setValue(0)
+    card.load_from_config()          # the opened-file path, `_loading` held
+    _pump()
+    assert _scroll_of(card).verticalScrollBar().value() == 0, (
+        "opening a file with the cubes already on scrolled the card away "
+        "from its top; displaying a configuration is not the user asking "
+        "for anything")
+
+
 TESTS = [
     test_the_cube_count_is_the_tools_own_rule,
     test_the_fast_count_agrees_with_the_tools_double_loop_everywhere,
@@ -1962,7 +2371,7 @@ TESTS = [
     test_the_probe_setting_is_written_as_a_number,
     test_opening_a_project_takes_the_placement_from_the_layout_file,
     test_the_engine_accepts_both_modes,
-    test_the_group_is_offered_on_the_local_mesh_and_not_on_the_global_one,
+    test_the_group_is_on_the_card_in_both_modes_and_says_which,
     test_the_settings_appear_only_once_the_switch_is_on,
     test_the_mode_shows_the_controls_that_mode_uses,
     test_the_height_is_recomputed_when_the_mesh_changes,
@@ -1999,10 +2408,22 @@ TESTS = [
     test_the_group_says_where_the_options_are_while_it_is_off,
     test_the_advanced_section_holds_only_the_layout_file_machinery,
     test_the_named_mode_table_is_visible_on_the_curated_site,
-    test_turning_the_cubes_off_puts_the_group_away_again,
+    test_the_toggle_moves_the_setting_and_not_the_group,
     test_a_blocked_card_does_not_invite_you_into_the_refusal,
     test_the_card_claims_no_provenance_for_a_setting_it_cannot_know,
     test_the_curated_mesh_reads_its_own_facet_scale,
+    # 10. round 2: the global mode showed nothing at all
+    test_a_global_run_still_shows_the_flux_cube_group,
+    test_the_global_card_says_the_mode_is_the_reason,
+    test_the_local_card_is_not_told_its_run_is_global,
+    test_the_global_switch_is_live_and_reveals_the_options,
+    test_every_moon_mode_offers_the_group_in_every_run_type,
+    # 11. round 2b: the reveal has to reach the screen
+    test_the_instrument_can_fail,
+    test_the_click_puts_the_options_on_the_screen_curated,
+    test_the_click_puts_the_options_on_the_screen_imported_mesh,
+    test_the_written_list_is_not_withdrawn_without_showing_the_real_thing,
+    test_the_reveal_does_not_scroll_a_card_nobody_touched,
 ]
 
 
