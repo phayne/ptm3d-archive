@@ -2800,23 +2800,38 @@ class MoonCard(BodyCard):
             self.site_combo.addItem(entry.display(), entry.key)
         self.site_combo.currentIndexChanged.connect(self._on_curated_site)
         grid.addWidget(self.site_combo, 0, 1)
+        # ONE LINE, AND A PLACE TO PUT THE REST. Picking a site used to write
+        # the whole provenance record here -- about thirty lines, 216 px tall
+        # at Paul's window width -- which pushed every group below it, the
+        # flux cubes among them, that far down the card and off the bottom of
+        # the window. The provenance is worth keeping and worth reading; it is
+        # not worth reading every time, and it was standing between the user
+        # and the controls underneath. What stays on the line is what the user
+        # needs to know without asking: whether the site is usable, and
+        # anything about their configuration that disagrees with it.
         self.site_note = _muted("")
         grid.addWidget(self.site_note, 1, 0, 1, 2)
+        self.site_details = CollapsibleSection(
+            "Details: the files this site uses, and why each one", collapsed=True)
+        self.site_details_text = _muted("")
+        self.site_details.add_widget(self.site_details_text)
+        self.site_details.setVisible(False)
+        grid.addWidget(self.site_details, 2, 0, 1, 2)
 
-        self.add_file_field(grid, 2, "Terrain mesh:", "mesh.import_file",
+        self.add_file_field(grid, 3, "Terrain mesh:", "mesh.import_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
         # The label argument is DEAD for this key: `_resolve_text` prefers
         # `gui_tooltips.LABELS`, which spells it "Shadow-only surrounding
         # mesh:". Kept identical to the rendered text so the call site cannot
         # be read as a second, disagreeing answer (BUGS.md
         # GUI-CARD-LABEL-LITERAL-DEAD).
-        self.add_file_field(grid, 3, "Shadow-only surrounding mesh:",
+        self.add_file_field(grid, 4, "Shadow-only surrounding mesh:",
                             "mesh.occluder_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
-        self.add_double_field(grid, 4, "Latitude (deg):",
+        self.add_double_field(grid, 5, "Latitude (deg):",
                               "mesh.latitude_override", -999.0, 90.0,
                               decimals=4)
-        self.add_double_field(grid, 5, "Longitude (deg):",
+        self.add_double_field(grid, 6, "Longitude (deg):",
                               "mesh.longitude_override", -999.0, 360.0,
                               decimals=4)
         self.local_group.setLayout(grid)
@@ -2972,6 +2987,23 @@ class MoonCard(BodyCard):
     def _describe_curated_site(self, applied=()):
         """Say what this site IS, and where the configuration disagrees.
 
+        ⛔ THE LINE AND THE DETAILS ARE NOT THE SAME THING, and which half a
+        sentence belongs in is a judgment about safety, not about length.
+
+        ON THE LINE, always: whether the site is usable, and any way in which
+        the open configuration DISAGREES with the curated set. A disagreement
+        is a statement about the run somebody is about to launch; putting it
+        behind a control they have to find first is how a warning stops being
+        a warning. It is on the line even though it is the longest thing here.
+
+        IN THE DETAILS, collapsed: the wiring record and `wiring_provenance` --
+        which file was chosen for each role, which near-name files were NOT
+        used and why, where the matrix came from and what proved it. True,
+        valuable, and about thirty lines. It used to be on the line, 216 px
+        tall at Paul's window width, pushing the surface, radiation, flux-cube,
+        thermal and output groups that far down the card. That is how the
+        flux-cube group ended up below the bottom of his window (2026-09-01).
+
         Never rewrites anything on its own. A file the user opened that names
         a curated site's terrain with some other ring or matrix keeps what it
         has and is told which keys differ -- opening a file is not an edit to
@@ -2987,15 +3019,12 @@ class MoonCard(BodyCard):
                 "No curated site: the terrain, the surrounding ring and the "
                 "view-factor cache below are yours to set. A curated site "
                 "fills all three from a set that has run to completion.")
+            self._set_site_details(None)
             return
         from gui_core.curated_sites import (site_status, site_wiring,
                                             wiring_provenance)
         status = site_status(entry)
-        lines = []
-        if applied:
-            lines.append("Wrote: " + "; ".join(f"{k} = {v}"
-                                               for k, v in applied))
-        lines.append(status.summary())
+        headline = [status.summary()]
         # Only worth computing when the card is DESCRIBING a configuration
         # somebody else wrote. Straight after `applied`, every key is by
         # construction the value just written.
@@ -3011,10 +3040,38 @@ class MoonCard(BodyCard):
                     differing.append(f"{key} is {current!r}, the curated set "
                                      f"uses {value!r}")
             if differing:
-                lines.append("THIS CONFIGURATION DIFFERS FROM THE CURATED SET "
-                             "AND HAS NOT BEEN CHANGED: " + "; ".join(differing))
-        lines.extend(wiring_provenance(entry))
-        note.setText("\n".join(lines))
+                headline.append(
+                    "THIS CONFIGURATION DIFFERS FROM THE CURATED SET "
+                    "AND HAS NOT BEEN CHANGED: " + "; ".join(differing))
+        detail_lines = []
+        if applied:
+            headline.append(f"{len(applied)} settings were written from this "
+                            f"site; see the details below for each one.")
+            detail_lines.append("Wrote: " + "; ".join(f"{k} = {v}"
+                                                      for k, v in applied))
+        detail_lines.extend(wiring_provenance(entry))
+        note.setText(" ".join(headline))
+        self._set_site_details(detail_lines)
+
+    def _set_site_details(self, lines):
+        """Fill the collapsed details, or take the section off the card.
+
+        ⛔ DOES NOT TOUCH THE COLLAPSED STATE. Re-describing happens on every
+        load, every mirror and every site change; forcing it shut would close
+        the section under a user who had just opened it, and forcing it open
+        would undo the whole point. It opens collapsed once, at construction,
+        and after that the state is the user's.
+        """
+        details = getattr(self, "site_details", None)
+        details_text = getattr(self, "site_details_text", None)
+        if details is None or details_text is None:
+            return
+        if not lines:
+            details_text.setText("")
+            details.setVisible(False)
+            return
+        details_text.setText("\n".join(lines))
+        details.setVisible(True)
 
     def _on_curated_site(self, _index):
         """Apply a whole set, or refuse it — and say which, every time.
@@ -3041,6 +3098,10 @@ class MoonCard(BodyCard):
             self.site_note.setText(
                 status.summary() + " Nothing was written; the site is left "
                 "unselected so the configuration cannot half-describe it.")
+            # The details belong to a site that is now unselected. Leaving the
+            # previous site's file list under a refusal would read as though
+            # the refusal were about those files.
+            self._set_site_details(None)
             return
         wiring = site_wiring(entry)
         for key, value in wiring:
