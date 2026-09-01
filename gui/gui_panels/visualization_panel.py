@@ -4,7 +4,9 @@ Visualization Panel for PTM3D GUI
 Enhanced with face selection via click or lat/lon input, and data export
 """
 
+import logging
 import numpy as np
+import os
 from pathlib import Path
 import re
 import struct
@@ -18,6 +20,27 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QValidator
 
+#: ⛔ THE ONE THING THAT CANNOT BE BUILT WITHOUT A DISPLAY, AND THE REASON THE
+#: WHOLE WINDOW COULD NOT BE TESTED.
+#:
+#: `pyvistaqt.QtInteractor` creates a native VTK render window, which needs a
+#: real GL context; under `QT_QPA_PLATFORM=offscreen` it SEGFAULTS the process
+#: (`pyvistaqt/rwi.py:386`, measured 2026-09-01, rc=139, no Python traceback
+#: without `faulthandler`). Every offscreen harness in this repository has
+#: therefore driven `ConfigurationPanel` directly and never built
+#: `PTM3DMainWindow` -- so nothing has ever tested the real window's own
+#: wiring, and three rounds of a flux-cube defect got past green suites
+#: (2026-08-31a, 08-31b, 09-01) because the harness was a sub-widget.
+#:
+#: Setting `PTM_GUI_DISABLE_3D=1` takes the SAME path this module already
+#: takes on a machine with no PyVista installed -- a path guarded at every one
+#: of its ~20 use sites and exercised in production -- so the window builds and
+#: everything except the 3D canvas is the real thing. It is opt-in by an
+#: explicitly named variable, it is never set by the application, and it says
+#: so out loud: a silently degraded window is exactly the class of defect this
+#: exists to catch.
+DISABLE_3D_CANVAS = os.environ.get("PTM_GUI_DISABLE_3D", "") == "1"
+
 # PyVista for 3D visualization
 try:
     import pyvista as pv
@@ -26,6 +49,17 @@ try:
 except ImportError:
     PYVISTA_AVAILABLE = False
     print("Warning: PyVista not available. 3D visualization disabled.")
+
+if DISABLE_3D_CANVAS and PYVISTA_AVAILABLE:
+    PYVISTA_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "[visualization] PTM_GUI_DISABLE_3D=1 is set: the 3D canvas is NOT "
+        "being created and every 3D view in this window is inert, even though "
+        "PyVista is installed and would work. This exists so a headless test "
+        "can build the real main window; if you are looking at a running "
+        "application with no 3D view, this variable is why.")
+    print("Warning: PTM_GUI_DISABLE_3D=1 -- 3D visualization disabled on "
+          "purpose. Unset it to get the 3D view back.")
 
 # Matplotlib for 2D plots
 try:

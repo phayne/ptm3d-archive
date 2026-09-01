@@ -49,6 +49,12 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 sys.path.insert(0, str(REPO_ROOT / "gui"))
 
+# ⛔ BEFORE ANY GUI IMPORT. `gui_panels.visualization_panel` reads this at
+# module import time; setting it later has no effect. Without it, building
+# `PTM3DMainWindow` SEGFAULTS under the offscreen platform plugin -- see
+# section 13.
+os.environ.setdefault("PTM_GUI_DISABLE_3D", "1")
+
 
 class Skip(Exception):
     """A check that cannot run here, as distinct from one that failed."""
@@ -2502,6 +2508,236 @@ def test_collapsing_the_note_lifts_the_flux_switch_above_the_fold():
             f"fold on a freshly opened curated card, with nothing scrolled")
 
 
+# ==========================================================================
+# 13. Round 3: the REAL window, and the race behind the one-click lag
+#
+# Paul, on the merged round-2 fix, curated card: "the flux cube options now
+# appear after checking and then unchecking the box."
+#
+# ⛔⛔ THE REASON THREE ROUNDS OF GREEN ARMS MISSED HIM IS IN THIS FILE'S OWN
+# HARNESS. Every arm above drives `ConfigurationPanel` directly, because
+# building `PTM3DMainWindow` SEGFAULTS offscreen -- `pyvistaqt.QtInteractor`
+# creates a native VTK render window and there is no GL context
+# (`pyvistaqt/rwi.py:386`, rc=139, no traceback without `faulthandler`). A
+# sub-widget is not the application, and the difference is not cosmetic:
+#
+#     ConfigurationPanel alone, window 2559x1381  ->  card 2559 px wide,
+#                                                     viewport 1023 px,
+#                                                     content 1605 px
+#     the REAL PTM3DMainWindow, same window size  ->  card  646 px wide,
+#                                                     viewport  736 px,
+#                                                     content 2302 px
+#
+# The real card is a QUARTER as wide (the window gives the rest to the 3D
+# view), so every line wraps further and the card is 700 px TALLER in a
+# viewport 287 px SHORTER. Every measurement in rounds 1 and 2 was taken on a
+# card four times too wide. `PTM_GUI_DISABLE_3D=1` takes the same path this
+# code already takes with no PyVista installed, so the window builds and
+# everything except the 3D canvas is real.
+#
+# THE LAG ITSELF is a race, and it is in round 2's own fix. `_reveal_flux_cubes`
+# deferred the scroll with `QTimer.singleShot(0)` because `height()` is still
+# the collapsed value inside the signal. That made the scroll depend on whether
+# Qt's layout pass beats a zero timer. Measured in the real window at the
+# instant the reveal fires: `flux_group.height() == 299` while
+# `sizeHint() == 526`. Lose the race and the scroll lands 227 px short --
+# 1 of 3 options on screen instead of 3 -- and the SECOND check finds the group
+# already laid out and works. Check, nothing; uncheck; check, and there they
+# are.
+#
+# A harness that pumps `processEvents()` wins that race every time, which is
+# why the deferred version measured clean here and not on his screen.
+# ==========================================================================
+
+_WINDOW = None
+
+
+def _real_window():
+    """The REAL PTM3DMainWindow, built once. Skips if it cannot be built."""
+    global _WINDOW
+    if _WINDOW is not None:
+        return _WINDOW
+    _panel()                                   # QApplication + QSettings first
+    # ⛔ IF THE CANVAS IS LIVE, DO NOT BUILD THE WINDOW -- IT WOULD SEGFAULT
+    # THE WHOLE PROCESS, taking every other arm with it and reporting nothing.
+    # This happens if something imported `visualization_panel` before this
+    # module set `PTM_GUI_DISABLE_3D` (module import order in a shared pytest
+    # process). A named refusal is recoverable; rc=139 is not.
+    try:
+        from gui_panels import visualization_panel as _vp
+    except ImportError as exc:                 # pragma: no cover
+        raise Skip(f"the visualization panel is unavailable here ({exc})")
+    if getattr(_vp, "PYVISTA_AVAILABLE", False):
+        raise Skip(
+            "the 3D canvas is live in this process, so building the real "
+            "window would segfault under the offscreen platform plugin. "
+            "`visualization_panel` was imported before this module could set "
+            "PTM_GUI_DISABLE_3D=1; set it in the environment before the run.")
+    try:
+        from ptm3d_gui import PTM3DMainWindow
+    except ImportError as exc:                 # pragma: no cover
+        raise Skip(f"the main window module is unavailable here ({exc})")
+    _WINDOW = PTM3DMainWindow()
+    _WINDOW.resize(PAUL_W, 1381)
+    _WINDOW.show()
+    _pump()
+    return _WINDOW
+
+
+def _window_curated_card():
+    """Moon / local / curated A03MP026, inside the real window."""
+    win = _real_window()
+    panel = win.config_panel
+    manager = panel.config_manager
+    start = panel.tabs["start"]
+    manager.reset_to_defaults()
+    start.choose_body("Moon")
+    start._choose_mode("local")
+    start.choose_run_type("time_series")
+    card = start.active_card()
+    if card is not panel.tabs["card_moon"]:
+        raise Skip("the flow did not open the Moon card")
+    _select_curated(card)
+    _pump()
+    _scroll_of(card).verticalScrollBar().setValue(0)
+    _pump()
+    return manager, card
+
+
+def test_the_real_main_window_can_be_built_in_a_test():
+    """⛔ THE LOAD-BEARING ARM. Everything else here is a sub-widget.
+
+    Three generations of this defect reached Paul because no arm had ever
+    built the window he uses. If this one starts skipping, the suite is back
+    to testing a panel and the next report will be the fourth round.
+    """
+    win = _real_window()
+    assert win.config_panel is not None, "the window has no configuration panel"
+    assert "card_moon" in win.config_panel.tabs, (
+        "the real window's configuration panel has no Moon card")
+    card = win.config_panel.tabs["card_moon"]
+    scroll = _scroll_of(card)
+    assert scroll.viewport().height() > 0
+    # And it is NOT the geometry the sub-widget harness reports. Stated so the
+    # difference cannot quietly go away and take the coverage with it.
+    assert card.width() < PAUL_W // 2, (
+        f"the real card is {card.width()} px wide in a {PAUL_W} px window; "
+        f"the panel-only harness reports the full width, and that difference "
+        f"is why its measurements did not describe Paul's screen")
+
+
+def test_the_curated_card_agrees_with_the_switch_after_every_click():
+    """PAUL'S SEQUENCE, in the real window: check, uncheck, check.
+
+    After EVERY click, what is inside the viewport must agree with
+    `isChecked()`. Not `isVisibleTo` -- the rectangle.
+    """
+    _manager, card = _window_curated_card()
+    switch = card.widgets["flux_cubes.enabled"]
+    # He cannot click a control he cannot see: the switch is ~1,150 px down a
+    # 736 px viewport on this card, so scroll to it first, as a person does.
+    bar = _scroll_of(card).verticalScrollBar()
+    for value in range(0, bar.maximum() + 40, 20):
+        bar.setValue(value)
+        _pump()
+        if _on_screen(card, switch):
+            break
+    assert _on_screen(card, switch), "could not bring the switch on screen"
+    for n in (1, 2, 3, 4):
+        switch.click()
+        _pump()
+        want = switch.isChecked()
+        for label, key in ON_SCREEN:
+            got = _on_screen(card, card.widgets[key])
+            assert got == want, (
+                f"click {n}: the switch reads {want} and {label} is "
+                f"{'on' if got else 'OFF'} screen -- the card is showing the "
+                f"state of the PREVIOUS click")
+
+
+def test_the_reveal_does_not_depend_on_winning_a_layout_race():
+    """⛔ THE FALSIFIER FOR THE LAG. Forces the ordering the real loop can hit.
+
+    Expand the group and scroll with NO event processing in between, which is
+    what a zero timer that beats the layout pass sees: `height()` still the
+    collapsed value. On round 2's code the scroll lands 227 px short and 1 of 3
+    options is on screen; reading `max(height, sizeHint)` it lands correctly.
+    """
+    manager, card = _window_curated_card()
+    switch = card.widgets["flux_cubes.enabled"]
+    bar = _scroll_of(card).verticalScrollBar()
+    for value in range(0, bar.maximum() + 40, 20):
+        bar.setValue(value)
+        _pump()
+        if _on_screen(card, switch):
+            break
+    # The adverse ordering, deterministically: no `_pump()` after this until
+    # the scroll has been computed.
+    manager.set_value("flux_cubes.enabled", True)
+    switch.blockSignals(True)
+    switch.setChecked(True)
+    switch.blockSignals(False)
+    card.flux_body.setVisible(True)
+    assert card.flux_group.height() < card.flux_group.sizeHint().height(), (
+        "this arm needs the pre-layout moment, where the realized height is "
+        "still the collapsed one; the layout has already run and it proves "
+        "nothing")
+    card.scroll_into_view(card.flux_group)
+    _pump()
+    missing = [label for label, key in ON_SCREEN
+               if not _on_screen(card, card.widgets[key])]
+    assert not missing, (
+        "a reveal computed before the layout pass scrolled short and left "
+        + ", ".join(missing) + " below the fold; that is the one-click lag")
+
+
+def test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck():
+    """ONE SOURCE OF TRUTH, ORDERED BY A RULE Qt ACTUALLY MAKES.
+
+    The card renders `flux_cubes.enabled` out of the CONFIGURATION -- it has
+    to, because presets and route defaults change it without touching the
+    switch -- so the re-describe must run after the configuration write. Round
+    2 got that by listening on `toggled` while the write was on
+    `stateChanged`: a CROSS-signal ordering, which `QCheckBox` documents
+    nowhere. Measured here on a bare box, isolated from every application
+    connection, `stateChanged` comes first, so it worked by luck.
+
+    ⛔ The arm asserts the STRUCTURE, because the luck is not observable from
+    the outcome: everything in this group now listens on the same signal as
+    the write, so Qt's connection-order guarantee does the ordering.
+    """
+    from PyQt6.QtWidgets import QCheckBox
+    order = []
+    bare = QCheckBox("order probe")
+    bare.toggled.connect(lambda _v: order.append("toggled"))
+    bare.stateChanged.connect(lambda _v: order.append("stateChanged"))
+    bare.click()
+    assert order, "a bare QCheckBox click emitted neither signal"
+
+    _manager, card = _window_curated_card()
+    switch = card.widgets["flux_cubes.enabled"]
+    # The write is on `stateChanged` (`BaseConfigTab.add_bool_field`). Anything
+    # that RENDERS the configuration must be on that same signal, or its order
+    # against the write is the cross-signal accident above.
+    assert switch.receivers(switch.stateChanged) >= 3, (
+        f"only {switch.receivers(switch.stateChanged)} slots on stateChanged: "
+        f"the configuration write, the re-describe and the reveal all belong "
+        f"on the signal that carries the write")
+    assert switch.receivers(switch.toggled) == 0, (
+        "something still renders this group from `toggled`, which is ordered "
+        "against the configuration write only by luck")
+
+    # And end to end: a real click leaves the configuration, the switch and
+    # the screen agreeing, whichever way Qt happens to order its signals.
+    for _ in range(4):
+        switch.click()
+        _pump()
+        assert bool(_manager.get_value("flux_cubes.enabled")) \
+            == switch.isChecked(), "the configuration is one click behind"
+        assert card.flux_body.isVisibleTo(card) == switch.isChecked(), (
+            "the group is one click behind the switch")
+
+
 TESTS = [
     test_the_cube_count_is_the_tools_own_rule,
     test_the_fast_count_agrees_with_the_tools_double_loop_everywhere,
@@ -2581,6 +2817,11 @@ TESTS = [
     test_no_curated_site_means_no_details_section,
     test_a_disagreement_stays_on_the_line_and_is_never_collapsed,
     test_collapsing_the_note_lifts_the_flux_switch_above_the_fold,
+    # 13. round 3: the real window, and the layout race behind the lag
+    test_the_real_main_window_can_be_built_in_a_test,
+    test_the_curated_card_agrees_with_the_switch_after_every_click,
+    test_the_reveal_does_not_depend_on_winning_a_layout_race,
+    test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck,
 ]
 
 
