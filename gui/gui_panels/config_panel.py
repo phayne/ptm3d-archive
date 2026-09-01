@@ -1145,13 +1145,29 @@ class SimulationTab(BaseConfigTab):
         elif is_custom:
             self.generic_body_label.setText("Custom body \u2014 configure on Body tab")
 
-        # Auto-populate duration to 1 synodic period of the selected body
+        # Read BEFORE anything below can move `_syncing`: nested helpers
+        # (`_sync_end_time_from_start_and_duration`) clear it in their own
+        # `finally`, so "was this a user action" has to be answered on entry.
+        may_seed = self._may_seed_duration()
+
+        # The synodic day is display state either way -- the "synodic periods"
+        # unit and the equilibration converters both read it -- so it is
+        # refreshed whether or not the duration itself may be written.
         self._current_synodic_days = self._get_synodic_period_days(text)
-        days = self._current_synodic_days
 
         self._syncing = True
         try:
-            self.config_manager.set_value("simulation.duration_days", days)
+            if may_seed:
+                # A NEW run: one synodic period of the selected body.
+                days = self._current_synodic_days
+                self.config_manager.set_value("simulation.duration_days", days)
+            else:
+                # An opened configuration: the author's window stands. Only the
+                # DISPLAY is refreshed, because the number shown under "synodic
+                # periods" depends on the body that just changed.
+                days = ConfigManager._as_number(
+                    self.config_manager.get_value("simulation.duration_days", 0.0),
+                    0.0)
             display_val = self._days_to_display(days)
             self.duration_spin.blockSignals(True)
             self.duration_spin.setValue(display_val)
@@ -1160,6 +1176,40 @@ class SimulationTab(BaseConfigTab):
         finally:
             self._syncing = False
         self.value_changed.emit()
+
+    def _may_seed_duration(self):
+        """Whether a body change may write `simulation.duration_days`.
+
+        The synodic default is a SEEDING rule, not a body-change rule -- the
+        same discipline as `BodyCardsPanel._apply_time_defaults` and the card
+        defaults: only-if-absent, only on a new run. Four clauses, in order:
+
+        * **Never while `_syncing`.** `load_from_config` reaches this handler
+          through `add_horizons_body`: a generic body is not in the combo, so
+          opening any HORIZONS/asteroid configuration ADDS its name and selects
+          it, and the selection fires this handler with the author's own
+          duration already loaded. Overwriting it there is what planned a
+          rewrite of all fourteen Justitia windows (3.75 / 3.0 / 6.0 / 2.0 d)
+          to one Justitia synodic period, 1.3816 d, on open --
+          GUI-DURATION-SILENT-OVERWRITE. Displaying a file is not an edit to
+          it, and the same handler runs on both paths.
+        * **A new run may seed.** This panel has no
+          `open_card(apply_defaults=True)` entry point, so "setting up a new
+          run" is exactly "there is no file yet" -- neither opened NOR saved,
+          which is what `has_source_file()` answers. `File > New` resets the
+          manager and it reads False again.
+        * **An opened file that carries no usable window may seed**, since
+          there is no author's value to preserve. `DEFAULT_CONFIG` always
+          supplies the key, so "absent" here means present and unusable -- a
+          non-number, or a value the engine rejects (it requires > 0).
+        * Otherwise the duration is left exactly as the file wrote it.
+        """
+        if self._syncing:
+            return False
+        if not self.config_manager.has_source_file():
+            return True
+        raw = self.config_manager.get_value("simulation.duration_days", 0.0)
+        return ConfigManager._as_number(raw, 0.0) <= 0
 
     def add_horizons_body(self, body_name, config_path):
         """Add a HORIZONS body to the combo box and select it."""

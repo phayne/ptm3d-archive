@@ -1183,6 +1183,30 @@ class ConfigManager:
                 "Comments and layout are preserved: saving rewrites only the "
                 "keys whose values changed.")
 
+    def has_source_file(self):
+        """True once this configuration corresponds to a file on disk.
+
+        The one question a control needs before it may seed a default: a NEW
+        run has nothing to preserve, and anything else is somebody's own file.
+
+        THREE transitions, and the third is why this is not called
+        `opened_from_file`:
+
+        * `load_from_yaml` sets it -- the file was opened;
+        * `save_to_yaml` sets it too, because it re-baselines against what is
+          now on disk. A run the user has SAVED is their file from that moment
+          on, and a body change afterward must not silently re-plan the window
+          they just wrote. That is the same rule, not an exception to it;
+        * `reset_to_defaults` clears it, so File > New reads as a new run again.
+
+        `_loaded_engine_view`, not `_source_doc`, because only the first is set
+        on EVERY load: `_source_doc` is None whenever ruamel.yaml is missing or
+        the YAML would not round-trip, and a predicate that answered "no file"
+        there would put the seeding rules back exactly where they were for
+        those users.
+        """
+        return self._loaded_engine_view is not None
+
     def plan_save_edits(self):
         """(updates, removals) a save would apply, or None if not round-tripping.
 
