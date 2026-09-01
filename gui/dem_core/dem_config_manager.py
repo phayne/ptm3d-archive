@@ -38,18 +38,6 @@ class DEMConfigManager:
             "sliver_angle_deg": 5.0,    # Minimum angle for sliver triangle removal
             "max_hole_edges": 20,       # Max boundary loop edges to fill (0=disable)
         },
-        "refinement": {
-            "enabled": False,
-            "center_lat": 0.0,
-            "center_lon": 0.0,
-            "inner_radius_km": 1.0,
-            "outer_radius_km": 20.0,
-            "max_faces": 100000,
-            "min_edge_m": 10.0,
-            "max_edge_m": 1000.0,
-            "initial_downsample": 10,
-            "output_file": "",
-        },
     }
 
     PRESETS = {
@@ -57,19 +45,16 @@ class DEMConfigManager:
             "conversion": {"downsample": 50, "max_edge_m": 0},
             "quality_control": {"enabled": False},
             "roi": {"enabled": False},
-            "refinement": {"enabled": False},
         },
         "standard": {
             "conversion": {"downsample": 10, "max_edge_m": -1.0},
             "quality_control": {"enabled": True},
             "roi": {"enabled": False},
-            "refinement": {"enabled": False},
         },
         "high_res_roi": {
             "conversion": {"downsample": 5, "density_exp": 2.0, "max_edge_m": -1.0},
             "quality_control": {"enabled": True},
             "roi": {"enabled": True, "radius_km": 10.0, "max_points": 500000},
-            "refinement": {"enabled": False},
         },
         "south_polar": {
             "conversion": {
@@ -79,18 +64,11 @@ class DEMConfigManager:
             },
             "quality_control": {"enabled": True},
             "roi": {"enabled": True, "radius_km": 15.0, "max_points": 1000000},
-            "refinement": {"enabled": False},
         },
         "adaptive_landing_site": {
             "conversion": {"downsample": 10, "density_exp": 1.5},
             "quality_control": {"enabled": True},
             "roi": {"enabled": True, "radius_km": 15.0, "max_points": 1000000},
-            "refinement": {
-                "enabled": True,
-                "inner_radius_km": 1.0,
-                "outer_radius_km": 20.0,
-                "max_faces": 100000,
-            },
         },
     }
 
@@ -154,15 +132,6 @@ class DEMConfigManager:
         density_exp = self.get_value("conversion.density_exp", 2.0)
         if density_exp < 0.1:
             messages.append("Density exponent must be >= 0.1")
-
-        if self.get_value("refinement.enabled", False):
-            inner = self.get_value("refinement.inner_radius_km", 0)
-            outer = self.get_value("refinement.outer_radius_km", 0)
-            if inner >= outer:
-                messages.append("Refinement inner radius must be < outer radius")
-            max_faces = self.get_value("refinement.max_faces", 0)
-            if max_faces < 100:
-                messages.append("Max faces must be >= 100")
 
         is_valid = len(messages) == 0 or (
             len(messages) == 1 and messages[0] == "No DEM file specified"

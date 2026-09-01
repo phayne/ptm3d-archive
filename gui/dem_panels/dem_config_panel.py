@@ -1,5 +1,5 @@
 """
-DEM Configuration Panel: 4-page nav rail with Preview, Convert, Inspect, Refine.
+DEM Configuration Panel: 3-page nav rail with Preview, Convert, Inspect.
 """
 
 from pathlib import Path
@@ -15,12 +15,12 @@ from PyQt6.QtCore import pyqtSignal, Qt, QSize
 from dem_panels.dem_preview_panel import DEMPreviewPanel
 from dem_panels.dem_mesh_panel import DEMMeshPanel
 from dem_panels.dem_results_panel import DEMResultsPanel
-from dem_core.dem_runner import DEMConvertThread, DEMRefineThread
+from dem_core.dem_runner import DEMConvertThread
 from dem_core.dem_tooltips import TOOLTIPS
 
 
 class DEMConfigurationPanel(QWidget):
-    """Main DEM configuration panel with nav rail and 4 pages."""
+    """Main DEM configuration panel with nav rail and 3 pages."""
 
     config_changed = pyqtSignal()
     mesh_converted = pyqtSignal(str)  # path to converted mesh
@@ -29,7 +29,6 @@ class DEMConfigurationPanel(QWidget):
         super().__init__(parent)
         self._cm = config_manager
         self._convert_thread = None
-        self._refine_thread = None
         self._init_ui()
 
     def _init_ui(self):
@@ -43,7 +42,7 @@ class DEMConfigurationPanel(QWidget):
         self._nav.setFixedWidth(130)
         self._nav.setIconSize(QSize(24, 24))
 
-        pages = ["Preview", "Convert", "Inspect", "Refine"]
+        pages = ["Preview", "Convert", "Inspect"]
         for name in pages:
             item = QListWidgetItem(name)
             item.setSizeHint(QSize(120, 40))
@@ -70,10 +69,6 @@ class DEMConfigurationPanel(QWidget):
         self._mesh_panel = DEMMeshPanel()
         self._mesh_panel.hide_3d_viewer()
         self._stack.addWidget(self._mesh_panel)
-
-        # Page 3: Refine
-        self._refine_page = self._create_refine_page()
-        self._stack.addWidget(self._refine_page)
 
         layout.addWidget(self._stack, 1)
 
@@ -284,149 +279,6 @@ class DEMConfigurationPanel(QWidget):
         layout.addWidget(scroll)
         return page
 
-    def _create_refine_page(self) -> QWidget:
-        """Create the Refine parameters page."""
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        title = QLabel("Adaptive Mesh Refinement")
-        title.setStyleSheet("color: #00bcd4; font-weight: bold; font-size: 14px;")
-        layout.addWidget(title)
-
-        desc = QLabel(
-            "Subdivide mesh faces near a center point for higher resolution.\n"
-            "Requires a DEM file (refinement reads elevations directly)."
-        )
-        desc.setStyleSheet("color: #a0a0a0;")
-        desc.setWordWrap(True)
-        layout.addWidget(desc)
-
-        # Refinement parameters
-        params_group = QGroupBox("Refinement Parameters")
-        form = QFormLayout(params_group)
-
-        self._ref_lat = QDoubleSpinBox()
-        self._ref_lat.setRange(-90.0, 90.0)
-        self._ref_lat.setDecimals(4)
-        self._ref_lat.setSuffix(" deg")
-        self._ref_lat.setToolTip(TOOLTIPS.get("refinement.center_lat", ""))
-        self._ref_lat.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.center_lat", v)
-        )
-        form.addRow("Center Latitude:", self._ref_lat)
-
-        self._ref_lon = QDoubleSpinBox()
-        self._ref_lon.setRange(-360.0, 360.0)
-        self._ref_lon.setDecimals(4)
-        self._ref_lon.setSuffix(" deg")
-        self._ref_lon.setToolTip(TOOLTIPS.get("refinement.center_lon", ""))
-        self._ref_lon.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.center_lon", v)
-        )
-        form.addRow("Center Longitude:", self._ref_lon)
-
-        self._ref_inner = QDoubleSpinBox()
-        self._ref_inner.setRange(0.01, 500.0)
-        self._ref_inner.setValue(1.0)
-        self._ref_inner.setDecimals(2)
-        self._ref_inner.setSuffix(" km")
-        self._ref_inner.setToolTip(TOOLTIPS.get("refinement.inner_radius_km", ""))
-        self._ref_inner.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.inner_radius_km", v)
-        )
-        form.addRow("Inner Radius:", self._ref_inner)
-
-        self._ref_outer = QDoubleSpinBox()
-        self._ref_outer.setRange(0.1, 1000.0)
-        self._ref_outer.setValue(20.0)
-        self._ref_outer.setDecimals(2)
-        self._ref_outer.setSuffix(" km")
-        self._ref_outer.setToolTip(TOOLTIPS.get("refinement.outer_radius_km", ""))
-        self._ref_outer.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.outer_radius_km", v)
-        )
-        form.addRow("Outer Radius:", self._ref_outer)
-
-        self._ref_max_faces = QSpinBox()
-        self._ref_max_faces.setRange(100, 10000000)
-        self._ref_max_faces.setValue(100000)
-        self._ref_max_faces.setSingleStep(10000)
-        self._ref_max_faces.setToolTip(TOOLTIPS.get("refinement.max_faces", ""))
-        self._ref_max_faces.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.max_faces", v)
-        )
-        form.addRow("Max Faces:", self._ref_max_faces)
-
-        self._ref_min_edge = QDoubleSpinBox()
-        self._ref_min_edge.setRange(0.1, 10000.0)
-        self._ref_min_edge.setValue(10.0)
-        self._ref_min_edge.setDecimals(1)
-        self._ref_min_edge.setSuffix(" m")
-        self._ref_min_edge.setToolTip(TOOLTIPS.get("refinement.min_edge_m", ""))
-        self._ref_min_edge.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.min_edge_m", v)
-        )
-        form.addRow("Min Edge Length:", self._ref_min_edge)
-
-        self._ref_max_edge = QDoubleSpinBox()
-        self._ref_max_edge.setRange(1.0, 100000.0)
-        self._ref_max_edge.setValue(1000.0)
-        self._ref_max_edge.setDecimals(1)
-        self._ref_max_edge.setSuffix(" m")
-        self._ref_max_edge.setToolTip(TOOLTIPS.get("refinement.max_edge_m", ""))
-        self._ref_max_edge.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.max_edge_m", v)
-        )
-        form.addRow("Max Edge Length:", self._ref_max_edge)
-
-        self._ref_init_ds = QSpinBox()
-        self._ref_init_ds.setRange(1, 200)
-        self._ref_init_ds.setValue(10)
-        self._ref_init_ds.setToolTip(TOOLTIPS.get("refinement.initial_downsample", ""))
-        self._ref_init_ds.valueChanged.connect(
-            lambda v: self._cm.set_value("refinement.initial_downsample", v)
-        )
-        form.addRow("Initial Downsample:", self._ref_init_ds)
-
-        layout.addWidget(params_group)
-
-        # Output file
-        output_group = QGroupBox("Output")
-        output_layout = QHBoxLayout(output_group)
-        self._refine_output = QLineEdit()
-        self._refine_output.setPlaceholderText("Refined PLY output path...")
-        output_layout.addWidget(self._refine_output)
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self._browse_refine_output)
-        output_layout.addWidget(browse_btn)
-        layout.addWidget(output_group)
-
-        # Refine button + progress
-        btn_layout = QHBoxLayout()
-        self._refine_btn = QPushButton("Refine Mesh")
-        self._refine_btn.setStyleSheet(
-            "QPushButton { background-color: #FF9800; color: white; "
-            "font-weight: bold; padding: 10px 20px; font-size: 13px; }"
-            "QPushButton:hover { background-color: #F57C00; }"
-        )
-        self._refine_btn.clicked.connect(self._run_refine)
-        btn_layout.addWidget(self._refine_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        self._refine_progress = QProgressBar()
-        self._refine_progress.setVisible(False)
-        layout.addWidget(self._refine_progress)
-
-        self._refine_status = QLabel("")
-        self._refine_status.setStyleSheet("color: #a0a0a0;")
-        self._refine_status.setWordWrap(True)
-        layout.addWidget(self._refine_status)
-
-        layout.addStretch()
-        return page
-
     # -- Navigation --------------------------------------------------------
 
     def _on_page_changed(self, index):
@@ -440,9 +292,6 @@ class DEMConfigurationPanel(QWidget):
 
     def _on_roi_selected(self, lat, lon, radius):
         self._roi_label.setText(f"ROI: ({lat:.3f}, {lon:.3f}), r={radius:.1f} km")
-        # Also populate refinement center with ROI center
-        self._ref_lat.setValue(lat)
-        self._ref_lon.setValue(lon)
 
     def _on_max_edge_mode_changed(self, index):
         """Handle max edge mode combo change."""
@@ -482,18 +331,6 @@ class DEMConfigurationPanel(QWidget):
                 filepath += '.ply'
             self._convert_output.setText(filepath)
             self._cm.set_value("conversion.output_file", filepath)
-
-    def _browse_refine_output(self):
-        filepath, _ = QFileDialog.getSaveFileName(
-            self, "Save Refined Mesh",
-            str(Path.home()),
-            "PLY Files (*.ply);;All Files (*)"
-        )
-        if filepath:
-            if not filepath.endswith('.ply'):
-                filepath += '.ply'
-            self._refine_output.setText(filepath)
-            self._cm.set_value("refinement.output_file", filepath)
 
     # -- Conversion --------------------------------------------------------
 
@@ -570,74 +407,6 @@ class DEMConfigurationPanel(QWidget):
 
         self._convert_thread = None
 
-    # -- Refinement --------------------------------------------------------
-
-    def _run_refine(self):
-        """Start adaptive refinement."""
-        output = self._refine_output.text()
-        if not output:
-            QMessageBox.warning(self, "Missing Output",
-                                "Please specify a refinement output PLY file path.")
-            return
-
-        self._cm.set_value("refinement.output_file", output)
-        self._cm.set_value("refinement.enabled", True)
-
-        self._refine_btn.setEnabled(False)
-        self._refine_progress.setVisible(True)
-        self._refine_progress.setValue(0)
-        self._refine_status.setText("Refining mesh...")
-
-        # Same single-label overwrite problem as the convert path above.
-        self._refine_last_error = ""
-
-        self._refine_thread = DEMRefineThread(self._cm)
-        self._refine_thread.output_ready.connect(
-            lambda t: self._refine_status.setText(t)
-        )
-        self._refine_thread.error_ready.connect(self._on_refine_error)
-        self._refine_thread.progress_update.connect(
-            lambda p: self._refine_progress.setValue(int(p))
-        )
-        self._refine_thread.finished.connect(self._on_refine_finished)
-        self._refine_thread.start()
-
-    def _on_refine_error(self, text):
-        self._refine_last_error = text
-        self._refine_status.setText(f"Error: {text}")
-
-    def _on_refine_finished(self, exit_code):
-        self._refine_btn.setEnabled(True)
-        self._refine_progress.setVisible(False)
-
-        if exit_code == 0:
-            output = self._cm.get_value("refinement.output_file", "")
-            self._refine_status.setText(
-                f"Refinement complete: {Path(output).name}"
-            )
-            if output and Path(output).exists():
-                self._mesh_panel.load_mesh(output)
-                self.mesh_converted.emit(output)
-        elif exit_code == 2:
-            # dtm_advanced_processor's own refusal code: its mesh pipeline is
-            # unfinished upstream, so refinement cannot succeed. Name the
-            # working alternative here -- this label is the one message that
-            # survives, since every output line overwrites the previous one.
-            self._refine_status.setText(
-                "Adaptive refinement is NOT IMPLEMENTED (exit 2). Use Convert "
-                "with ROI enabled instead: it grades point density radially "
-                "(Core Fraction / Density Exponent). "
-                "See docs/dem-to-mesh-workflow.md."
-            )
-        else:
-            message = f"Refinement failed (exit code {exit_code})"
-            detail = getattr(self, "_refine_last_error", "")
-            if detail:
-                message += f"\n{detail}"
-            self._refine_status.setText(message)
-
-        self._refine_thread = None
-
     # -- Config loading ----------------------------------------------------
 
     def load_from_config(self):
@@ -692,19 +461,6 @@ class DEMConfigurationPanel(QWidget):
         # Output
         self._convert_output.setText(
             self._cm.get_value("conversion.output_file", "")
-        )
-
-        # Refinement
-        self._ref_lat.setValue(self._cm.get_value("refinement.center_lat", 0.0))
-        self._ref_lon.setValue(self._cm.get_value("refinement.center_lon", 0.0))
-        self._ref_inner.setValue(self._cm.get_value("refinement.inner_radius_km", 1.0))
-        self._ref_outer.setValue(self._cm.get_value("refinement.outer_radius_km", 20.0))
-        self._ref_max_faces.setValue(self._cm.get_value("refinement.max_faces", 100000))
-        self._ref_min_edge.setValue(self._cm.get_value("refinement.min_edge_m", 10.0))
-        self._ref_max_edge.setValue(self._cm.get_value("refinement.max_edge_m", 1000.0))
-        self._ref_init_ds.setValue(self._cm.get_value("refinement.initial_downsample", 10))
-        self._refine_output.setText(
-            self._cm.get_value("refinement.output_file", "")
         )
 
         # ROI status

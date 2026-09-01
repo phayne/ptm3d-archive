@@ -238,33 +238,34 @@ gui/
 │
 ├── dem_core/              # DEM module: logic (no Qt widgets)
 │   ├── dem_config_manager.py # DEM tool settings
-│   ├── dem_runner.py         # Runs dtm_to_ply_delaunay / dtm_advanced_processor
+│   ├── dem_runner.py         # Runs dtm_to_ply_delaunay
 │   └── dem_tooltips.py       # Flag-level help text
 │
-└── dem_panels/            # DEM module: UI panels
+└── dem_panels/            # DEM module: UI panels (Preview / Convert / Inspect)
     ├── dem_preview_panel.py  # GeoTIFF preview + ROI picking (needs osgeo/GDAL)
-    ├── dem_config_panel.py   # Conversion / ROI / QC options
-    ├── dem_mesh_panel.py     # Mesh options and refinement controls
+    ├── dem_config_panel.py   # Nav rail + Conversion / ROI / QC options
+    ├── dem_mesh_panel.py     # Mesh statistics and quality analysis
     └── dem_results_panel.py  # Generated-mesh summary
 ```
 
 ### DEM module prerequisites
 
-`dem_runner.py` is a thin wrapper around two **compiled C++ binaries built from
-this repository**: `dtm_to_ply_delaunay` (DTM → PLY conversion and ROI
-extraction) and `dtm_advanced_processor` (mesh refinement). It looks for them in
-`build/bin/` first, then a legacy `../dtm/` directory, then `PATH`. Both targets
-require GDAL at build time; without GDAL, CMake skips them and the DEM actions
-report a missing executable with build instructions.
+`dem_runner.py` is a thin wrapper around one **compiled C++ binary built from
+this repository**: `dtm_to_ply_delaunay` (DTM → PLY conversion, ROI extraction
+and radial density grading). It looks in `build/bin/` first, then a legacy
+`../dtm/` directory, then `PATH`. That target requires GDAL at build time;
+without GDAL, CMake skips it and the Convert action reports a missing executable
+with build instructions.
 
-Two limitations are worth knowing before you use this module:
+Two things are worth knowing before you use this module:
 
-- **Adaptive mesh refinement is not implemented.** `dtm_advanced_processor`
-  builds and runs but cannot construct the initial mesh its refiner needs, so it
-  refuses and exits non-zero. Use the Convert action with ROI enabled instead —
-  it grades point density radially, which is what refinement was meant to
-  achieve.
-- **The DEM actions are POSIX-only.** They stream tool output through
+- **There is no mesh-refinement step, and no Refine page.** A separate
+  `dtm_advanced_processor` binary was meant to provide adaptive refinement; it
+  was never implemented (it wrote a zero-vertex mesh and exited 0) and has been
+  removed, page and all. Use the **Convert** page with ROI enabled instead: it
+  grades point density radially (Core Fraction / Density Exponent), which is
+  what refinement was meant to achieve.
+- **The Convert action is POSIX-only.** It streams tool output through
   `select.select()` on pipes, which does not work on Windows; the module says so
   rather than failing obscurely.
 

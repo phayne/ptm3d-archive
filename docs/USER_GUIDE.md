@@ -420,8 +420,8 @@ through `build/bin/ptm_exosphere_main`; the viewshed capability is the
 `src/cpp/viewshed/` module, whose command-line front end is
 `build/bin/dark_horse_viewshed`.
 
-The DEM module needs two compiled binaries (`dtm_to_ply_delaunay`,
-`dtm_advanced_processor`) that require GDAL to build — see
+The DEM module needs one compiled binary (`dtm_to_ply_delaunay`) that
+requires GDAL to build — see
 [dem-to-mesh-workflow.md](dem-to-mesh-workflow.md) for the full walkthrough and
 [../INSTALL.md](../INSTALL.md) ("DEM / DTM tools") for the prerequisites.
 

@@ -4,32 +4,31 @@ This page covers the whole path from a digital terrain model (DTM) raster to a
 PLY mesh `ptm_thermal_sim` can run on — from the command line and from the GUI
 dashboard's **DEM module**.
 
-Read the [Status and known gaps](#status-and-known-gaps) section before you
-plan work around this toolchain. One of the three advertised capabilities
-(adaptive mesh refinement) is **not implemented**, and this page says exactly
-what to use instead.
+Read the [Status and known gaps](#status-and-known-gaps) section before you plan
+work around this toolchain. There is **no separate mesh-refinement step** — the
+converter's region-of-interest density grading is how you get a mesh that is
+fine where the physics is and coarse where it is not, and §4 shows exactly how.
 
 ---
 
-## 1. What the tools are
+## 1. What the tool is
 
-Two binaries, both built from this repository into `build/bin/`:
+One binary, built from this repository into `build/bin/`:
 
 | Binary | Source | Does |
 |---|---|---|
-| `dtm_to_ply_delaunay` | `src/cpp/tools/dtm_to_ply_delaunay.cpp` | GeoTIFF DTM → PLY. Delaunay triangulation of the projected point cloud, region-of-interest extraction, radial density grading, edge filtering, mesh quality control. **This is the working tool.** |
-| `dtm_advanced_processor` | `src/cpp/tools/dtm_advanced_processor.cpp` | Intended: ROI extraction + adaptive radial mesh refinement. **Its mesh pipeline is unfinished; it refuses to write a mesh and exits 2.** |
+| `dtm_to_ply_delaunay` | `src/cpp/tools/dtm_to_ply_delaunay.cpp` | GeoTIFF DTM → PLY. Delaunay triangulation of the projected point cloud, region-of-interest extraction, radial density grading, edge filtering, mesh quality control. |
 
-A third, `dem_mesh_generator` (`src/cpp/tools/dem_mesh_generator.cpp`), is a
-separate, older DEM→mesh path referenced by `data/external/README.md` and
+`dem_mesh_generator` (`src/cpp/tools/dem_mesh_generator.cpp`) is a separate,
+older DEM→mesh path referenced by `data/external/README.md` and
 `data/dem/copernicus/README.md`. It is **not** what the GUI's DEM module runs,
 and it is not covered here.
 
-All three need **GDAL** at build time. Without GDAL, CMake prints
+Both need **GDAL** at build time. Without GDAL, CMake prints
 
 ```
 CMake Warning: GDAL not properly configured. SKIPPING these targets:
-dem_mesh_generator, dtm_to_ply_delaunay, dtm_advanced_processor. ...
+dem_mesh_generator, dtm_to_ply_delaunay. ...
 ```
 
 and configures successfully without them. Install GDAL and **re-run
@@ -43,7 +42,7 @@ conda install -c conda-forge gdal
 
 cd <repo>
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target dtm_to_ply_delaunay dtm_advanced_processor -j 8
+cmake --build build --target dtm_to_ply_delaunay -j 8
 ```
 
 `dtm_to_ply_delaunay` also uses [CDT](https://github.com/artem-ogre/CDT) 1.4.4,
@@ -169,62 +168,24 @@ Cartesian coordinates are body-fixed: +X through (0°N, 0°E), +Y through
 
 ---
 
-## 4. `dtm_advanced_processor` — status
+## 4. Grading mesh resolution with the ROI controls
 
-This tool is documented here so nobody spends an afternoon on it.
+This is the recommended way — and, in this repository, the only way — to get a
+mesh that is fine at a site and coarse at the rim under a point budget.
 
-It **runs**, prints a plausible banner, and then refuses:
+There is no separate refinement pass. A `dtm_advanced_processor` binary once
+existed for that; it was **never implemented** and has been removed (see
+[Port record](#port-record)). Everything it was meant to deliver comes out of
+the converter's ROI grading:
 
-```
-$ ./build/bin/dtm_advanced_processor synth.tif out.ply \
-      --refine-center -89.95 0.0 --refine-inner 1 --refine-outer 4 \
-      --refine-max-faces 50000 --initial-downsample 4 --radius 1737400
-
-STATUS: adaptive refinement in this tool is NOT IMPLEMENTED.
-...
-WARNING: --initial-downsample is parsed but NEVER USED (value 4 has no effect).
-...
-ERROR: adaptive refinement needs an initial mesh, and the
-       'create initial mesh from DTM' step is NOT IMPLEMENTED.
-       Refusing to write an empty mesh to: out.ply
-$ echo $?
-2
-```
-
-Three pieces were never written by the original author:
-
-1. **ROI → initial mesh.** The ROI extractor runs and produces a real gridded
-   elevation patch, and the result is then discarded.
-2. **Initial mesh from DTM.** With no input mesh, none is built, so the refiner
-   is handed empty vertex and triangle vectors.
-3. **The elevation callback.** `getElevation(lat, lon)` returns `0.0f` for every
-   query, so subdivision midpoints would sit on a flat datum regardless of the
-   terrain.
-
-The `ROIExtractor` and `AdaptiveMeshRefiner` classes themselves are complete and
-ported unchanged; only `main()`'s wiring is missing.
-
-**Before this port, the failure was silent.** The original wrote a 432-byte PLY
-containing `element vertex 0` / `element face 0`, printed
-`Processing completed successfully!`, reported `Average edge length: nan m`, and
-**exited 0**. The GUI saw a zero exit code and reported success. That is why the
-symptom looked like "refinement produces a broken mesh" rather than "refinement
-does not exist". It now exits 2 and writes nothing.
-
-### Use this instead
-
-Everything adaptive refinement was meant to deliver — fine facets at the site,
-coarse facets at the rim, under a face budget — is what `dtm_to_ply_delaunay`'s
-ROI grading already does:
-
-| Refinement concept | `dtm_to_ply_delaunay` equivalent |
+| What you want | `dtm_to_ply_delaunay` flag |
 |---|---|
-| `--refine-center LAT LON` | `--roi-center LAT LON` |
-| `--refine-inner KM` (full resolution radius) | `--roi-core-frac` × `--roi-radius` |
-| `--refine-outer KM` (minimum resolution radius) | `--roi-radius KM` |
-| `--refine-max-faces N` | `--roi-max-points N` (vertex budget; faces ≈ 2×) |
-| falloff shape | `--density-exp P` |
-| `--refine-min-edge` / `--refine-max-edge` | `--max-edge METERS` (upper bound only) |
+| Center the fine region on a site | `--roi-center LAT LON` |
+| Radius kept at full resolution | `--roi-core-frac` × `--roi-radius` |
+| Radius beyond which nothing is kept | `--roi-radius KM` |
+| A budget on mesh size | `--roi-max-points N` (vertices; faces ≈ 2×) |
+| The shape of the falloff between them | `--density-exp P` |
+| An upper bound on triangle edge length | `--max-edge METERS` |
 
 Measured on a synthetic 400×400 south-polar lunar DTM at 20 m/pixel, with
 `--roi-center -89.95 0.0 --roi-radius 2.0 --roi-max-points 8000
@@ -252,7 +213,8 @@ python run_dashboard.py
 
 The dashboard is the optional multi-module launcher (`run_gui.py` is the
 supported entry point for the thermal application alone; the DEM module lives
-only in the dashboard). Pick the **DEM** module in the sidebar.
+only in the dashboard). Pick the **DEM** module in the sidebar. It has three
+pages: **Preview**, **Convert**, **Inspect**.
 
 **Preview page** — `dem_panels/dem_preview_panel.py`
 
@@ -264,7 +226,7 @@ only in the dashboard). Pick the **DEM** module in the sidebar.
 2. Tick **Enable ROI extraction** and set center latitude/longitude and radius,
    or click on the preview to place the center.
 
-**Configuration page** — `dem_panels/dem_config_panel.py`
+**Convert page** — `dem_panels/dem_config_panel.py`
 
 - *Grid & Body*: downsample factor, body (sets the radius), body radius.
 - *ROI*: core fraction, density exponent. The center/radius come from the
@@ -278,14 +240,17 @@ only in the dashboard). Pick the **DEM** module in the sidebar.
 Press **Convert**. The panel streams the tool's own output live, including its
 progress percentages, into the status line.
 
-**Mesh page** — `dem_panels/dem_mesh_panel.py`
+**Inspect page** — `dem_panels/dem_mesh_panel.py`
 
-The refinement controls (center, inner/outer radius, max faces, min/max edge,
-initial downsample) map onto `dtm_advanced_processor`. **This action cannot
-succeed** — see §4. The module now announces that before launching the tool
-rather than letting you discover it from the exit code.
+Statistics for the mesh just produced (the 3D viewer is the dashboard's right
+pane). A converted mesh loads here automatically.
 
-### Where the GUI looks for the binaries
+There is no Refine page. It invoked `dtm_advanced_processor`, which was never
+implemented; the page went with the binary, because a button that shells out
+to something that cannot work is the defect this whole toolchain change
+closes. Use the Convert page's ROI controls instead — §4.
+
+### Where the GUI looks for the binary
 
 `gui/dem_core/dem_runner.py` searches, in order:
 
@@ -300,8 +265,8 @@ names GDAL as the prerequisite.
 
 ### Platform support
 
-The DEM module's conversion and refinement actions stream the child process's
-stdout/stderr using `select.select()` on pipes. **That is POSIX-only** — on
+The DEM module's Convert action streams the child process's stdout/stderr
+using `select.select()` on pipes. **That is POSIX-only** — on
 Windows, `select` handles sockets only. macOS and Linux work; on Windows the
 module reports that it is unsupported and points at the command line, rather
 than failing somewhere deep in the read loop. There is no fallback
@@ -339,18 +304,33 @@ bitten this project before:
 | DTM → PLY conversion | **Works.** |
 | ROI extraction + radial density grading | **Works** (`dtm_to_ply_delaunay --roi-*`). |
 | Mesh quality control (slivers, normals, holes) | **Works.** |
-| Empty-mesh handling | **Fixed.** Both tools now refuse and exit 2 instead of writing a 0-face PLY and reporting success. |
-| Adaptive mesh refinement | **Not implemented** (`dtm_advanced_processor`). Fails loudly, exit 2. Use ROI grading instead (§4). |
+| Empty-mesh handling | **Fixed.** The converter refuses and exits 2 instead of writing a 0-face PLY and reporting success. |
+| Adaptive mesh refinement | **Removed** — it was never implemented. Use ROI density grading (§4). |
 | `--south-pole-coords` | **No-op.** Parsed, stored, never read. Warns when used. |
-| `--initial-downsample` (refiner) | **Dead.** Parsed, never used. Warns when used. |
-| Windows support for the GUI DEM actions | **Not supported** (POSIX pipe I/O). Command line works anywhere the binaries build. |
+| Windows support for the GUI Convert action | **Not supported** (POSIX pipe I/O). The command line works anywhere the binary builds. |
 
 ## Port record
 
-Both sources were brought into this repository from a standalone `heat3d/dtm`
-working directory that was never in version control and never in CMake. The port
-preserves the algorithms; the only changes are the guards and disclosures listed
-above, plus two missing standard-library includes.
+`dtm_to_ply_delaunay` was brought into this repository from a standalone
+`heat3d/dtm` working directory that was never in version control and never in
+CMake. The port preserves the algorithm; the only changes are the guards and
+disclosures listed above, plus one missing standard-library include.
+
+**The adaptive refiner (`dtm_advanced_processor`) was removed rather than
+ported, because it was never implemented.** Its `main()` had three unwritten
+comment stubs — "ROI → initial mesh", "create initial mesh from DTM", and an
+elevation callback returning `0.0f` for every query — so it handed an empty mesh
+to the refiner, wrote a 432-byte PLY containing `element vertex 0` /
+`element face 0`, printed `Processing completed successfully!`, reported
+`Average edge length: nan m`, and **exited 0**. The GUI keys on the exit code,
+so the dashboard reported success and handed the user an empty mesh; that is why
+the symptom read as "refinement produces a broken mesh" rather than "refinement
+does not exist". The source, its CMake target, its Refine page in the dashboard
+and its `DEMRefineThread` are all gone. A button that shells out to a binary
+that cannot work is the same silent-failure class the rest of this change
+closes, so the button went with the binary.
+`src/python/tests/test_dem_tools.py::test_the_unimplemented_refiner_stays_removed`
+is the tripwire that keeps it gone.
 
 Verification: on a synthetic south-polar-stereographic lunar GeoTIFF, the
 in-repo `dtm_to_ply_delaunay` produces output **byte-identical** (md5-equal) to

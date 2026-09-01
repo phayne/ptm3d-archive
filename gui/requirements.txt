@@ -65,9 +65,9 @@ rasterio>=1.3.0
 #
 # Linux: `apt install libgdal-dev python3-gdal` (or the conda command above).
 #
-# The SAME GDAL install is the build-time prerequisite for the DTM tools
-# (`dtm_to_ply_delaunay`, `dtm_advanced_processor`) that the dashboard's DEM
-# conversion and ROI actions run. Without GDAL, CMake SKIPS those targets and
-# the dashboard reports a missing executable. See INSTALL.md, "DEM / DTM
-# tools", and docs/dem-to-mesh-workflow.md.
+# The SAME GDAL install is the build-time prerequisite for the DTM tool
+# (`dtm_to_ply_delaunay`) that the dashboard's DEM conversion and ROI actions
+# run. Without GDAL, CMake SKIPS that target and the dashboard reports a
+# missing executable. See INSTALL.md, "DEM / DTM tools", and
+# docs/dem-to-mesh-workflow.md.
 # ---------------------------------------------------------------------------

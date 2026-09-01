@@ -105,12 +105,12 @@ if(GDAL_FOUND)
 endif()
 
 # Only build the GDAL-dependent DEM tools if GDAL is properly configured.
-# dem_mesh_generator, dtm_to_ply_delaunay and dtm_advanced_processor all need
-# the GDAL C++ headers and library; the rest of PTM3D does not, so configure
-# must still succeed without GDAL (with the warning at the bottom of this
-# block naming exactly which targets were skipped).
+# dem_mesh_generator and dtm_to_ply_delaunay both need the GDAL C++ headers and
+# library; the rest of PTM3D does not, so configure must still succeed without
+# GDAL (with the warning at the bottom of this block naming exactly which
+# targets were skipped).
 if(GDAL_FOUND AND GDAL_LIBRARIES)
-    message(STATUS "GDAL found: Building dem_mesh_generator, dtm_to_ply_delaunay, dtm_advanced_processor")
+    message(STATUS "GDAL found: Building dem_mesh_generator, dtm_to_ply_delaunay")
     message(STATUS "GDAL include dir: ${GDAL_INCLUDE_DIR}")
     message(STATUS "GDAL library: ${GDAL_LIBRARIES}")
 
@@ -176,36 +176,13 @@ if(GDAL_FOUND AND GDAL_LIBRARIES)
         CXX_STANDARD_REQUIRED ON
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-
-    # Advanced DTM processor (ROI extraction + adaptive radial refinement).
-    # The GUI dashboard's "Refine" action invokes this binary. NOTE: its mesh
-    # pipeline is unfinished upstream -- it builds and runs, but refuses to
-    # write a mesh and exits 2. See the port record at the top of
-    # dtm_advanced_processor.cpp and docs/dem-to-mesh-workflow.md.
-    add_executable(dtm_advanced_processor dtm_advanced_processor.cpp)
-    target_include_directories(dtm_advanced_processor PRIVATE
-        ${GDAL_INCLUDE_DIR}
-    )
-    target_link_libraries(dtm_advanced_processor
-        PRIVATE
-        ${GDAL_LIBRARIES}
-    )
-    if(APPLE AND CONDA_PREFIX_DIR)
-        target_link_options(dtm_advanced_processor PRIVATE "-Wl,-rpath,${CONDA_PREFIX_DIR}/lib")
-    endif()
-    set_target_properties(dtm_advanced_processor
-        PROPERTIES
-        CXX_STANDARD 17
-        CXX_STANDARD_REQUIRED ON
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-    )
 else()
     message(WARNING
         "GDAL not properly configured. SKIPPING these targets: "
-        "dem_mesh_generator, dtm_to_ply_delaunay, dtm_advanced_processor. "
-        "The GUI dashboard's DEM conversion / ROI extraction / mesh refinement "
-        "actions will report a missing executable until GDAL is installed and "
-        "CMake is re-run. Install GDAL (conda-forge recommended on macOS: "
+        "dem_mesh_generator, dtm_to_ply_delaunay. "
+        "The GUI dashboard's DEM conversion / ROI extraction actions will "
+        "report a missing executable until GDAL is installed and CMake is "
+        "re-run. Install GDAL (conda-forge recommended on macOS: "
         "'conda install -c conda-forge gdal') -- see INSTALL.md, 'DEM / DTM tools'.")
     message(STATUS "  GDAL_FOUND: ${GDAL_FOUND}")
     message(STATUS "  GDAL_LIBRARIES: ${GDAL_LIBRARIES}")

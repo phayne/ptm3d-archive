@@ -1,5 +1,5 @@
 """
-DEM Results Panel: browse converted/refined mesh files.
+DEM Results Panel: browse converted mesh files.
 """
 
 from pathlib import Path
@@ -12,7 +12,7 @@ from PyQt6.QtCore import pyqtSignal
 
 
 class DEMResultsPanel(QWidget):
-    """Browse DEM conversion and refinement results."""
+    """Browse DEM conversion results."""
 
     mesh_selected = pyqtSignal(str)  # path to selected mesh
 

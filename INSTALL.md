@@ -58,9 +58,9 @@ for how to check what you have and how to build a multi-ISA one alongside it.
 
 ### DEM / DTM tools (optional — GDAL)
 
-The engine does **not** need GDAL. It is needed only to build the three tools that turn a
-GeoTIFF digital terrain model into a PTM3D mesh — `dtm_to_ply_delaunay`, `dtm_advanced_processor`
-and `dem_mesh_generator` — and to give the GUI dashboard's DEM preview its `osgeo` bindings.
+The engine does **not** need GDAL. It is needed only to build the two tools that turn a
+GeoTIFF digital terrain model into a PTM3D mesh — `dtm_to_ply_delaunay` and
+`dem_mesh_generator` — and to give the GUI dashboard's DEM preview its `osgeo` bindings.
 If you never start from a DEM, skip this.
 
 ```bash
@@ -81,16 +81,16 @@ tried as a fallback hint. **Configure succeeds without GDAL** — it prints
 
 ```
 CMake Warning: GDAL not properly configured. SKIPPING these targets: dem_mesh_generator,
-dtm_to_ply_delaunay, dtm_advanced_processor. ...
+dtm_to_ply_delaunay. ...
 ```
 
 and builds everything else. If you install GDAL later, re-run `cmake -S . -B build` before
 building; the skip is decided at configure time, not build time.
 
-Then build the DEM tools (see §3):
+Then build the DEM tool (see §3):
 
 ```bash
-cmake --build build --target dtm_to_ply_delaunay dtm_advanced_processor -j
+cmake --build build --target dtm_to_ply_delaunay -j
 ```
 
 `dtm_to_ply_delaunay` also uses the header-only [CDT](https://github.com/artem-ogre/CDT)

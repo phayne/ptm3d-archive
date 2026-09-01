@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""DEM tools: the binaries do what the GUI asks, and the GUI asks for flags that exist.
+"""DEM tools: the binary does what the GUI asks, and the GUI asks for flags that exist.
 
-Covers the two compiled DTM tools (``src/cpp/tools/dtm_to_ply_delaunay.cpp``,
-``src/cpp/tools/dtm_advanced_processor.cpp``) and the GUI wrapper that runs
-them (``gui/dem_core/dem_runner.py``). See ``docs/dem-to-mesh-workflow.md``.
+Covers the compiled DTM converter (``src/cpp/tools/dtm_to_ply_delaunay.cpp``)
+and the GUI wrapper that runs it (``gui/dem_core/dem_runner.py``). See
+``docs/dem-to-mesh-workflow.md``.
 
 This file **builds nothing**. Three groups of checks, with different needs:
 
 * **Argv coverage** (no binaries, no GDAL, no Qt -- always runs). Every
-  ``--flag`` the GUI emits must be one the corresponding C++ ``main()``
-  actually parses. This is a source-level cross-check because the failure mode
-  it guards against is silent: both tools ignore an argument they do not
-  recognize, so a renamed or dropped flag changes the mesh with nothing in the
-  log. Two flags are known-dead and asserted to still carry their warning, so
-  that implementing one forces a deliberate edit here.
+  ``--flag`` the GUI emits must be one the C++ ``main()`` actually parses. This
+  is a source-level cross-check because the failure mode it guards against is
+  silent: the tool ignores an argument it does not recognize, so a renamed or
+  dropped flag changes the mesh with nothing in the log. ``--south-pole-coords``
+  is known-dead and asserted to still carry its warning, so that implementing it
+  forces a deliberate edit here.
 
 * **Synthetic-DTM smoke** (needs ``build/bin/dtm_to_ply_delaunay`` and the GDAL
   Python bindings). Generates its own south-polar lunar GeoTIFF -- no fixture
@@ -24,11 +24,13 @@ This file **builds nothing**. Three groups of checks, with different needs:
   ``--roi-max-points`` is honored, and that ``--roi-core-frac`` /
   ``--density-exp`` really do grade the point density from core to rim.
 
-* **Refusal** (needs ``build/bin/dtm_advanced_processor``). Adaptive refinement
-  is not implemented. Before the port this tool wrote a 432-byte PLY with zero
-  vertices, printed "Processing completed successfully!" and exited 0 -- a
-  silent failure the GUI reported as success. The arm here is that it now exits
-  non-zero and writes no file at all.
+* **Refusal, and staying removed.** A request that cannot be honored must fail
+  rather than write an empty mesh. And ``dtm_advanced_processor`` -- the
+  adaptive refiner that was never implemented, wrote a 432-byte 0-vertex PLY,
+  printed "Processing completed successfully!" and exited 0 -- was **removed
+  from the repository** by Paul's ruling. A tripwire here keeps it removed: a
+  button that shells out to a binary that does not exist is the defect class
+  this whole change closes, so it must not come back by accident.
 
 Missing prerequisites SKIP, naming exactly what is missing; a skip is printed
 and reported, never counted as a pass. Run directly::
@@ -56,10 +58,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 CONVERT_BIN = REPO_ROOT / "build" / "bin" / "dtm_to_ply_delaunay"
-REFINE_BIN = REPO_ROOT / "build" / "bin" / "dtm_advanced_processor"
 CONVERT_SRC = REPO_ROOT / "src" / "cpp" / "tools" / "dtm_to_ply_delaunay.cpp"
-REFINE_SRC = REPO_ROOT / "src" / "cpp" / "tools" / "dtm_advanced_processor.cpp"
 RUNNER_PY = REPO_ROOT / "gui" / "dem_core" / "dem_runner.py"
+
+# Removed by Paul's ruling (never implemented). See
+# test_the_unimplemented_refiner_stays_removed.
+REMOVED_REFINER_SRC = REPO_ROOT / "src" / "cpp" / "tools" / "dtm_advanced_processor.cpp"
 
 MOON_RADIUS_M = 1737400.0
 
@@ -125,36 +129,22 @@ def _implemented_flags(cpp_path: Path) -> set[str]:
     return set(re.findall(r'arg\s*==\s*"(--[a-z0-9-]+)"', text))
 
 
-def _emitted_flags(runner_path: Path) -> dict[str, set[str]]:
-    """Flags dem_runner.py puts on each tool's command line.
+def _emitted_flags(runner_path: Path) -> set[str]:
+    """Flags DEMConvertThread puts on dtm_to_ply_delaunay's command line.
 
-    Split on the two thread classes so a convert-only flag is never credited to
-    the refiner. Both ``cmd.extend([...])`` and ``cmd.append(...)`` forms count.
+    Scoped to the thread class rather than the whole module, so a flag named
+    only in a docstring or a help string is never credited as emitted. Both
+    ``cmd.extend([...])`` and ``cmd.append(...)`` forms count.
     """
     if not runner_path.is_file():
         raise Skip(f"runner not found: {runner_path}")
     text = runner_path.read_text(encoding="utf-8", errors="replace")
-
-    convert_at = text.index("class DEMConvertThread")
-    refine_at = text.index("class DEMRefineThread")
-    if convert_at > refine_at:                      # pragma: no cover - layout guard
-        raise AssertionError(
-            "dem_runner.py class order changed; this parser assumes "
-            "DEMConvertThread precedes DEMRefineThread"
-        )
-
-    sections = {
-        "dtm_to_ply_delaunay": text[convert_at:refine_at],
-        "dtm_advanced_processor": text[refine_at:],
-    }
-    out = {}
-    for name, body in sections.items():
-        out[name] = set(re.findall(r'"(--[a-z0-9-]+)"', body))
-    return out
+    body = text[text.index("class DEMConvertThread"):]
+    return set(re.findall(r'"(--[a-z0-9-]+)"', body))
 
 
 def test_every_flag_the_gui_emits_is_implemented_by_the_converter():
-    emitted = _emitted_flags(RUNNER_PY)["dtm_to_ply_delaunay"]
+    emitted = _emitted_flags(RUNNER_PY)
     implemented = _implemented_flags(CONVERT_SRC)
     assert emitted, "parsed no flags out of DEMConvertThread -- parser is broken"
     unknown = sorted(emitted - implemented)
@@ -165,36 +155,88 @@ def test_every_flag_the_gui_emits_is_implemented_by_the_converter():
     )
 
 
-def test_every_flag_the_gui_emits_is_implemented_by_the_refiner():
-    emitted = _emitted_flags(RUNNER_PY)["dtm_advanced_processor"]
-    implemented = _implemented_flags(REFINE_SRC)
-    assert emitted, "parsed no flags out of DEMRefineThread -- parser is broken"
-    unknown = sorted(emitted - implemented)
-    assert not unknown, (
-        f"DEMRefineThread emits flags dtm_advanced_processor does not parse: "
-        f"{unknown}. Implemented: {sorted(implemented)}"
-    )
+def test_the_dead_flag_still_announces_itself():
+    """--south-pole-coords is parsed and never used.
 
-
-def test_the_two_dead_flags_still_announce_themselves():
-    """--south-pole-coords and --initial-downsample are parsed and never used.
-
-    Both are wired to the GUI, so a user can switch them on and get no effect.
-    The only honest state is a warning. If someone implements either, this arm
-    fails and forces the warning (and docs/dem-to-mesh-workflow.md) to be
+    It is wired to a GUI checkbox, so a user can switch it on and get no
+    effect. The only honest state is a warning. If someone implements it, this
+    arm fails and forces the warning (and docs/dem-to-mesh-workflow.md) to be
     updated deliberately rather than left behind as a lie.
     """
     convert = CONVERT_SRC.read_text(encoding="utf-8", errors="replace")
-    refine = REFINE_SRC.read_text(encoding="utf-8", errors="replace")
-
     assert "--south-pole-coords is accepted but NOT IMPLEMENTED" in convert, (
         "dtm_to_ply_delaunay must warn that --south-pole-coords is a no-op "
         "(use_south_pole_coords_ is stored and never read), or implement it "
         "and update this test and docs/dem-to-mesh-workflow.md"
     )
-    assert "--initial-downsample is parsed but NEVER USED" in refine, (
-        "dtm_advanced_processor must warn that --initial-downsample has no "
-        "effect, or implement it and update this test"
+
+
+def test_the_unimplemented_refiner_stays_removed():
+    """dtm_advanced_processor was removed; nothing may reach for it again.
+
+    Paul's ruling. It was never implemented -- three comment stubs in main(),
+    an elevation callback returning 0.0 for every query -- and it wrote a
+    432-byte 0-vertex PLY while printing "Processing completed successfully!"
+    and exiting 0. A GUI button that shells out to a binary that does not exist
+    is the defect class this change closes, so the button went with the binary.
+
+    This arm is a tripwire, not a style check: reintroducing the source, the
+    CMake target or the GUI thread without also implementing the pipeline puts
+    the silent failure straight back.
+    """
+    assert not REMOVED_REFINER_SRC.exists(), (
+        f"{REMOVED_REFINER_SRC} is back. If the adaptive refiner has actually "
+        f"been implemented (initial mesh from the DTM, a real getElevation), "
+        f"delete this arm deliberately and add real coverage. Do not restore "
+        f"the unimplemented version."
+    )
+
+    cmake = (REPO_ROOT / "src" / "cpp" / "tools" / "CMakeLists.txt").read_text(
+        encoding="utf-8", errors="replace")
+    assert "dtm_advanced_processor" not in cmake, (
+        "src/cpp/tools/CMakeLists.txt still names dtm_advanced_processor"
+    )
+
+    runner = RUNNER_PY.read_text(encoding="utf-8", errors="replace")
+    assert "dtm_advanced_processor" not in runner, (
+        "gui/dem_core/dem_runner.py still names dtm_advanced_processor"
+    )
+    assert "DEMRefineThread" not in runner, (
+        "gui/dem_core/dem_runner.py still defines DEMRefineThread"
+    )
+
+    panel = (REPO_ROOT / "gui" / "dem_panels" / "dem_config_panel.py").read_text(
+        encoding="utf-8", errors="replace")
+    for needle in ("DEMRefineThread", "_create_refine_page", "_run_refine",
+                   '"Refine"'):
+        assert needle not in panel, (
+            f"gui/dem_panels/dem_config_panel.py still carries {needle!r} -- "
+            f"the Refine page must stay gone"
+        )
+
+
+def test_the_nav_rail_still_offers_the_three_surviving_pages():
+    """Removing a page must not leave the rail and the stack out of step.
+
+    The rail is a plain QListWidget whose row index is fed straight to
+    QStackedWidget.setCurrentIndex, so a name list and a widget list that
+    disagree in length silently mis-route clicks rather than raising.
+    """
+    panel = (REPO_ROOT / "gui" / "dem_panels" / "dem_config_panel.py").read_text(
+        encoding="utf-8", errors="replace")
+
+    match = re.search(r"pages = \[([^\]]*)\]", panel)
+    assert match, "could not find the nav rail's page list in dem_config_panel.py"
+    names = re.findall(r'"([^"]+)"', match.group(1))
+    assert names == ["Preview", "Convert", "Inspect"], (
+        f"nav rail pages are {names}; expected Preview/Convert/Inspect"
+    )
+
+    init = panel[panel.index("def _init_ui"):panel.index("def _create_convert_page")]
+    added = init.count("self._stack.addWidget(")
+    assert added == len(names), (
+        f"the rail lists {len(names)} pages but _init_ui adds {added} widgets "
+        f"to the stack; clicks would be routed to the wrong page"
     )
 
 
@@ -551,54 +593,12 @@ def test_conversion_refuses_instead_of_writing_an_empty_mesh():
     )
 
 
-def test_refinement_refuses_instead_of_writing_an_empty_mesh():
-    """The pre-port tool wrote 0 vertices / 0 faces and exited 0."""
-    if not REFINE_BIN.is_file() or not os.access(REFINE_BIN, os.X_OK):
-        raise Skip(
-            f"missing binary: {REFINE_BIN}. Build it with "
-            f"'cmake --build build --target dtm_advanced_processor -j' "
-            f"(needs GDAL at configure time; see INSTALL.md 'DEM / DTM tools')."
-        )
-    work = _scratch()
-    dtm = work / "synthetic_dtm.tif"
-    if not dtm.is_file():
-        _write_synthetic_dtm(dtm)
-    out = work / "refined.ply"
-    if out.exists():
-        out.unlink()
-
-    proc = subprocess.run(
-        [
-            str(REFINE_BIN), str(dtm), str(out),
-            "--refine-center", str(_ROI_LAT), str(_ROI_LON),
-            "--refine-inner", "1", "--refine-outer", "4",
-            "--refine-max-faces", "50000",
-            "--refine-min-edge", "3", "--refine-max-edge", "500",
-            "--initial-downsample", "4",
-            "--radius", str(MOON_RADIUS_M),
-        ],
-        capture_output=True, text=True, timeout=600,
-    )
-    combined = proc.stdout + proc.stderr
-    assert proc.returncode != 0, (
-        "dtm_advanced_processor exited 0. Adaptive refinement is not "
-        "implemented; exiting 0 is what made the GUI report success while "
-        "handing the user an empty mesh.\n" + combined[-2000:]
-    )
-    assert not out.exists(), (
-        f"an output file was written to {out} despite the refusal; it can only "
-        f"be the 0-vertex / 0-face PLY"
-    )
-    assert "NOT IMPLEMENTED" in combined, (
-        "the refusal must say why, not just fail:\n" + combined[-2000:]
-    )
-
-
 TESTS = [
     # 1. flag coverage and wiring -- no binaries, no GDAL, no Qt
     test_every_flag_the_gui_emits_is_implemented_by_the_converter,
-    test_every_flag_the_gui_emits_is_implemented_by_the_refiner,
-    test_the_two_dead_flags_still_announce_themselves,
+    test_the_dead_flag_still_announces_itself,
+    test_the_unimplemented_refiner_stays_removed,
+    test_the_nav_rail_still_offers_the_three_surviving_pages,
     test_the_runner_prefers_the_in_repo_build_directory,
     test_the_missing_binary_message_names_the_build_target_and_gdal,
     # 2. synthetic-DTM smoke -- needs build/bin + osgeo
@@ -607,7 +607,6 @@ TESTS = [
     test_the_same_command_twice_gives_the_same_mesh,
     # 3. a request that cannot be honored must fail, never write an empty mesh
     test_conversion_refuses_instead_of_writing_an_empty_mesh,
-    test_refinement_refuses_instead_of_writing_an_empty_mesh,
 ]
 
 
