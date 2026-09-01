@@ -1,0 +1,20 @@
+{
+  "source": "PDS Small Bodies Node",
+  "archive": "urn:nasa:pds:ast-bennu.radar.shape-model::1.1",
+  "doi": "10.1016/j.icarus.2013.05.028",
+  "citation": "Nolan, M. C. et al. (2013), Shape model and surface properties of the OSIRIS-REx target Asteroid (101955) Bennu from radar and lightcurve observations, Icarus 226, 629-640",
+  "version": "radar + lightcurve inversion, 2013 (pre-encounter)",
+  "retrieved": "before 2026-08-28",
+  "md5": "df9cbba2f8d59d5e50fa73d85636767e",
+  "sha256": "44b83da69b37763012a83b5e092ba0893c9d18cf4f43fe53ab138a084deb0209",
+  "bytes": 89181,
+  "vertices": 1348,
+  "faces": 2692,
+  "units": "km",
+  "status": "archived, superseded 2026-08-28 by g_06370mm_alt_obj_0000n00000_v021.obj",
+  "used_by": "NOT on any engine path. docs/tutorials/notebooks/04_asteroid_spice.ipynb names this exact path in its own cells, so it cannot be deleted or renamed without breaking a shipped, executed notebook.",
+  "retained_because": "It is the shape behind every Bennu number published from this repository before 2026-08-28. A superseded artifact that has been deleted cannot be re-checked.",
+  "tracked": true,
+  "gitignore_note": "*.obj is ignored by this repository (.gitignore, a rule written for C object files -- PTM-303). This file is TRACKED anyway, through a named '!' exception on this exact path.",
+  "narrative": "PROVENANCE.md, in this directory -- including the measured old-versus-new differences (volume -1.555%, R_vol -0.521%, surface area +2.528%)."
+}

@@ -7,23 +7,25 @@
     "spk_stop": "2036-06-01",
     "has_damit_shape": true,
     "damit_id": 2858,
-    "config_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml",
-    "spk_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/ephemeris.spk",
-    "metakernel_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm",
-    "shape_path": "/Users/paha3326/projects/ptm-justitia-horizons-2026-08-15/data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj"
+    "config_path": "data/horizons_cache/bodies/269_Justitia_(A887_SA)/body_config.yaml",
+    "spk_path": "data/horizons_cache/bodies/269_Justitia_(A887_SA)/ephemeris.spk",
+    "metakernel_path": "data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm",
+    "shape_path": "data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj",
+    "shape_md5": "4e7c109b8a2e17bc3c84bbd8a123a365"
   },
   "623 Chimaera (A907 BC)": {
-    "naif_id": "623",
+    "naif_id": "20000623",
     "body_type": "asteroid",
     "cache_date": "2026-02-02T11:51:00.417901",
     "spk_start": "2024-12-24",
     "spk_stop": "2025-01-31",
     "has_damit_shape": true,
     "damit_id": 9110,
-    "config_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/body_config.yaml",
-    "spk_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/ephemeris.spk",
-    "metakernel_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/metakernel.tm",
-    "shape_path": "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape.obj"
+    "config_path": "data/horizons_cache/bodies/623_Chimaera_(A907_BC)/body_config.yaml",
+    "spk_path": "data/horizons_cache/bodies/623_Chimaera_(A907_BC)/ephemeris.spk",
+    "metakernel_path": "data/horizons_cache/bodies/623_Chimaera_(A907_BC)/metakernel.tm",
+    "shape_path": "data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape_refined.obj",
+    "shape_md5": "a17fe60812a836bf63a519794eed4e36"
   },
   "13294 Rockox (1998 QO105)": {
     "naif_id": "13294",

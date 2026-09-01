@@ -13,24 +13,82 @@ and updates it; a body that is not in the cache is fetched on first use.
 
 Four bodies are committed — 269 Justitia, 623 Chimaera, 13294 Rockox, and
 101955 Bennu. They are here as **provenance for published small-body runs**, so
-the orbit and spin elements those runs used can be inspected. They are **not
-runnable inputs on a fresh clone**, for two independent reasons:
+the orbit and spin elements those runs used can be inspected.
 
-1. **The shape meshes are not distributed.** Each `body_config.yaml` points at a
-   `shape*.obj` (for example `shape_refined.obj`) that `.gitignore` excludes.
-2. **`index.json` and every `metakernel.tm` carry absolute paths from the
-   machine that generated them.** `PATH_VALUES` in the metakernels and the
-   `config_path` / `spk_path` / `metakernel_path` / `shape_path` entries in
-   `index.json` are machine-specific strings; they do not resolve anywhere else,
-   and the kernel subdirectories they name (`$KERNELS/lsk`, `$KERNELS/pck`,
-   `$KERNELS/spk`) are not part of the cache at all.
+**269 Justitia, 623 Chimaera and 101955 Bennu are runnable from a fresh clone.**
+Their shape models are tracked (see the policy below), and their `metakernel.tm`
+and `index.json` entries carry **repository-root-relative** paths, not absolute
+ones.
 
-The failure mode is benign: `DataManager.is_cached()` tests those paths with
-`os.path.exists()`, finds nothing, and treats the body as uncached, so the next
-run re-queries Horizons and rewrites the entry with paths valid for *your*
-machine. Nothing silently uses a wrong ephemeris. But do not read the committed
-absolute paths as something you can follow, and do not hand a committed
-`metakernel.tm` to SPICE directly — regenerate it.
+Justitia's committed kernel was verified against fourteen real Justitia
+configurations on 2026-08-31 (the `examples/justitia_*.yaml` set, which is local
+to one machine and **not yet tracked** — see PTM-300/PTM-446): all fourteen
+resolve every metakernel member, and the committed SPK
+(**2033-12-14T23:58:51 → 2036-05-31T23:58:51 UTC, 899.0 days for body
+20000269**, one interval) contains every run window *including its
+equilibration reach-back*. All fourteen ran to `rc=0` with
+`[ephemeris] Keplerian fallback: 0 of N Sun-position epochs`.
+
+Two things a fresh clone still has to supply:
+
+1. **The standard kernels.** `$KERNELS/lsk/naif0012.tls`, `$KERNELS/pck/pck00011.tpc`
+   and `$KERNELS/spk/de440s.bsp` are not part of the cache. Fetch them with
+   `python3 scripts/fetch_kernels.py`.
+2. **The working directory.** A metakernel's `PATH_VALUES` are resolved by
+   SPICE's `furnsh_c` against the **current working directory**, not by the
+   engine's own path contract — so **launch these runs from the repository
+   root.** (The engine resolves `generic_body.spice_metakernel` itself, from any
+   cwd; it is the paths *inside* the metakernel that are cwd-relative.)
+
+**13294 Rockox is the remaining exception**: its `index.json` entry still carries
+absolute paths from the machine that generated it, and it has no tracked shape.
+Treat it as provenance only.
+
+⛔ **Do not regenerate a committed `metakernel.tm`.** `SPKGenerator.create_metakernel()`
+emits absolute paths by design (the deep-OneDrive-path and SPICE 78-character
+truncation workaround), so regenerating one bakes in a single machine's layout
+and the file stops resolving anywhere else. The committed metakernels are
+hand-written relative on purpose; each says so in its own header. This is not
+hypothetical — it is how the fourteen Justitia configurations came to name a
+directory that does not exist (PTM-446), and a stray regeneration was found
+sitting in the working tree on 2026-08-31.
+
+## Shape-model policy
+
+**A shape model that a committed configuration loads is a production input, so
+it is tracked.** Concretely, every such file has all four of:
+
+1. **The file itself, tracked in git.**
+2. **A named `!` exception in `.gitignore`**, by exact filename. `.gitignore`'s
+   `*.obj` is a C/C++ object-file rule that also swallows every Wavefront shape
+   model in the tree (PTM-303). The exception is written out rather than the file
+   force-added, because a force-add is invisible to the next person and silently
+   stops applying the day someone re-adds the file without `-f`.
+3. **A machine-readable provenance sidecar** next to it, `<stem>_provenance.json`
+   — source, archive, version/model id, URL, md5, sha256, byte count, vertex and
+   face counts, units, and the date retrieved. `gui_core.body_fetch.shape_provenance()`
+   reads exactly this name.
+4. **A `PROVENANCE.md` in the body directory** explaining what the file is, what
+   it supersedes, what was measured and what was not.
+
+The tracked set, as of 2026-08-31:
+
+| body | file | what it is |
+|---|---|---|
+| (269) Justitia | `shape.obj` | DAMIT model 2858, the original |
+| (269) Justitia | `shape_reconstructed_20260704.obj` | the superseded 2026-07-04 hand reconstruction (PTM-303), geometrically identical to the original — max vertex deviation 0.000000000 km |
+| (623) Chimaera | `shape.obj` | DAMIT model 9110, the original (byte-identical to a 2026-08-31 re-download) |
+| (623) Chimaera | `shape_refined.obj` | 2-pass Loop subdivision of the above; **this** is what `body_config.yaml` loads, and its generator is not in this repository |
+| (101955) Bennu | `g_06370mm_alt_obj_0000n00000_v021.obj` | OSIRIS-REx OLA v21 global model |
+| (101955) Bennu | `bennu_radar_shape.obj` | the superseded Nolan et al. (2013) radar model |
+
+Superseded models are kept, not deleted, for the same reason in every case: they
+are the geometry behind results already published from this repository, and an
+artifact that has been deleted cannot be re-checked.
+
+**Adding a body's shape is a four-file act**, and skipping any one of them is the
+failure this policy exists to prevent: a tracked mesh with no provenance is a
+number no one can re-derive, and an untracked mesh is one copy on one machine.
 
 Bennu is the exception to both. It is not a Horizons-fetched entry at all — it
 has no `body_config.yaml`, no `metakernel.tm`, and no `index.json` record,
@@ -52,9 +110,8 @@ cells. As of 2026-08-27 `data/kernels/bennu.tm` loads
 See `bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` for the checksums, the
 citations, the closed-form mesh validation and the measured differences.
 
-Note that the shape models are tracked despite `.gitignore`'s `*.obj` rule (a
-C/C++ object-file pattern that also matches every Wavefront shape model in the
-tree). They are excepted by name, not force-added — see that rule's comment.
+Bennu's shape models follow the same policy as the rest — tracked, excepted by
+name in `.gitignore`, sidecar plus `PROVENANCE.md`.
 
 ## Regenerating a body locally
 

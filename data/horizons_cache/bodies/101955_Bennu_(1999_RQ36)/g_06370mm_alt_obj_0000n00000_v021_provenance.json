@@ -1,0 +1,26 @@
+{
+  "source": "PDS Small Bodies Node",
+  "archive": "urn:nasa:pds:orex.altimetry:data_derived_altimetry_lidar_global_models:g_06370mm_alt_obj_0000n00000_v021.obj, version 1.0",
+  "model_url": "https://sbnarchive.psi.edu/pds4/orex/orex.altimetry/data_derived_altimetry_lidar_global_models/global_digital_terrain_models/OLAv21/g_06370mm_alt_obj_0000n00000_v021.obj",
+  "pds4_label_url": "https://sbnarchive.psi.edu/pds4/orex/orex.altimetry/data_derived_altimetry_lidar_global_models/global_digital_terrain_models/OLAv21/g_06370mm_alt_obj_0000n00000_v021.xml",
+  "version": "OLA v21, 6.37 m ground sample distance",
+  "citation": "Barnouin, O.; Daly, M.; Espiritu, R.; OSIRIS-REx Altimetry Working Group (2026), Bennu Shape Model, g_06370mm_alt_obj_0000n00000_v021.obj",
+  "references": [
+    "Barnouin et al. (2019), Nature Geoscience 12, 247-252, doi:10.1038/s41561-019-0330-x",
+    "Daly et al. (2020), Science Advances 6, doi:10.1126/sciadv.abd3649"
+  ],
+  "retrieved": "2026-08-28",
+  "md5": "bd1b8b152c20ac46a8509640b0ce6ae7",
+  "sha256": "4a998173386899b3c6aeced38450b656e146a4e4f7ecfb9ad7b524d97f840e73",
+  "bytes": 3741261,
+  "vertices": 25350,
+  "faces": 49152,
+  "units": "km",
+  "status": "live",
+  "used_by": "examples/quickstart_asteroid_bennu.yaml; the GUI's curated Bennu card (gui/gui_core/curated_sources.py)",
+  "modified": false,
+  "modification_note": "Shipped byte for byte as the archive serves it. Nothing was decimated, recentered, rewound or cleaned.",
+  "tracked": true,
+  "gitignore_note": "*.obj is ignored by this repository (.gitignore, a rule written for C object files -- PTM-303). This file is TRACKED anyway, through a named '!' exception on this exact path.",
+  "narrative": "PROVENANCE.md, in this directory -- why this product and not the alternatives, the closed-form mesh validation, the frame, and the measured resolution convergence."
+}

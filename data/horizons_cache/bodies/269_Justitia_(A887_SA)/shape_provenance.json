@@ -1,0 +1,32 @@
+{
+  "source": "DAMIT",
+  "damit_id": 2858,
+  "damit_asteroid_number": 269,
+  "damit_asteroid_name": "Justitia",
+  "model_url": "https://astro.troja.mff.cuni.cz/projects/damit/asteroids/view/2858",
+  "archive": "DAMIT (Database of Asteroid Models from Inversion Techniques), Astronomical Institute, Charles University, Prague",
+  "archive_reference": "Durech, J., Sidorin, V., Kaasalainen, M. (2010), DAMIT: a database of asteroid models, Astronomy & Astrophysics 513, A46, doi:10.1051/0004-6361/200912693",
+  "fetched": "2026-08-31",
+  "fetched_by": "gui_core.body_fetch.fetch_damit_shape (src/python/damit/damit_client.py)",
+  "md5": "4e7c109b8a2e17bc3c84bbd8a123a365",
+  "sha256": "d32c75e1562333f83a64492e6067ff1baa6551df660575ce446299f45f599a0f",
+  "bytes": 37311,
+  "vertices": 574,
+  "faces": 1144,
+  "units": "km",
+  "spin_pole_ecliptic_lon_deg": 73.0,
+  "spin_pole_ecliptic_lat_deg": -81.0,
+  "spin_pole_ra_deg": 85.069,
+  "spin_pole_dec_deg": -57.852,
+  "spin_period_hours": 33.1296,
+  "scaled_to_radius_km": 25.364,
+  "tracked": true,
+  "gitignore_note": "*.obj is ignored by this repository (.gitignore, a rule written for C object files -- PTM-303). This file is TRACKED anyway, through a named '!' exception on this exact path, so a fresh clone contains it and no force-add is needed. Do not remove that exception without also removing this file from the tree.",
+  "supersedes": {
+    "file": "shape_reconstructed_20260704.obj",
+    "md5": "9626bf7eefe8af89ab9ae5cad8bdc021",
+    "sha256": "66dcb23b178e7a34eabab524ff5dde5a7c125aa2d4a200a8aade7a3d3d88d13a",
+    "bytes": 41016,
+    "note": "The 2026-07-04 hand reconstruction (PTM-303), rebuilt from mesh.ply vertex/face data preserved in prior thermal-sim output. Measured against this DAMIT original on 2026-08-31: same 574 vertices and 1144 faces, identical face index lists, maximum in-order vertex deviation 0.000000000 km. The two differ only in header text and in decimal formatting (10 places written, 8 significant), which is why the md5 differs and the geometry does not. The original is kept as the tracked file because provenance, not geometry, is what separated them."
+  }
+}
