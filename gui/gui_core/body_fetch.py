@@ -47,6 +47,27 @@ of 2034 while every Justitia configuration targeted 2035, and all fifteen ran
 at all (``illumination_model.cpp:2793-2818``), so every one of them "passed".
 The engine still does not report it. Until it does, this is the guard.
 
+**A kernel the repository SHIPS is not overwritten.** ``data/horizons_cache``
+is not scratch space: four ``ephemeris.spk`` and three ``metakernel.tm`` files
+in it are tracked, and the fourteen shipped Justitia configurations resolve
+their ephemeris through two of them. A fetch used to install its download over
+whichever file was at the destination and regenerate the metakernel beside it,
+with no check of either -- and on 2026-08-31 that replaced Justitia's committed
+899-day kernel with a 762-day one spanning NONE of the campaign windows, and
+rewrote two committed metakernels to machine-absolute ``PATH_VALUES`` that each
+file's own header forbids (GUI-FETCH-CLOBBERS-COMMITTED-KERNELS). Worse, the
+metakernel half needed no download at all: a cache HIT rewrote them too.
+:func:`tracked_by_git` now decides, and the default is to save the new kernel
+BESIDE the tracked one and point the configuration at the copy. See
+:func:`fetch_spk`'s ``on_tracked`` and :func:`_ensure_metakernel`.
+
+**A replacement that loses coverage is refused even when it is asked for.**
+Consent to replace a tracked kernel is not consent to install a shorter one:
+the old and new coverages are read and compared BEFORE anything is written, and
+a new kernel that does not contain the old one's span is refused with both
+spans named. That comparison is what the 899 -> 762 day clobber would have
+failed.
+
 **A shape model is not fetched without saying where it will live.** ``.obj``
 is matched by this project's ``.gitignore`` line 14 -- a rule written for C
 object files that swallows every asteroid shape model in the repository
@@ -70,6 +91,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DAMIT_TIMEOUT_S",
     "HORIZONS_SPK_TIMEOUT_S",
+    "ON_TRACKED_CANCEL",
+    "ON_TRACKED_CHOICES",
+    "ON_TRACKED_REPLACE",
+    "ON_TRACKED_SAVE_BESIDE",
     "SPK_MARGIN_DAYS",
     "FetchResult",
     "body_cache_dir",
@@ -79,6 +104,7 @@ __all__ = [
     "fetch_sbdb_properties",
     "shape_provenance",
     "spin_consistency",
+    "tracked_by_git",
 ]
 
 #: An SPK download builds a kernel server-side and can take appreciably longer
@@ -109,7 +135,8 @@ class FetchResult:
 
     def __init__(self, ok=False, kind="", values=None, provenance=None,
                  message="", warnings=(), paths=None, refusal="",
-                 from_cache=False, offer="", offer_bytes=0):
+                 from_cache=False, offer="", offer_bytes=0,
+                 tracked_destination=""):
         self.ok = bool(ok)
         #: "spk", "damit_shape" or "sbdb".
         self.kind = kind
@@ -138,6 +165,12 @@ class FetchResult:
         #: What agreeing to ``offer`` would transfer, in bytes. Disclosed
         #: before the question, not after it.
         self.offer_bytes = int(offer_bytes)
+        #: The tracked file this fetch declined to overwrite, or ``""``. A
+        #: FLAG, for the same reason ``offer`` is one: the card offers the user
+        #: the Replace it did not take, and a card that decided by searching
+        #: ``message`` for words would break the first time the wording
+        #: improved.
+        self.tracked_destination = str(tracked_destination or "")
 
     def lines(self):
         """The block the card shows: message, refusal, then warnings."""
@@ -182,6 +215,195 @@ def body_cache_dir(project_root, name):
             f"({candidate} is outside {root}). Rename the body without path "
             f"separators or '..' before fetching anything for it.")
     return root / safe
+
+
+# ---------------------------------------------------------------------------
+# Files the repository ships
+# ---------------------------------------------------------------------------
+
+#: What a fetch does when its destination is a file the repository TRACKS.
+#: These are the three answers the card offers, and the string a caller passes
+#: back as ``on_tracked``; anything else is refused by name rather than
+#: silently treated as the default.
+ON_TRACKED_SAVE_BESIDE = "save_beside"     #: keep the tracked file, install a copy beside it
+ON_TRACKED_REPLACE = "replace"             #: overwrite it -- still coverage-checked
+ON_TRACKED_CANCEL = "cancel"               #: change nothing at all
+ON_TRACKED_CHOICES = (ON_TRACKED_SAVE_BESIDE, ON_TRACKED_REPLACE,
+                      ON_TRACKED_CANCEL)
+
+#: Where to look for git. ``shutil.which`` first, so a colleague's ordinary
+#: install is used; the Command Line Tools path is the fallback for a GUI
+#: launched from a desktop bundle, whose PATH is the login shell's and often
+#: does not carry Xcode's shims.
+_GIT_FALLBACKS = ("/Library/Developer/CommandLineTools/usr/bin/git",
+                  "/usr/bin/git")
+
+
+def _git_program():
+    """The git to ask, or ``""`` when there is none."""
+    import shutil
+    found = shutil.which("git")
+    if found:
+        return found
+    for candidate in _GIT_FALLBACKS:
+        if Path(candidate).exists():
+            return candidate
+    return ""
+
+
+def tracked_by_git(path):
+    """``(tracked, detail)`` -- is this path a file the repository tracks?
+
+    ``tracked`` is **True**, **False**, or **None** for "the question could not
+    be asked", and the third is not folded into the second on purpose. This is
+    the predicate a guard turns on: answering "not tracked" when the truth is
+    "I could not look" is how the guard would go quiet exactly on the machines
+    where it cannot check, and quietly-not-guarding is the defect, not the
+    remedy. Callers treat None as protected and say why.
+
+    A checkout with no ``.git`` -- a release tarball -- is a definite **False**:
+    git ran, and answered that this is not a repository. That is what keeps the
+    guard from turning a plain install into one that cannot fetch.
+
+    Cheap by construction: one ``git ls-files --error-unmatch`` on one path,
+    bounded by a timeout, with the ``GIT_*`` variables stripped for the reason
+    ``scripts/ptm_qa.py`` strips them (under an exported ``GIT_DIR`` the answer
+    describes the INHERITED repository, whatever cwd it is given).
+    """
+    import os
+    import subprocess
+
+    target = Path(str(path))
+    program = _git_program()
+    if not program:
+        return None, ("git could not be found on this machine, so whether "
+                      "this file is part of the distribution could not be "
+                      "checked")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # The nearest ancestor that EXISTS, not `Path.cwd()`: a body fetched for
+    # the first time has no directory yet, and asking git from wherever the GUI
+    # happens to have been launched would answer about a different repository
+    # -- or about none, reported as "not tracked", which is the wrong answer in
+    # the one direction that matters here.
+    directory = target.parent
+    while not directory.is_dir() and directory != directory.parent:
+        directory = directory.parent
+    try:
+        out = subprocess.run(
+            [program, "ls-files", "--error-unmatch", "--", str(target)],
+            cwd=str(directory), capture_output=True, text=True, env=env,
+            timeout=30)
+    except Exception as exc:                                 # noqa: BLE001
+        return None, (f"git could not be run to check whether this file is "
+                      f"part of the distribution ({exc})")
+    if out.returncode == 0:
+        return True, ""
+    stderr = (out.stderr or "").lower()
+    if "not a git repository" in stderr or "not a working tree" in stderr:
+        return False, ""
+    # Exit 1 is read as "not tracked" ONLY with git's own words for it. Any
+    # other exit-1 failure is a question that could not be asked, and mapping
+    # it to False would switch this guard off exactly where it cannot check.
+    # The concrete case on macOS: `shutil.which("git")` finds the /usr/bin/git
+    # xcrun shim, and with the Command Line Tools missing or moved that shim
+    # prints "xcrun: error: invalid active developer path" and exits 1 -- on
+    # which the committed kernel used to be overwritten in place, which is the
+    # incident this function exists to prevent.
+    if out.returncode == 1 and "did not match" in stderr:
+        return False, ""
+    return None, (f"git answered {out.returncode} when asked whether this file "
+                  f"is part of the distribution "
+                  f"({out.stderr.strip() or '<no stderr>'})")
+
+
+def _beside_path(path, label="fetched", same_as=None):
+    """A distinct, non-colliding name next to ``path``.
+
+    Dated rather than numbered so two fetches on different days are
+    distinguishable in a directory listing, and suffixed until it is free so a
+    second fetch on one day never overwrites the first -- this whole guard
+    exists because something overwrote something.
+
+    ``same_as`` is the file about to be installed. When a sibling from an
+    earlier fetch already holds exactly those bytes it is REUSED rather than
+    duplicated: the card's Replace offer re-runs the whole fetch, so without
+    this a user who answers Yes and is then refused on coverage collects a
+    fresh copy of the identical kernel on every attempt.
+    """
+    path = Path(str(path))
+    stamp = datetime.now().strftime("%Y%m%d")
+    if same_as is not None:
+        try:
+            wanted = _md5(same_as)
+            for sibling in sorted(path.parent.glob(
+                    f"{path.stem}_{label}_*{path.suffix}")):
+                if _md5(sibling) == wanted:
+                    return sibling
+        except OSError:                                      # pragma: no cover
+            pass
+    candidate = path.with_name(f"{path.stem}_{label}_{stamp}{path.suffix}")
+    index = 2
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.stem}_{label}_{stamp}_{index}{path.suffix}")
+        index += 1
+    return candidate
+
+
+def _install_beside(scratch, path):
+    """Put ``scratch`` next to ``path`` without overwriting it, and say where.
+
+    Both branches that decline to replace a tracked kernel end here, and they
+    have to agree: a second copy of a kernel already on disk is exactly what
+    the card's Replace offer would accumulate, one per attempt.
+    """
+    beside = _beside_path(path, same_as=scratch)
+    if beside.exists():
+        scratch.unlink()               # an identical copy is already there
+    else:
+        scratch.replace(beside)
+    return beside
+
+
+def _coverage_loss(old, new):
+    """``""`` when ``new`` keeps everything ``old`` covered, else why not.
+
+    Asked BEFORE any replacement, and asked as containment rather than as a
+    day count: a kernel can be longer in days and still not span what the old
+    one spanned, which is precisely the 899 -> 762 day clobber (the new arc did
+    not merely shrink, it sat somewhere else).
+
+    ``old is None`` means there is no file at the destination, so there is
+    nothing to lose. An old file whose coverage cannot be READ is the opposite:
+    it is a shipped kernel about which this cannot answer, and returning ""
+    there would let an unreadable-coverage machine -- no spiceypy, or no
+    leapseconds kernel, which is the state of any fresh checkout -- replace
+    the 899-day kernel and only afterward report COVERAGE UNKNOWN. That is the
+    incident, reproduced through the guard meant to stop it.
+    """
+    if old is None:
+        return ""
+    if not old.available:
+        return (f"the coverage of the file on disk could not be read "
+                f"({old.detail}), so the fetched kernel cannot be shown to "
+                f"keep what it spans. A replacement that cannot be checked is "
+                f"not a replacement this will make")
+    if not new.available:
+        return (f"the file on disk covers {old.start_utc} to {old.end_utc} "
+                f"({old.days:.1f} days) and the fetched kernel's own coverage "
+                f"could not be read back ({new.detail}), so it cannot be shown "
+                f"to keep it")
+    verdict = new.covers(old.start_utc, old.end_utc)
+    if verdict:
+        return ""
+    if verdict is None:
+        return (f"the file on disk covers {old.start_utc} to {old.end_utc} "
+                f"and the two coverages could not be compared, so the fetched "
+                f"kernel cannot be shown to keep it")
+    return (f"the file on disk covers {old.start_utc} to {old.end_utc} "
+            f"({old.days:.1f} days) and the fetched kernel covers "
+            f"{new.start_utc} to {new.end_utc} ({new.days:.1f} days), which "
+            f"does not contain it")
 
 
 def _md5(path):
@@ -581,7 +803,7 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
               margin_days=SPK_MARGIN_DAYS, allow_online=True, refetch=False,
               timeout=HORIZONS_SPK_TIMEOUT_S, client_factory=None,
               curated=True, curated_download=False, progress=None,
-              downloader=None):
+              downloader=None, on_tracked=ON_TRACKED_SAVE_BESIDE):
     """Get an SPK that spans this run: curated registry, cache, or HORIZONS.
 
     Returns a :class:`FetchResult`. ``values`` sets the metakernel path and
@@ -608,12 +830,32 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
     and nothing is downloaded; the card asks, and calls again with it True.
     Downloading 80 MB because somebody pressed a button labeled "fetch
     kernel" would be a surprise measured in minutes.
+
+    ``on_tracked`` decides what happens when the destination is a file the
+    repository SHIPS -- four ``ephemeris.spk`` are tracked, and the fourteen
+    Justitia configurations read one of them. The default,
+    ``ON_TRACKED_SAVE_BESIDE``, keeps the tracked file exactly as it is,
+    installs the download beside it under a dated name and points the
+    configuration at the copy; the answer says which file was written, which
+    was left alone, and what each covers. ``ON_TRACKED_REPLACE`` is the
+    explicit consent to overwrite -- and is STILL refused if the new kernel
+    does not contain the old one's coverage, because agreeing to replace a
+    kernel is not agreeing to lose an arc. ``ON_TRACKED_CANCEL`` discards the
+    download. An untracked destination is unaffected by any of this.
     """
     name = str(name or "").strip()
     if not name:
         return FetchResult(kind="spk", message=(
             "This body has no name yet, so there is nowhere to cache a kernel. "
             "Fill in the Name field (Look up will do it) and try again."))
+
+    if on_tracked not in ON_TRACKED_CHOICES:
+        # By name, not by falling back to the default: a caller that passed a
+        # misspelled choice would otherwise get the default's behavior under
+        # its own word for something else.
+        return FetchResult(kind="spk", message=(
+            f"on_tracked={on_tracked!r} is not one of "
+            f"{', '.join(ON_TRACKED_CHOICES)}. Nothing has been fetched."))
 
     earliest, latest, note = _needed_window(config)
     if earliest is None:
@@ -734,7 +976,11 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
 
     # -- verify BEFORE installing -----------------------------------------
     verdict, coverage = _coverage_verdict(str(scratch), earliest, latest)
-    scratch.replace(spk_path)
+    (spk_path, metakernel_path, tracked_warnings, refused,
+     protected) = _place_download(scratch, spk_path, metakernel_path,
+                                  coverage, earliest, latest, on_tracked)
+    if refused is not None:
+        return refused
 
     if verdict is None or not verdict:
         # BOTH refusals keep the file and index it -- it is a real kernel and
@@ -742,18 +988,20 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
         # cannot set the ephemeris source over it. The two share this block on
         # purpose: they are one decision ("do not claim SPICE") with two
         # reasons, and writing it twice is how the two would drift apart.
-        _write_metakernel(spk_path, metakernel_path, name)
+        metakernel_path, mk_usable, mk_warnings = _ensure_metakernel(
+            spk_path, metakernel_path, name, project_root)
+        tracked_warnings = list(tracked_warnings) + mk_warnings
         _update_index(project_root, name, {
             "naif_id": str(naif_id or ""), "body_type": body_type,
             "spk_path": str(spk_path), "spk_start": start_text,
             "spk_stop": stop_text,
-            "metakernel_path": str(metakernel_path)
-                               if metakernel_path.exists() else "",
+            "metakernel_path": str(metakernel_path) if mk_usable else "",
         })
 
     if verdict is None:
         return FetchResult(
             kind="spk", ok=False, paths={"spk": str(spk_path)},
+            warnings=tracked_warnings, tracked_destination=protected,
             message=(f"A kernel was downloaded to {spk_path} for "
                      f"{start_text} to {stop_text}."),
             refusal=(f"COVERAGE UNKNOWN: the kernel's own coverage could not "
@@ -768,6 +1016,7 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
     if not verdict:
         return FetchResult(
             kind="spk", ok=False, paths={"spk": str(spk_path)},
+            warnings=tracked_warnings, tracked_destination=protected,
             message=(f"A kernel was downloaded to {spk_path}; it covers "
                      f"{coverage.start_utc} to {coverage.end_utc} "
                      f"({coverage.days:.1f} days)."),
@@ -784,16 +1033,249 @@ def fetch_spk(config, project_root, name="", naif_id="", body_type="asteroid",
 
     return _spk_success(project_root, name, naif_id, spk_path, metakernel_path,
                         coverage, earliest, latest, note, from_cache=False,
-                        requested=(start_text, stop_text), body_type=body_type)
+                        requested=(start_text, stop_text), body_type=body_type,
+                        extra_warnings=tracked_warnings,
+                        tracked_destination=protected)
+
+
+def _place_download(scratch, spk_path, metakernel_path, coverage, earliest,
+                    latest, on_tracked):
+    """Install a downloaded kernel without overwriting one the repository ships.
+
+    ``(spk_path, metakernel_path, warnings, refusal, protected)``. The first
+    two are where the kernel and its metakernel ACTUALLY are afterward -- which
+    for a tracked destination is beside the shipped file, not over it -- so
+    everything downstream, including the value written into
+    ``generic_body.spice_metakernel``, points at what was really written.
+    ``refusal`` is a :class:`FetchResult` to return instead, or None, and
+    ``protected`` is the tracked path that was NOT overwritten (``""`` when the
+    destination was ordinary), which is the flag the card offers Replace on.
+
+    An untracked destination takes the original path: ``scratch.replace``,
+    nothing else changed. That is the ordinary case and it is deliberately
+    untouched -- ``data/horizons_cache`` is a cache for every body nobody has
+    committed, and a guard that made those slower or noisier would be paid for
+    by everyone to protect four files.
+    """
+    tracked, why = tracked_by_git(spk_path)
+    if tracked is False:
+        scratch.replace(spk_path)
+        return spk_path, metakernel_path, [], None, ""
+
+    if tracked is None and not spk_path.exists():
+        # Unknown, but there is nothing at the destination to protect. Install
+        # normally, and SAY that the check could not be made -- guarding an
+        # absent file would make every first fetch on such a machine land under
+        # a dated name the cache-first check never looks for, so the next press
+        # downloads the whole kernel again and parks another copy.
+        scratch.replace(spk_path)
+        return spk_path, metakernel_path, [
+            f"Whether {spk_path.name} is part of the distribution could not be "
+            f"checked, because {why}. Nothing was at that path, so the fetched "
+            f"kernel was installed there as usual."], None, ""
+
+    # tracked is True, or None with a file already there -- both protected.
+    # Treating "could not ask" as "not tracked" would switch this guard off
+    # exactly where it cannot check, which is the failure mode it exists to
+    # remove.
+    def unchecked(what_happened):
+        """The 'could not ask git' line, per branch.
+
+        Built where the branch is, not once up front: the first draft appended
+        one sentence saying the file had been left alone and saved beside, and
+        the REPLACE and CANCEL branches then did neither -- a result carrying
+        both "left alone" and "REPLACED".
+        """
+        if tracked is not None:
+            return []
+        return [f"{spk_path.name} was treated as part of the distribution "
+                f"because {why}. {what_happened} If this file is yours, move "
+                f"or delete it and fetch again."]
+
+    old_coverage = _coverage_verdict(str(spk_path), earliest, latest)[1] \
+        if spk_path.exists() else None
+    spans = _both_spans(old_coverage, coverage)
+
+    if on_tracked == ON_TRACKED_CANCEL:
+        try:
+            scratch.unlink()
+        except OSError:
+            pass
+        warnings = unchecked("The download was discarded, as asked.")
+        return spk_path, metakernel_path, warnings, FetchResult(
+            kind="spk", ok=False, warnings=warnings,
+            message=(f"Canceled: {spk_path.name} is part of the distribution "
+                     f"and has NOT been touched. The downloaded kernel was "
+                     f"discarded. {spans}")), ""
+
+    if on_tracked == ON_TRACKED_REPLACE:
+        loss = _coverage_loss(old_coverage, coverage)
+        if not loss:
+            scratch.replace(spk_path)
+            warnings = unchecked("It has been REPLACED, as asked.")
+            warnings.append(
+                f"{spk_path.name} is part of the distribution and has been "
+                f"REPLACED, as asked. {spans} Restore the shipped kernel with "
+                f"`git checkout -- {spk_path}` if this was not what you meant.")
+            return spk_path, metakernel_path, warnings, None, ""
+        # Asked to replace, and refusing -- but the download is real and is
+        # kept, beside, rather than thrown away. Which file is which is stated;
+        # this is not a quiet substitution.
+        beside = _install_beside(scratch, spk_path)
+        warnings = unchecked(f"It has been left alone and the new kernel is at "
+                             f"{beside.name}.")
+        return spk_path, metakernel_path, warnings, FetchResult(
+            kind="spk", ok=False, paths={"spk": str(beside)},
+            warnings=warnings,
+            message=(f"The kernel was saved as {beside.name}. "
+                     f"{spk_path.name} has NOT been changed."),
+            refusal=(f"REFUSED to replace {spk_path.name}: {loss}. Replacing "
+                     f"it would drop coverage this repository ships and other "
+                     f"configurations read -- the exact failure that put a "
+                     f"762-day kernel over Justitia's 899-day one, spanning "
+                     f"none of the campaign windows. Point the configuration "
+                     f"at {beside.name} if the new arc is the one you want, or "
+                     f"widen the run window and fetch again.")), ""
+
+    # ON_TRACKED_SAVE_BESIDE -- the default, and the only one that writes
+    # something useful without asking anybody to agree to anything.
+    beside = _install_beside(scratch, spk_path)
+    # The metakernel goes with THIS kernel, under a name that pairs with it by
+    # sight: a `.tm` that names a different `.spk` than the one beside it is
+    # how a run ends up on a kernel nobody chose.
+    warnings = unchecked(f"It has been left alone and the new kernel is at "
+                         f"{beside.name}.")
+    warnings.append(
+        f"{spk_path.name} is part of the distribution, so it has been left "
+        f"exactly as it is and the fetched kernel saved beside it as "
+        f"{beside.name}; this configuration now points at the copy. {spans} "
+        f"To replace the shipped kernel instead, fetch again with Replace -- "
+        f"it is refused if it would lose coverage.")
+    return beside, beside.with_suffix(".tm"), warnings, None, str(spk_path)
+
+
+def _both_spans(old_coverage, new_coverage):
+    """One sentence naming what each kernel covers, for the offer."""
+    def span(label, coverage):
+        if coverage is None:
+            return f"{label}: not on disk"
+        if not coverage.available:
+            return f"{label}: coverage could not be read ({coverage.detail})"
+        return (f"{label}: {coverage.start_utc} to {coverage.end_utc} "
+                f"({coverage.days:.1f} days)")
+    return (f"Coverage -- {span('the file on disk', old_coverage)}; "
+            f"{span('the fetched kernel', new_coverage)}.")
+
+
+def _ensure_metakernel(spk_path, metakernel_path, name, project_root=None):
+    """``(path, wrote, warnings)`` -- a usable metakernel, without clobbering one.
+
+    The write itself reuses ``SPKGenerator``, which carries the PTM-145 fixes:
+    ``PATH_VALUES`` points at the shared ``data/kernels`` tree rather than at
+    the body's own directory, and long paths are split with SPICE's '+'
+    continuation so ``furnsh`` does not silently truncate them. It also emits
+    ABSOLUTE paths, by design, for that same truncation workaround -- which is
+    exactly why it must not be pointed at a committed metakernel:
+    ``data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm`` says so
+    in its own header ("Hand-written relative, NOT regenerated verbatim from
+    SPKGenerator.create_metakernel() ... baking those in here would make this
+    committed file resolve only on the machine that generated it"), and a fetch
+    regenerated it anyway. On a CACHE HIT, with nothing downloaded at all.
+
+    So: a tracked metakernel that still resolves is LEFT ALONE and returned as
+    it is. One that is tracked and does NOT resolve gets a machine-local
+    variant written beside it, named, and pointed at -- the committed file
+    stays the committed file either way.
+
+    The middle value is USABLE, not "was written": "leave it alone" is the
+    right answer AND a usable metakernel, while "it does not resolve and the
+    local copy could not be written either" is neither. Reporting the second
+    as usable would wire ``generic_body.spice_metakernel`` to the very file
+    :func:`_metakernel_resolves` had just rejected -- the run served from the
+    ephemeris that file names, which is the same silence in the other
+    direction.
+    """
+    metakernel_path = Path(str(metakernel_path))
+    tracked, why = tracked_by_git(metakernel_path)
+    if metakernel_path.exists() and tracked is not False:
+        resolved, detail = _metakernel_resolves(metakernel_path, spk_path,
+                                                project_root)
+        protected = ("part of the distribution" if tracked
+                     else f"treated as part of the distribution because {why}")
+        if resolved:
+            logger.info("[body-fetch] %s is %s and resolves on this machine; "
+                        "leaving it as it is.", metakernel_path.name, protected)
+            return metakernel_path, True, []
+        local = _local_metakernel_path(metakernel_path)
+        wrote = _write_metakernel(spk_path, local, name)
+        if not wrote:
+            return metakernel_path, False, [
+                f"{metakernel_path.name} is {protected} and {detail}, and a "
+                f"machine-local replacement could not be written either. The "
+                f"kernel is on disk and the SPICE metakernel field points at "
+                f"the .spk directly rather than at a .tm this fetch has "
+                f"already found unusable."]
+        return local, True, [
+            f"{metakernel_path.name} is {protected}, so it has NOT been "
+            f"rewritten -- {detail}. A machine-local {local.name} was written "
+            f"beside it and this configuration points at that instead. The "
+            f"committed file is unchanged."]
+
+    wrote = _write_metakernel(spk_path, metakernel_path, name)
+    return metakernel_path, wrote, []
+
+
+def _local_metakernel_path(metakernel_path):
+    """``<stem>_local.tm`` beside a committed metakernel, or a dated name.
+
+    One stable name, because this is a machine-local artifact that a second
+    fetch should overwrite rather than accumulate -- unless that name is itself
+    tracked somewhere, in which case the dated fallback applies and the guard
+    does not have to trust its own naming convention.
+    """
+    local = metakernel_path.with_name(
+        f"{metakernel_path.stem}_local{metakernel_path.suffix}")
+    if tracked_by_git(local)[0] is False:
+        return local
+    return _beside_path(metakernel_path, label="local")
+
+
+def _metakernel_resolves(metakernel_path, spk_path, project_root):
+    """``(resolves, detail)`` -- would this metakernel load, and load THIS spk?
+
+    Both halves matter. A committed metakernel that resolves is the right file
+    to keep; one that resolves but names a DIFFERENT kernel than the one just
+    installed would quietly serve the run from the old ephemeris, which is the
+    same silence in the other direction.
+    """
+    try:
+        from gui_core.body_cards import metakernel_members
+        members = metakernel_members(str(metakernel_path), project_root)
+    except Exception as exc:                                 # noqa: BLE001
+        return False, f"it could not be read on this machine ({exc})"
+    if members.error:
+        return False, f"it does not resolve here ({members.error})"
+    absent = [token for token, _p in list(members.missing) + list(members.dataless)]
+    absent += list(members.unresolved)
+    if absent:
+        return False, (f"it names {len(absent)} kernel(s) that are not usable "
+                       f"on this machine ({', '.join(absent[:3])})")
+    try:
+        target = Path(str(spk_path)).resolve()
+    except OSError:                                          # pragma: no cover
+        target = Path(str(spk_path))
+    if not any(path.resolve() == target for _token, path in members.kernels):
+        return False, (f"it does not name {Path(str(spk_path)).name}, so it "
+                       f"would serve the run from a different ephemeris")
+    return True, ""
 
 
 def _write_metakernel(spk_path, metakernel_path, name):
-    """Write the .tm beside the kernel. Never raises.
+    """Write the .tm at ``metakernel_path``. Never raises.
 
-    Reuses ``SPKGenerator``, which carries the PTM-145 fixes: ``PATH_VALUES``
-    points at the shared ``data/kernels`` tree rather than at the body's own
-    directory, and long paths are split with SPICE's '+' continuation so
-    ``furnsh`` does not silently truncate them.
+    The unguarded write. Reached only through :func:`_ensure_metakernel`, which
+    decides WHETHER this path may be written -- do not call it directly, or the
+    committed-metakernel guard is back to being a comment.
     """
     try:
         from horizons.spk_generator import SPKGenerator
@@ -808,9 +1290,16 @@ def _write_metakernel(spk_path, metakernel_path, name):
 
 def _spk_success(project_root, name, naif_id, spk_path, metakernel_path,
                  coverage, earliest, latest, note, from_cache, requested,
-                 body_type="asteroid"):
-    warnings = []
-    have_metakernel = _write_metakernel(spk_path, metakernel_path, name)
+                 body_type="asteroid", extra_warnings=(),
+                 tracked_destination=""):
+    warnings = list(extra_warnings)
+    # `_ensure_metakernel`, NOT `_write_metakernel`. This line is reached on
+    # the CACHE-HIT path too -- from_cache=True, nothing downloaded -- and that
+    # is how two committed metakernels were regenerated to machine-absolute
+    # PATH_VALUES by a button press that fetched nothing at all.
+    metakernel_path, have_metakernel, mk_warnings = _ensure_metakernel(
+        spk_path, metakernel_path, name, project_root)
+    warnings.extend(mk_warnings)
     if not have_metakernel:
         warnings.append(
             "The kernel is on disk but its metakernel could not be written, "
@@ -869,7 +1358,7 @@ def _spk_success(project_root, name, naif_id, spk_path, metakernel_path,
                   f"requested, one year of margin at each end)")
     return FetchResult(
         ok=True, kind="spk", values=values, provenance=provenance,
-        from_cache=from_cache,
+        from_cache=from_cache, tracked_destination=tracked_destination,
         paths={"spk": str(spk_path),
                "metakernel": str(metakernel_path) if have_metakernel else ""},
         warnings=warnings,

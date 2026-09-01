@@ -4279,8 +4279,10 @@ class GenericBodyCard(BodyCard):
         # mention a download.
         if getattr(result, "offer", ""):
             self._offer_curated_download(result)
+        elif getattr(result, "tracked_destination", ""):
+            self._offer_tracked_replacement(result)
 
-    def _on_fetch_spk(self, curated_download=False):
+    def _on_fetch_spk(self, curated_download=False, on_tracked=None):
         """Get this run's ephemeris: the curated registry, or HORIZONS.
 
         `curated_download` is False on the button press and True only on the
@@ -4289,6 +4291,13 @@ class GenericBodyCard(BodyCard):
         result rather than a phrase in its message: the card has to be able to
         tell "this needs your consent" from "this failed" without reading
         English.
+
+        `on_tracked` is the same shape of answer for the other question this
+        fetch can raise -- "the destination is a kernel this repository ships"
+        -- and is None on the button press, meaning `fetch_spk`'s own default:
+        leave the shipped file alone and save beside it. The user is then
+        OFFERED the replacement, which costs a second request and is refused
+        anyway if it would lose coverage.
         """
         from gui_core.body_fetch import fetch_spk
 
@@ -4315,12 +4324,13 @@ class GenericBodyCard(BodyCard):
         # which the tests require, because an 80 MB download with no sign of
         # life is indistinguishable from a hung window -- dead in the one
         # place it matters.
+        extra = {} if on_tracked is None else {"on_tracked": on_tracked}
         self._start_fetch(
             "spk",
             lambda emit: fetch_spk(config, project_root, name=name,
                                    naif_id=naif_id,
                                    curated_download=curated_download,
-                                   progress=emit),
+                                   progress=emit, **extra),
             self.spk_fetch_button, self.coverage_note)
 
     def _offer_curated_download(self, result):
@@ -4343,6 +4353,47 @@ class GenericBodyCard(BodyCard):
                 "message above for the command.")
             return True
         self._on_fetch_spk(curated_download=True)
+        return True
+
+    def _offer_tracked_replacement(self, result):
+        """The shipped kernel was left alone. Offer the replacement anyway.
+
+        The fetch has already done the safe thing -- the kernel is beside the
+        tracked one and this configuration points at the copy -- so this
+        dialog is the way OUT of the guard, not the way past it. Saying yes
+        costs a second HORIZONS request and is still refused if the new kernel
+        would not contain what the shipped one covers.
+
+        Defaulting the button to No is the whole point: the thing that went
+        wrong was a replacement nobody chose.
+        """
+        from gui_core.body_fetch import ON_TRACKED_REPLACE
+
+        tracked = str(getattr(result, "tracked_destination", "") or "")
+        if not tracked:
+            return False
+        answer = QMessageBox.question(
+            self, "Replace the kernel this repository ships?",
+            f"{Path(tracked).name} is part of the distribution and has NOT "
+            f"been changed. The kernel that was just fetched is beside it, "
+            f"and this body now points at that copy.\n\n"
+            f"{' '.join(result.lines())}\n\n"
+            f"Replace the shipped kernel with the fetched one instead? It "
+            f"will be fetched again, and the replacement is refused if it "
+            f"would drop coverage the shipped kernel has.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            # APPENDED. `_apply_fetch` has just put the lines naming both files
+            # and both coverages into this label; replacing them with a
+            # sentence that says "the message above names both" would delete
+            # the message it is talking about.
+            self.coverage_note.setText(
+                self.coverage_note.text()
+                + f"\n{Path(tracked).name} was left as it is; this body uses "
+                  f"the kernel saved beside it.")
+            return True
+        self._on_fetch_spk(on_tracked=ON_TRACKED_REPLACE)
         return True
 
     def _on_fetch_damit(self):
