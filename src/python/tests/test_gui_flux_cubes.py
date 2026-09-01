@@ -751,16 +751,31 @@ def test_the_card_refuses_a_run_the_engine_would_refuse_and_edits_nothing():
 
     A file that asks for cubes on a run the engine cannot serve keeps its
     setting, and the card says the rules disagree with it.
+
+    The refusal is SAID, not enforced by a dead control. This arm used to
+    assert the switch went insensitive, which is what swallowed Paul's click
+    on 2026-08-31; the guarantee that replaces it is the launch check, and it
+    is asserted here rather than assumed.
     """
+    from gui_core import flux_cubes as fc
     manager, card = _card()
     manager.set_value("flux_cubes.enabled", True)
     manager.set_value("radiation.enabled", False)
     card.refresh_flux_cubes()
     assert manager.get_value("flux_cubes.enabled") is True, (
         "the card turned the cubes off by itself")
-    assert not card.widgets["flux_cubes.enabled"].isEnabled(), (
-        "the switch is still live on a run that cannot produce cubes")
+    assert card.widgets["flux_cubes.enabled"].isEnabled(), (
+        "the switch went dead on a run that cannot produce cubes; a click on "
+        "it is then a silent no-op and nothing on the card says so")
     assert "CANNOT PRODUCE" in card.flux_note.text(), card.flux_note.text()
+    # What actually protects the user: the launch check turns the same
+    # blocker into an ERROR, so the run does not start.
+    errors = fc.preflight_findings(
+        manager.get_config(), REPO_ROOT, lambda p, r: Path(p),
+        lambda p, r: Path(p), lambda p: False, lambda p: False,
+        lambda p: 0).errors
+    assert any("Facet-to-facet infrared exchange is off" in e
+               for e in errors), errors
     manager.set_value("radiation.enabled", True)
     card.refresh_flux_cubes()
     assert card.widgets["flux_cubes.enabled"].isEnabled()
@@ -1580,6 +1595,353 @@ def test_the_layout_file_field_is_advanced_and_the_placement_is_not():
     card.flux_advanced.toggle()
 
 
+# ==========================================================================
+# 9. Paul's curated-site sequence, clicked rather than configured
+#
+# THE ARMS ABOVE ALL SET `flux_cubes.enabled` THROUGH THE CONFIGURATION AND
+# THEN CALL `refresh_flux_cubes()` BY HAND. `_card()` also hands every one of
+# them a mesh and radiation already on, so they only ever ran in the state
+# where `engine_support` is satisfied. Two things follow, and both are why
+# thirty-six green arms sat in front of Paul's 2026-08-31 report:
+#
+#   * `set_value` + `refresh` cannot fail on a DEAD control. A real click on a
+#     disabled QCheckBox changes nothing and emits nothing -- measured on the
+#     pre-fix build: `switch.click()` left it unchecked, with a 79 px group of
+#     one checkbox and one gray line as the entire feedback.
+#   * a card reached by `card.activate(...)` skips the preset, the curated-site
+#     picker and the whole body-first flow, so "the mesh arrived from the site
+#     combo" was never exercised at all.
+#
+# Every arm below therefore drives the REAL flow and CLICKS.
+# ==========================================================================
+
+#: The essential options, by the name Paul used for each: a control key in
+#: `card.widgets`, or an attribute on the card for the blocks and the lines.
+#: ONE table, so "is it on screen" and "did it fall behind the Advanced
+#: collapse" cannot come to disagree about what "essential" means.
+ESSENTIAL = (("placement mode", "flux_cubes.mode"),
+             ("grid spacing", "flux_cubes.spacing_m"),
+             ("grid radius", "flux_cubes.radius_m"),
+             ("the grid spacing box", "flux_lattice"),
+             ("the cube height line", "flux_height"),
+             ("the layout status line", "flux_status"),
+             ("the size estimate", "flux_estimate"))
+
+
+def _essentials(card):
+    """`[(name, widget), ...]` for every essential option."""
+    return [(label, card.widgets[name] if "." in name else getattr(card, name))
+            for label, name in ESSENTIAL]
+
+
+def _flow_card(mode="local", run_type="time_series"):
+    """The Moon card as the FLOW opens it: body -> mode -> run type.
+
+    Not `card.activate(...)`: that skips `_apply_route_defaults`, so a card
+    reached that way has neither the preset's radiation setting nor the
+    landing screen's clearing rules, and the curated-site combo is being
+    driven against a configuration no user ever has.
+    """
+    manager, panel = _panel()
+    manager.reset_to_defaults()
+    start = panel.tabs["start"]
+    start.choose_body("Moon")
+    start._choose_mode(mode)
+    start.choose_run_type(run_type)
+    card = start.active_card()
+    if card is not panel.tabs["card_moon"]:
+        raise Skip("the flow did not open the Moon card")
+    return manager, card
+
+
+def _select_curated(card, key="A03MP026"):
+    """Pick a curated site through the COMBO, as a click does, and prove the
+    selection landed.
+
+    ONE function, because the steps have to happen together and the review
+    found what happens when they do not. The curated artifacts are
+    machine-local: `_on_curated_site` REFUSES a site whose files are missing,
+    resets the combo and writes nothing -- so an arm that skips the on-disk
+    check silently ends up testing an empty `mesh.import_file` under whatever
+    name it gave itself. Checking on disk first, and then asserting the mesh
+    actually landed, closes both halves. Absent files SKIP; they do not pass
+    quietly and they do not fail on somebody else's laptop.
+    """
+    from gui_core.curated_sites import curated_site, site_status
+    entry = curated_site(key, body="Moon")
+    if entry is None:
+        raise Skip(f"{key} is not in this build's curated-site registry")
+    status = site_status(entry)
+    if not status.ready:
+        raise Skip(f"{key} is not on this disk: {status.summary()}")
+    for position in range(card.site_combo.count()):
+        if card.site_combo.itemData(position) == key:
+            card.site_combo.setCurrentIndex(position)
+            break
+    else:
+        raise Skip(f"{key} is not in this card's curated-site list")
+    assert card.config_manager.get_value("mesh.import_file"), (
+        f"selecting {key} wrote no terrain mesh")
+    return card
+
+
+def _curated_card(key="A03MP026"):
+    """A flow-opened Moon local-mesh card with the curated site selected."""
+    manager, card = _flow_card()
+    _select_curated(card, key)
+    return manager, card
+
+
+def _assert_options_visible(card, where):
+    switch = card.widgets["flux_cubes.enabled"]
+    assert switch.isChecked(), (
+        f"{where}: the switch is not on after a click -- it was a dead "
+        f"control and the click was discarded in silence")
+    for label, widget in _essentials(card):
+        assert widget.isVisibleTo(card), (
+            f"{where}: {label} is not on screen with the cubes turned on")
+
+
+def test_pauls_curated_site_sequence_shows_the_options():
+    """PAUL'S REPORT, 2026-08-31, driven exactly as he described it.
+
+    Moon card -> Local mesh -> the curated site A03MP026 -> tick the box.
+    Every essential option must be on screen afterwards. Before the fix this
+    passed only because the site had already satisfied `engine_support` by the
+    time the box was clicked; the arm below it is the one that failed.
+    """
+    _manager, card = _curated_card()
+    card.widgets["flux_cubes.enabled"].click()
+    _assert_options_visible(card, "curated site then tick")
+
+
+def test_the_reverse_order_shows_the_options_too():
+    """Tick FIRST, then pick the site. THIS IS THE ONE THAT FAILED.
+
+    On a freshly opened local-mesh card there is no terrain yet, so
+    `engine_support` refuses and the switch used to go insensitive. The click
+    was discarded -- no setting changed, no message, no option revealed -- and
+    picking the site afterwards left a live-but-unticked box above one gray
+    line. That is "there still doesn't seem to be any options list for the
+    flux cubes, such as grid spacing and height", verbatim.
+    """
+    _manager, card = _flow_card()
+    switch = card.widgets["flux_cubes.enabled"]
+    assert switch.isEnabled(), (
+        "the flux-cube switch is dead on a freshly opened local-mesh card; a "
+        "click on it is a silent no-op")
+    switch.click()
+    assert switch.isChecked(), "the click was swallowed"
+    _assert_options_visible(card, "tick with no mesh yet")
+    # The options are honest about not knowing the mesh yet, rather than absent
+    assert "not known yet" in card.flux_height.text(), card.flux_height.text()
+    _select_curated(card)
+    _assert_options_visible(card, "tick then curated site")
+    assert "not known yet" not in card.flux_height.text(), (
+        "the height did not re-measure when the curated site's mesh arrived: "
+        + card.flux_height.text())
+
+
+def test_the_switch_is_never_a_dead_control():
+    """A click always lands, in every state `engine_support` refuses.
+
+    Each of the four blockers, one at a time, plus the state that has none.
+    A refusal is a sentence and a launch error; it is never a control that
+    throws the click away.
+    """
+    from gui_core import flux_cubes as fc
+    blockers = (("radiation.enabled", False),
+                ("radiation.band_separated", False),
+                ("mesh.import_file", ""),
+                ("thermal.checkpoint_lookahead_steps", 4))
+    for key, value in blockers:
+        # `_curated_card` is what keeps three of these four cells from
+        # silently collapsing onto the missing-MESH blocker under another
+        # name on a machine without the site's files.
+        manager, card = _curated_card()
+        manager.set_value(key, value)
+        card.refresh_flux_cubes()
+        assert not fc.engine_support(manager.get_config()).allowed, (
+            f"{key}={value!r} was expected to block the pass and does not; "
+            f"this arm is no longer testing what it says")
+        switch = card.widgets["flux_cubes.enabled"]
+        assert switch.isEnabled(), (
+            f"the switch is dead while {key}={value!r}; the click a user "
+            f"makes there is discarded with no message")
+        switch.click()
+        assert switch.isChecked(), f"the click was swallowed with {key}={value!r}"
+        _assert_options_visible(card, f"{key}={value!r}")
+        assert "CANNOT PRODUCE" in card.flux_note.text(), (
+            f"the card does not say the run cannot produce cubes with "
+            f"{key}={value!r}: {card.flux_note.text()}")
+
+
+def test_the_group_says_where_the_options_are_while_it_is_off():
+    """OFF, the note is the whole group. It has to name the options list.
+
+    A checkbox above one sentence about the physics is what Paul read as "no
+    options list at all"; the sentence now says there is one and what is in
+    it, in the words the controls themselves use.
+    """
+    _manager, card = _curated_card()
+    assert not card.widgets["flux_cubes.enabled"].isChecked()
+    text = card.flux_note.text()
+    for phrase in ("Turn the cubes on", "distance between them", "grid radius",
+                   "cube height"):
+        assert phrase in text, f"the off-state note does not say {phrase!r}: {text}"
+    assert not card.flux_body.isVisibleTo(card), (
+        "the options are on screen while the cubes are off, which is a "
+        "different card from the one this arm describes")
+
+
+def test_the_advanced_section_holds_only_the_layout_file_machinery():
+    """Nothing essential may migrate behind the collapse.
+
+    Checked by WALKING the section rather than by naming what should not be
+    there: a control added to `flux_advanced` in a later round is caught here
+    even though nobody thought to list it.
+    """
+    from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox,
+                                 QSpinBox, QTableWidget, QWidget)
+    _manager, card = _curated_card()
+    card.widgets["flux_cubes.enabled"].click()
+    # THE OBJECTS, not their `id()`. `findChildren` mints a fresh Python
+    # wrapper for any child that has none and frees it at the end of the
+    # comprehension, so an id-keyed set can collide with anything constructed
+    # afterwards. Only sound today because every widget compared below already
+    # existed; an arm added later would get a phantom hit.
+    inside = card.flux_advanced.findChildren(QWidget)
+    for label, widget in _essentials(card) + [("the named-points table",
+                                               card.flux_table)]:
+        assert widget not in inside, (
+        "the named-locations table is inside the collapsed Advanced section")
+    # And what IS in there is only the layout file and its build button.
+    controls = card.flux_advanced.findChildren(
+        (QCheckBox, QComboBox, QDoubleSpinBox, QSpinBox, QTableWidget))
+    assert not controls, (
+        "the Advanced section has grown a setting control: "
+        + ", ".join(sorted(type(c).__name__ for c in controls)))
+    assert card.widgets["flux_cubes.cache_file"] in inside, (
+        "the layout-file field left the Advanced section")
+
+
+def test_the_named_mode_table_is_visible_on_the_curated_site():
+    """`table for named mode`, on the site Paul is using."""
+    from gui_core import flux_cubes as fc
+    manager, card = _curated_card()
+    card.widgets["flux_cubes.enabled"].click()
+    assert not card.flux_named.isVisibleTo(card), (
+        "the named-points table is on screen in the grid mode")
+    manager.set_value("flux_cubes.mode", fc.MODE_LOCATIONS)
+    card.refresh_flux_cubes()
+    assert card.flux_named.isVisibleTo(card), (
+        "the named-points table is off screen in the named mode")
+    assert card.flux_table.isVisibleTo(card)
+    assert not card.flux_lattice.isVisibleTo(card), (
+        "the grid boxes are on screen in the named-points-only mode")
+    manager.set_value("flux_cubes.mode", fc.MODE_BOTH)
+    card.refresh_flux_cubes()
+    assert card.flux_named.isVisibleTo(card) \
+        and card.flux_lattice.isVisibleTo(card), (
+            "the combined mode does not show both placements")
+
+
+def test_turning_the_cubes_off_puts_the_group_away_again():
+    """The mode rule is re-applied on a TOGGLE, not only on a mode change.
+
+    A live switch means `flux_cubes.enabled` can now move without
+    `apply_mode` ever running -- which was impossible while the control was
+    dead. Without re-applying the rule, unticking on the global mode leaves an
+    empty "Flux cubes" box, inviting placement options, on a run that builds
+    its sphere in memory and can never produce a cube.
+    """
+    manager, card = _flow_card(mode="global")
+    switch = card.widgets["flux_cubes.enabled"]
+    switch.click()
+    assert switch.isChecked()
+    assert card.flux_group.isVisibleTo(card), (
+        "the group hid itself on the global mode while its setting is on")
+    switch.click()
+    assert not switch.isChecked()
+    assert manager.get_value("flux_cubes.enabled") is False
+    assert not card.flux_group.isVisibleTo(card), (
+        "the group is still on screen on the global mode with the cubes off")
+    # ...and the local mode keeps it, on or off.
+    _manager, card = _flow_card(mode="local")
+    assert card.flux_group.isVisibleTo(card)
+
+
+def test_a_blocked_card_does_not_invite_you_into_the_refusal():
+    """OFF and blocked: name the blocker, do not advertise the options.
+
+    `engine_support`'s own text ends "Turn it on above" about the RADIATION
+    switch. Appending "Turn the cubes on ..." beside it put an "it" and a
+    "the cubes" one clause apart pointing at two different controls, and
+    invited the user into the state the launch check refuses.
+    """
+    manager, card = _flow_card()
+    assert not manager.get_value("mesh.import_file"), (
+        "this arm needs the blocked state a freshly opened card has")
+    text = card.flux_note.text()
+    assert "imported terrain mesh" in text, text
+    assert "Turn the cubes on" not in text, (
+        "the card advertises the placement options on a run that cannot "
+        "produce cubes: " + text)
+
+
+def test_the_card_claims_no_provenance_for_a_setting_it_cannot_know():
+    """A refusal must not tell the user their FILE did what they just did.
+
+    The message used to read "The setting has NOT been changed -- it is your
+    file's", which was only ever reachable from an opened file while the
+    switch was dead. It is now reachable from a click.
+    """
+    manager, card = _flow_card()
+    card.widgets["flux_cubes.enabled"].click()
+    text = card.flux_note.text()
+    assert "CANNOT PRODUCE" in text, text
+    assert "your file" not in text, (
+        "the card blames the file for a setting the user just clicked: " + text)
+
+
+def test_the_curated_mesh_reads_its_own_facet_scale():
+    """The height and the cube count ON A03MP026, against the real PLY.
+
+    ⛔ 0.35 m IS THE WRONG NUMBER for this mesh, and it is wrong in a way
+    worth recording: it is `sqrt(mean face area)` = 3.4596 m, and the layout
+    tool's length scale is the MEDIAN EQUIVALENT EDGE
+    `sqrt(4A/sqrt(3))` (`flux_cube_geom.cpp:873`). Measured exhaustively over
+    all 2,397,890 faces of the delivered PLY: median equivalent edge
+    3.0453 m, median area 4.0156 m^2, mean area 11.9691 m^2 -- a distribution
+    skewed 3:1, which is why the two disagree by 14%. The card's sampled
+    estimate lands at 3.0441 m, 0.04% off the exhaustive answer, so the
+    ANSWER IS 0.3045 m and the sampler is not the reason.
+    """
+    from gui_core import flux_cubes as fc
+    from gui_core.facet_scale import facet_scale
+    manager, card = _curated_card()
+    card.widgets["flux_cubes.enabled"].click()
+
+    scale = facet_scale(manager.get_config(), card._project_root())
+    assert scale.median_edge_m is not None, scale.detail
+    assert abs(scale.median_edge_m - 3.0453) < 0.02, (
+        f"the median equivalent edge of the curated MP026 mesh moved: "
+        f"{scale.median_edge_m} m, measured exhaustively as 3.0453 m")
+    geometry = fc.auto_geometry(manager.get_config(), card._project_root())
+    assert abs(geometry.height_m - 0.3045) < 0.002, (
+        f"the automatic cube height on MP026 is {geometry.height_m} m; the "
+        f"tool's rule gives 0.1 x 3.0453 m = 0.3045 m")
+    assert "30.4 cm" in card.flux_height.text(), card.flux_height.text()
+
+    manager.set_value("flux_cubes.spacing_m", 25.0)
+    manager.set_value("flux_cubes.radius_m", 500.0)
+    card.refresh_flux_cubes()
+    assert fc.lattice_cube_count(25.0, 500.0) == 1257
+    assert "1,257 cubes" in card.flux_estimate.text(), card.flux_estimate.text()
+    assert card.flux_estimate.isVisibleTo(card), (
+        "the cube-count estimate is off screen")
+
+
 TESTS = [
     test_the_cube_count_is_the_tools_own_rule,
     test_the_fast_count_agrees_with_the_tools_double_loop_everywhere,
@@ -1630,6 +1992,17 @@ TESTS = [
     test_the_shared_prepare_step_names_the_layout_it_built,
     test_the_card_button_builds_the_same_layout_the_launch_would,
     test_the_layout_file_field_is_advanced_and_the_placement_is_not,
+    # 9. the curated-site sequence, clicked
+    test_pauls_curated_site_sequence_shows_the_options,
+    test_the_reverse_order_shows_the_options_too,
+    test_the_switch_is_never_a_dead_control,
+    test_the_group_says_where_the_options_are_while_it_is_off,
+    test_the_advanced_section_holds_only_the_layout_file_machinery,
+    test_the_named_mode_table_is_visible_on_the_curated_site,
+    test_turning_the_cubes_off_puts_the_group_away_again,
+    test_a_blocked_card_does_not_invite_you_into_the_refusal,
+    test_the_card_claims_no_provenance_for_a_setting_it_cannot_know,
+    test_the_curated_mesh_reads_its_own_facet_scale,
 ]
 
 
