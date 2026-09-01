@@ -518,18 +518,27 @@ class DEMConfigurationPanel(QWidget):
         self._convert_progress.setValue(0)
         self._convert_status.setText("Converting...")
 
+        # Every emitted line overwrites this single status label, so an error
+        # that arrives before the process exits (a missing executable, an
+        # unsupported platform) is clobbered by the "failed (exit code ...)"
+        # line one moment later. Keep the last one so the failure branch can
+        # show WHY instead of only the code.
+        self._convert_last_error = ""
+
         self._convert_thread = DEMConvertThread(self._cm)
         self._convert_thread.output_ready.connect(
             lambda t: self._convert_status.setText(t)
         )
-        self._convert_thread.error_ready.connect(
-            lambda t: self._convert_status.setText(f"Error: {t}")
-        )
+        self._convert_thread.error_ready.connect(self._on_convert_error)
         self._convert_thread.progress_update.connect(
             lambda p: self._convert_progress.setValue(int(p))
         )
         self._convert_thread.finished.connect(self._on_convert_finished)
         self._convert_thread.start()
+
+    def _on_convert_error(self, text):
+        self._convert_last_error = text
+        self._convert_status.setText(f"Error: {text}")
 
     def _on_convert_finished(self, exit_code):
         self._convert_btn.setEnabled(True)
@@ -545,9 +554,19 @@ class DEMConfigurationPanel(QWidget):
                 self._mesh_panel.load_mesh(output)
                 self.mesh_converted.emit(output)
         else:
-            self._convert_status.setText(
-                f"Conversion failed (exit code {exit_code})"
-            )
+            message = f"Conversion failed (exit code {exit_code})"
+            if exit_code == 2:
+                # dtm_to_ply_delaunay's "the mesh is empty" refusal.
+                message += (
+                    " - the tool produced no faces and refused to write a file. "
+                    "Check the ROI center against the DEM (a wrong latitude "
+                    "sign puts it off the raster), the ROI radius, and "
+                    "Max Edge Length."
+                )
+            detail = getattr(self, "_convert_last_error", "")
+            if detail:
+                message += f"\n{detail}"
+            self._convert_status.setText(message)
 
         self._convert_thread = None
 
@@ -569,18 +588,23 @@ class DEMConfigurationPanel(QWidget):
         self._refine_progress.setValue(0)
         self._refine_status.setText("Refining mesh...")
 
+        # Same single-label overwrite problem as the convert path above.
+        self._refine_last_error = ""
+
         self._refine_thread = DEMRefineThread(self._cm)
         self._refine_thread.output_ready.connect(
             lambda t: self._refine_status.setText(t)
         )
-        self._refine_thread.error_ready.connect(
-            lambda t: self._refine_status.setText(f"Error: {t}")
-        )
+        self._refine_thread.error_ready.connect(self._on_refine_error)
         self._refine_thread.progress_update.connect(
             lambda p: self._refine_progress.setValue(int(p))
         )
         self._refine_thread.finished.connect(self._on_refine_finished)
         self._refine_thread.start()
+
+    def _on_refine_error(self, text):
+        self._refine_last_error = text
+        self._refine_status.setText(f"Error: {text}")
 
     def _on_refine_finished(self, exit_code):
         self._refine_btn.setEnabled(True)
@@ -594,10 +618,23 @@ class DEMConfigurationPanel(QWidget):
             if output and Path(output).exists():
                 self._mesh_panel.load_mesh(output)
                 self.mesh_converted.emit(output)
-        else:
+        elif exit_code == 2:
+            # dtm_advanced_processor's own refusal code: its mesh pipeline is
+            # unfinished upstream, so refinement cannot succeed. Name the
+            # working alternative here -- this label is the one message that
+            # survives, since every output line overwrites the previous one.
             self._refine_status.setText(
-                f"Refinement failed (exit code {exit_code})"
+                "Adaptive refinement is NOT IMPLEMENTED (exit 2). Use Convert "
+                "with ROI enabled instead: it grades point density radially "
+                "(Core Fraction / Density Exponent). "
+                "See docs/dem-to-mesh-workflow.md."
             )
+        else:
+            message = f"Refinement failed (exit code {exit_code})"
+            detail = getattr(self, "_refine_last_error", "")
+            if detail:
+                message += f"\n{detail}"
+            self._refine_status.setText(message)
 
         self._refine_thread = None
 

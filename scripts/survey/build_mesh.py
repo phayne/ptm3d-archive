@@ -12,14 +12,28 @@ from utils import save_state, load_state
 
 
 def find_converter():
-    """Find the dtm_to_ply_delaunay binary."""
+    """Find the dtm_to_ply_delaunay binary.
+
+    The in-repo build (build/bin/) comes first: dtm_to_ply_delaunay is built
+    from src/cpp/tools/ by this repository's CMake, so that is the binary
+    matching this checkout. The legacy standalone ``dtm/`` locations stay as
+    fallbacks for machines that have not rebuilt yet -- those binaries predate
+    the port and may target a different CPU architecture. See BUGS.md PTM-04.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
     candidates = [
-        Path(__file__).parent.parent.parent / "dtm" / "dtm_to_ply_delaunay",
+        repo_root / "build" / "bin" / "dtm_to_ply_delaunay",
+        # Legacy locations, kept so existing setups keep working. The first is
+        # the original candidate; the second is the sibling `dtm/` directory
+        # the tools actually lived in before the port.
+        repo_root / "dtm" / "dtm_to_ply_delaunay",
+        repo_root.parent / "dtm" / "dtm_to_ply_delaunay",
         Path("dtm/dtm_to_ply_delaunay"),
         Path("../dtm/dtm_to_ply_delaunay"),
     ]
     for p in candidates:
         if p.exists():
+            print(f"[build_mesh] dtm_to_ply_delaunay: {p}")
             return str(p)
     return None
 
@@ -28,7 +42,16 @@ def build_mesh(cfg: SurveyConfig) -> bool:
     """Build the PLY mesh from DEM + ROI configuration."""
     converter = find_converter()
     if not converter:
-        print("ERROR: dtm_to_ply_delaunay not found. Build it first: cd dtm && make")
+        repo_root = Path(__file__).resolve().parents[2]
+        print("ERROR: dtm_to_ply_delaunay not found. Build it from this "
+              "repository:\n"
+              f"    cd {repo_root}\n"
+              "    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release\n"
+              "    cmake --build build --target dtm_to_ply_delaunay -j 8\n"
+              "PREREQUISITE: GDAL must be installed and visible to CMake, or "
+              "the target is skipped at configure time.\n"
+              "See INSTALL.md ('DEM / DTM tools') and "
+              "docs/dem-to-mesh-workflow.md.")
         return False
 
     mesh_path = cfg.mesh_path

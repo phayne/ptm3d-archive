@@ -57,6 +57,26 @@ find_package(GDAL QUIET
 
 # If GDAL was found but include directory wasn't, set it manually
 if(GDAL_FOUND)
+    # Normalize the library variable BEFORE anything reads it.
+    #
+    # CMake's bundled FindGDAL module sets GDAL_LIBRARIES (plural). GDAL's own
+    # installed CMake config package -- which Homebrew and many conda builds
+    # ship, and which find_package prefers when present -- sets only
+    # GDAL_LIBRARY (singular) plus the GDAL::GDAL imported target, leaving
+    # GDAL_LIBRARIES EMPTY. The `GDAL_FOUND AND GDAL_LIBRARIES` gate below then
+    # evaluated false on a machine that has a perfectly good GDAL, and every
+    # GDAL tool was skipped with no error -- the configure log said
+    # "GDAL_FOUND: 1" on the line above the skip. Close that hole here.
+    if(NOT GDAL_LIBRARIES)
+        if(GDAL_LIBRARY)
+            set(GDAL_LIBRARIES "${GDAL_LIBRARY}")
+            message(STATUS "GDAL config package: using GDAL_LIBRARY = ${GDAL_LIBRARIES}")
+        elseif(TARGET GDAL::GDAL)
+            set(GDAL_LIBRARIES GDAL::GDAL)
+            message(STATUS "GDAL config package: using imported target GDAL::GDAL")
+        endif()
+    endif()
+
     # Normalize include dir: prefer Conda include when library is in Conda
     if(NOT GDAL_INCLUDE_DIR AND DEFINED GDAL_INCLUDE_DIRS)
         set(GDAL_INCLUDE_DIR "${GDAL_INCLUDE_DIRS}")
@@ -84,9 +104,13 @@ if(GDAL_FOUND)
     endif()
 endif()
 
-# Only build dem_mesh_generator if GDAL is properly configured
+# Only build the GDAL-dependent DEM tools if GDAL is properly configured.
+# dem_mesh_generator, dtm_to_ply_delaunay and dtm_advanced_processor all need
+# the GDAL C++ headers and library; the rest of PTM3D does not, so configure
+# must still succeed without GDAL (with the warning at the bottom of this
+# block naming exactly which targets were skipped).
 if(GDAL_FOUND AND GDAL_LIBRARIES)
-    message(STATUS "GDAL found: Building dem_mesh_generator")
+    message(STATUS "GDAL found: Building dem_mesh_generator, dtm_to_ply_delaunay, dtm_advanced_processor")
     message(STATUS "GDAL include dir: ${GDAL_INCLUDE_DIR}")
     message(STATUS "GDAL library: ${GDAL_LIBRARIES}")
 
@@ -114,8 +138,75 @@ if(GDAL_FOUND AND GDAL_LIBRARIES)
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
+
+    # DTM -> PLY converter with true 2D Delaunay triangulation. This is the
+    # binary the GUI dashboard's "Convert" and "ROI" actions invoke
+    # (gui/dem_core/dem_runner.py). Header-only CDT comes from third_party/;
+    # the source includes it as "CDT/include/CDT.h", so third_party/ itself is
+    # the include root.
+    add_executable(dtm_to_ply_delaunay dtm_to_ply_delaunay.cpp)
+    target_include_directories(dtm_to_ply_delaunay PRIVATE
+        ${GDAL_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/third_party
+    )
+    # IEEE-754 semantics are REQUIRED here, so override the project-wide
+    # -ffast-math for this target. CDT's predicates.h is Shewchuk's adaptive
+    # exact-arithmetic orient2d/incircle: its error bounds assume strict
+    # round-to-nearest and no reassociation or FMA contraction. Under
+    # -ffast-math the compiler is free to break both, which silently corrupts
+    # the triangulation on the near-degenerate triangles that ROI thinning
+    # produces -- exactly the case this tool exists for. With these flags the
+    # output is byte-identical to the pre-port standalone build.
+    # (Target options land after the directory-scope ones on the command line,
+    # so these win. Gated on the compiler family that understands them.)
+    target_compile_options(dtm_to_ply_delaunay PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-fno-fast-math>
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>
+    )
+    target_link_libraries(dtm_to_ply_delaunay
+        PRIVATE
+        ${GDAL_LIBRARIES}
+    )
+    if(APPLE AND CONDA_PREFIX_DIR)
+        target_link_options(dtm_to_ply_delaunay PRIVATE "-Wl,-rpath,${CONDA_PREFIX_DIR}/lib")
+    endif()
+    set_target_properties(dtm_to_ply_delaunay
+        PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+
+    # Advanced DTM processor (ROI extraction + adaptive radial refinement).
+    # The GUI dashboard's "Refine" action invokes this binary. NOTE: its mesh
+    # pipeline is unfinished upstream -- it builds and runs, but refuses to
+    # write a mesh and exits 2. See the port record at the top of
+    # dtm_advanced_processor.cpp and docs/dem-to-mesh-workflow.md.
+    add_executable(dtm_advanced_processor dtm_advanced_processor.cpp)
+    target_include_directories(dtm_advanced_processor PRIVATE
+        ${GDAL_INCLUDE_DIR}
+    )
+    target_link_libraries(dtm_advanced_processor
+        PRIVATE
+        ${GDAL_LIBRARIES}
+    )
+    if(APPLE AND CONDA_PREFIX_DIR)
+        target_link_options(dtm_advanced_processor PRIVATE "-Wl,-rpath,${CONDA_PREFIX_DIR}/lib")
+    endif()
+    set_target_properties(dtm_advanced_processor
+        PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
 else()
-    message(WARNING "GDAL not properly configured: dem_mesh_generator will not be built")
+    message(WARNING
+        "GDAL not properly configured. SKIPPING these targets: "
+        "dem_mesh_generator, dtm_to_ply_delaunay, dtm_advanced_processor. "
+        "The GUI dashboard's DEM conversion / ROI extraction / mesh refinement "
+        "actions will report a missing executable until GDAL is installed and "
+        "CMake is re-run. Install GDAL (conda-forge recommended on macOS: "
+        "'conda install -c conda-forge gdal') -- see INSTALL.md, 'DEM / DTM tools'.")
     message(STATUS "  GDAL_FOUND: ${GDAL_FOUND}")
     message(STATUS "  GDAL_LIBRARIES: ${GDAL_LIBRARIES}")
 endif()

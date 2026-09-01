@@ -148,6 +148,11 @@ pip install -r requirements.txt
 - `pyopencl` - GPU detection
 - `h5py` - HDF5 export
 - `netCDF4` - NetCDF export
+- `rasterio` - GeoTIFF export of results
+- `gdal` (`osgeo`) - GeoTIFF **DEM preview** in the dashboard's DEM module.
+  Not pip-installable on its own; use `conda install -c conda-forge gdal`.
+  The same GDAL install is the build-time prerequisite for the DTM tools the
+  DEM module runs — see INSTALL.md, "DEM / DTM tools".
 
 ## Usage
 
@@ -203,8 +208,10 @@ python run_gui.py --results /path/to/output/
 
 ```
 gui/
-├── ptm3d_gui.py           # Main application
-├── run_gui.py             # Launcher script
+├── ptm3d_gui.py           # Main application (thermal simulation)
+├── run_gui.py             # Launcher script — the supported entry point
+├── dashboard.py           # Multi-module dashboard shell
+├── run_dashboard.py       # Dashboard launcher (optional, less tested)
 ├── requirements.txt       # Python dependencies
 ├── README.md              # This file
 │
@@ -214,13 +221,55 @@ gui/
 │   ├── styles.py          # Modern dark theme
 │   └── simulation_runner.py # Background execution
 │
-└── gui_panels/            # UI panels
-    ├── __init__.py
-    ├── config_panel.py    # Configuration tabs
-    ├── visualization_panel.py  # 3D/2D views
-    ├── results_panel.py   # Results browser
-    └── console_panel.py   # Console output
+├── gui_panels/            # UI panels
+│   ├── __init__.py
+│   ├── config_panel.py    # Configuration tabs
+│   ├── visualization_panel.py  # 3D/2D views
+│   ├── results_panel.py   # Results browser
+│   └── console_panel.py   # Console output
+│
+├── dashboard_core/        # Dashboard shell: module registry + chaining
+│   ├── module_interface.py  # Base class every dashboard module implements
+│   ├── module_registry.py   # Discovery/registration of modules
+│   ├── chaining_manager.py  # Hands one module's output to the next
+│   └── sidebar.py           # Module navigation
+│
+├── module_adapters/       # Adapters wrapping each app as a dashboard module
+│
+├── dem_core/              # DEM module: logic (no Qt widgets)
+│   ├── dem_config_manager.py # DEM tool settings
+│   ├── dem_runner.py         # Runs dtm_to_ply_delaunay / dtm_advanced_processor
+│   └── dem_tooltips.py       # Flag-level help text
+│
+└── dem_panels/            # DEM module: UI panels
+    ├── dem_preview_panel.py  # GeoTIFF preview + ROI picking (needs osgeo/GDAL)
+    ├── dem_config_panel.py   # Conversion / ROI / QC options
+    ├── dem_mesh_panel.py     # Mesh options and refinement controls
+    └── dem_results_panel.py  # Generated-mesh summary
 ```
+
+### DEM module prerequisites
+
+`dem_runner.py` is a thin wrapper around two **compiled C++ binaries built from
+this repository**: `dtm_to_ply_delaunay` (DTM → PLY conversion and ROI
+extraction) and `dtm_advanced_processor` (mesh refinement). It looks for them in
+`build/bin/` first, then a legacy `../dtm/` directory, then `PATH`. Both targets
+require GDAL at build time; without GDAL, CMake skips them and the DEM actions
+report a missing executable with build instructions.
+
+Two limitations are worth knowing before you use this module:
+
+- **Adaptive mesh refinement is not implemented.** `dtm_advanced_processor`
+  builds and runs but cannot construct the initial mesh its refiner needs, so it
+  refuses and exits non-zero. Use the Convert action with ROI enabled instead —
+  it grades point density radially, which is what refinement was meant to
+  achieve.
+- **The DEM actions are POSIX-only.** They stream tool output through
+  `select.select()` on pipes, which does not work on Windows; the module says so
+  rather than failing obscurely.
+
+Full walkthrough, flag reference and known gaps:
+[`docs/dem-to-mesh-workflow.md`](../docs/dem-to-mesh-workflow.md).
 
 ## Configuration File Format
 

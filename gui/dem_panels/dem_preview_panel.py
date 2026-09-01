@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QFileDialog, QGroupBox, QFormLayout,
     QCheckBox, QLineEdit, QMessageBox, QSizePolicy
 )
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -138,8 +138,11 @@ class DEMPreviewPanel(QWidget):
         """Load and display a GeoTIFF DEM."""
         if not HAS_GDAL:
             self._info_label.setText(
-                "GDAL not available. Install with: pip install GDAL\n"
-                "DEM preview requires GDAL for GeoTIFF reading."
+                "GDAL Python bindings (osgeo) not available; DEM preview is "
+                "disabled.\n"
+                "Install with: conda install -c conda-forge gdal\n"
+                "(pip install GDAL needs the GDAL C library already present "
+                "and matching -- see INSTALL.md, 'DEM / DTM tools'.)"
             )
             self._file_edit.setText(filepath)
             self._cm.set_value("input.dem_file", filepath)

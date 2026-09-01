@@ -56,6 +56,50 @@ Homebrew's `embree` bottle is built SSE2-only for portability, which leaves meas
 illumination performance on the table on any AVX/AVX-512 host — see §3 "Embree ISA (performance)"
 for how to check what you have and how to build a multi-ISA one alongside it.
 
+### DEM / DTM tools (optional — GDAL)
+
+The engine does **not** need GDAL. It is needed only to build the three tools that turn a
+GeoTIFF digital terrain model into a PTM3D mesh — `dtm_to_ply_delaunay`, `dtm_advanced_processor`
+and `dem_mesh_generator` — and to give the GUI dashboard's DEM preview its `osgeo` bindings.
+If you never start from a DEM, skip this.
+
+```bash
+# macOS / Linux, recommended (installs the C++ library AND the Python bindings):
+conda install -c conda-forge gdal
+
+# macOS, Homebrew alternative (C++ library only; add the bindings separately):
+brew install gdal
+python3 -m pip install "GDAL==$(gdal-config --version)"
+
+# Debian/Ubuntu:
+sudo apt-get install -y libgdal-dev python3-gdal
+```
+
+CMake finds GDAL through its own config package or through `gdal-config`; a conda environment is
+picked up automatically when `CONDA_PREFIX` is set, and `$HOME/anaconda3/envs/europa_viz` is
+tried as a fallback hint. **Configure succeeds without GDAL** — it prints
+
+```
+CMake Warning: GDAL not properly configured. SKIPPING these targets: dem_mesh_generator,
+dtm_to_ply_delaunay, dtm_advanced_processor. ...
+```
+
+and builds everything else. If you install GDAL later, re-run `cmake -S . -B build` before
+building; the skip is decided at configure time, not build time.
+
+Then build the DEM tools (see §3):
+
+```bash
+cmake --build build --target dtm_to_ply_delaunay dtm_advanced_processor -j
+```
+
+`dtm_to_ply_delaunay` also uses the header-only [CDT](https://github.com/artem-ogre/CDT)
+triangulation library, vendored at `third_party/CDT/` (MPL-2.0) — nothing to install.
+
+The end-to-end DEM workflow, including what each command-line flag does and which parts of
+the toolchain are **not** implemented, is documented in
+[docs/dem-to-mesh-workflow.md](docs/dem-to-mesh-workflow.md).
+
 ### CSPICE (both platforms — manual)
 
 CSPICE is distributed by NASA NAIF, not a package manager. It is shipped as a **prebuilt static
