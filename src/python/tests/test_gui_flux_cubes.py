@@ -2351,6 +2351,157 @@ def test_the_reveal_does_not_scroll_a_card_nobody_touched():
         "for anything")
 
 
+# ==========================================================================
+# 12. The curated-site note, collapsed (Paul's ruling, 2026-09-01)
+#
+# Round 2 left one contributor unfixed and asked: picking a curated site wrote
+# the whole provenance record onto the card -- about thirty lines, MEASURED at
+# 216 px tall at Paul's 2559 px window width -- and every group below it, the
+# flux cubes among them, started 216 px further down. He ruled: one line, with
+# the rest behind an expander.
+#
+# These arms live here, beside the fold measurements they exist to protect,
+# and not in `test_gui_curated_sites.py`, because the reason for the change is
+# the fold. That suite owns what the note SAYS; this one owns how much room it
+# takes and what that costs the controls underneath.
+#
+# ⛔ ONE THING MUST NEVER GO IN THE EXPANDER: a statement that the open
+# configuration DISAGREES with the curated set. That is a warning about the run
+# somebody is about to launch, and a warning behind a control you have to find
+# first is not a warning.
+# ==========================================================================
+
+def _site_wiring_pairs(card):
+    from gui_core.curated_sites import curated_site, site_wiring
+    entry = curated_site("A03MP026", body="Moon")
+    if entry is None:
+        raise Skip("A03MP026 is not in the curated registry")
+    return site_wiring(entry)
+
+
+def test_the_curated_note_is_one_line_at_pauls_window():
+    """MEASURED, not eyeballed: the note was 216 px and is now one line.
+
+    A line of `_muted` text renders at 12 px here. The bound is deliberately
+    loose -- two lines is still a note, thirty is a wall -- and the number that
+    matters is the one it is nowhere near.
+    """
+    _manager, card = _sized_card(PAUL_W, 1381, "curated")
+    note = card.site_note
+    assert "\n" not in note.text(), (
+        "the curated-site note is still multi-line:\n" + note.text())
+    assert note.height() <= 40, (
+        f"the curated-site note renders {note.height()} px tall at "
+        f"{PAUL_W} px wide; it was 216 px and the ruling was one line")
+    assert "A03MP026" in note.text(), note.text()
+
+
+def test_the_details_expander_starts_closed_and_holds_the_provenance():
+    """The record is kept, and kept out of the way until it is asked for."""
+    _manager, card = _sized_card(PAUL_W, 1381, "curated")
+    details = getattr(card, "site_details", None)
+    assert details is not None, "there is no details section on the card"
+    assert details.isVisibleTo(card), (
+        "a curated site is selected and its details section is not on the card")
+    body = card.site_details_text
+    assert not body.isVisibleTo(card), (
+        "the provenance is on screen without being asked for; the section "
+        "should open collapsed")
+    details.toggle_button.click()
+    _pump()
+    assert body.isVisibleTo(card), (
+        "opening the details section revealed nothing")
+    text = body.text()
+    assert "NOT used" in text, (
+        "the expander does not carry the which-files-were-rejected record, "
+        "which is the part of the provenance that prevents a wrong rerun:\n"
+        + text[:400])
+    assert text.count("\n") >= 8, (
+        f"the expander holds {text.count(chr(10)) + 1} lines; the provenance "
+        f"record is longer than that and something has been dropped")
+    # ⛔ PUT IT BACK. `_panel()` hands every arm the SAME panel, and the
+    # collapsed state is the user's -- the card deliberately does not reset it
+    # on a re-describe, so an arm that opens the section and walks away adds
+    # ~200 px to the card for every arm after it. Caught the honest way: the
+    # fold arm below failed at 2559x1381, which is a real measurement of a
+    # state no user is in.
+    details.toggle_button.click()
+    _pump()
+    assert not body.isVisibleTo(card), "the details section did not close again"
+
+
+def test_no_curated_site_means_no_details_section():
+    """Nothing to expand, so nothing offering to expand."""
+    manager, panel = _panel()
+    panel.resize(PAUL_W, 1381)
+    manager.reset_to_defaults()
+    start = panel.tabs["start"]
+    start.choose_body("Moon")
+    start._choose_mode("local")
+    start.choose_run_type("time_series")
+    card = start.active_card()
+    panel.show()
+    _pump()
+    assert not card.site_details.isVisibleTo(card), (
+        "the details section is on the card with no curated site selected")
+
+
+def test_a_disagreement_stays_on_the_line_and_is_never_collapsed():
+    """⛔ THE ONE THING THE EXPANDER MUST NOT SWALLOW.
+
+    Open a file that names this site's terrain with one of its other settings
+    changed and the card says so. That sentence is about the run the user is
+    about to launch, not about provenance, and it belongs where they cannot
+    miss it -- the expander is closed by default, so a warning inside it is a
+    warning nobody reads.
+    """
+    _manager, card = _sized_card(PAUL_W, 1381, "curated")
+    manager = _panel()[0]
+    changed = None
+    for key, value in _site_wiring_pairs(card):
+        if key.startswith("engine_env.") or not isinstance(value, bool):
+            continue
+        manager.set_value(key, not value)
+        changed = key
+        break
+    if changed is None:
+        raise Skip("this site wires no boolean this arm can disagree with")
+    card._describe_curated_site()          # the DESCRIBING path, no `applied`
+    _pump()
+    line = card.site_note.text()
+    assert "DIFFERS FROM THE CURATED SET" in line, (
+        f"changing {changed} away from the curated value is not reported on "
+        f"the line: " + line)
+    assert changed in line, line
+    body = card.site_details_text.text()
+    assert "DIFFERS FROM THE CURATED SET" not in body, (
+        "the disagreement warning was put inside the collapsed section, "
+        "where the user has to open it to be warned")
+
+
+def test_collapsing_the_note_lifts_the_flux_switch_above_the_fold():
+    """The point of the ruling, measured on the control it was blocking.
+
+    Before: the curated card's content was 1,774 px and the flux-cube switch
+    sat at y=1000, outside a 883 px viewport -- the user could not reach the
+    control at all at 2559x1200. After: 1,605 px of content and the switch at
+    y=831, on screen at both of the window heights Paul actually uses, with no
+    scrolling at all.
+    """
+    for height in (1381, 1200):
+        _manager, card = _sized_card(PAUL_W, height, "curated")
+        # Stated, not assumed: this measurement is only about the collapsed
+        # card, and `_panel()` is shared. An earlier arm leaving the section
+        # open must say so here rather than show up as a mystery 200 px.
+        assert card.site_details._collapsed, (
+            "the details section is open before this measurement; an earlier "
+            "arm left it that way and this is not the state being measured")
+        switch = card.widgets["flux_cubes.enabled"]
+        assert _on_screen(card, switch), (
+            f"at {PAUL_W}x{height} the flux-cube switch is still below the "
+            f"fold on a freshly opened curated card, with nothing scrolled")
+
+
 TESTS = [
     test_the_cube_count_is_the_tools_own_rule,
     test_the_fast_count_agrees_with_the_tools_double_loop_everywhere,
@@ -2424,6 +2575,12 @@ TESTS = [
     test_the_click_puts_the_options_on_the_screen_imported_mesh,
     test_the_written_list_is_not_withdrawn_without_showing_the_real_thing,
     test_the_reveal_does_not_scroll_a_card_nobody_touched,
+    # 12. the curated-site note, collapsed (Paul's ruling)
+    test_the_curated_note_is_one_line_at_pauls_window,
+    test_the_details_expander_starts_closed_and_holds_the_provenance,
+    test_no_curated_site_means_no_details_section,
+    test_a_disagreement_stays_on_the_line_and_is_never_collapsed,
+    test_collapsing_the_note_lifts_the_flux_switch_above_the_fold,
 ]
 
 
