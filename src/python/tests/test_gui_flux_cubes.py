@@ -2723,9 +2723,17 @@ def test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck():
         f"only {switch.receivers(switch.stateChanged)} slots on stateChanged: "
         f"the configuration write, the re-describe and the reveal all belong "
         f"on the signal that carries the write")
-    assert switch.receivers(switch.toggled) == 0, (
-        "something still renders this group from `toggled`, which is ordered "
-        "against the configuration write only by luck")
+    # `toggled` may carry exactly ONE listener, the record-keeper in
+    # `gui_core.flux_trace`, which only writes a line to a log and shows the
+    # order the two signals arrive in. Anything else on it would be rendering
+    # the group from a signal ordered against the write only by luck.
+    from gui_core import flux_trace
+    allowed_on_toggled = 1 if flux_trace.enabled() else 0
+    assert switch.receivers(switch.toggled) == allowed_on_toggled, (
+        f"{switch.receivers(switch.toggled)} listeners on `toggled` and only "
+        f"{allowed_on_toggled} is accounted for; something renders this group "
+        f"from a signal whose order against the configuration write is not "
+        f"guaranteed")
 
     # And end to end: a real click leaves the configuration, the switch and
     # the screen agreeing, whichever way Qt happens to order its signals.

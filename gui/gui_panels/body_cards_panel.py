@@ -2023,7 +2023,44 @@ class BodyCard(BaseConfigTab):
         # given a bool.
         self.widgets["flux_cubes.enabled"].stateChanged.connect(
             lambda state: self._reveal_flux_cubes(bool(state)))
+
+        # -- the record of what a click does (gui_core/flux_trace.py) --------
+        # Connected LAST on `stateChanged`, so it reports the state after the
+        # three slots above have run, and separately on `toggled`, which
+        # nothing in this group renders from any more -- a `toggled` line in
+        # the log is proof the signal still arrives, and its ORDER against
+        # `stateChanged` is visible in the timestamps.
+        #
+        # Only when the record is being kept: with `PTM_GUI_TRACE=0` neither
+        # observer is connected at all, so the group costs nothing and
+        # `receivers(toggled)` is zero, which is what
+        # `test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck` reads.
+        from gui_core import flux_trace
+        if flux_trace.enabled():
+            switch = self.widgets["flux_cubes.enabled"]
+            switch.stateChanged.connect(
+                lambda state: self._trace_switch("stateChanged", state))
+            switch.toggled.connect(
+                lambda on: self._trace_switch("toggled", on))
         return group
+
+    def _trace_switch(self, signal_name, argument):
+        """Write down the click, and look again half a second later.
+
+        The delayed look is the part that matters for "the box does not stay
+        ticked": it reports the checkbox and every option row again, after
+        anything else in the program has had a chance to change them.
+        """
+        from gui_core import flux_trace
+        if not flux_trace.enabled():
+            return
+        switch = self.widgets.get("flux_cubes.enabled")
+        flux_trace.note(
+            "checkbox-signal", signal=signal_name, argument=argument,
+            checkbox_says=None if switch is None else switch.isChecked(),
+            loading=self._loading)
+        flux_trace.snapshot(self, "at-click")
+        QTimer.singleShot(500, lambda: flux_trace.snapshot(self, "500ms-later"))
 
     def _reveal_flux_cubes(self, on):
         """Put the placement options on the screen when they are switched on.
@@ -2076,6 +2113,11 @@ class BodyCard(BaseConfigTab):
         config = self.config_manager.get_config()
         policy = fc.engine_support(config)
         enabled = self._flux_enabled()
+        from gui_core import flux_trace
+        flux_trace.note_with_caller(
+            "describe-group", rendering_value=enabled,
+            checkbox_says=switch.isChecked(), loading=self._loading,
+            engine_allows=policy.allowed)
         # ⛔ THE SWITCH IS NEVER DISABLED, and that is the fix for Paul's
         # 2026-08-31 report, not a style preference. `setEnabled(policy.allowed)`
         # made a real click a SILENT no-op: on a freshly opened Moon
@@ -2097,6 +2139,8 @@ class BodyCard(BaseConfigTab):
         switch.setEnabled(True)
         body = getattr(self, "flux_body", None)
         if body is not None:
+            flux_trace.note_with_caller("show-or-hide", what="options_block",
+                                        visible=enabled)
             body.setVisible(enabled)
 
         if not policy.allowed and enabled:
@@ -2286,8 +2330,25 @@ class BodyCard(BaseConfigTab):
         elif top + height > current + view_h:
             target = top + height - view_h     # below the fold
         else:
+            from gui_core import flux_trace
+            flux_trace.note_with_caller(
+                "scroll-not-needed", already_at=current, widget_top=top,
+                widget_height=height, viewport_height=view_h)
             return True                        # already whole on screen
-        bar.setValue(max(bar.minimum(), min(bar.maximum(), target)))
+        clamped = max(bar.minimum(), min(bar.maximum(), target))
+        bar.setValue(clamped)
+        # The position aimed for, the position asked for after clamping, and
+        # the position actually reached. A scrollbar that will not go where it
+        # was sent -- because the card has not grown yet, so the maximum is
+        # still the old one -- shows up here as three different numbers.
+        from gui_core import flux_trace
+        flux_trace.note_with_caller(
+            "scrolled", from_position=current, aimed_for=target,
+            after_clamping=clamped, actually_reached=bar.value(),
+            scroll_maximum=bar.maximum(), widget_top=top,
+            widget_height_used=height, realized_height=widget.height(),
+            preferred_height=widget.sizeHint().height(),
+            viewport_height=view_h)
         return True
 
     def _flux_mode(self):
@@ -2297,10 +2358,17 @@ class BodyCard(BaseConfigTab):
 
     def _refresh_flux_placement(self):
         from gui_core import flux_cubes as fc
+        from gui_core import flux_trace
         mode = self._flux_mode()
         if getattr(self, "flux_lattice", None) is not None:
+            flux_trace.note_with_caller(
+                "show-or-hide", what="grid_rows",
+                visible=fc.mode_builds_lattice(mode), placement=mode)
             self.flux_lattice.setVisible(fc.mode_builds_lattice(mode))
         if getattr(self, "flux_named", None) is not None:
+            flux_trace.note_with_caller(
+                "show-or-hide", what="named_points_rows",
+                visible=fc.mode_uses_locations(mode), placement=mode)
             self.flux_named.setVisible(fc.mode_uses_locations(mode))
 
     def _refresh_flux_height(self):
@@ -2981,6 +3049,10 @@ class MoonCard(BodyCard):
         """
         local = self._mode == "local"
         enabled = self._flux_enabled()      # the switch, not the configuration
+        from gui_core import flux_trace
+        flux_trace.note_with_caller("show-or-hide", what="whole_group",
+                                    visible=True, mode=self._mode,
+                                    setting=enabled)
         self.flux_group.setVisible(True)
         if not local and enabled:
             logger.warning(
@@ -3004,6 +3076,13 @@ class MoonCard(BodyCard):
                 "record flux cubes.")
 
     def load_card(self):
+        from gui_core import flux_trace
+        switch = self.widgets.get("flux_cubes.enabled")
+        flux_trace.note_with_caller(
+            "card-reloaded",
+            checkbox_before=None if switch is None else switch.isChecked(),
+            setting_before=self.config_manager.get_value("flux_cubes.enabled",
+                                                         None))
         super().load_card()
         self._mirror_curated_site()
         self._refresh_surface()
