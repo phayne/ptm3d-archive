@@ -78,25 +78,4 @@ TOOLTIPS = {
         "Small holes (up to this many edges) are triangulated.\n"
         "0 = disable hole filling. Default: 20."
     ),
-
-    # Refinement
-    "refinement.enabled": "Enable adaptive mesh refinement after conversion.",
-    "refinement.center_lat": "Latitude of the refinement center in degrees.",
-    "refinement.center_lon": "Longitude of the refinement center in degrees.",
-    "refinement.inner_radius_km": (
-        "Inner radius (km) where maximum refinement is applied.\n"
-        "Faces within this radius are subdivided to minimum edge length."
-    ),
-    "refinement.outer_radius_km": (
-        "Outer radius (km) beyond which no refinement occurs.\n"
-        "Between inner and outer, edge length transitions linearly."
-    ),
-    "refinement.max_faces": "Maximum number of faces after refinement.",
-    "refinement.min_edge_m": "Minimum edge length in meters (finest resolution).",
-    "refinement.max_edge_m": "Maximum edge length in meters (coarsest resolution).",
-    "refinement.initial_downsample": (
-        "Downsample factor for the initial mesh before refinement.\n"
-        "A coarser initial mesh speeds up the refinement process."
-    ),
-    "refinement.output_file": "Output path for the refined PLY mesh file.",
 }

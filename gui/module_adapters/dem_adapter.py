@@ -1,6 +1,6 @@
 """
 DEM/Mesh module adapter for the unified dashboard.
-Wraps the DEM preview, conversion, inspection, and refinement panels.
+Wraps the DEM preview, conversion and inspection panels.
 Uses a splitter layout: config pages on the left, 3D mesh viewer on the right.
 """
 
@@ -17,9 +17,10 @@ from dashboard_core.module_interface import AbstractModule
 class DEMModule(AbstractModule):
     """DEM/Mesh manipulation module for the dashboard.
 
-    Provides GeoTIFF preview, mesh conversion, 3D inspection, and
-    adaptive refinement. The 3D mesh viewer lives in the right panel
-    (like the other modules) while config/preview pages are on the left.
+    Provides GeoTIFF preview, mesh conversion (including region-of-interest
+    extraction with radial density grading) and 3D inspection. The 3D mesh
+    viewer lives in the right panel (like the other modules) while
+    config/preview pages are on the left.
     """
 
     def __init__(self, console_panel):
@@ -97,9 +98,9 @@ class DEMModule(AbstractModule):
             "DEM/Mesh Tools\n\n"
             "This module provides:\n"
             "  - GeoTIFF DEM preview and ROI selection\n"
-            "  - Mesh conversion (DEM to PLY)\n"
-            "  - 3D mesh inspection and quality analysis\n"
-            "  - Adaptive mesh refinement\n\n"
+            "  - Mesh conversion (DEM to PLY), with ROI extraction and\n"
+            "    radial point-density grading\n"
+            "  - 3D mesh inspection and quality analysis\n\n"
             f"(Loading full panels: {error_msg})"
         )
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -124,13 +125,13 @@ class DEMModule(AbstractModule):
             return {"mesh_file": self._output_mesh}
         return {}
 
-    # -- Simulation (conversion/refinement) --------------------------------
+    # -- Simulation (conversion) -------------------------------------------
 
     def run_simulation(self):
-        self._console.append_info("[DEM] Use the Convert or Refine buttons in the panel")
+        self._console.append_info("[DEM] Use the Convert button in the panel")
 
     def _on_mesh_converted(self, mesh_path: str):
-        """Called after successful conversion or refinement."""
+        """Called after a successful conversion."""
         self._output_mesh = mesh_path
 
         # Load in the right-side viewer

@@ -73,7 +73,9 @@ and thermal emission from surrounding terrain.*
   thermal model
 - **Ice**: subsurface ice-stability depth (vapor diffusion), and a full Europa
   exosphere/ice-evolution research module
-- **Meshes**: built-in icosphere generator, PLY/OBJ/VTK import, DEM-to-mesh and
+- **Meshes**: built-in icosphere generator, PLY/OBJ/VTK import,
+  [DEM-to-mesh](docs/dem-to-mesh-workflow.md) (GeoTIFF DTM → Delaunay-triangulated
+  PLY, with region-of-interest extraction and radial density grading) and
   synthetic crater tools; ParaView-compatible outputs
 - **Performance**: threaded CPU core everywhere; optional OpenCL GPU
   acceleration for the thermal, radiosity, and ray-tracing stages

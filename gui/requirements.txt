@@ -32,4 +32,42 @@ pyopencl>=2022.3
 h5py>=3.8.0
 netCDF4>=1.6.0
 scipy>=1.10.0
+
+# GeoTIFF EXPORT of simulation results (gui_core/data_exporter.py imports
+# rasterio, rasterio.transform and rasterio.crs; visualization_panel.py reports
+# its absence). Without it the "GeoTIFF" export format is skipped.
 rasterio>=1.3.0
+
+# ---------------------------------------------------------------------------
+# GDAL Python bindings (`osgeo`) -- NOT installable by pip alone.
+#
+# Needed by:
+#   gui/dem_panels/dem_preview_panel.py   GeoTIFF DEM preview + ROI picking
+#                                         (the panel degrades to a text notice
+#                                         without it, it does not crash)
+#   scripts/build_lola_ring.py, scripts/verify_corrected_ring.py,
+#   scripts/audit_ring_horizon.py, src/python/ptm_cog.py
+#
+# It is deliberately NOT listed as a pip requirement above: the `GDAL` wheel
+# only builds against a GDAL C library that is ALREADY installed and whose
+# version matches exactly, so an unconditional `GDAL>=3.4` here would make
+# `pip install -r requirements.txt` fail for most users.
+#
+# Install the library and the bindings together instead. macOS (recommended):
+#
+#     conda install -c conda-forge gdal
+#
+# Homebrew alternative (installs the C/C++ library; then match the pip
+# version to it):
+#
+#     brew install gdal
+#     python3 -m pip install "GDAL==$(gdal-config --version)"
+#
+# Linux: `apt install libgdal-dev python3-gdal` (or the conda command above).
+#
+# The SAME GDAL install is the build-time prerequisite for the DTM tool
+# (`dtm_to_ply_delaunay`) that the dashboard's DEM conversion and ROI actions
+# run. Without GDAL, CMake SKIPS that target and the dashboard reports a
+# missing executable. See INSTALL.md, "DEM / DTM tools", and
+# docs/dem-to-mesh-workflow.md.
+# ---------------------------------------------------------------------------

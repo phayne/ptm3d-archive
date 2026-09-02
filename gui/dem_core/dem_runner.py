@@ -1,6 +1,16 @@
 """
-DEM processing threads: wraps the dtm_to_ply_delaunay and
-dtm_advanced_processor executables.
+DEM processing thread: wraps the dtm_to_ply_delaunay executable.
+
+That binary is built from this repository -- ``src/cpp/tools/`` -- and lands in
+``build/bin/``. It requires GDAL at build time; see
+``docs/dem-to-mesh-workflow.md`` and INSTALL.md ("DEM / DTM tools").
+
+PLATFORM NOTE: ``_run_subprocess`` below streams the child's output with
+``select.select`` on pipe file descriptors. That is a POSIX-only construct --
+on Windows ``select`` accepts sockets only, so DEM conversion does not work
+there. macOS and Linux are supported. There is no fallback: rather than promise
+something we do not do, the code fails visibly with the platform check in
+``_require_posix_pipes``.
 """
 
 import math
@@ -8,23 +18,41 @@ import os
 import re
 import subprocess
 import select
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
 
+# Build target name -> the CMake/`cmake --build` target that produces it.
+# Used to give an accurate "how do I get this binary" message.
+_BUILD_TARGETS = {
+    "dtm_to_ply_delaunay": "dtm_to_ply_delaunay",
+}
+
+
+def _repo_root():
+    """Repository root, resolved from this file (gui/dem_core/ -> repo)."""
+    return Path(__file__).resolve().parent.parent.parent
+
+
 def _find_executable(name):
     """Search for a DEM tool executable.
 
-    Searches relative to gui/ directory:
-      ../../dtm/<name>     (the dtm directory)
-      ../build/bin/<name>  (PTM build directory)
-    Then falls back to PATH.
+    Search order, most authoritative first:
+      1. <repo>/build/bin/<name>   -- what `cmake --build build` produces
+      2. <repo>/../dtm/<name>      -- legacy standalone dtm/ working directory
+      3. PATH
+
+    The in-repo build directory is searched FIRST so that a rebuild of this
+    checkout is what actually runs. The legacy ``dtm/`` location is kept only
+    so existing local setups do not break; those binaries predate the port and
+    may be built for a different architecture.
     """
-    gui_dir = Path(__file__).resolve().parent.parent
+    repo = _repo_root()
     search_paths = [
-        gui_dir / ".." / ".." / "dtm" / name,
-        gui_dir / ".." / "build" / "bin" / name,
+        repo / "build" / "bin" / name,
+        repo / ".." / "dtm" / name,
     ]
 
     for p in search_paths:
@@ -36,6 +64,45 @@ def _find_executable(name):
     import shutil
     found = shutil.which(name)
     return found
+
+
+def _missing_executable_message(name):
+    """Accurate build instructions for a DEM tool that was not found."""
+    repo = _repo_root()
+    target = _BUILD_TARGETS.get(name, name)
+    return (
+        f"Could not find the '{name}' executable.\n"
+        f"Searched: {repo / 'build' / 'bin' / name}, "
+        f"{(repo / '..' / 'dtm' / name)}, and PATH.\n"
+        "\n"
+        "Build it from this repository:\n"
+        f"    cd {repo}\n"
+        "    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release\n"
+        f"    cmake --build build --target {target} -j 8\n"
+        "\n"
+        "PREREQUISITE: GDAL (C++ headers and library) must be installed and\n"
+        "visible to CMake, or this target is SKIPPED at configure time -- look\n"
+        "for 'GDAL not properly configured ... SKIPPING' in the CMake output.\n"
+        "On macOS: conda install -c conda-forge gdal   (or: brew install gdal)\n"
+        "See INSTALL.md, section 'DEM / DTM tools'."
+    )
+
+
+def _require_posix_pipes():
+    """Return an error string if pipe-based streaming is unsupported here.
+
+    ``select.select`` on pipes is POSIX-only; on Windows it handles sockets
+    only. Report that plainly instead of failing deep inside the read loop.
+    """
+    if sys.platform.startswith("win"):
+        return (
+            "The DEM conversion action is not supported on Windows.\n"
+            "It streams the child process's output with select.select() on "
+            "pipes, which is POSIX-only.\n"
+            "Run dtm_to_ply_delaunay from the command line instead (see "
+            "docs/dem-to-mesh-workflow.md), or use macOS/Linux."
+        )
+    return None
 
 
 def _run_subprocess(process_holder, cmd, output_signal, error_signal,
@@ -126,12 +193,15 @@ class DEMConvertThread(QThread):
         self._stop = [False]
 
     def run(self):
+        unsupported = _require_posix_pipes()
+        if unsupported:
+            self.error_ready.emit(unsupported)
+            self.finished.emit(-1)
+            return
+
         executable = _find_executable("dtm_to_ply_delaunay")
         if not executable:
-            self.error_ready.emit(
-                "Could not find dtm_to_ply_delaunay executable.\n"
-                "Build it: cd dtm && make"
-            )
+            self.error_ready.emit(_missing_executable_message("dtm_to_ply_delaunay"))
             self.finished.emit(-1)
             return
 
@@ -201,74 +271,6 @@ class DEMConvertThread(QThread):
             max_hole = qc.get("max_hole_edges", 20)
             if max_hole != 20:
                 cmd.extend(["--qc-max-hole", str(max_hole)])
-
-        self.output_ready.emit(f"Running: {' '.join(cmd)}")
-        _run_subprocess(
-            self._process, cmd,
-            self.output_ready, self.error_ready,
-            self.progress_update, self.finished,
-            self._stop,
-        )
-
-    def stop(self):
-        self._stop[0] = True
-        if self._process[0]:
-            self._process[0].terminate()
-
-
-class DEMRefineThread(QThread):
-    """Wraps the dtm_advanced_processor executable."""
-
-    output_ready = pyqtSignal(str)
-    error_ready = pyqtSignal(str)
-    progress_update = pyqtSignal(float)
-    finished = pyqtSignal(int)
-
-    def __init__(self, config_manager):
-        super().__init__()
-        self._cm = config_manager
-        self._process = [None]
-        self._stop = [False]
-
-    def run(self):
-        executable = _find_executable("dtm_advanced_processor")
-        if not executable:
-            self.error_ready.emit(
-                "Could not find dtm_advanced_processor executable.\n"
-                "Build it: cd dtm && make"
-            )
-            self.finished.emit(-1)
-            return
-
-        config = self._cm.get_config()
-        dem_file = config["input"]["dem_file"]
-        output_file = config["refinement"]["output_file"]
-
-        if not dem_file or not output_file:
-            self.error_ready.emit("DEM file and refinement output file must be specified")
-            self.finished.emit(-1)
-            return
-
-        cmd = [executable, dem_file, output_file]
-
-        ref = config["refinement"]
-        cmd.extend(["--refine-center", str(ref["center_lat"]), str(ref["center_lon"])])
-        cmd.extend(["--refine-inner", str(ref["inner_radius_km"])])
-        cmd.extend(["--refine-outer", str(ref["outer_radius_km"])])
-        cmd.extend(["--refine-max-faces", str(ref["max_faces"])])
-
-        if ref.get("min_edge_m", 0) > 0:
-            cmd.extend(["--refine-min-edge", str(ref["min_edge_m"])])
-        if ref.get("max_edge_m", 0) > 0:
-            cmd.extend(["--refine-max-edge", str(ref["max_edge_m"])])
-
-        initial_ds = ref.get("initial_downsample", 10)
-        if initial_ds > 1:
-            cmd.extend(["--initial-downsample", str(initial_ds)])
-
-        body_radius = config["input"].get("body_radius_m", 0)
-        if body_radius > 0:
-            cmd.extend(["--radius", str(body_radius)])
 
         self.output_ready.emit(f"Running: {' '.join(cmd)}")
         _run_subprocess(

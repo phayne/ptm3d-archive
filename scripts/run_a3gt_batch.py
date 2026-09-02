@@ -75,13 +75,32 @@ SITES = [
 
 REPO   = Path(__file__).resolve().parent.parent
 DEM    = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/DEM/a3gt/mons-mouton/mm-sfs-dem.tif")
-# Prefer a local /tmp copy of the mesh-generator binary so OneDrive's
-# on-demand fetch can't trigger an `execve` "operation canceled"
-# (errno 89) mid-run. Fall back to the OneDrive-tiered path if /tmp
-# doesn't have it.
+# dtm_to_ply_delaunay is now built from this repository
+# (src/cpp/tools/dtm_to_ply_delaunay.cpp -> build/bin/). Prefer that copy: it
+# is the binary this checkout built, and it is on local disk, so it cannot hit
+# OneDrive's on-demand fetch and the `execve` "operation canceled" (errno 89)
+# that motivated the /tmp copy. Both older paths remain as fallbacks, and the
+# choice is PRINTED rather than made silently. See BUGS.md PTM-04 and
+# docs/dem-to-mesh-workflow.md.
+DTM_TOOL_REPO   = REPO / "build" / "bin" / "dtm_to_ply_delaunay"
 DTM_TOOL_LOCAL  = Path("/tmp/dtm_to_ply_delaunay")
 DTM_TOOL_REMOTE = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/dtm_to_ply_delaunay")
-DTM_TOOL = DTM_TOOL_LOCAL if DTM_TOOL_LOCAL.is_file() and os.access(DTM_TOOL_LOCAL, os.X_OK) else DTM_TOOL_REMOTE
+
+
+def _pick_dtm_tool():
+    for label, path in (("in-repo build/bin", DTM_TOOL_REPO),
+                        ("local /tmp copy", DTM_TOOL_LOCAL)):
+        if path.is_file() and os.access(path, os.X_OK):
+            print(f"[a3gt-batch] dtm_to_ply_delaunay: {label} -> {path}")
+            return path
+    print(f"[a3gt-batch] WARNING: no dtm_to_ply_delaunay in {DTM_TOOL_REPO} or "
+          f"{DTM_TOOL_LOCAL}; falling back to the OneDrive copy "
+          f"{DTM_TOOL_REMOTE}. Build the in-repo tool with "
+          f"'cmake --build build --target dtm_to_ply_delaunay -j' (needs GDAL).")
+    return DTM_TOOL_REMOTE
+
+
+DTM_TOOL = _pick_dtm_tool()
 PTM_BIN   = REPO / "build" / "bin" / "ptm_thermal_sim"
 MERGE_BIN = REPO / "build" / "bin" / "ptm_merge_chunks"
 CHUNK_RUN = REPO / "scripts" / "run_chunked_simulation.py"

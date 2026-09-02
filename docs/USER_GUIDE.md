@@ -406,13 +406,24 @@ shift of the whole series is invisible from inside it).
 
 ## Graphical User Interface
 
-PTM3D includes three PyQt6-based GUIs for configuring simulations and visualizing results:
+PTM3D ships one supported PyQt6 GUI, plus an optional dashboard shell that
+bundles additional modules:
 
-| GUI | Script | Purpose |
+| Entry point | Script | Purpose |
 |-----|--------|---------|
-| **PTM3D Main** | `gui/run_gui.py` | Thermal simulation configuration and 3D visualization |
-| **Exosphere** | `gui/exosphere_gui.py` | Exosphere sublimation/sputtering modeling |
-| **Viewshed** | `gui/viewshed_gui.py` | Line-of-sight visibility analysis |
+| **PTM3D Main** (supported) | `gui/run_gui.py` | Thermal simulation configuration, 3D visualization, results browsing |
+| **Dashboard** (optional) | `gui/run_dashboard.py` | Multi-module shell; adds the **DEM module** (GeoTIFF DTM → PLY mesh, ROI extraction) alongside the thermal app. Convenience wrapper, less tested than `run_gui.py`. |
+
+The standalone `exosphere_gui.py` and `viewshed_gui.py` scripts listed in
+earlier revisions of this guide **no longer exist**. Run the exosphere model
+through `build/bin/ptm_exosphere_main`; the viewshed capability is the
+`src/cpp/viewshed/` module, whose command-line front end is
+`build/bin/dark_horse_viewshed`.
+
+The DEM module needs one compiled binary (`dtm_to_ply_delaunay`) that
+requires GDAL to build — see
+[dem-to-mesh-workflow.md](dem-to-mesh-workflow.md) for the full walkthrough and
+[../INSTALL.md](../INSTALL.md) ("DEM / DTM tools") for the prerequisites.
 
 ### Quick Start
 

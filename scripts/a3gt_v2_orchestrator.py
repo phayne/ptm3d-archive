@@ -59,11 +59,34 @@ sys.path.insert(0, str(REPO / "scripts"))
 # Legacy single-DEM fallback (used only when the manifest is NOT catalog mode).
 DEFAULT_DEM = Path(
     "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/DEM/a3gt/mons-mouton/mm-sfs-dem.tif")
+# dtm_to_ply_delaunay is now built from this repository
+# (src/cpp/tools/dtm_to_ply_delaunay.cpp -> build/bin/). Prefer that copy: it
+# is on local disk, so it cannot hit OneDrive's on-demand fetch, and it is the
+# binary this checkout actually built. The /tmp and OneDrive paths are kept as
+# fallbacks so an in-flight campaign on a machine without a local build keeps
+# working. Which one was picked is PRINTED -- silently running a different
+# mesh generator than the one in the tree is how meshes and view factors drift
+# apart. See BUGS.md PTM-04 and docs/dem-to-mesh-workflow.md.
+DTM_TOOL_REPO = REPO / "build" / "bin" / "dtm_to_ply_delaunay"
 DTM_TOOL_LOCAL = Path("/tmp/dtm_to_ply_delaunay")
 DTM_TOOL_REMOTE = Path(
     "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/dtm_to_ply_delaunay")
-DTM_TOOL = (DTM_TOOL_LOCAL if DTM_TOOL_LOCAL.is_file()
-            and os.access(DTM_TOOL_LOCAL, os.X_OK) else DTM_TOOL_REMOTE)
+
+
+def _pick_dtm_tool():
+    for label, path in (("in-repo build/bin", DTM_TOOL_REPO),
+                        ("local /tmp copy", DTM_TOOL_LOCAL)):
+        if path.is_file() and os.access(path, os.X_OK):
+            print(f"[a3gt] dtm_to_ply_delaunay: {label} -> {path}")
+            return path
+    print(f"[a3gt] WARNING: no dtm_to_ply_delaunay in {DTM_TOOL_REPO} or "
+          f"{DTM_TOOL_LOCAL}; falling back to the OneDrive copy "
+          f"{DTM_TOOL_REMOTE}. Build the in-repo tool with "
+          f"'cmake --build build --target dtm_to_ply_delaunay -j' (needs GDAL).")
+    return DTM_TOOL_REMOTE
+
+
+DTM_TOOL = _pick_dtm_tool()
 # PTM_A3GT_MESH_DIR: point mesh/VRT lookup at a local, pre-verified copy
 # (e.g. ~/projects/a3gt/meshes/) instead of REPO/data/dem/a3gt_v2 -- kills the
 # OneDrive-eviction hazard for the one artifact class (multi-GB core+ring
