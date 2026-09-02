@@ -255,6 +255,72 @@ def file_md5(path):
     return h.hexdigest()
 
 
+def ply_face_count(path):
+    """`element face <n>` from a PLY header, or None if it cannot be read."""
+    import re as _re
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                m = _re.match(rb"element face (\d+)", line)
+                if m:
+                    return int(m.group(1))
+                if line.strip() == b"end_header":
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def read_face_stat_bin(path, expect_faces=None, expect_source=""):
+    """Read one `statistics/*.bin`: a uint32 face count, then that many float32.
+
+    PTM-460. This function existed here as a bare
+    ``np.fromfile(path, dtype=float32)``, which reads the 4-byte face-count
+    HEADER as if it were the first face's value and shifts every face by one
+    index -- PTM-06's bug class, recurring in a script written after PTM-06 was
+    fixed in `ptm_qa.py`. On the MP026 product it reported "2397891 faces" for a
+    2,397,890-face mesh, and every temperature it then reduced belonged to the
+    face before it. The consumer here takes a median over 2.4M faces, so the
+    delivered number was unharmed; the next consumer need not be.
+
+    Two independent checks, because the header alone cannot catch a truncated
+    or foreign file:
+
+    * **length**, which is the check the flux-cube reader learned the hard way
+      (a wrong record size does not raise -- it lands in a neighboring block and
+      returns plausible numbers). The file must be exactly ``4 + 4*n`` bytes.
+    * **identity**, against the face count this product says its core mesh has.
+      A statistics file from a different run is a silent wrong answer otherwise.
+
+    Raises ValueError on either. A packager that cannot verify its input should
+    refuse, not average it.
+    """
+    import os as _os
+
+    import numpy as _np
+    size = _os.path.getsize(path)
+    if size < 4:
+        raise ValueError("%s is %d bytes -- shorter than its 4-byte face-count "
+                         "header" % (path, size))
+    n = int(_np.fromfile(path, dtype="<u4", count=1)[0])
+    want = 4 + 4 * n
+    if size != want:
+        raise ValueError(
+            "%s: the header says %d faces, which needs %d bytes, but the file "
+            "is %d. Either it is truncated or it is not a statistics binary "
+            "(uint32 face count + float32 per face)." % (path, n, want, size))
+    if expect_faces is not None and n != expect_faces:
+        raise ValueError(
+            "%s holds %d faces but %s says this product's core mesh has %d. "
+            "This statistics file is from a different run or a different mesh."
+            % (path, n, expect_source or "the product", expect_faces))
+    body = _np.fromfile(path, dtype="<f4", offset=4)
+    if body.size != n:
+        raise ValueError("%s: read %d values for a declared %d faces"
+                         % (path, body.size, n))
+    return body
+
+
 def idx(d, cu, fa, co, st):
     return ((cu * d["n_faces"] + fa) * d["n_comp"] + co) * d["n_steps"] + st
 
@@ -618,14 +684,34 @@ def main():
         extra["engine_tree_state"] = a.engine_tree_state
     core_B = None
     if a.temperature_max:
+        # The face count to check the statistics file against, in order of
+        # authority: the core PLY the caller named, then the count the engine
+        # wrote into this product's own provenance JSON. Neither is required --
+        # the length check inside read_face_stat_bin always runs.
+        expect, src = None, ""
+        if a.core_mesh:
+            expect = ply_face_count(a.core_mesh)
+            src = "the core mesh %s" % a.core_mesh
+        if expect is None and isinstance(d.get("meta"), dict):
+            try:
+                expect = int(d["meta"]["n_faces_core"])
+                src = "the .fcb provenance JSON"
+            except (KeyError, TypeError, ValueError):
+                expect = None
         try:
             import numpy as _np
-            T = _np.fromfile(a.temperature_max, dtype=_np.float32)
+            T = read_face_stat_bin(a.temperature_max, expect, src)
+            n_all = T.size
             T = T[_np.isfinite(T) & (T > 0)]
             core_B = float(_np.median(a.emissivity * 5.670374419e-8 * T.astype(_np.float64) ** 4))
             print("core radiosity anchor: median eps*sigma*T_max^4 = %.2f W/m^2 "
-                  "(eps=%.2f, %d faces)" % (core_B, a.emissivity, T.size))
-        except Exception as e:
+                  "(eps=%.2f, %d of %d faces usable%s)"
+                  % (core_B, a.emissivity, T.size, n_all,
+                     "" if expect is None else ", face count checked against %s" % src))
+        except (OSError, ValueError, ImportError) as e:
+            # Narrower than the `except Exception` this replaced: a malformed
+            # or foreign statistics file, a missing one, or no NumPy. A defect
+            # in the arithmetic below is no longer swallowed as "could not read".
             print("  could not read --temperature-max (%s); ring bound will be omitted" % e)
     summarize(d)
     fails = qa(d) if a.qa else []

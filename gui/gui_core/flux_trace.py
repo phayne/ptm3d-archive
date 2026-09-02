@@ -25,9 +25,24 @@ Two places, so it is hard to lose:
 * ``~/ptm3d_fluxcube_trace.log`` -- appended to, one line per event;
 * standard error, which is the terminal the program was started from.
 
-It is on by default. It costs a string comparison per setting read and a line
-of text per click, and it only writes when the Flux cubes group is involved.
-Set ``PTM_GUI_TRACE=0`` in the environment to turn it off.
+It is OFF by default, and was on by default from 2026-08-31 to 2026-09-02
+while the checkbox was being chased. Set ``PTM_GUI_TRACE=1`` in the environment
+to turn it on::
+
+    PTM_GUI_TRACE=1 python3 gui/run_gui.py
+
+Off means OFF: with the variable unset, `enabled()` is false, nothing is
+written to the log or to standard error, and
+``body_cards_panel._build_flux_cube_group`` does not even CONNECT the two
+observer slots -- so ``switch.receivers(switch.toggled)`` is zero and the
+group costs nothing at all. That property is what
+``test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck`` reads, and it
+is now the DEFAULT-tested path rather than the exception.
+
+A value other than the accepted spellings is a WARNING, not a silent OFF: a
+user who writes ``PTM_GUI_TRACE=yes`` (which works) or ``PTM_GUI_TRACE=on``
+(which works) or ``PTM_GUI_TRACE=please`` (which does not) is told which
+happened, once, at import.
 """
 
 from __future__ import annotations
@@ -48,7 +63,29 @@ LOG_PATH = Path.home() / "ptm3d_fluxcube_trace.log"
 #: The setting this is all about.
 KEY = "flux_cubes.enabled"
 
-_ENABLED = os.environ.get("PTM_GUI_TRACE", "1") != "0"
+#: The spellings that turn the record on. Anything else is off, and anything
+#: else that is not plainly an "off" spelling says so rather than being
+#: quietly ignored -- a switch that does nothing and reports nothing is the
+#: defect this whole module was written to investigate.
+_ON = ("1", "true", "yes", "on")
+_OFF = ("", "0", "false", "no", "off")
+
+
+def _read_switch(raw):
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in _ON:
+        return True
+    if value in _OFF:
+        return False
+    print(f"{PREFIX} PTM_GUI_TRACE={raw!r} is not a value this understands; "
+          f"the record is OFF. Use one of {', '.join(_ON)} to turn it on.",
+          file=sys.stderr)
+    return False
+
+
+_ENABLED = _read_switch(os.environ.get("PTM_GUI_TRACE"))
 _started = False
 _handle = None
 

@@ -19,6 +19,8 @@ Thresholds are DERIVED FROM REAL FIXTURES, not invented — see `--selftest`.
 Subcommands
 -----------
   thermal   <run_dir>                 statistics/*.bin: coherence, inversions, ranges
+                                      (never-lit faces are judged against the
+                                       indirect flux they receive -- PTM-462)
   derived   --parent P --derived D    a derived product must differ from its parent
   signal    <fits|dir>                on-body field is non-zero; degeneracy metrics
   manifest  <out_dir> --binary B      record what produced an output directory
@@ -50,16 +52,45 @@ except ModuleNotFoundError:  # actionable instead of a bare traceback
     raise SystemExit(2)
 
 # --- thresholds, each traceable to a measurement on an archived fixture -------------
-# never-lit faces receive zero direct solar; their Tmin must be nearly uniform.
-# Measured on 623 Chimaera (18,304 faces):
+# never-lit faces receive zero direct solar; WITH NO INDIRECT FLUX their Tmin
+# must be nearly uniform. Measured on 623 Chimaera (18,304 faces, no radiation
+# coupling, no indirect-band statistics):
 #     broken binary 5bfbdbe -> std = 18.00 K      (scrambled shadow-face seeds)
 #     fixed  binary 79f091e -> std =  0.96 K
 # 3.0 K sits ~3x above the good run and ~6x below the broken one.
+#
+# PTM-462: this threshold is only meaningful on faces that receive NO indirect
+# flux. Applied to every never-lit face it fails valid radiation-coupled runs --
+# measured on the MP026 flux-cube run (2,397,890 faces, corrected VF v3): 10,707
+# never-lit faces, std 8.17 K, of which the 9 with identically zero indirect flux
+# have std 0.0020 K and the other 10,698 track their own indirect flux. Worse, it
+# fails in the WRONG DIRECTION: with an EMPTY view-factor matrix every never-lit
+# face sits at exactly T_geo, std 0.00 K, and this check PASSES. See
+# `_never_lit_checks`.
 COHERENCE_MAX_K = 3.0
 CMB_K = 2.7          # below this a temperature is not physical; treat as uncomputed
 TMAX_K = 500.0
 INVALID_FRAC_FAIL = 1e-3   # 1 invalid face in 18,304 is a warning, not a failure
 INVERSION_TOL_K = 0.5
+
+SIGMA = 5.670374419e-8     # Stefan-Boltzmann, W m-2 K-4
+#: Emissivity used to invert absorbed flux into an equilibrium temperature. The
+#: value the built-in bodies use. T_eq scales as eps^(-1/4), so the whole range
+#: 0.85-1.00 moves the bracket by under 3%; measured on MP026 the below-bracket
+#: count is 0 for every eps in that range and for every internal-flux choice
+#: from 0 to the lunar 0.018 W/m^2, i.e. the gate does not turn on this number.
+DEFAULT_EMISSIVITY = 0.95
+#: A never-lit face counts as UNFORCED when the absorbed indirect flux it
+#: receives is zero at every step of the statistics window. Exactly zero, not
+#: "small": these are the faces the coherence threshold above was calibrated on,
+#: and any nonzero forcing is exactly what the bracket check below handles.
+UNFORCED_FLUX_W = 0.0
+#: Fraction of forced never-lit faces allowed above the bracket before it is
+#: worth a warning. Above the high end is NOT energy-forbidden -- it is a face
+#: still cooling from a season when it was lit, the same lag that makes the
+#: inversion check below a WARN on a short window. Measured on MP026: 9 of
+#: 10,694, 0.08%. A shuffled copy of the same field gives 6.0%.
+LAG_FRAC_WARN = 0.01
 
 
 class Report:
@@ -141,6 +172,87 @@ def md5(path):
     return h.hexdigest()
 
 
+def indirect_absorbed(run_dir, which):
+    """Absorbed indirect flux per face for `which` in {min, avg, max}, or None.
+
+    ``indirect_solar`` and ``indirect_ir`` are the two radiosity bands, and the
+    engine stores them ABSORBED -- (1-A)*sum_j F_ij B^vis_j and eps*sum_j F_ij
+    B^ir_j -- not incident (ptm_thermal_sim.cpp:12429-12441). Their sum is
+    exactly the flux coupled into the surface boundary condition, which is what
+    makes the closed-form bracket below a statement about the same quantity the
+    solver used rather than a reconstruction of it.
+
+    None when either band is absent: radiation-off, gray-radiosity and
+    multi-GPU-pool runs omit them by design (ptm_thermal_sim.cpp:21754), and a
+    run that did not record them cannot have its faces attributed.
+    """
+    s = stat(run_dir, f"indirect_solar_{which}.bin")
+    i = stat(run_dir, f"indirect_ir_{which}.bin")
+    if s is None or i is None:
+        return None
+    if len(s) != len(i):
+        raise ValueError(f"{run_dir}: indirect_solar_{which}.bin has {len(s)} "
+                         f"faces but indirect_ir_{which}.bin has {len(i)}")
+    return s.astype(np.float64) + i.astype(np.float64)
+
+
+def radiation_declared(run_dir):
+    """True/False if the run's own config says radiation was on, else None.
+
+    A shallow read of the `radiation:` block -- the first `enabled:` under it --
+    rather than a YAML parse, because this tool has no YAML dependency and the
+    question is one boolean. None means "no config beside the output", which is
+    the case for the archived EMA fixtures; the caller says so rather than
+    assuming either answer.
+    """
+    for name in ("config_used.yaml", "config.yaml", "run_config.yaml"):
+        p = os.path.join(run_dir, name)
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r", errors="replace") as fh:
+                inside = False
+                for line in fh:
+                    if re.match(r"^radiation:\s*(#.*)?$", line):
+                        inside = True
+                        continue
+                    if inside:
+                        if re.match(r"^\S", line):      # next top-level key
+                            break
+                        m = re.match(r"\s+enabled:\s*(\w+)", line)
+                        if m:
+                            return m.group(1).lower() in ("true", "yes", "on", "1")
+        except OSError:
+            continue
+    return None
+
+
+def equilibrium_bracket(f_lo, f_hi, floor_k, emissivity):
+    """[T_eq(min forcing), T_eq(max forcing)] for a face with no direct sun.
+
+    At equilibrium the surface radiates what it absorbs plus what conducts up
+    from below::
+
+        eps*sigma*T^4 = F_absorbed + Q_b,    Q_b = eps*sigma*T_floor^4
+
+    so ``T_eq(F) = (T_floor^4 + F/(eps*sigma))^(1/4)``. The forcing varies over
+    the window, and the interval between its extremes is INVARIANT for the
+    surface: the solver drives T toward the instantaneous T_eq, so a face that
+    is inside cannot leave. Tmin therefore belongs inside the bracket.
+
+    The two ends are not equally strong, and the check treats them differently:
+
+    * BELOW the low end is energy-forbidden. A face cannot be colder than
+      equilibrium with the least forcing it ever receives.
+    * ABOVE the high end is thermal lag -- a face still cooling from a season
+      when it was lit, or from deeper in the column. Legitimate, and reported
+      as a count rather than a failure.
+    """
+    a = emissivity * SIGMA
+    base = float(floor_k) ** 4
+    return ((base + f_lo / a) ** 0.25, (base + f_hi / a) ** 0.25)
+
+
 def _fits_frames(path):
     if os.path.isdir(path):
         return sorted(glob.glob(os.path.join(path, "*.fits")))
@@ -159,6 +271,177 @@ def _read(fp, ext):
 
 
 # ------------------------------------------------------------------ thermal
+def _never_lit_checks(r, run, args, valid, tv, never):
+    """PTM-462. Judge never-lit faces against the forcing they actually get.
+
+    The original check was one line -- ``std(Tmin) <= 3 K`` over every face with
+    ``direct_solar_max == 0`` -- and it was right about the run it was calibrated
+    on and wrong about every radiation-coupled one. On the MP026 flux-cube run it
+    measured 8.17 K and failed a product that 57 other checks passed. The scatter
+    was real and it was PHYSICS: those faces are lit by neighboring terrain, they
+    have different neighbors, so they sit at different temperatures.
+
+    Raising the threshold would have been a clamp, and a clamp in the wrong
+    direction. With an EMPTY view-factor matrix every never-lit face sits at
+    exactly the geothermal floor, ``std = 0.00 K``, and the old check PASSES the
+    one failure it most needs to catch. So the fix is to ask a question the
+    forcing can answer:
+
+    * faces with NO indirect flux must still agree with each other -- the
+      original detector, on the population it was calibrated for
+      (Chimaera 623: broken 18.00 K, fixed 0.96 K; MP026's 9 unforced faces:
+      0.0020 K);
+    * faces WITH indirect flux must sit inside their own closed-form
+      equilibrium bracket, and may never sit below it.
+
+    Measured on MP026's 10,694 forced never-lit faces, and on scrambled copies
+    of the same field (the same seeds, so the comparison is like for like):
+
+        field                              inside    below the low end
+        REAL                               99.916%       0
+        shuffled among never-lit faces     89.166%     522
+        gaussian, std 18 K about the mean  73.345%   1,982
+        all at T_geo (an EMPTY VF)          7.238%   9,932
+
+    -- so the below-the-bracket count is the gate, it is zero on the real run,
+    and it catches the empty-VF case the old check waved through.
+    """
+    t_never = tv[never].astype(np.float64)
+    n_never = int(never.sum())
+    # `getattr`, like `strict_inversion` above: cmd_thermal is reachable from
+    # cmd_selftest through main(argv), and from any caller that builds its own
+    # namespace. A missing option is the documented default, not a crash.
+    emissivity = getattr(args, "emissivity", DEFAULT_EMISSIVITY)
+
+    # The forcing, if the run recorded it. `valid` selects the same faces the
+    # temperatures were selected with, so every array here is face-aligned.
+    try:
+        f_lo = indirect_absorbed(run, "min")
+        f_hi = indirect_absorbed(run, "max")
+    except ValueError as exc:
+        r.add("never-lit face coherence (std of Tmin)", "WARN",
+              measured=f"{float(t_never.std()):.2f} K",
+              note=f"the indirect-band statistics are inconsistent ({exc}), so "
+                   f"the never-lit faces could not be attributed to their "
+                   f"forcing; the scatter above is reported, not judged")
+        return
+    have_bands = f_lo is not None and f_hi is not None
+    if have_bands and (len(f_lo) != len(valid) or len(f_hi) != len(valid)):
+        have_bands = False
+        r.add("indirect-band statistics face count", "WARN",
+              measured=f"{len(f_lo)} vs {len(valid)} in temperature_min.bin",
+              note="the indirect-band files do not cover the same mesh, so they "
+                   "were not used")
+
+    if not have_bands:
+        declared = radiation_declared(run)
+        std = float(t_never.std())
+        if declared:
+            # The one case where the honest answer is "cannot tell". A run that
+            # coupled indirect flux and did not record the bands -- radoff is
+            # not this, but gray radiosity and the multi-GPU pool are -- has
+            # never-lit faces whose scatter is unattributable. Failing it is
+            # what PTM-462 was; passing it silently would be the same defect
+            # with the sign flipped.
+            r.add("never-lit face coherence (std of Tmin)", "WARN",
+                  measured=f"{std:.2f} K", threshold=f"<= {args.coherence_max_k} K",
+                  note="this run declares radiation coupling but wrote no "
+                       "indirect_solar/indirect_ir statistics, so the tight "
+                       "threshold cannot be applied and the scatter cannot be "
+                       "attributed. Re-run with band-separated indirect output "
+                       "to get a verdict.")
+            return
+        r.add("never-lit face coherence (std of Tmin)",
+              "PASS" if std <= args.coherence_max_k else "FAIL",
+              measured=f"{std:.2f} K", threshold=f"<= {args.coherence_max_k} K",
+              note="no indirect flux in this run, so every never-lit face is "
+                   "unforced and must agree with the others. High scatter means "
+                   "an initial-condition or forcing defect, not physics."
+                   + ("" if declared is False else
+                      " (No config beside the output; taken from the absence of "
+                      "any indirect-flux record.)"))
+        return
+
+    fl, fh = f_lo[valid][never], f_hi[valid][never]
+    # `_min` over a window cannot exceed `_max` over the same window. If it
+    # does, the two files are not a matched pair and the bracket they imply is
+    # inverted -- which would score faces as both below and above it. Say so
+    # and stop, rather than reporting a number computed from a contradiction.
+    n_inverted = int((fl > fh).sum())
+    if n_inverted:
+        r.add("indirect-band min/max are a matched pair", "FAIL",
+              measured=f"{n_inverted} never-lit faces have "
+                       f"indirect_min > indirect_max", threshold="0 faces",
+              note="the *_min and *_max statistics are not from the same "
+                   "window, so no equilibrium bracket can be formed from them")
+        return
+    unforced = fh <= UNFORCED_FLUX_W
+    forced = ~unforced
+
+    # -- 1. the unforced faces, on the threshold calibrated for them ---------
+    n_un = int(unforced.sum())
+    if n_un >= 8:
+        std = float(t_never[unforced].std())
+        r.add("unforced never-lit face coherence (std of Tmin)",
+              "PASS" if std <= args.coherence_max_k else "FAIL",
+              measured=f"{std:.2f} K over {n_un} faces",
+              threshold=f"<= {args.coherence_max_k} K",
+              note="faces that receive neither direct sun nor indirect flux have "
+                   "identical forcing and must therefore agree. Scatter here is "
+                   "an initial-condition defect (Chimaera 623: 18.00 K broken, "
+                   "0.96 K fixed).")
+    else:
+        r.add("unforced never-lit face coherence (std of Tmin)", "WARN",
+              measured=f"{n_un} faces",
+              note="fewer than 8 never-lit faces receive zero indirect flux, so "
+                   "the coherence threshold has too small a sample; the bracket "
+                   "check below carries this run")
+
+    # -- 2. the forced faces, against their own equilibrium ------------------
+    n_fo = int(forced.sum())
+    if n_fo == 0:
+        return
+    # The floor the bracket sits on: this run's OWN unforced faces, which is
+    # the closed-form zero-forcing solution measured rather than assumed. With
+    # none to measure, 0 K -- a weaker bound, never a false failure, and said.
+    if n_un:
+        floor_k = float(t_never[unforced].min())
+        floor_src = f"measured from this run's {n_un} unforced never-lit faces"
+    else:
+        floor_k = 0.0
+        floor_src = ("0 K: this run has no unforced never-lit face to measure "
+                     "the geothermal floor from, so the low end omits the "
+                     "internal heat flux and is a weaker bound")
+    lo, hi = equilibrium_bracket(fl[forced], fh[forced], floor_k, emissivity)
+    t_fo = t_never[forced]
+    below = t_fo < lo - INVERSION_TOL_K
+    above = t_fo > hi + INVERSION_TOL_K
+    n_below, n_above = int(below.sum()), int(above.sum())
+    worst = float((lo - t_fo)[below].max()) if n_below else 0.0
+    r.add("forced never-lit faces are not colder than their own equilibrium",
+          "PASS" if n_below == 0 else "FAIL",
+          measured=f"{n_below} of {n_fo} below by more than {INVERSION_TOL_K} K"
+                   + (f" (worst {worst:.2f} K)" if n_below else ""),
+          threshold="0 faces",
+          note=f"T_eq(F) = (T_floor^4 + F/(eps*sigma))^(1/4) with eps="
+               f"{emissivity} and T_floor={floor_k:.4f} K, {floor_src}. F is "
+               f"the ABSORBED indirect flux the solver itself coupled in. A face "
+               f"colder than equilibrium with the LEAST forcing it ever receives "
+               f"is energy-forbidden. An empty view-factor matrix puts every one "
+               f"of these faces below the bracket, which is the failure the old "
+               f"std-only check passed.")
+    frac_above = n_above / float(n_fo)
+    r.add("forced never-lit faces sit inside the equilibrium bracket",
+          "PASS" if frac_above <= LAG_FRAC_WARN else "WARN",
+          measured=f"{100.0 * (n_fo - n_below - n_above) / n_fo:.3f}% inside, "
+                   f"{n_above} above ({100.0 * frac_above:.2f}%)",
+          threshold=f"<= {100.0 * LAG_FRAC_WARN:.0f}% above",
+          note="above the high end is thermal lag, not an energy violation: a "
+               "face still cooling from a season when it was lit, or from a "
+               "column warmer than the surface. Reported so a large lag "
+               "population is visible; it is not a failure.")
+
+
 def cmd_thermal(args):
     run = args.run_dir
     r = Report(run, "thermal-statistics")
@@ -194,14 +477,7 @@ def cmd_thermal(args):
     if never.sum() < 8:
         r.add("never-lit coherence", "WARN", note=f"only {int(never.sum())} never-lit faces; not evaluated")
     else:
-        std = float(tv[never].std())
-        # THE regression detector: a scrambled shadow-face initial condition freezes
-        # never-lit faces at unrelated temperatures. Broken=18.00 K, fixed=0.96 K.
-        r.add("never-lit face coherence (std of Tmin)",
-              "PASS" if std <= args.coherence_max_k else "FAIL",
-              measured=f"{std:.2f} K", threshold=f"<= {args.coherence_max_k} K",
-              note="high scatter means faces that never see the Sun disagree -- "
-                   "an initial-condition or forcing defect, not physics")
+        _never_lit_checks(r, run, args, v, tv, never)
 
         floor = float(tv[never].min())
         viol = int((tv[lit] < floor - INVERSION_TOL_K).sum())
@@ -971,6 +1247,11 @@ def main(argv=None):
 
     t = sub.add_parser("thermal"); t.add_argument("run_dir")
     t.add_argument("--coherence-max-k", type=float, default=COHERENCE_MAX_K)
+    t.add_argument("--emissivity", type=float, default=DEFAULT_EMISSIVITY,
+                   help="emissivity used to turn absorbed indirect flux into an "
+                        "equilibrium temperature for the never-lit bracket "
+                        f"(default {DEFAULT_EMISSIVITY}; the bracket verdict is "
+                        "insensitive to it over 0.85-1.00)")
     t.add_argument("--strict-inversion", action="store_true",
                    help="treat a forbidden inversion as FAIL (only valid when the "
                         "output window spans >= 1 full rotation)")

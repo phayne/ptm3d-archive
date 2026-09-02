@@ -54,7 +54,8 @@ from PyQt6.QtGui import QAction, QIcon, QFont, QKeySequence, QPalette, QColor
 # Local modules
 from gui_core.config_manager import ConfigManager
 from gui_core.styles import ModernStyle
-from gui_core.simulation_runner import SimulationRunner, SimulationThread, CameraSimThread
+from gui_core.simulation_runner import (SimulationRunner, SimulationThread,
+                                        CameraSimThread, ENGINE_LOG_NAME)
 from gui_core.preflight import (run_preflight, confirm_preflight,
                                 engine_validate_config)
 
@@ -891,9 +892,15 @@ class PTM3DMainWindow(QMainWindow):
         # Create simulation thread (cwd is pinned to the project root and the
         # engine env flags are applied inside SimulationThread)
         try:
+            # LAUNCHER 1 OF 2. The engine's stdout and stderr are teed beside
+            # the run's own outputs; `output_dir` here is the one already
+            # resolved above for the run YAML, so the log lands with the
+            # configuration that produced it. The dashboard's thermal module
+            # is launcher 2 and does the same.
             self.simulation_thread = SimulationThread(
                 run_config_path,
-                config_dict=config_dict
+                config_dict=config_dict,
+                log_path=str(output_dir / ENGINE_LOG_NAME)
             )
             self.simulation_thread.output_ready.connect(self.on_simulation_output)
             self.simulation_thread.warning_ready.connect(self.on_simulation_warning)

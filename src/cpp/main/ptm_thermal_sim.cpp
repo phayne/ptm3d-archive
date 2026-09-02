@@ -21986,6 +21986,28 @@ int main(int argc, char** argv) {
         // identity at all; a product that cannot be traced to the code that made
         // it is not a deliverable.
         {
+            // PTM-461: the mesh-identity hash needs ROUND-TRIP precision.
+            // A bare `ostream << double` uses 6 significant digits, so a
+            // geomhash of 28733826.165896364 was recorded as 2.87338e+07 and
+            // read back as 28733800.0, and the packager copies whatever is
+            // here into the delivered HDF5 verbatim.
+            //
+            // PROVENANCE ONLY -- and the scale is worth being exact about,
+            // because it is not what it looks like. The loss is 26.17 in hash
+            // units, 9.1e-7 relative, which is INSIDE the pass's own 1e-3
+            // relative match tolerance (flux_cube_pass.cpp:222). No gate is
+            // fooled: that gate compares the .fcg binary header's double
+            // against this run's double and never reads this string, and
+            // nothing else in the tree parses `geomhash_core` out of the JSON.
+            // What is lost is identification -- the recorded hash is no longer
+            // the hash, so it cannot be matched against the authoritative
+            // full-precision constants the crew keeps for these meshes (e.g.
+            // gui/gui_core/curated_sites.py: 28733826.165896364 for A03MP026).
+            // 17 significant digits is the IEEE-754 double round-trip width.
+            // Formatted in its own stream so the surrounding integer and
+            // string fields keep their default formatting.
+            std::ostringstream gh_s;
+            gh_s << std::setprecision(17) << fcin.geomhash_core;
             std::ostringstream pj;
             pj << "{\"engine_git_sha\":\"" << PTM_BUILD_GIT_SHA << "\""
                << ",\"engine_build_type\":\"" << PTM_BUILD_TYPE << "\""
@@ -21993,7 +22015,7 @@ int main(int argc, char** argv) {
                << ",\"mesh_core\":\"" << sim_config.mesh.import_file << "\""
                << ",\"mesh_ring\":\"" << sim_config.mesh.occluder_file << "\""
                << ",\"n_faces_core\":" << num_faces
-               << ",\"geomhash_core\":" << fcin.geomhash_core
+               << ",\"geomhash_core\":" << gh_s.str()
                << ",\"radiation_use_gpu\":"
                << (sim_config.radiation.use_gpu ? "true" : "false")
                << ",\"vf_replace\":\""
