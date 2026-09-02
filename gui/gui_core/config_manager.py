@@ -764,6 +764,21 @@ class ConfigManager:
                 current[k] = {}
             current = current[k]
 
+        # Record changes to the flux-cube switch, with the value that was
+        # there before, so the log shows the order the click's two effects
+        # happened in. One string comparison; see gui_core/flux_trace.py.
+        if key == "flux_cubes.enabled":
+            # Guarded: a diagnostic must never be able to break the settings
+            # it is watching. If the module cannot be imported, nothing is
+            # recorded and the program carries on.
+            try:
+                from gui_core import flux_trace
+            except Exception:                                # noqa: BLE001
+                flux_trace = None
+            if flux_trace is not None:
+                flux_trace.note_with_caller(
+                    "setting-written", key=key,
+                    was=current.get(keys[-1]), now=value)
         current[keys[-1]] = value
         if key == "simulation.body":
             # Somebody chose this: a control, a preset, or a card's mirror of
@@ -778,9 +793,23 @@ class ConfigManager:
         try:
             for k in keys:
                 current = current[k]
-            return current
+            value = current
         except (KeyError, TypeError):
-            return default
+            value = default
+        # Record reads of the flux-cube switch, with the function that asked.
+        # This is what shows a decision being made from a value that has not
+        # been written yet. One string comparison; see flux_trace.py.
+        if key == "flux_cubes.enabled":
+            # Guarded: a diagnostic must never be able to break the settings
+            # it is watching. If the module cannot be imported, nothing is
+            # recorded and the program carries on.
+            try:
+                from gui_core import flux_trace
+            except Exception:                                # noqa: BLE001
+                flux_trace = None
+            if flux_trace is not None:
+                flux_trace.note_with_caller("setting-read", key=key, got=value)
+        return value
 
     def reset_to_default(self, path):
         """Reset one section or one key to its default, reporting what moved.
