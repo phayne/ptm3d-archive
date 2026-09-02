@@ -1983,7 +1983,22 @@ class BodyCard(BaseConfigTab):
         # group is described from the live configuration, and a control that
         # changes an answer and does not re-ask for it leaves the previous
         # answer on screen.
-        for key, signal in (("flux_cubes.enabled", "toggled"),
+        # ⛔ `stateChanged`, NOT `toggled`, FOR THE ENABLE SWITCH -- and that
+        # is the whole ordering argument, not a style choice.
+        #
+        # `refresh_flux_cubes` renders `flux_cubes.enabled` OUT of the
+        # configuration, and the configuration is written by
+        # `add_bool_field`'s slot on `stateChanged`. Listening on `toggled`
+        # made "does the write happen first?" a question about the order Qt
+        # emits TWO DIFFERENT SIGNALS, which is an implementation detail of
+        # `QCheckBox::nextCheckState` and guaranteed by nothing. Listening on
+        # the SAME signal, connected after, is a documented Qt guarantee:
+        # slots of one signal run in connection order. Measured on a bare
+        # `QCheckBox` here: `stateChanged` then `toggled` -- so round 2 was
+        # right by luck, and a build where those flipped would render every
+        # click one behind, which is exactly "the options appear after
+        # checking and then unchecking" (Paul, 2026-09-01).
+        for key, signal in (("flux_cubes.enabled", "stateChanged"),
                             ("flux_cubes.mode", "currentTextChanged"),
                             ("flux_cubes.cache_file", "textChanged"),
                             ("flux_cubes.spacing_m", "valueChanged"),
@@ -1997,14 +2012,17 @@ class BodyCard(BaseConfigTab):
                 lambda _v: self.refresh_flux_cubes())
 
         # ⛔ AND THE REVEAL HAS TO REACH THE SCREEN. Ticking the box adds
-        # ~305 px of controls BELOW the box; on this card that lands outside
-        # the scroll viewport and the window does not move. Connected AFTER
-        # `refresh_flux_cubes` above, deliberately: Qt delivers in connection
-        # order, so the group has already been given its final size when this
-        # runs and `ensureWidgetVisible` scrolls to the right place rather
-        # than to where the group used to end. See `scroll_into_view`.
-        self.widgets["flux_cubes.enabled"].toggled.connect(
-            self._reveal_flux_cubes)
+        # ~300 px of controls BELOW the box; on this card that lands outside
+        # the scroll viewport and the window does not move.
+        #
+        # On `stateChanged` as well, and connected THIRD, so the whole chain
+        # of one click -- write the configuration, re-describe the group,
+        # scroll it into view -- is three slots of ONE signal in connection
+        # order. Nothing here depends on how Qt orders `toggled` against
+        # `stateChanged`. `stateChanged` carries an int, so the reveal is
+        # given a bool.
+        self.widgets["flux_cubes.enabled"].stateChanged.connect(
+            lambda state: self._reveal_flux_cubes(bool(state)))
         return group
 
     def _reveal_flux_cubes(self, on):
@@ -2017,20 +2035,24 @@ class BodyCard(BaseConfigTab):
         """
         if not on or self._loading:
             return
-        # ⛔ NEXT EVENT-LOOP TURN, NOT NOW. `refresh_flux_cubes` has just
-        # called `flux_body.setVisible(True)`, and Qt does not re-lay-out
-        # inside the signal: at this instant `flux_group.height()` is still
-        # the COLLAPSED 116 px, so a scroll computed here targets the bottom
-        # the group had before it grew and lands ~300 px short. Measured: the
-        # immediate version left the grid spacing and radius outside the
-        # viewport on the curated card, which is the reported symptom with a
-        # smaller number. `singleShot(0)` runs after the layout pass, so the
-        # geometry it reads is the geometry the user is looking at.
+        # ⛔ IMMEDIATELY, AND AGAIN AFTER THE LAYOUT -- and the FIRST one has
+        # to be correct on its own.
+        #
+        # Round 2 deferred this with `singleShot(0)` because `height()` is
+        # still the collapsed value inside the signal. That made the scroll
+        # depend on whether Qt's layout pass beats a zero timer, which is an
+        # event-loop race: a harness that pumps `processEvents` wins it every
+        # time and a real loop need not. `scroll_into_view` now reads
+        # `max(height, sizeHint)`, so the immediate call is already right and
+        # the deferred one is an idempotent second opinion -- it returns early
+        # when the group is whole on screen, which after the first call it is.
+        # Belt and braces, with the belt doing the work.
         #
         # The WHOLE group, not just `flux_body`: the note above the placement
         # says whether this run can produce cubes at all, and a reveal that
         # scrolls the refusal off the top answers one question by hiding
         # the other.
+        self.scroll_into_view(getattr(self, "flux_group", None))
         QTimer.singleShot(
             0, lambda: self.scroll_into_view(getattr(self, "flux_group", None)))
 
@@ -2053,8 +2075,7 @@ class BodyCard(BaseConfigTab):
             return
         config = self.config_manager.get_config()
         policy = fc.engine_support(config)
-        enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
-                                                     False))
+        enabled = self._flux_enabled()
         # ⛔ THE SWITCH IS NEVER DISABLED, and that is the fix for Paul's
         # 2026-08-31 report, not a style preference. `setEnabled(policy.allowed)`
         # made a real click a SILENT no-op: on a freshly opened Moon
@@ -2136,6 +2157,29 @@ class BodyCard(BaseConfigTab):
         self._refresh_flux_cache()
         self._refresh_flux_estimate()
 
+    def _flux_enabled(self):
+        """⛔ ONE SOURCE OF TRUTH: THE CONFIGURATION, read in ONE place.
+
+        The configuration is what gets saved and what the engine runs, and
+        several production paths change it without touching the switch (a
+        preset, a route default, `reset_to_defaults`), so the card has to
+        render the configuration or it would ignore them.
+
+        WHAT MAKES THAT SAFE IS THE SIGNAL THIS GROUP LISTENS ON, not this
+        function. The configuration write and the re-describe are two slots of
+        the SAME click. `add_bool_field` puts the write on `stateChanged`;
+        this group therefore also listens on `stateChanged`, connected
+        afterwards, because Qt delivers slots of ONE signal in connection
+        order -- a documented guarantee. Listening on `toggled` instead made
+        it a CROSS-signal ordering question, which is an implementation detail
+        of `QCheckBox::nextCheckState` and no guarantee at all: measured on
+        this build a bare `QCheckBox` emits `stateChanged` then `toggled`, so
+        round 2 happened to be right, and a build where that flipped would
+        render every click one behind -- "the options appear after checking
+        and then unchecking". See `flux_cube_group`.
+        """
+        return bool(self.config_manager.get_value("flux_cubes.enabled", False))
+
     def _apply_flux_group_visibility(self):
         """Show or hide the whole group. Cards that offer it on one mode only
         override this; a card that offers it always needs nothing here."""
@@ -2215,7 +2259,23 @@ class BodyCard(BaseConfigTab):
         bar = scroll.verticalScrollBar()
         view_h = scroll.viewport().height()
         top = widget.mapTo(content, QPoint(0, 0)).y()
-        height = widget.height()
+        # ⛔ NOT `height()` ALONE. `height()` is the REALIZED geometry, and a
+        # reveal runs before Qt has re-laid-out: measured in the real window
+        # at the instant `_reveal_flux_cubes` fires, the flux group reports
+        # `height() == 305` (still collapsed) while `sizeHint() == 618` (what
+        # it is about to become). Scrolling to `top + 305 - view_h` is 313 px
+        # short, which puts every control the click just revealed below the
+        # fold -- and the SECOND time round the group is already laid out, so
+        # it works. Check, nothing; uncheck; check, and there they are. That is
+        # Paul's 2026-09-01 report, and `QTimer.singleShot(0)` only hides it:
+        # whether the layout pass runs before a zero timer is an event-loop
+        # race, not a guarantee, and it comes out differently under a test
+        # harness that pumps `processEvents` than under a real loop.
+        #
+        # The larger of the two is right in both directions: before layout the
+        # size hint is the answer, after layout they agree, and neither can
+        # under-scroll.
+        height = max(widget.height(), widget.sizeHint().height())
         current = bar.value()
         if height >= view_h:
             # Taller than the window: show as much of the END as fits, which
@@ -2920,8 +2980,7 @@ class MoonCard(BodyCard):
         callers use this one rule.
         """
         local = self._mode == "local"
-        enabled = bool(self.config_manager.get_value("flux_cubes.enabled",
-                                                     False))
+        enabled = self._flux_enabled()      # the switch, not the configuration
         self.flux_group.setVisible(True)
         if not local and enabled:
             logger.warning(
