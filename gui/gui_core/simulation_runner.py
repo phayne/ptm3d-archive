@@ -23,11 +23,25 @@ ensure_ptm_importable()
 from ptm import run as ptm_run                        # noqa: E402
 from ptm.run import EngineProcess, build_command      # noqa: E402
 
-from gui_core.preflight import build_engine_env, find_project_root  # noqa: E402
+from gui_core.preflight import (build_engine_env, find_project_root,  # noqa: E402
+                                resolve_path)
+
+#: The engine's stdout and stderr, teed into the run's own output directory.
+#: One name, so a consumer can find it without being told where it is.
+ENGINE_LOG_NAME = "engine.log"
 
 
 class SimulationThread(QThread):
-    """Thread for running PTM simulations without blocking GUI"""
+    """Thread for running PTM simulations without blocking GUI
+
+    Everything the engine writes is teed to ``<output directory>/engine.log``
+    as well as to the console. Until 2026-09-02 a GUI-launched run left NO
+    engine output anywhere on disk: verifying the MP026 flux-cube run meant
+    reconstructing which view-factor matrix had been loaded from the product's
+    own header, because the engine's ``ROUTE = ...`` banner and its
+    coupling-convergence report existed only in a widget that the next launch
+    clears. The console display is unchanged; this only adds the file.
+    """
 
     output_ready = pyqtSignal(str)    # info  (white)
     warning_ready = pyqtSignal(str)   # warn  (yellow)
@@ -44,14 +58,40 @@ class SimulationThread(QThread):
     WATCHDOG_INTERVAL_S = EngineProcess.WATCHDOG_INTERVAL_S
     STALL_CPU_DELTA_S = EngineProcess.STALL_CPU_DELTA_S
 
-    def __init__(self, config_file, working_dir=None, config_dict=None):
+    def __init__(self, config_file, working_dir=None, config_dict=None,
+                 log_path=None):
         super().__init__()
         self.config_file = config_file
         self.working_dir = working_dir
         self.config_dict = config_dict  # Full config for engine env + CLI options
+        # Where the engine's own output is kept. A launcher that already knows
+        # the output directory passes it; otherwise it is derived below from
+        # the same config key, so a third launcher gets a log without being
+        # changed. There are two launchers today (the main window and the
+        # dashboard's thermal module) and both have been wrong about this once.
+        self.log_path = log_path
         self.process = None             # the child Popen, once started
         self._engine = None             # ptm.run.EngineProcess
         self._stop_requested = False
+
+    def _resolve_log_path(self):
+        """``<output directory>/engine.log``, or None with a reason.
+
+        The reason is returned rather than swallowed: a run with no record has
+        to say so at the moment it starts, not when somebody later goes looking
+        for a log that was never written.
+        """
+        if self.log_path:
+            return str(self.log_path), ""
+        directory = ((self.config_dict or {}).get("output") or {}).get("directory")
+        if not directory:
+            return None, ("no output.directory in this configuration, so the "
+                          "engine's output cannot be filed anywhere")
+        try:
+            root = Path(self.working_dir) if self.working_dir else Path.cwd()
+            return str(resolve_path(directory, root) / ENGINE_LOG_NAME), ""
+        except (TypeError, ValueError, OSError) as exc:
+            return None, f"output.directory {directory!r} did not resolve ({exc})"
 
     def run(self):
         """Execute the simulation and emit output"""
@@ -91,10 +131,18 @@ class SimulationThread(QThread):
             for msg in ptm_run.long_run_advisory(self.config_dict or {}):
                 self.warning_ready.emit(msg)
 
+            log_path, why_not = self._resolve_log_path()
+            if log_path is None:
+                self.warning_ready.emit(
+                    f"WARNING: this run will leave no engine.log -- {why_not}. "
+                    f"The console is then the only record, and it is cleared "
+                    f"by the next launch.")
+
             self._engine = EngineProcess(
                 command,
                 working_dir=self.working_dir,
                 env=env,
+                log_path=log_path,
                 on_output=self.output_ready.emit,
                 on_warning=self.warning_ready.emit,
                 on_error=self.error_ready.emit,

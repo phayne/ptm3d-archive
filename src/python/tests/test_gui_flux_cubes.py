@@ -2723,12 +2723,17 @@ def test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck():
         f"only {switch.receivers(switch.stateChanged)} slots on stateChanged: "
         f"the configuration write, the re-describe and the reveal all belong "
         f"on the signal that carries the write")
-    # `toggled` may carry exactly ONE listener, the record-keeper in
-    # `gui_core.flux_trace`, which only writes a line to a log and shows the
-    # order the two signals arrive in. Anything else on it would be rendering
-    # the group from a signal ordered against the write only by luck.
+    # `toggled` carries NOTHING on the ordinary path. The record-keeper in
+    # `gui_core.flux_trace` is the one thing allowed on it, and since
+    # 2026-09-02 it is off unless `PTM_GUI_TRACE=1`, so the number this arm
+    # expects by default is ZERO. Anything else on `toggled` would be
+    # rendering the group from a signal ordered against the write only by luck.
     from gui_core import flux_trace
     allowed_on_toggled = 1 if flux_trace.enabled() else 0
+    if "PTM_GUI_TRACE" not in os.environ:
+        assert allowed_on_toggled == 0, (
+            "with PTM_GUI_TRACE unset the flux-cube trace must be OFF; it "
+            "reports enabled, so the default was flipped back")
     assert switch.receivers(switch.toggled) == allowed_on_toggled, (
         f"{switch.receivers(switch.toggled)} listeners on `toggled` and only "
         f"{allowed_on_toggled} is accounted for; something renders this group "
@@ -2744,6 +2749,105 @@ def test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck():
             == switch.isChecked(), "the configuration is one click behind"
         assert card.flux_body.isVisibleTo(card) == switch.isChecked(), (
             "the group is one click behind the switch")
+
+
+# ==========================================================================
+# 14. The trace switch: off by default, and off means nothing is connected
+# ==========================================================================
+
+def _reload_trace(value):
+    """Re-import `gui_core.flux_trace` with PTM_GUI_TRACE set to `value`.
+
+    The module reads the variable ONCE, at import, which is what makes it
+    cheap; the price is that the only way to measure the other setting is to
+    import it again. `body_cards_panel` does `from gui_core import flux_trace`
+    inside each function, so it picks the reloaded module up on the next call.
+    """
+    import importlib
+
+    from gui_core import flux_trace
+    if value is None:
+        os.environ.pop("PTM_GUI_TRACE", None)
+    else:
+        os.environ["PTM_GUI_TRACE"] = value
+    return importlib.reload(flux_trace)
+
+
+def test_the_trace_switch_is_off_unless_it_is_asked_for():
+    """OFF is the default, and an unreadable value SAYS so.
+
+    The record was on by default from 2026-08-31, while the checkbox was being
+    chased; it costs a line of standard error per click and a file in the home
+    directory, and it is diagnostic equipment, not a feature. Flipped
+    2026-09-02.
+    """
+    import contextlib
+    import io
+
+    saved = os.environ.get("PTM_GUI_TRACE")
+    try:
+        assert _reload_trace(None).enabled() is False, (
+            "with PTM_GUI_TRACE unset the record must be OFF")
+        for on in ("1", "true", "YES", " on "):
+            assert _reload_trace(on).enabled() is True, f"{on!r} must turn it on"
+        for off in ("0", "false", "no", "OFF", ""):
+            assert _reload_trace(off).enabled() is False, f"{off!r} must leave it off"
+        # ⛔ The one thing it must not do is ignore a value in silence.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            m = _reload_trace("please")
+        assert m.enabled() is False, "an unrecognized value must not turn it on"
+        assert "PTM_GUI_TRACE" in err.getvalue() and "OFF" in err.getvalue(), (
+            f"an unrecognized PTM_GUI_TRACE was ignored without a word: "
+            f"{err.getvalue()!r}")
+    finally:
+        _reload_trace(saved)
+
+
+def test_with_the_trace_off_not_even_the_observers_are_connected():
+    """THE PROPERTY, on the DEFAULT path.
+
+    "Off" must mean the two observer slots are never connected -- not that
+    they are connected and return early. It is what keeps
+    `receivers(toggled) == 0` true for
+    `test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck`, and with the
+    default flipped that arm now exercises this state rather than the other
+    one. Both settings are built here so the arm cannot pass by the group
+    never being built at all.
+    """
+    _panel()                       # Qt up, QSettings redirected to scratch
+    from gui_core.config_manager import ConfigManager
+    from gui_panels.config_panel import ConfigurationPanel
+
+    def switch_for(value):
+        _reload_trace(value)
+        manager = ConfigManager()
+        panel = ConfigurationPanel(manager)
+        manager.reset_to_defaults()
+        card = panel.tabs["card_moon"]
+        manager.set_value("mesh.import_file", str(CRATER))
+        manager.set_value("radiation.enabled", True)
+        card.activate("local", "time_series")
+        # the panel is returned too, or Qt collects it under the switch
+        return panel, card.widgets["flux_cubes.enabled"]
+
+    saved = os.environ.get("PTM_GUI_TRACE")
+    try:
+        _off_panel, off_switch = switch_for(None)
+        n_off = off_switch.receivers(off_switch.toggled)
+        _on_panel, on_switch = switch_for("1")
+        n_on = on_switch.receivers(on_switch.toggled)
+    finally:
+        _reload_trace(saved)
+
+    assert n_off == 0, (
+        f"with the trace off the switch still carries {n_off} listener(s) on "
+        f"`toggled`; 'off' must mean the observer is never connected, not "
+        f"that it is connected and returns early")
+    assert n_on == 1, (
+        f"with PTM_GUI_TRACE=1 the switch carries {n_on} listeners on "
+        f"`toggled`, not 1 -- so this arm's OFF measurement above proves "
+        f"nothing about the trace")
 
 
 TESTS = [
@@ -2830,6 +2934,10 @@ TESTS = [
     test_the_curated_card_agrees_with_the_switch_after_every_click,
     test_the_reveal_does_not_depend_on_winning_a_layout_race,
     test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck,
+
+    # 14. the trace switch's default
+    test_the_trace_switch_is_off_unless_it_is_asked_for,
+    test_with_the_trace_off_not_even_the_observers_are_connected,
 ]
 
 

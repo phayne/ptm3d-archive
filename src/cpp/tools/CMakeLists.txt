@@ -72,25 +72,52 @@ if(GDAL_FOUND)
             set(GDAL_LIBRARIES "${GDAL_LIBRARY}")
             message(STATUS "GDAL config package: using GDAL_LIBRARY = ${GDAL_LIBRARIES}")
         elseif(TARGET GDAL::GDAL)
-            set(GDAL_LIBRARIES GDAL::GDAL)
-            message(STATUS "GDAL config package: using imported target GDAL::GDAL")
+            # ASK THE TARGET WHERE IT IS. Taking the literal string
+            # "GDAL::GDAL" here sent the resolution below off to `find_library`,
+            # which searched the conda hints first and came back with a
+            # DIFFERENT GDAL installation from the one find_package had just
+            # located -- conda's 3.5 library against Homebrew's 3.12 headers.
+            # The imported target knows its own file.
+            get_target_property(_GDAL_IMP GDAL::GDAL IMPORTED_LOCATION)
+            if(NOT _GDAL_IMP)
+                foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL DEBUG NOCONFIG)
+                    get_target_property(_GDAL_IMP GDAL::GDAL
+                                        IMPORTED_LOCATION_${_cfg})
+                    if(_GDAL_IMP)
+                        break()
+                    endif()
+                endforeach()
+            endif()
+            if(_GDAL_IMP AND EXISTS "${_GDAL_IMP}")
+                set(GDAL_LIBRARIES "${_GDAL_IMP}")
+                message(STATUS "GDAL config package: GDAL::GDAL resolves to "
+                               "${GDAL_LIBRARIES}")
+            else()
+                set(GDAL_LIBRARIES GDAL::GDAL)
+                message(STATUS "GDAL config package: using imported target GDAL::GDAL")
+            endif()
         endif()
     endif()
 
-    # Normalize include dir: prefer Conda include when library is in Conda
-    if(NOT GDAL_INCLUDE_DIR AND DEFINED GDAL_INCLUDE_DIRS)
-        set(GDAL_INCLUDE_DIR "${GDAL_INCLUDE_DIRS}")
-    endif()
-
-    if(CONDA_PREFIX_DIR AND GDAL_LIBRARIES AND GDAL_LIBRARIES MATCHES "${CONDA_PREFIX_DIR}")
-        set(GDAL_INCLUDE_DIR "${CONDA_PREFIX_DIR}/include" CACHE PATH "GDAL include dir" FORCE)
-        message(STATUS "GDAL library in conda env; forcing GDAL_INCLUDE_DIR = ${GDAL_INCLUDE_DIR}")
-    elseif(CONDA_ENV_PATH AND GDAL_LIBRARIES AND GDAL_LIBRARIES MATCHES "${CONDA_ENV_PATH}")
-        set(GDAL_INCLUDE_DIR "${CONDA_ENV_PATH}/include" CACHE PATH "GDAL include dir" FORCE)
-        message(STATUS "GDAL library in europa_viz env; forcing GDAL_INCLUDE_DIR = ${GDAL_INCLUDE_DIR}")
-    endif()
-
-    # If GDAL_LIBRARIES is just the name, resolve to a full path within hints
+    # RESOLVE THE LIBRARY TO A REAL PATH FIRST. This block used to run AFTER
+    # the include-dir normalization below, and the ordering was the whole bug:
+    # on a machine with both Homebrew and conda GDAL, `find_package` returns
+    # the imported target `GDAL::GDAL` with GDAL_LIBRARY empty, so the branch
+    # above sets GDAL_LIBRARIES to the literal string "GDAL::GDAL". The
+    # include-dir rules then asked "does GDAL_LIBRARIES look like a conda
+    # path?" -- of a string that is not a path at all -- and did nothing. Only
+    # afterwards did this find_library replace it with CONDA'S libgdal, by
+    # which point the include dir was settled (in fact EMPTY). The tools then
+    # compiled against Homebrew's headers, which are on the default search
+    # path, and linked conda's older library:
+    #
+    #   Undefined symbols for architecture x86_64:
+    #     "GDALDataset::GetGeoTransform(double*) const"
+    #
+    # Measured 2026-09-02 on a fresh configure of origin/main ab7f2f9 in a
+    # shell with CONDA_PREFIX=.../envs/europa_viz. It fails the WHOLE default
+    # target build, which is what `./rebuild.sh` and `cmake --build build -j`
+    # both do.
     if(GDAL_LIBRARIES STREQUAL "gdal" OR GDAL_LIBRARIES STREQUAL "GDAL::GDAL")
         find_library(GDAL_LIBRARY_FILE
             NAMES gdal
@@ -102,6 +129,30 @@ if(GDAL_FOUND)
             message(STATUS "Resolved GDAL library: ${GDAL_LIBRARIES}")
         endif()
     endif()
+
+    # Normalize include dir, from the library that was actually resolved.
+    if(NOT GDAL_INCLUDE_DIR AND DEFINED GDAL_INCLUDE_DIRS)
+        set(GDAL_INCLUDE_DIR "${GDAL_INCLUDE_DIRS}")
+    endif()
+
+    if(CONDA_PREFIX_DIR AND GDAL_LIBRARIES AND GDAL_LIBRARIES MATCHES "${CONDA_PREFIX_DIR}")
+        set(GDAL_INCLUDE_DIR "${CONDA_PREFIX_DIR}/include" CACHE PATH "GDAL include dir" FORCE)
+        message(STATUS "GDAL library in conda env; forcing GDAL_INCLUDE_DIR = ${GDAL_INCLUDE_DIR}")
+    elseif(CONDA_ENV_PATH AND GDAL_LIBRARIES AND GDAL_LIBRARIES MATCHES "${CONDA_ENV_PATH}")
+        set(GDAL_INCLUDE_DIR "${CONDA_ENV_PATH}/include" CACHE PATH "GDAL include dir" FORCE)
+        message(STATUS "GDAL library in europa_viz env; forcing GDAL_INCLUDE_DIR = ${GDAL_INCLUDE_DIR}")
+    elseif(GDAL_LIBRARIES AND IS_ABSOLUTE "${GDAL_LIBRARIES}")
+        # The general case, which is what the two conda rules above are two
+        # instances of: headers come from the SAME installation prefix as the
+        # library. <prefix>/lib/libgdal.dylib -> <prefix>/include.
+        get_filename_component(_GDAL_PREFIX "${GDAL_LIBRARIES}" DIRECTORY)
+        get_filename_component(_GDAL_PREFIX "${_GDAL_PREFIX}" DIRECTORY)
+        if(EXISTS "${_GDAL_PREFIX}/include/gdal_priv.h")
+            set(GDAL_INCLUDE_DIR "${_GDAL_PREFIX}/include" CACHE PATH "GDAL include dir" FORCE)
+            message(STATUS "GDAL headers taken from the resolved library's own "
+                           "prefix: ${GDAL_INCLUDE_DIR}")
+        endif()
+    endif()
 endif()
 
 # Only build the GDAL-dependent DEM tools if GDAL is properly configured.
@@ -109,13 +160,25 @@ endif()
 # library; the rest of PTM3D does not, so configure must still succeed without
 # GDAL (with the warning at the bottom of this block naming exactly which
 # targets were skipped).
-if(GDAL_FOUND AND GDAL_LIBRARIES)
+#
+# GDAL_INCLUDE_DIR IS PART OF THE GATE. Without it the tools still compiled --
+# against whatever gdal_priv.h happened to sit on the default include path,
+# which on this machine is a DIFFERENT GDAL from the one being linked. An
+# empty include directory is not "use the default"; it is "we do not know
+# which headers these are", and this build has no business guessing.
+if(GDAL_FOUND AND GDAL_LIBRARIES AND GDAL_INCLUDE_DIR
+        AND EXISTS "${GDAL_INCLUDE_DIR}/gdal_priv.h")
     message(STATUS "GDAL found: Building dem_mesh_generator, dtm_to_ply_delaunay")
     message(STATUS "GDAL include dir: ${GDAL_INCLUDE_DIR}")
     message(STATUS "GDAL library: ${GDAL_LIBRARIES}")
 
     add_executable(dem_mesh_generator dem_mesh_generator.cpp)
-    target_include_directories(dem_mesh_generator PRIVATE
+    # BEFORE: the project adds -I/usr/local/include at directory scope (Eigen,
+    # yaml-cpp, Embree all live there on macOS), and on a machine with a
+    # Homebrew GDAL that directory ALSO holds a gdal_priv.h. Without BEFORE it
+    # wins over the GDAL installation this target was told to use, and the
+    # object file is compiled against one GDAL and linked against another.
+    target_include_directories(dem_mesh_generator BEFORE PRIVATE
         ${GDAL_INCLUDE_DIR}
     )
     target_link_libraries(dem_mesh_generator
@@ -145,7 +208,8 @@ if(GDAL_FOUND AND GDAL_LIBRARIES)
     # the source includes it as "CDT/include/CDT.h", so third_party/ itself is
     # the include root.
     add_executable(dtm_to_ply_delaunay dtm_to_ply_delaunay.cpp)
-    target_include_directories(dtm_to_ply_delaunay PRIVATE
+    # BEFORE, for the reason given on dem_mesh_generator above.
+    target_include_directories(dtm_to_ply_delaunay BEFORE PRIVATE
         ${GDAL_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/third_party
     )
@@ -186,6 +250,12 @@ else()
         "'conda install -c conda-forge gdal') -- see INSTALL.md, 'DEM / DTM tools'.")
     message(STATUS "  GDAL_FOUND: ${GDAL_FOUND}")
     message(STATUS "  GDAL_LIBRARIES: ${GDAL_LIBRARIES}")
+    message(STATUS "  GDAL_INCLUDE_DIR: ${GDAL_INCLUDE_DIR}")
+    if(GDAL_FOUND AND GDAL_LIBRARIES AND NOT GDAL_INCLUDE_DIR)
+        message(STATUS "  -- the library was found and the HEADERS were not. "
+                       "Building against the default include path would mix a "
+                       "second GDAL's headers with this library; refusing.")
+    endif()
 endif()
 
 # Conductivity-model anchor tests (Hayne 2017 vs Martinez & Siegler 2021).

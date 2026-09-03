@@ -17,6 +17,7 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -70,7 +71,7 @@ CHILD = textwrap.dedent("""
 """)
 
 
-def _run_child(code=0, tail="pass"):
+def _run_child(code=0, tail="pass", log_path=None):
     seen = {"info": [], "warning": [], "error": [], "progress": [], "beat": []}
     proc = EngineProcess(
         [sys.executable, "-c", CHILD.format(code=code, tail=tail)],
@@ -79,6 +80,7 @@ def _run_child(code=0, tail="pass"):
         on_error=seen["error"].append,
         on_progress=seen["progress"].append,
         on_heartbeat=lambda m, s: seen["beat"].append((m, s)),
+        log_path=log_path,
     )
     return proc.run(), seen
 
@@ -464,6 +466,90 @@ def test_resolve_engine_names_the_build_command_when_absent():
             raise AssertionError("a missing engine did not raise")
 
 
+# ------------------------------------------------------------------ the log
+# A GUI-launched run left NO engine stdout or stderr anywhere on disk. On
+# 2026-09-02 the MP026 flux-cube run had to be verified without its
+# `[PTM_HMATRIX_VF_REPLACE] ROUTE = ...` banner and without its
+# coupling-convergence report, because the only place either had ever existed
+# was a console widget that the next launch clears.
+
+def _log_lines(path):
+    return [l for l in Path(path).read_text().split("\n") if l.strip()]
+
+
+def test_the_engine_log_holds_every_line_the_child_wrote():
+    """Both streams, in the file, alongside the callbacks."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "deeper" / "engine.log"
+        rc, seen = _run_child(code=0, log_path=log)
+        assert rc == 0, rc
+        assert log.exists(), "no engine.log was written (and the directory " \
+                             "under it was supposed to be created)"
+        text = log.read_text()
+        for needle in ("Mesh created with 642 vertices",       # stdout
+                       "equilibration seed from cold-face",     # stderr
+                       "Calculating illumination: 42.5%",
+                       "Simulation completed"):
+            assert needle in text, f"{needle!r} is not in the log:\n{text}"
+        assert "command:" in text and "cwd:" in text, \
+            "the log does not say what was run or where"
+        assert "engine exit status 0" in text, \
+            "the log does not record how the run ended"
+        # The console is unchanged: everything in the file is also in a callback.
+        assert any("Mesh created" in l for l in seen["info"])
+        assert seen["progress"] == [42.5], seen["progress"]
+
+
+def test_the_log_survives_a_failing_run_and_appends_on_the_next():
+    """THE CASE THE LOG EXISTS FOR, and the one that must not truncate.
+
+    A crash is exactly when the record is wanted. And a chunked or resumed run
+    writes into the same output directory more than once -- a second launch
+    that erased the first one's diagnosis would recreate the gap.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "engine.log"
+        rc, _ = _run_child(
+            code=3,
+            tail='sys.stderr.write("FATAL: Failed to load mesh\\n")',
+            log_path=log)
+        assert rc == 3, rc
+        first = log.read_text()
+        assert "FATAL: Failed to load mesh" in first, first
+        assert "engine exit status 3" in first, first
+
+        rc2, _ = _run_child(code=0, log_path=log)
+        assert rc2 == 0
+        second = log.read_text()
+        assert "FATAL: Failed to load mesh" in second, \
+            "the second run TRUNCATED the first run's log"
+        assert second.count("===== engine start") == 2, \
+            f"expected two start banners, got {second.count('===== engine start')}"
+
+
+def test_no_log_path_writes_no_file_and_changes_nothing():
+    """DO-NO-HARM: every existing caller passes nothing and is unaffected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        before = sorted(Path(tmp).iterdir())
+        rc, seen = _run_child(code=0)
+        assert rc == 0
+        assert sorted(Path(tmp).iterdir()) == before
+        assert not seen["error"], seen["error"]
+        assert seen["progress"] == [42.5]
+
+
+def test_a_log_that_cannot_be_opened_warns_and_the_run_continues():
+    """Failing a run over its own diagnostics would be worse than the gap."""
+    with tempfile.TemporaryDirectory() as tmp:
+        blocker = Path(tmp) / "not_a_directory"
+        blocker.write_text("this is a file")
+        rc, seen = _run_child(code=0, log_path=blocker / "engine.log")
+        assert rc == 0, f"the run must still complete (exit {rc})"
+        assert any("no engine log" in w for w in seen["warning"]), (
+            f"the run silently produced no log; warnings were "
+            f"{seen['warning']}")
+
+
 TESTS = [
     test_classification_of_real_engine_lines,
     test_progress_extraction,
@@ -480,6 +566,10 @@ TESTS = [
     test_binary_provenance_identifies_a_binary_with_no_run,
     test_binary_provenance_flags_a_binary_that_cannot_answer_help,
     test_resolve_engine_names_the_build_command_when_absent,
+    test_the_engine_log_holds_every_line_the_child_wrote,
+    test_the_log_survives_a_failing_run_and_appends_on_the_next,
+    test_no_log_path_writes_no_file_and_changes_nothing,
+    test_a_log_that_cannot_be_opened_warns_and_the_run_continues,
 ]
 
 

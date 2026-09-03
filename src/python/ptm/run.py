@@ -37,9 +37,11 @@ saw.
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -296,6 +298,15 @@ class EngineProcess:
     unattended sweep needs that distinction and an exit status alone does not
     carry it.
 
+    ``log_path`` tees every line the child writes to a file, in addition to the
+    callbacks, which are untouched. A GUI-launched run used to leave NO engine
+    stdout or stderr anywhere on disk: after the 2026-09-02 MP026 flux-cube run
+    the ``[PTM_HMATRIX_VF_REPLACE] ROUTE = ...`` banner and the whole
+    coupling-convergence report were simply gone, and which view-factor matrix
+    had been used had to be reconstructed from the product's own header. The
+    console is not a record -- it is a widget that is cleared on the next
+    launch. Default ``None`` keeps every existing caller byte-identical.
+
     :meth:`run` blocks and returns the child's exit status.
     """
 
@@ -304,7 +315,8 @@ class EngineProcess:
 
     def __init__(self, command, working_dir=None, env=None,
                  on_output=None, on_warning=None, on_error=None,
-                 on_progress=None, on_heartbeat=None, timeout=None):
+                 on_progress=None, on_heartbeat=None, timeout=None,
+                 log_path=None):
         self.command = [str(c) for c in command]
         self.working_dir = str(working_dir) if working_dir else None
         self.env = env
@@ -317,7 +329,67 @@ class EngineProcess:
         self.timed_out = False
         self.process = None
         self.returncode = None
+        self.log_path = str(log_path) if log_path else None
+        self._log = None
         self._stop_requested = False
+
+    # -- the on-disk record -------------------------------------------------
+    def _open_log(self):
+        """Open ``log_path`` for appending, or say why there will be no log.
+
+        APPEND, never truncate: a chunked or resumed run writes into the same
+        output directory more than once, and a second launch that erased the
+        first one's diagnosis would recreate the gap this exists to close.
+        Line-buffered so the file is complete up to the last line the engine
+        managed to write -- which is the case that matters, because a crash is
+        exactly when the record is wanted and exactly when nothing gets
+        flushed on the way out.
+
+        A log that cannot be opened is reported through ``on_warning`` and the
+        run continues. Failing the run over its own diagnostics would be worse
+        than the gap; being silent about it would be the same defect one level
+        down.
+        """
+        if not self.log_path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            self._log = open(self.log_path, "a", buffering=1, encoding="utf-8",
+                             errors="replace")
+        except OSError as exc:
+            self._log = None
+            self._emit(self.on_warning,
+                       f"WARNING: no engine log will be written to "
+                       f"{self.log_path} ({exc}); the console is the only "
+                       f"record of this run")
+            return
+        stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        self._write_log(f"===== engine start {stamp} =====")
+        self._write_log("command: " + " ".join(shlex.quote(c) for c in self.command))
+        self._write_log(f"cwd: {self.working_dir}")
+        self._emit(self.on_output, f"[run] engine log: {self.log_path}")
+
+    def _write_log(self, text):
+        if self._log is None:
+            return
+        try:
+            self._log.write(text + "\n")
+        except (OSError, ValueError):
+            # ValueError = already closed. A trace that stops the run it is
+            # tracing would be worse than no trace.
+            self._log = None
+
+    def _close_log(self, returncode):
+        if self._log is None:
+            return
+        stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        self._write_log(f"===== engine exit status {returncode} at {stamp} "
+                        f"(timed_out={self.timed_out}) =====")
+        try:
+            self._log.close()
+        except OSError:
+            pass
+        self._log = None
 
     # -- callback plumbing --------------------------------------------------
     def _emit(self, cb, *args):
@@ -325,6 +397,8 @@ class EngineProcess:
             cb(*args)
 
     def _emit_classified(self, text):
+        # The file first: a callback that raises must not cost the record.
+        self._write_log(text)
         severity = classify_severity(text)
         if severity == "error":
             self._emit(self.on_error, text)
@@ -363,6 +437,18 @@ class EngineProcess:
     # -- execution ----------------------------------------------------------
     def run(self):
         """Start the child, pump both pipes to exhaustion, return its status."""
+        # Before Popen, so a child that fails to start at all still leaves the
+        # command and the working directory on disk to look at.
+        self._open_log()
+        try:
+            return self._run_inner()
+        finally:
+            # `finally`, not the end of the happy path: an exception on the way
+            # out is precisely when the record is wanted, and the caller sees
+            # nothing else.
+            self._close_log(self.returncode)
+
+    def _run_inner(self):
         self.process = subprocess.Popen(
             self.command,
             stdout=subprocess.PIPE,
@@ -411,12 +497,17 @@ class EngineProcess:
                         if stall_since is None:
                             stall_since = now - self.WATCHDOG_INTERVAL_S
                         mins = (now - stall_since) / 60.0
-                        self._emit(self.on_heartbeat,
-                                   f"No progress for {mins:.1f} min (CPU idle) -- "
-                                   "likely blocked on file I/O (cloud-synced or "
-                                   "dataless file?)", True)
+                        msg = (f"No progress for {mins:.1f} min (CPU idle) -- "
+                               "likely blocked on file I/O (cloud-synced or "
+                               "dataless file?)")
+                        # In the log too: "did it wedge, and when" is the
+                        # question this file gets asked most, and the answer
+                        # is not in the engine's own output.
+                        self._write_log(f"[watchdog] {msg}")
+                        self._emit(self.on_heartbeat, msg, True)
                     else:
                         if stall_since is not None:
+                            self._write_log("[watchdog] Progress resumed (CPU active)")
                             self._emit(self.on_heartbeat,
                                        "Progress resumed (CPU active)", False)
                         stall_since = None

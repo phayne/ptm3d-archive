@@ -12,7 +12,8 @@ from PyQt6.QtCore import Qt
 
 from dashboard_core.module_interface import AbstractModule
 from gui_core.config_manager import ConfigManager
-from gui_core.simulation_runner import SimulationRunner, SimulationThread
+from gui_core.simulation_runner import (SimulationRunner, SimulationThread,
+                                        ENGINE_LOG_NAME)
 from gui_core.preflight import (
     run_preflight, confirm_preflight, resolve_path
 )
@@ -218,8 +219,13 @@ class ThermalModule(AbstractModule):
             self._console.append_error(f"[THERMAL] Failed to save config: {e}")
             return
 
+        # LAUNCHER 2 OF 2. Same tee as the main window, from this launcher's
+        # own already-resolved output directory. A GUI-launched run that left
+        # no engine.log is the gap this closes; there are two ways in, so both
+        # are wired rather than one.
         self._sim_thread = SimulationThread(
-            self._run_config_file, config_dict=config_dict
+            self._run_config_file, config_dict=config_dict,
+            log_path=str(out_dir / ENGINE_LOG_NAME)
         )
         self._sim_thread.output_ready.connect(
             lambda t: self._console.append_output(f"[THERMAL] {t}")

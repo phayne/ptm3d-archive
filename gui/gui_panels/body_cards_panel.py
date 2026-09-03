@@ -2031,10 +2031,12 @@ class BodyCard(BaseConfigTab):
         # the log is proof the signal still arrives, and its ORDER against
         # `stateChanged` is visible in the timestamps.
         #
-        # Only when the record is being kept: with `PTM_GUI_TRACE=0` neither
-        # observer is connected at all, so the group costs nothing and
+        # Only when the record is being kept -- which, since 2026-09-02, is
+        # NOT the default. Without `PTM_GUI_TRACE=1` neither observer is
+        # connected at all, so the group costs nothing and
         # `receivers(toggled)` is zero, which is what
-        # `test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck` reads.
+        # `test_the_click_chain_is_ordered_by_a_guarantee_not_by_luck` reads
+        # on the ordinary path.
         from gui_core import flux_trace
         if flux_trace.enabled():
             switch = self.widgets["flux_cubes.enabled"]
