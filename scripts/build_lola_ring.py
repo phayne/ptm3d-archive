@@ -9,13 +9,25 @@ in the selenocentric frame XYZ = (R+elev)*spherical(lat,lon) — verified to
 
   python3 build_lola_ring.py --lola <LOLA.tif> --site-lat -84.223 \
       --site-lon 33.502 --r-core-km 3 --r-ext-km 81.6712 \
-      --max-points 80000 --out ring.ply
+      --max-points 80000 --core-ply core.ply --out ring.ply
+
+The inner hole is registered to the core mesh's ACTUAL outer boundary
+polygon (--core-ply). The legacy nominal-circle centroid clip kept every
+triangle whose centroid sat outside R_core, so its inward-most vertex could
+protrude ~130 m inside — laying coarse ring surface on top of the core's own
+terrain, which at grazing polar sun casts a spurious hard shadow on core edge
+faces. See scripts/ring_registration.py.
 """
 from __future__ import annotations
 import argparse
+import sys
+from pathlib import Path
 import numpy as np
 from osgeo import gdal
 gdal.UseExceptions()
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ring_registration as rreg  # noqa: E402
 
 R = 1737400.0  # Moon 2015 sphere radius (m), matches the LOLA base CRS
 
@@ -41,7 +53,25 @@ def main():
                          "See docs/KNOWN_LIMITATIONS.md, 'Workflow / tooling'.")
     ap.add_argument("--elev-offset", type=float, default=None,
                     help="Additive meters. Default: read band.GetOffset() (or 0).")
+    ap.add_argument("--core-ply", default=None,
+                    help="Core mesh PLY. Its actual outer boundary polygon "
+                         "defines the ring's inner hole. Required unless "
+                         "--allow-unregistered.")
+    ap.add_argument("--seam-margin-m", type=float, default=0.0,
+                    help="Extra clearance beyond the core boundary (m).")
+    ap.add_argument("--allow-unregistered", action="store_true",
+                    help="Use the legacy nominal-circle centroid clip. The "
+                         "resulting ring overlaps the core mesh and casts "
+                         "spurious hard shadows on its edge faces.")
     a = ap.parse_args()
+    if a.core_ply is None and not a.allow_unregistered:
+        raise SystemExit(
+            "[build_lola_ring] REFUSING to proceed: no --core-ply. The ring's "
+            "inner hole must be registered to the core mesh's actual outer "
+            "boundary; the legacy nominal-circle centroid clip leaves up to "
+            "~130 m of ring surface lying on top of the core and casts a "
+            "spurious hard shadow on its edge faces. Pass --core-ply, or "
+            "--allow-unregistered to reproduce the old geometry deliberately.")
     rng = np.random.default_rng(a.seed)
 
     slat, slon = np.radians(a.site_lat), np.radians(a.site_lon)
@@ -129,10 +159,29 @@ def main():
     tri = Delaunay(np.column_stack([px, py]))
     faces = tri.simplices.astype(np.int64)
 
-    # drop triangles whose centroid is inside R_core (geodesic) -> annulus
-    clat = la[faces].mean(axis=1); clon = lo[faces].mean(axis=1)
-    cd = geodesic_m(slat, slon, clat, clon)
-    faces = faces[cd >= a.r_core_km*1000.0]
+    # punch the inner hole
+    core = None
+    if a.core_ply is not None:
+        core = rreg.core_boundary_profile(Path(a.core_ply), a.site_lat,
+                                          a.site_lon, body_r_m=R)
+        keep, _, _ = rreg.clip_ring_to_core(lat, lon, faces, core,
+                                            a.site_lat, a.site_lon,
+                                            margin_m=a.seam_margin_m,
+                                            body_r_m=R)
+        print(f"[build_lola_ring] inner hole registered to "
+              f"{Path(a.core_ply).name} (boundary r = {core.r.min():.1f} .. "
+              f"{core.r.max():.1f} m): kept {int(keep.sum())} of "
+              f"{faces.shape[0]} disk triangles")
+        faces = faces[keep]
+    else:
+        print("[build_lola_ring] WARNING: UNREGISTERED ring (legacy "
+              "nominal-circle centroid clip). Ring geometry will overlap the "
+              "core mesh and cast spurious hard shadows on its edge faces. "
+              "Do not use this for science.")
+        # drop triangles whose centroid is inside R_core (geodesic) -> annulus
+        clat = la[faces].mean(axis=1); clon = lo[faces].mean(axis=1)
+        cd = geodesic_m(slat, slon, clat, clon)
+        faces = faces[cd >= a.r_core_km*1000.0]
 
     # renumber used vertices
     used = np.unique(faces)
@@ -167,6 +216,24 @@ def main():
     print(f"wrote {a.out}: {nv} verts, {nf} faces, "
           f"elev[{el.min():.0f},{el.max():.0f}] dist_km[{(geodesic_m(slat,slon,la[used] if False else np.radians(lat),np.radians(lon)).min())/1e3:.2f},"
           f"{geodesic_m(slat,slon,np.radians(lat),np.radians(lon)).max()/1e3:.2f}]")
+
+    # registration gate: re-measure what was actually written
+    if core is not None:
+        rlat, rlon, _, rtris = rreg.read_ply(Path(a.out))
+        rep = rreg.registration_report(rlat, rlon, rtris, core,
+                                       a.site_lat, a.site_lon, body_r_m=R)
+        rreg.print_report(rep, name=Path(a.out).name)
+        if not rreg.gate(rep, name=Path(a.out).name):
+            # Do not leave a rejected ring at the requested path: the caller
+            # sees exit 1, but anything that later globs for the file finds a
+            # ring that failed its own gate.
+            try:
+                Path(a.out).unlink()
+                print(f"[build_lola_ring] removed the rejected ring {a.out}")
+            except OSError as e:
+                print(f"[build_lola_ring] WARNING: could not remove the "
+                      f"rejected ring {a.out}: {e}. DELETE IT BY HAND.")
+            raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
