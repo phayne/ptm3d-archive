@@ -54,6 +54,17 @@ Makefile
 *.dylib
 *.a
 
+# scripts/ptm12_diag compiled diagnostic binaries. These build with a bare
+# `c++ ... -o mc_ref_pp` (no CMake target, no extension), so none of the
+# patterns above catch them, and a bare `git add -A`/`git add scripts/` would
+# happily stage a compiled artifact -- exactly the "stale untracked binary"
+# trap this repo already paid for once (mc_ref_pp compiled 2026-07-23,
+# predating the back-face-cull fix 44210d8/ce3ca8c, silently reused by
+# run_pp_sweep.sh). It and its build cache must always be rebuilt from
+# mc_ref_pp.cpp via scripts/ptm12_diag/ensure_mc_ref_pp.py, never committed.
+scripts/ptm12_diag/mc_ref_pp
+scripts/ptm12_diag/.mc_ref_pp_cache/
+
 # Editor / IDE files
 .vscode/
 .idea/
