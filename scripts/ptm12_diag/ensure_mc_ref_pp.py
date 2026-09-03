@@ -86,6 +86,16 @@ def _build_command(out_path, cxx):
                               capture_output=True, text=True).stdout.strip()
         if sdk:
             cmd += ["-isysroot", sdk]
+        # ld64 embeds a random LC_UUID load command on every link by default, so
+        # two back-to-back compiles of BYTE-IDENTICAL source with this exact
+        # command otherwise produce different binaries (measured 2026-09-03:
+        # same source, same cmd, two invocations -> two different md5s). Without
+        # this flag, verify_or_refuse's stale-vs-fresh comparison would refuse
+        # on every single invocation, including right after a correct --replace
+        # -- the guard would cry wolf permanently rather than occasionally.
+        # GNU ld (Linux) already defaults to a content hash (SHA-1) build-id,
+        # which is deterministic, so this is Darwin-only.
+        cmd += ["-Wl,-no_uuid"]
     pkg_c, pkg_l = [], []
     for probe, sink in ((["--cflags"], pkg_c), (["--libs"], pkg_l)):
         r = subprocess.run(["pkg-config"] + probe + ["embree4"], capture_output=True, text=True)
@@ -157,14 +167,24 @@ def resolve_current(cache_root=None):
     """Return a binary GUARANTEED to be a fresh compile of the mc_ref_pp.cpp
     currently on disk. Nothing is cached by BINARY identity -- only by
     source+toolchain hash -- so a source change always misses the cache and
-    always recompiles; there is no stale-binary state this function can be in."""
+    always recompiles; there is no stale-binary state this function can be in.
+
+    Builds to a PID-suffixed temp file and os.replace()s it into place, so two
+    callers racing on the same cache entry (e.g. a sweep and a regression gate
+    launched together) never hand either one a half-written binary: the loser
+    of the race simply overwrites an already-complete file with a byte-identical
+    one, and a caller that lands between mkdir and the rename falls through to
+    building its own temp file rather than reading a partial out_path."""
     cache_root = Path(cache_root) if cache_root else CACHE_ROOT
     out_dir = cache_root / _source_key()
     out_path = out_dir / "mc_ref_pp"
     if out_path.is_file() and os.access(str(out_path), os.X_OK):
         return str(out_path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    return build_mc_ref_pp(out_path)
+    tmp_path = out_dir / f".mc_ref_pp.tmp-{os.getpid()}"
+    build_mc_ref_pp(tmp_path)
+    os.replace(tmp_path, out_path)   # atomic on the same filesystem
+    return str(out_path)
 
 
 def _md5(path):
