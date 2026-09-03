@@ -641,18 +641,75 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
                 f"_Rext{r_ext:g}km.ply")
     if ring_ply.exists() and ring_ply.stat().st_size > 100_000:
         print(f"  [{site['ellipse_id']}] ring present ({ring_ply.name}) — skip")
+        if not check_ring_registration(site, core_mesh, ring_ply, args):
+            return None, None
         return core_mesh, ring_ply
     from a3gt_v2_ring_mesh import build_ring
     try:
         build_ring(float(site["lat_deg"]), float(site["lon_deg"]), ring_vrt,
                    ring_ply, r_core_km=r_core, r_ext_km=r_ext,
                    ring_max_points=args.ring_max_points,
+                   core_ply=(None if args.allow_unregistered_rings
+                             else core_mesh),
+                   seam_margin_m=args.ring_seam_margin_m,
+                   allow_unregistered=args.allow_unregistered_rings,
                    dry_run=args.dry_run)
     except (RuntimeError, ValueError) as e:
-        print(f"  [{site['ellipse_id']}] SKIP: ring build failed ({e})",
-              file=sys.stderr)
+        # Name what actually failed. A core mesh whose outer boundary cannot be
+        # described is a CORE-MESH defect; reporting it as "ring build failed"
+        # sends the next person to the wrong file.
+        what = ("core mesh unsuitable for ring registration"
+                if "CORE MESH" in str(e) else "ring build failed")
+        print(f"  [{site['ellipse_id']}] SKIP: {what} ({e})", file=sys.stderr)
         return None, None
     return core_mesh, ring_ply
+
+
+def check_ring_registration(site: dict, core_mesh, ring_ply: Path,
+                            args) -> bool:
+    """Refuse to reuse a cached ring whose inner hole overlaps the core mesh.
+
+    An unregistered ring lays coarse occluder surface on top of the core's own
+    terrain; at grazing polar sun that lip casts a spurious hard shadow and
+    produces the >50 K discontinuous cold rim artifact. Reusing one silently is
+    exactly how the defect survived several campaign generations."""
+    if args.dry_run or core_mesh is None:
+        return True
+    try:
+        import ring_registration as rreg
+        core = rreg.core_boundary_profile(Path(core_mesh),
+                                          float(site["lat_deg"]),
+                                          float(site["lon_deg"]))
+        lat, lon, _, tris = rreg.read_ply(Path(ring_ply))
+        rep = rreg.registration_report(lat, lon, tris, core,
+                                       float(site["lat_deg"]),
+                                       float(site["lon_deg"]))
+    except (ValueError, OSError, MemoryError) as e:
+        # Fail CLOSED. The build path already refuses when the core boundary
+        # cannot be extracted; accepting the same site here just because its
+        # ring happens to exist on disk would give opposite verdicts for the
+        # same inputs, and the accepting branch is the one that reaches science.
+        msg = (f"  [{site['ellipse_id']}] ring registration COULD NOT BE "
+               f"CHECKED ({e})")
+        if args.allow_unregistered_rings:
+            print(msg + " -- --allow-unregistered-rings: continuing anyway.",
+                  file=sys.stderr)
+            return True
+        print(msg + " SKIPPING SITE (pass --allow-unregistered-rings to "
+              "override).", file=sys.stderr)
+        return False
+    if rep["n_overlapping_faces"] == 0:
+        return True
+    msg = (f"  [{site['ellipse_id']}] cached ring {ring_ply.name} is "
+           f"UNREGISTERED: {rep['n_overlapping_faces']} faces overlap the core "
+           f"by up to {rep['max_overlap_m']:.1f} m. Delete it and re-run "
+           f"generate-meshes to rebuild it against the core boundary.")
+    if args.allow_unregistered_rings:
+        print(msg + " (--allow-unregistered-rings: continuing anyway)",
+              file=sys.stderr)
+        return True
+    print(msg + " SKIPPING SITE.", file=sys.stderr)
+    return False
 
 
 def filter_sites(manifest: dict, only: list[str], also_partial: bool) -> list[dict]:
@@ -879,6 +936,14 @@ def main() -> int:
     p.add_argument("--ring-max-points", type=int, default=80_000,
                    help="Occluder-ring point budget (default 80k). Raise for "
                         "finer distant-horizon shadows on a large R_ext.")
+    p.add_argument("--ring-seam-margin-m", type=float, default=0.0,
+                   help="Extra clearance between the occluder ring's inner "
+                        "hole and the core mesh's outer boundary (m).")
+    p.add_argument("--allow-unregistered-rings", action="store_true",
+                   help="Build/reuse occluder rings whose inner hole is not "
+                        "registered to the core mesh's outer boundary. Those "
+                        "rings overlap the core and cast spurious hard shadows "
+                        "on its edge faces; for reproducing old runs only.")
     p.add_argument("--steps-per-day", type=float, default=24.0,
                    help="Output samples per Earth-day (cadence). 24=hourly "
                         "(default), 48=30-min, 144=10-min.")

@@ -67,6 +67,42 @@ Coarse facets are adequate: occluders only have to block rays, so DEM-native
 resolution of 80-160 m over the annulus is enough, and the added BVH cost is
 small.
 
+`scripts/a3gt_v2_ring_mesh.py` is the A3GT campaign path (a coarse full disk
+from the site's clipped VRT, then the inner hole).
+
+### The inner hole must be registered to the core mesh
+
+The ring's inner hole is **not** a nominal circle of radius `R_core`. It is
+clipped against the core mesh's **actual outer boundary polygon**, which is
+what `--core-ply` supplies; `scripts/ring_registration.py` extracts that
+polygon, performs the clip, and gates the result. Both builders refuse to
+emit an unregistered ring unless `--allow-unregistered` is passed.
+
+This is not cosmetic. Both builders used to keep a ring triangle whenever its
+**centroid** lay outside a nominal `R_core` circle. A kept triangle's
+inward-most vertex then protrudes inside `R_core` by up to its
+centroid-to-vertex distance -- 100-130 m at LOLA ring resolution -- so coarse
+ring surface ends up lying planimetrically on top of the core's own terrain.
+At lunar polar sun elevations of 0-5 deg, that overlapping lip casts a hard,
+near-permanent spurious shadow on core edge faces. Measured at A03MP026:
+2,730 core faces covered by ring geometry, a severe-cold rate of 0.165 under
+the lip against 0.031 on clear edge faces, and no severely cold edge face
+anywhere more than 200 m from the lip. The same defect was present at every
+A3GT ring measured (A03N1016 97 m, A03SP010 88 m, and MP026's wide sweep ring
+78 m).
+
+Registration trades the overlap for a small **gap**: the clip drops whole
+triangles, so the ring's inner boundary sits a fraction of one ring facet
+outside the core rim (at A03MP026, 0.4 m minimum / 46 m median / 167 m
+maximum). That band carries no occluder geometry, which can slightly
+*under*-shadow a core edge face at grazing sun. The trade is heavily
+favorable -- an overlap produces a hard permanent shadow worth 50-300 K,
+while the gap omits ~100 m of near-flat LOLA terrain -- but it is a trade, and
+the gate prints the per-azimuth gap profile so it can be inspected.
+
+Re-clipping a ring never requires a view-factor rebuild: the ring is
+shadow-only geometry and never enters a VF matrix.
+
 ## What the ring does not do
 
 The ring is occluder-only, so **thermal IR re-radiation and reflected sunlight
@@ -96,3 +132,14 @@ radiation exchange as a one-way source; it is not today.
    ring's horizon profile against the source DEM. A ring built with the wrong
    elevation scale reads as a systematically over-tall horizon and
    over-shadows grazing sun.
+4. **The inner hole is registered.** Run the gate on any ring before using it:
+
+   ```
+   python3 scripts/ring_registration.py --core core.ply --ring ring.ply \
+       --site-lat <lat> --site-lon <lon>
+   ```
+
+   It exits non-zero if any ring geometry lies inside the core's outer
+   boundary, and prints the per-azimuth seam-gap profile either way. A ring
+   that fails this test produces a discontinuous cold rim on the core's edge
+   faces that no mesh-quality, coverage or face-count check will catch.
