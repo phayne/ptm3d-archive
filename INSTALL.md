@@ -438,12 +438,23 @@ not distributed.
   `configs/` may reference datasets and machine-specific paths that are not distributed.
 - `BUILD_TESTS=ON` currently references a nonexistent top-level `tests/` directory; build the
   individual test programs directly (as in §6).
-- `rebuild.sh` in the repository root is a **macOS developer convenience script, not the
-  supported build path**. It deletes the contents of `build/`, passes none of
-  `-DPTM_ENABLE_GPU` / `-DPTM_ARCH_NATIVE` / `-DCSPICE_ROOT`, and so produces a **CPU-only**
-  binary tuned to the build host's own CPU (`-march=native`), covering every default target
-  rather than `ptm_thermal_sim` alone. It states all of that when it starts. Use §3 unless you
-  specifically want those defaults.
+- `rebuild.sh` in the repository root is a **macOS developer convenience script**. It owns a
+  **canonical configuration and converges to it on every run**: `-DPTM_ENABLE_GPU=ON`
+  (OpenCL), `-DPTM_ARCH_NATIVE=ON`, `-DBUILD_SHARED_LIBS=ON`, `-DCSPICE_ROOT` auto-detected,
+  and `-DEMBREE_ROOT` auto-detected by reading each candidate installation's own
+  `EMBREE_MAX_ISA` and preferring the widest (see "Embree ISA (performance)" above). It
+  deletes the contents of `build/` and builds every default target rather than
+  `ptm_thermal_sim` alone.
+
+  It **never takes settings from `build/CMakeCache.txt`** — it reads the cache only to print
+  what it is correcting. Until 2026-09-02 it passed none of those options, so CMake's defaults
+  applied and it produced a **CPU-only, statically linked** binary against whichever Embree
+  happened to be found, *and* it deleted the correct cache on the way. Deliberate variants are
+  explicit flags only: `--cpu-only`, `--portable`, `--embree <prefix>`. `--dry-run` prints the
+  configure it would run and stops. After the build it interrogates the binary and **fails** if
+  a GPU build has no GPU core.
+
+  Use §3 when you want a configuration different from the canonical one.
 - The GPU path has been exercised mainly on macOS with AMD hardware. A one-time per-machine
   calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
   driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver
