@@ -135,8 +135,11 @@ sys.path.insert(0, str(HERE))
 # Reuse the referee driver wholesale. A second copy of "how to run mc_ref_pp"
 # is a second thing to keep in step with mc_ref_pp.
 from test_vf_assembler_gate import (           # noqa: E402
-    assemble, find_or_build_mc_ref_pp, read_csr, sweep, write_binary_ply, write_tmax,
+    assemble, read_csr, sweep, write_binary_ply, write_tmax,
 )
+# find_or_build_mc_ref_pp itself lives in ensure_mc_ref_pp.py -- the single
+# source of truth shared with run_pp_sweep.sh's staleness guard.
+from ensure_mc_ref_pp import find_or_build_mc_ref_pp  # noqa: E402
 
 REPO = HERE.parent.parent
 

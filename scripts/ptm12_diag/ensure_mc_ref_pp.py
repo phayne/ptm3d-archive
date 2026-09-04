@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Single source of truth for locating a CURRENT mc_ref_pp binary.
+
+scripts/ptm12_diag/mc_ref_pp is an UNTRACKED compiled artifact -- there is no
+build step or CI job that keeps it in sync with mc_ref_pp.cpp. A copy compiled
+before a merged source fix (e.g. the back-face cull, 44210d8/ce3ca8c) silently
+produces defective view factors, and nothing catches it if a script just runs
+./mc_ref_pp by its fixed path. That happened: a binary compiled 2026-07-23 sat
+at that path and was used verbatim by scripts/ptm12_diag/run_pp_sweep.sh.
+
+Every caller in this repository now resolves the referee through this module
+instead of a bare path, so there is exactly one place that knows how to build
+mc_ref_pp and exactly one place that decides whether an existing binary may be
+trusted. Two entry points, for two different callers:
+
+  resolve_current(cache_root=None)
+      The guard production scripts use (run_pp_sweep.sh, via the CLI below).
+      ALWAYS compiles mc_ref_pp.cpp: there is no persistent "trust this old
+      binary" state, so there is no staleness left to detect by construction.
+      Compiles are cached under a directory keyed by a hash of the source
+      bytes plus the exact compile command, so re-running with an unchanged
+      tree is a hash check and a stat rather than a fresh compile (a real
+      source or toolchain change always misses the cache).
+
+  find_or_build_mc_ref_pp(explicit, work)
+      The EXPLICIT-override resolution the regression gates use
+      (test_vf_assembler_gate.py, test_vf_cross_agreement.py, both --mc-ref-pp
+      and $PTM_MC_REF_PP). An operator naming a specific binary is pinning it
+      on purpose -- e.g. to gate a scratch build before promoting it -- so a
+      missing/non-executable explicit path is FATAL rather than silently
+      replaced. Unchanged from the pre-2026-09-03 copy of this function that
+      used to live in test_vf_assembler_gate.py.
+
+CLI (called by run_pp_sweep.sh so the shell script never hardcodes the compile
+recipe or the staleness check):
+  ensure_mc_ref_pp.py               resolve a fresh binary, verify the legacy
+                                     fixed path (scripts/ptm12_diag/mc_ref_pp)
+                                     against it if that path exists, REFUSE
+                                     (nonzero exit, message naming the stale
+                                     path and the rebuild command) on a
+                                     mismatch, and print ONLY the resolved
+                                     path to stdout (all other output goes to
+                                     stderr, so `BIN=$(...)` is safe).
+  ensure_mc_ref_pp.py --replace     also overwrite the legacy fixed path with
+                                     the fresh binary (on-disk hygiene).
+  ensure_mc_ref_pp.py --check-only  exit 0/1 only; no path on stdout.
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MC_SRC = HERE / "mc_ref_pp.cpp"
+LEGACY_BIN = HERE / "mc_ref_pp"
+CACHE_ROOT = HERE / ".mc_ref_pp_cache"
+
+
+def _log(*args):
+    print(*args, file=sys.stderr)
+
+
+def _compiler():
+    cxx = os.environ.get("CXX")
+    if cxx:
+        return cxx
+    # The /usr/bin/c++ shim on this machine is a stub; prefer the Xcode
+    # CommandLineTools clang++ where it exists. CI runs this on Linux too, so
+    # fall back to a plain "c++" rather than assuming that path exists.
+    for cand in ("/Library/Developer/CommandLineTools/usr/bin/clang++", "c++"):
+        if cand == "c++" or Path(cand).is_file():
+            return cand
+    return "c++"
+
+
+def _build_command(out_path, cxx):
+    """Portable build. mc_ref_pp is one translation unit against Embree 4, so
+    it needs no CMake. Include/library roots: pkg-config first, then the usual
+    prefixes."""
+    cmd = [cxx, "-O3", "-std=c++17"]
+    if sys.platform == "darwin":
+        sdk = subprocess.run(["/usr/bin/xcrun", "--show-sdk-path"],
+                              capture_output=True, text=True).stdout.strip()
+        if sdk:
+            cmd += ["-isysroot", sdk]
+        # ld64 embeds a random LC_UUID load command on every link by default, so
+        # two back-to-back compiles of BYTE-IDENTICAL source with this exact
+        # command otherwise produce different binaries (measured 2026-09-03:
+        # same source, same cmd, two invocations -> two different md5s). Without
+        # this flag, verify_or_refuse's stale-vs-fresh comparison would refuse
+        # on every single invocation, including right after a correct --replace
+        # -- the guard would cry wolf permanently rather than occasionally.
+        # GNU ld (Linux) already defaults to a content hash (SHA-1) build-id,
+        # which is deterministic, so this is Darwin-only.
+        cmd += ["-Wl,-no_uuid"]
+    pkg_c, pkg_l = [], []
+    for probe, sink in ((["--cflags"], pkg_c), (["--libs"], pkg_l)):
+        r = subprocess.run(["pkg-config"] + probe + ["embree4"], capture_output=True, text=True)
+        if r.returncode == 0:
+            sink.extend(r.stdout.split())
+    if pkg_c:
+        cmd += pkg_c
+    else:
+        for inc in ("/usr/local/include", "/opt/homebrew/include", "/usr/include"):
+            if (Path(inc) / "embree4" / "rtcore.h").is_file():
+                cmd += ["-I" + inc]
+                break
+    cmd += [str(MC_SRC)]
+    if pkg_l:
+        cmd += pkg_l
+    else:
+        for lib in ("/usr/local/lib", "/opt/homebrew/lib"):
+            if Path(lib).is_dir():
+                cmd += ["-L" + lib]
+        cmd += ["-lembree4"]
+    cmd += ["-o", str(out_path)]
+    return cmd
+
+
+def build_mc_ref_pp(out_path):
+    """Compile mc_ref_pp.cpp to out_path. FATAL (SystemExit) on failure, with
+    the compiler's own stdout/stderr surfaced first."""
+    cmd = _build_command(out_path, _compiler())
+    _log("  mc_ref_pp: building --", " ".join(cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not Path(out_path).is_file():
+        sys.stderr.write(r.stdout + r.stderr)
+        raise SystemExit("FATAL: could not build mc_ref_pp. Install Embree 4 (headers in "
+                          "<prefix>/include/embree4) or pass --mc-ref-pp /path/to/mc_ref_pp.")
+    return str(out_path)
+
+
+def find_or_build_mc_ref_pp(explicit, work):
+    """Explicit-override resolution used by the regression gates. See module
+    docstring: an EXPLICITLY named binary that cannot be used is fatal -- the
+    point of naming one is to gate that exact build, and silently substituting
+    a fresh compile would return a PASS that describes a different binary.
+    With no override, an already-built binary at the legacy fixed path is
+    reused as-is; gate callers accept that trust because a caller who wants a
+    guaranteed-current binary regardless of what sits on disk should call
+    resolve_current() instead (this is what run_pp_sweep.sh does)."""
+    if explicit and not (Path(explicit).is_file() and os.access(str(explicit), os.X_OK)):
+        raise SystemExit(f"FATAL: --mc-ref-pp {explicit} is missing or not executable. "
+                          "Refusing to substitute a different binary.")
+    for cand in (explicit, os.environ.get("PTM_MC_REF_PP"), LEGACY_BIN):
+        if cand and Path(cand).is_file() and os.access(str(cand), os.X_OK):
+            _log(f"  mc_ref_pp: using existing {cand}")
+            return str(cand)
+    return build_mc_ref_pp(Path(work) / "mc_ref_pp")
+
+
+def _source_key():
+    """sha256 of mc_ref_pp.cpp + the exact compile command, truncated to 16 hex
+    chars for a directory name. Covers a source edit AND a toolchain/flag
+    change (e.g. a different Embree found by pkg-config) -- either can change
+    what the binary does, so either must bust the cache."""
+    h = hashlib.sha256()
+    h.update(MC_SRC.read_bytes())
+    h.update(" ".join(_build_command("<out>", _compiler())).encode())
+    return h.hexdigest()[:16]
+
+
+def resolve_current(cache_root=None):
+    """Return a binary GUARANTEED to be a fresh compile of the mc_ref_pp.cpp
+    currently on disk. Nothing is cached by BINARY identity -- only by
+    source+toolchain hash -- so a source change always misses the cache and
+    always recompiles; there is no stale-binary state this function can be in.
+
+    Builds to a PID-suffixed temp file and os.replace()s it into place, so two
+    callers racing on the same cache entry (e.g. a sweep and a regression gate
+    launched together) never hand either one a half-written binary: the loser
+    of the race simply overwrites an already-complete file with a byte-identical
+    one, and a caller that lands between mkdir and the rename falls through to
+    building its own temp file rather than reading a partial out_path."""
+    cache_root = Path(cache_root) if cache_root else CACHE_ROOT
+    out_dir = cache_root / _source_key()
+    out_path = out_dir / "mc_ref_pp"
+    if out_path.is_file() and os.access(str(out_path), os.X_OK):
+        return str(out_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_dir / f".mc_ref_pp.tmp-{os.getpid()}"
+    build_mc_ref_pp(tmp_path)
+    os.replace(tmp_path, out_path)   # atomic on the same filesystem
+    return str(out_path)
+
+
+def _md5(path):
+    return hashlib.md5(Path(path).read_bytes()).hexdigest()
+
+
+def verify_or_refuse(candidate=None, fresh=None):
+    """Compare `candidate` (default: the legacy fixed-name binary
+    scripts/ptm12_diag/mc_ref_pp) against a fresh compile of current source.
+    Returns quietly if candidate does not exist (nothing to be stale) or its
+    content matches. REFUSES -- SystemExit, nonzero exit -- naming `candidate`
+    and the exact rebuild command if it exists and differs.
+
+    This is the check that would have caught the incident this module exists
+    for: mc_ref_pp compiled 2026-07-23, predating the back-face-cull fix
+    (44210d8, ce3ca8c), sitting at this fixed path and used verbatim."""
+    candidate = Path(candidate) if candidate else LEGACY_BIN
+    if not candidate.is_file():
+        return
+    fresh = fresh or resolve_current()
+    if _md5(candidate) == _md5(fresh):
+        return
+    raise SystemExit(
+        f"FATAL: {candidate} does not match a fresh compile of {MC_SRC.name}.\n"
+        f"  stale on-disk binary : md5 {_md5(candidate)}  ({candidate})\n"
+        f"  fresh compile        : md5 {_md5(fresh)}  ({fresh})\n"
+        "This binary predates a merged source fix and MUST NOT be used for a "
+        "production sweep. Rebuild it with:\n"
+        f"  python3 {Path(__file__).resolve()} --replace\n"
+        "or delete it -- every caller in this repository now resolves a "
+        "guaranteed-fresh binary through this module and does not need the "
+        "fixed path to exist."
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--replace", action="store_true",
+                     help="overwrite the legacy fixed path (scripts/ptm12_diag/mc_ref_pp) "
+                          "with the fresh binary, after building/verifying it")
+    ap.add_argument("--check-only", action="store_true",
+                     help="exit 0/1 only; do not print the resolved path")
+    a = ap.parse_args()
+
+    fresh = resolve_current()
+    if a.replace:
+        old_md5 = _md5(LEGACY_BIN) if LEGACY_BIN.is_file() else None
+        shutil.copy2(fresh, LEGACY_BIN)
+        os.chmod(LEGACY_BIN, 0o755)
+        _log(f"  mc_ref_pp: replaced {LEGACY_BIN} "
+             f"(was {old_md5 or 'absent'}, now {_md5(LEGACY_BIN)})")
+    else:
+        verify_or_refuse(fresh=fresh)
+
+    if not a.check_only:
+        print(fresh)
+
+
+if __name__ == "__main__":
+    main()

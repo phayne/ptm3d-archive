@@ -79,8 +79,14 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+# find_or_build_mc_ref_pp lives in ensure_mc_ref_pp.py, the single source of
+# truth for building/verifying the referee (shared with run_pp_sweep.sh via
+# its CLI, and with test_vf_cross_agreement.py). See that module's docstring.
+from ensure_mc_ref_pp import find_or_build_mc_ref_pp  # noqa: E402
+
 ASSEMBLER = HERE / "assemble_vf_haworth.py"
-MC_SRC = HERE / "mc_ref_pp.cpp"
 REPO = HERE.parent.parent
 CRATER_PLY = REPO / "data" / "meshes" / "lunar_crater_80N.ply"
 
@@ -185,65 +191,6 @@ def convert_ascii_ply(src, dst):
 # --------------------------------------------------------------------------------------
 # referee pipeline
 # --------------------------------------------------------------------------------------
-def find_or_build_mc_ref_pp(explicit, work):
-    # An EXPLICITLY named binary that cannot be used is fatal: the point of naming one is
-    # to gate that build, and silently substituting a fresh compile would return a PASS
-    # that describes a different binary.
-    if explicit and not (Path(explicit).is_file() and os.access(str(explicit), os.X_OK)):
-        raise SystemExit(f"FATAL: --mc-ref-pp {explicit} is missing or not executable. "
-                         "Refusing to substitute a different binary.")
-    for cand in (explicit, os.environ.get("PTM_MC_REF_PP"), HERE / "mc_ref_pp"):
-        if cand and Path(cand).is_file() and os.access(str(cand), os.X_OK):
-            print(f"  mc_ref_pp: using existing {cand}")
-            return str(cand)
-    out = work / "mc_ref_pp"
-    # Portable build. The referee is one translation unit against Embree 4, so it
-    # needs no CMake -- but it must not assume the Mac Pro's toolchain, because CI
-    # runs this on Linux too. Compiler: $CXX, else the Xcode CommandLineTools
-    # clang++ where it exists (the /usr/bin/c++ shim on this machine is a stub),
-    # else c++. Include/library roots: pkg-config first, then the usual prefixes.
-    cxx = os.environ.get("CXX")
-    if not cxx:
-        for cand in ("/Library/Developer/CommandLineTools/usr/bin/clang++", "c++"):
-            if cand == "c++" or Path(cand).is_file():
-                cxx = cand
-                break
-    cmd = [cxx, "-O3", "-std=c++17"]
-    if sys.platform == "darwin":
-        sdk = subprocess.run(["/usr/bin/xcrun", "--show-sdk-path"],
-                             capture_output=True, text=True).stdout.strip()
-        if sdk:
-            cmd += ["-isysroot", sdk]
-    pkg_c, pkg_l = [], []
-    for probe, sink in ((["--cflags"], pkg_c), (["--libs"], pkg_l)):
-        r = subprocess.run(["pkg-config"] + probe + ["embree4"], capture_output=True, text=True)
-        if r.returncode == 0:
-            sink.extend(r.stdout.split())
-    if pkg_c:
-        cmd += pkg_c
-    else:
-        for inc in ("/usr/local/include", "/opt/homebrew/include", "/usr/include"):
-            if (Path(inc) / "embree4" / "rtcore.h").is_file():
-                cmd += ["-I" + inc]
-                break
-    cmd += [str(MC_SRC)]
-    if pkg_l:
-        cmd += pkg_l
-    else:
-        for lib in ("/usr/local/lib", "/opt/homebrew/lib"):
-            if Path(lib).is_dir():
-                cmd += ["-L" + lib]
-        cmd += ["-lembree4"]
-    cmd += ["-o", str(out)]
-    print("  mc_ref_pp: building --", " ".join(cmd))
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not out.is_file():
-        sys.stderr.write(r.stdout + r.stderr)
-        raise SystemExit("FATAL: could not build mc_ref_pp. Install Embree 4 (headers in "
-                         "<prefix>/include/embree4) or pass --mc-ref-pp /path/to/mc_ref_pp.")
-    return str(out)
-
-
 def write_tmax(path, n, value=100.0):
     """mc_ref_pp's per-face temperature input: int32 count followed by float32 values.
     Only the F_warm384/Qir diagnostic columns use it; the view factors do not."""
