@@ -96,7 +96,7 @@ __all__ = [
 
 
 #: Faces above which the preview stops drawing a surface. Chosen from the
-#: meshes this project actually opens: the A3GT A03MP026 3 km core is 2,397,890
+#: meshes this project actually opens: the A3GT lunar polar site A 3 km core is 2,397,890
 #: faces and the moon3d flagship is 509,337, so the cap has to sit below both
 #: or the "big mesh" path is never exercised on a real file. 500,000 also keeps
 #: the point-cloud fallback under a second on this machine.

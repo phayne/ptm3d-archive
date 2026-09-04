@@ -10,7 +10,7 @@ Statistics directory layout (per writeStatisticsBinary):
 
 Usage:
   python lookup_face_at_site.py \
-      --mesh data/dem/mons_mouton/mm_site1_*.ply \
+      --mesh data/dem/<region>/<site>.ply \
       --stats-dir output/mm_site1_yearly/statistics \
       --lat -84.36705 --lon 39.14019
 """

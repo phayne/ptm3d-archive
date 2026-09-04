@@ -487,7 +487,7 @@ facet scales, $\sqrt{\text{mean face area}}$:
 |---|---|---|
 | `sunlit_radcore_r50` (50 km core, 140k faces) | 237 m | **ON** |
 | `haworth_radcore_r32c` (32 km core, 100k faces) | 181 m | **ON** |
-| A3GT `A03MP026` (3 km core, 2.4 M faces) | 3.46 m | **ON** |
+| A3GT lunar polar site A (3 km core, 2.4 M faces) | 3.46 m | **ON** |
 | `moon3d` 509k (a ~1.6 m simulated crater) | 1.96 mm | **OFF** |
 
 **Policy.** Beaming is standard for **site and regional** lunar polar configurations — meters and
@@ -569,7 +569,7 @@ moves the radiosity replica and the GPU thermal pool onto **disjoint devices**
 and keeps the GPU rung — a derived +7-10 min per A3GT-scale window. It gives up
 the rung only below `hard_min_vram_margin_gib` (0.25), or on a rung that cannot
 be separated. That matters because the alternative is expensive: measured on
-A03N1016 (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window against
+lunar polar site B (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window against
 31.4 min on the GPU pool, 8 windows each. The reason the margin needs guarding
 at all is that the GPU thermal pool allocates roughly 0.77 GiB per device on
 the *same* dies while the replica is resident, and the fit check does not count

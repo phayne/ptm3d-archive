@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 A3GT batch driver — runs PTM3D 18-year chunked simulations for a list of
-candidate landing sites that all share the same Mons-Mouton DEM.
+candidate sites that all share one regional DEM.
 
 For each site this driver:
   1. Generates a variable-resolution ROI PLY via `dtm_to_ply_delaunay`
      (1 m/px in the central 1-km-diameter core, quadratic falloff to
      10 km, ~5 M faces total).
-  2. Renders a per-site YAML config from `examples/moon_mm_site1_18yr.yaml`
+  2. Renders a per-site YAML config from the 18-year template
      by substituting `simulation.start_time` (kept), `mesh.import_file`,
      and `output.directory`.
   3. Invokes `scripts/run_chunked_simulation.py --resume` to run the
@@ -17,19 +17,34 @@ Sites are processed sequentially because GPU + RAM are shared
 resources. Each site uses --resume so a single chunk failure does not
 lose more than ~10 minutes of progress.
 
+**The site list, the DEM and the template are INPUTS, not constants.** They
+used to be a table of coordinates and two absolute paths in this file.
+Candidate site coordinates are not published with PTM3D, so the catalog now
+comes from a GeoJSON of `[lon, lat]` positions that the operator supplies, the
+DEM comes from `--dem`, the template from `--template`, and NONE has a
+default: with one missing the driver exits and says what it wants. A silent
+fallback to a built-in list is the one behavior worth refusing here — it would
+run a whole 18-year batch on the wrong places and look completely normal doing
+it.
+
 Usage::
 
-    python3 scripts/run_a3gt_batch.py
-    # or limit to a specific subset:
-    python3 scripts/run_a3gt_batch.py --sites A3GT_MM01,A3GT_MM02
+    python3 scripts/run_a3gt_batch.py --sites-geojson sites.geojson \\
+        --dem dem.tif --template examples/my_18yr.yaml
+    # or limit to a specific subset (tags are <prefix><NN> in file order):
+    python3 scripts/run_a3gt_batch.py --sites-geojson sites.geojson \\
+        --dem dem.tif --template examples/my_18yr.yaml --sites SITE01,SITE02
     # see what would run, without actually running:
-    python3 scripts/run_a3gt_batch.py --dry-run
+    python3 scripts/run_a3gt_batch.py --sites-geojson sites.geojson \\
+        --dem dem.tif --template examples/my_18yr.yaml --dry-run
 """
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -47,34 +62,107 @@ class Site:
     lat: float
     lon: float
 
-# A3GT Mons-Mouton traverse sites. Source of truth is
-# data/a3gt_sites.geojson (LineString with 15 (lon, lat) points); this
-# list mirrors it as Site(tag, lat, lon) entries. Tags are MM<NN> in
-# LineString order (1-indexed). Run a subset by tag with --sites.
-SITES = [
-    Site("A3GT_MM01", lat=-84.25056,   lon=29.16221),
-    Site("A3GT_MM02", lat=-84.370352,  lon=31.976699),
-    Site("A3GT_MM03", lat=-84.223374,  lon=33.528003),
-    Site("A3GT_MM04", lat=-83.791051,  lon=38.736246),
-    Site("A3GT_MM05", lat=-83.639768,  lon=39.693158),
-    Site("A3GT_MM06", lat=-84.012182,  lon=42.634203),
-    Site("A3GT_MM07", lat=-84.069908,  lon=44.233216),
-    Site("A3GT_MM08", lat=-84.367782,  lon=39.148603),
-    Site("A3GT_MM09", lat=-84.51299,   lon=38.696035),
-    Site("A3GT_MM10", lat=-84.571642,  lon=39.327352),
-    Site("A3GT_MM11", lat=-84.629704,  lon=39.233225),
-    Site("A3GT_MM12", lat=-85.009852,  lon=37.826427),
-    Site("A3GT_MM13", lat=-85.070507,  lon=37.425461),
-    Site("A3GT_MM14", lat=-85.193938,  lon=32.99094),
-    Site("A3GT_MM15", lat=-85.218543,  lon=31.838977),
-]
+
+#: Tag prefix for sites read out of the catalog, numbered in file order
+#: (1-indexed). Overridable so two catalogs' outputs cannot collide.
+DEFAULT_SITE_PREFIX = "SITE"
+
+#: What a site tag may contain. Enforced in `load_sites`, because a tag from
+#: the catalog becomes a file name in three places.
+SAFE_TAG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*")
+
+
+def load_sites(path, prefix=DEFAULT_SITE_PREFIX):
+    """``[Site, ...]`` from a GeoJSON of ``[lon, lat]`` positions.
+
+    Accepts a bare ``LineString``/``MultiPoint`` geometry, a ``Feature``
+    wrapping one, or a ``FeatureCollection`` of ``Point`` features. A feature's
+    ``properties.tag`` or ``properties.name`` is used as the tag when it has
+    one, so a catalog can carry its own names rather than positional ones.
+
+    Coordinates are ``[lon, lat]`` -- GeoJSON order, and the reverse of how
+    they are written everywhere else in this project. Getting that backwards
+    puts a polar site on the equator and the run completes, so the range check
+    below is not decoration: it is the only thing that catches a transposed
+    file.
+    """
+    try:
+        document = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        sys.exit(f"Could not read the site catalog {path}: {exc}")
+
+    positions, tags = [], []
+
+    def take(geometry, properties=None):
+        kind = (geometry or {}).get("type")
+        coords = (geometry or {}).get("coordinates")
+        if kind in ("LineString", "MultiPoint"):
+            positions.extend(coords or [])
+            tags.extend([None] * len(coords or []))
+        elif kind == "Point":
+            positions.append(coords)
+            props = properties or {}
+            tags.append(props.get("tag") or props.get("name"))
+        else:
+            sys.exit(f"{path}: geometry type {kind!r} is not a site list; "
+                     f"expected LineString, MultiPoint or Point.")
+
+    kind = document.get("type") if isinstance(document, dict) else None
+    if kind == "FeatureCollection":
+        for feature in document.get("features", []):
+            take(feature.get("geometry"), feature.get("properties"))
+    elif kind == "Feature":
+        take(document.get("geometry"), document.get("properties"))
+    else:
+        take(document if isinstance(document, dict) else {})
+
+    if not positions:
+        sys.exit(f"{path} contains no site positions.")
+
+    sites = []
+    for index, (position, tag) in enumerate(zip(positions, tags), start=1):
+        try:
+            lon, lat = float(position[0]), float(position[1])
+        except (TypeError, ValueError, IndexError):
+            sys.exit(f"{path}: position {index} is not a [lon, lat] pair: "
+                     f"{position!r}")
+        if not -90.0 <= lat <= 90.0:
+            sys.exit(f"{path}: position {index} has latitude {lat}, which is "
+                     f"out of range. GeoJSON order is [lon, lat] -- this file "
+                     f"looks transposed.")
+        sites.append(Site(tag or f"{prefix}{index:02d}", lat=lat, lon=lon))
+
+    seen = set()
+    for site in sites:
+        # A TAG BECOMES THREE FILESYSTEM PATHS -- the ROI mesh, the rendered
+        # per-site config, and the output directory (`mesh_path`, `yaml_path`,
+        # `out_dir`). It used to be a constant in this file and is now read out
+        # of a file the operator points at, so it is validated rather than
+        # trusted: a tag of "../../etc/x" would otherwise write outside the
+        # trees this driver owns, and one containing a separator would write
+        # somewhere nobody looks for it.
+        if not SAFE_TAG.fullmatch(site.tag):
+            sys.exit(f"{path}: the site tag {site.tag!r} is not usable as a "
+                     f"file name. Tags become the mesh, config and output "
+                     f"directory names, so they are limited to letters, "
+                     f"digits, '.', '_' and '-', and may not begin with '.'.")
+        if site.tag in seen:
+            sys.exit(f"{path}: two sites share the tag {site.tag!r}. A tag "
+                     f"names the mesh, the config and the output directory, so "
+                     f"a duplicate would have them overwrite each other.")
+        seen.add(site.tag)
+    return sites
+
 
 # --------------------------------------------------------------------------
 # Paths
 # --------------------------------------------------------------------------
 
 REPO   = Path(__file__).resolve().parent.parent
-DEM    = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/DEM/a3gt/mons-mouton/mm-sfs-dem.tif")
+#: Bound from --dem in main(). There is deliberately no default: see the module
+#: docstring. A module-level constant here was an absolute path to one
+#: machine's copy of one campaign's DEM.
+DEM    = None
 # dtm_to_ply_delaunay is now built from this repository
 # (src/cpp/tools/dtm_to_ply_delaunay.cpp -> build/bin/). Prefer that copy: it
 # is the binary this checkout built, and it is on local disk, so it cannot hit
@@ -104,9 +192,10 @@ DTM_TOOL = _pick_dtm_tool()
 PTM_BIN   = REPO / "build" / "bin" / "ptm_thermal_sim"
 MERGE_BIN = REPO / "build" / "bin" / "ptm_merge_chunks"
 CHUNK_RUN = REPO / "scripts" / "run_chunked_simulation.py"
-TEMPLATE  = REPO / "examples" / "moon_mm_site1_18yr.yaml"
+#: Bound from --template in main(). No default -- see the module docstring.
+TEMPLATE  = None
 
-MESH_DIR    = REPO / "data" / "dem" / "mons_mouton"
+MESH_DIR    = REPO / "data" / "dem" / "a3gt_batch"
 EXAMPLES    = REPO / "examples"
 OUT_ROOT    = REPO / "output"
 
@@ -139,7 +228,7 @@ def _roi_suffix(roi_radius_km: float, roi_core_frac: float,
 def mesh_path(site: Site, roi_radius_km: float = 10.0,
               roi_core_frac: float = 0.05,
               roi_max_points: int = 2_500_000) -> Path:
-    """data/dem/mons_mouton/A3GT_MM<NN>_<|lat|>S_<lon>E[<roi suffix>].ply"""
+    """``<mesh dir>/<TAG>_<|lat|>S_<lon>E[<roi suffix>].ply``"""
     suffix = _roi_suffix(roi_radius_km, roi_core_frac, roi_max_points)
     return MESH_DIR / f"{site.tag}_{abs(site.lat):.3f}S_{site.lon:.3f}E{suffix}.ply"
 
@@ -233,7 +322,7 @@ def build_mesh(site: Site, log_path: Path, dry_run: bool,
 
 def render_yaml(site: Site, ply: Path, dry_run: bool,
                 output_root: Path = OUT_ROOT) -> Path:
-    """Render a per-site YAML config from the moon_mm_site1_18yr.yaml
+    """Render a per-site YAML config from the 18-year
     template by substituting mesh.import_file and output.directory.
 
     Doing this with simple string substitution rather than yaml.safe_load
@@ -376,12 +465,34 @@ def preflight() -> None:
 # --------------------------------------------------------------------------
 
 def main():
+    # DEM, TEMPLATE and MESH_DIR are bound from the command line below; they
+    # were module constants naming one machine's copy of one campaign's data.
+    global DEM, TEMPLATE, MESH_DIR
     p = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__)
-    p.add_argument("--sites", default=",".join(s.tag for s in SITES),
-                   help=f"Comma-separated list of A3GT site tags to run "
-                        f"(default: all {len(SITES)} sites in SITES).")
+    p.add_argument("--sites-geojson", type=Path, required=True,
+                   help="REQUIRED. GeoJSON of [lon, lat] site positions "
+                        "(LineString, MultiPoint, or a FeatureCollection of "
+                        "Points). There is no built-in catalog; see the "
+                        "module docstring for why.")
+    p.add_argument("--dem", type=Path, required=True,
+                   help="REQUIRED. The regional DEM every site is cut from.")
+    p.add_argument("--site-prefix", default=DEFAULT_SITE_PREFIX,
+                   help=f"Tag prefix for sites the catalog does not name "
+                        f"(default: {DEFAULT_SITE_PREFIX}).")
+    p.add_argument("--template", type=Path, required=True,
+                   help="REQUIRED. The 18-year config template each per-site "
+                        "config is rendered from. No default: the one this "
+                        "driver used to name is not in the repository, so a "
+                        "default here was a path that always failed "
+                        "pre-flight.")
+    p.add_argument("--mesh-dir", type=Path, default=MESH_DIR,
+                   help=f"Where per-site ROI meshes are written "
+                        f"(default: {MESH_DIR}).")
+    p.add_argument("--sites", default="",
+                   help="Comma-separated subset of site tags to run "
+                        "(default: every site in --sites-geojson).")
     p.add_argument("--total-days", type=float, default=6798.5,
                    help="Total simulated duration per site in days "
                         "(default: 6798.5 = full 18.61-yr lunar nodal cycle).")
@@ -425,13 +536,25 @@ def main():
                    help="Print the per-site plan and exit without running anything.")
     args = p.parse_args()
 
+    # Bind the three things that used to be constants BEFORE pre-flight, so
+    # pre-flight checks what this invocation will actually use.
+    DEM = args.dem
+    TEMPLATE = args.template
+    MESH_DIR = args.mesh_dir
+
     preflight()
 
+    catalog = load_sites(args.sites_geojson, args.site_prefix)
     requested = [t.strip() for t in args.sites.split(",") if t.strip()]
-    sites_to_run = [s for s in SITES if s.tag in requested]
-    unknown = set(requested) - {s.tag for s in sites_to_run}
-    if unknown:
-        sys.exit(f"Unknown site tag(s): {sorted(unknown)}")
+    if requested:
+        sites_to_run = [s for s in catalog if s.tag in requested]
+        unknown = set(requested) - {s.tag for s in sites_to_run}
+        if unknown:
+            sys.exit(f"Unknown site tag(s): {sorted(unknown)}. "
+                     f"{args.sites_geojson} defines "
+                     f"{[s.tag for s in catalog]}.")
+    else:
+        sites_to_run = list(catalog)
 
     args.output_root.mkdir(parents=True, exist_ok=True)
 

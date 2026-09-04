@@ -10974,7 +10974,7 @@ struct MeshUnitReport {
 // rule written to refuse millimeter facets. Beaming double-counts on the facets
 // that already resolve the roughness, so what matters is whether a meaningful
 // fraction of the mesh sits at that scale. Measured, sqrt(mean) vs
-// sqrt(5th percentile): sunlit_radcore_r50 234 m / 169 m; A3GT A03MP026 core
+// sqrt(5th percentile): sunlit_radcore_r50 234 m / 169 m; A3GT lunar polar site A core
 // 3.47 m / 0.708 m; A3GT ring 146 m / 25.1 m.
 //
 // UNITS come from inspectMeshLengthUnit's verdict, not from an assumption --
@@ -19166,7 +19166,7 @@ int main(int argc, char** argv) {
                     //    device(s)" and then ran the re-thermal on 4 devices,
                     //    rebuilding 4 OpenCL contexts per coupling iteration --
                     //    the exact churn this pool exists to remove (see the
-                    //    SMC -108 note at its declaration). A03MP026 windows
+                    //    SMC -108 note at its declaration). Lunar polar site A windows
                     //    show 24 kernel compiles where 8 suffice and ZERO
                     //    "Hoisted re-thermal pool" lines.
                     //  * The prior commit made the cap real. Leaving its old
@@ -21988,9 +21988,9 @@ int main(int argc, char** argv) {
         {
             // PTM-461: the mesh-identity hash needs ROUND-TRIP precision.
             // A bare `ostream << double` uses 6 significant digits, so a
-            // geomhash of 28733826.165896364 was recorded as 2.87338e+07 and
-            // read back as 28733800.0, and the packager copies whatever is
-            // here into the delivered HDF5 verbatim.
+            // geomhash of the form 31904726.165896364 was recorded as
+            // 3.19047e+07 and read back as 31904700.0, and the packager
+            // copies whatever is here into the delivered HDF5 verbatim.
             //
             // PROVENANCE ONLY -- and the scale is worth being exact about,
             // because it is not what it looks like. The loss is 26.17 in hash
@@ -22002,7 +22002,7 @@ int main(int argc, char** argv) {
             // What is lost is identification -- the recorded hash is no longer
             // the hash, so it cannot be matched against the authoritative
             // full-precision constants the crew keeps for these meshes (e.g.
-            // gui/gui_core/curated_sites.py: 28733826.165896364 for A03MP026).
+            // the site registry's own entry for each mesh).
             // 17 significant digits is the IEEE-754 double round-trip width.
             // Formatted in its own stream so the surrounding integer and
             // string fields keep their default formatting.

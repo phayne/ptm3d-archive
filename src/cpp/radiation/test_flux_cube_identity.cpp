@@ -91,7 +91,7 @@ ArmResult runArm(const char* label, int N, double s, bool shadow_face0) {
     ArmResult r;
 
     // --- Heterogeneous, all-distinct properties. eps spans lunar regolith
-    // (0.95) to a dark rock analog; A_bond spans the measured MP026 range
+    // (0.95) to a dark rock analog; A_bond spans the measured site A range
     // (0.137 - 0.290) widened both ways; A_src is deliberately offset from
     // A_bond by a face-dependent amount so the two can never be confused.
     std::vector<double> areas(N, 1.0), emiss(N), bond(N), a_src(N), T(N), solar(N);

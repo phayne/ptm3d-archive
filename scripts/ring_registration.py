@@ -22,9 +22,9 @@ That rule is wrong in a way that is invisible to every mesh-quality check:
 The result is ring surface lying planimetrically on top of core terrain. At
 lunar polar sun elevations (0-5 deg) that overlapping lip casts a hard,
 near-permanent spurious shadow on the core's edge faces. Measured at
-A03MP026: 2,730 core faces covered by ring geometry, P(severe cold) 0.165
+lunar polar site A: 2,730 core faces covered by ring geometry, P(severe cold) 0.165
 under the lip vs 0.031 clear, and no severely cold edge face anywhere more
-than 200 m from the lip. Same-order overlap at A03N1016 and A03SP010.
+than 200 m from the lip. Same-order overlap at lunar polar site B and lunar polar site C.
 
 This module replaces the nominal circle with the core mesh's **actual outer
 boundary polygon**, and adds a registration gate that refuses to emit a ring

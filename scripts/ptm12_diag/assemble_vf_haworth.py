@@ -80,7 +80,7 @@ def radiance_prune(rows, cols, F, N, eps, R, Tface, area, out_csr):
             "T_source": "face T_max (stats dir)" if Tface is not None else "reference 40 K floor",
             "caveat": "loose UPPER bound (partner MAX radiance, timing-decoupled)."},
         "MEASURED_AGT_counter_example": (
-            "MP026 radiance eps=1e-3 (3.2x nnz) MEASURED FAIL: PSR-floor Tmax mean 3.3 K / "
+            "site A radiance eps=1e-3 (3.2x nnz) MEASURED FAIL: PSR-floor Tmax mean 3.3 K / "
             "max 22.6 K cold (rims pass, <0.6 K). Diffuse polar terrain does NOT prune "
             "safely; isolated-crater / warm-body terrain is where it pays. "
             "See ~/projects/a3gt/prune_test/verdict.json."),
@@ -94,7 +94,7 @@ def radiance_prune(rows, cols, F, N, eps, R, Tface, area, out_csr):
           % (disc.max(), np.percentile(disc, 99), disc.mean()))
     print("  a-priori dT bound (K, %s): max=%.2f p99=%.3f mean=%.4f  [LOOSE upper bound]"
           % (receipt["dT_bound_K"]["T_source"], dT.max(), np.percentile(dT, 99), dT.mean()))
-    print("  CAUTION: measured AGT MP026 3.2x -> PSR floor mean 3.3 K / max 22.6 K (verdict.json).")
+    print("  CAUTION: measured AGT site A 3.2x -> PSR floor mean 3.3 K / max 22.6 K (verdict.json).")
     return keep, receipt
 
 _PLY_NP = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
@@ -110,7 +110,7 @@ def read_ply_geometry(path):
     PTM-23 fix: the old path used pyvista's ``mesh.points``, which VTK downcasts
     to float32; the resulting float32 areas made the VF_REPLACE geomhash
     (Sum_i area_i + (i+1)*area_i*1e-9) differ from the C++ sim's float64
-    ``areas_`` by ~1e-4 (A03MP026: 1.37e-4 of the 1e-3 gate) -- fine here but
+    ``areas_`` by ~1e-4 (lunar polar site A: 1.37e-4 of the 1e-3 gate) -- fine here but
     liable to trip the gate on a larger/higher-area mesh. Reading float64 in the
     same PLY face order the C++ loader uses makes the two hashes agree to
     round-off. Also drops the pyvista/VTK dependency (runs in the base python)."""

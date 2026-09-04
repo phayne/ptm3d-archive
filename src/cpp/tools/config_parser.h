@@ -824,7 +824,7 @@ struct SimulationConfig {
         //              (Paul's ruling, 2026-08-22).
         //   refuse   = give up the GPU rung (radiosity on the CPU).
         // Both remove the co-residency the 2026-08 wedges died in; they differ
-        // by a lot in price on a large-matrix site. Measured on A3GT A03N1016,
+        // by a lot in price on a large-matrix site. Measured on A3GT lunar polar site B,
         // the CPU radiosity rung cost 108.9 min/window against 31.4 min on the
         // GPU pool (+77.5 measured), while separation costs a derived
         // +7-10 min. See docs/gpu-wedge-guardrails.md.

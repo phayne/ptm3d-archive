@@ -250,17 +250,17 @@ def test_the_mesh_placement_keys_are_writable():
 
     manager.set_value("mesh.import_file", "data/meshes/core.ply")
     manager.set_value("mesh.occluder_file", "data/meshes/ring.ply")
-    manager.set_value("mesh.latitude_override", -84.223)
-    manager.set_value("mesh.longitude_override", 33.502)
+    manager.set_value("mesh.latitude_override", -71.625)
+    manager.set_value("mesh.longitude_override", 218.375)
 
     written = manager._config_for_yaml()["mesh"]
     assert written["occluder_file"] == "data/meshes/ring.ply", written
-    assert written["latitude_override"] == -84.223, written
-    assert written["longitude_override"] == 33.502, written
+    assert written["latitude_override"] == -71.625, written
+    assert written["longitude_override"] == 218.375, written
 
     back = _round_trip(manager)
     assert back.get_value("mesh.occluder_file") == "data/meshes/ring.ply"
-    assert back.get_value("mesh.latitude_override") == -84.223
+    assert back.get_value("mesh.latitude_override") == -71.625
 
 
 def test_the_occluder_is_preflight_checked_like_the_core_mesh():
@@ -542,7 +542,7 @@ def test_validate_catches_the_mesh_placement_traps():
     assert any("longitude_override" in m for m in messages), (
         f"...but it must still be said: {messages}")
 
-    manager.set_value("mesh.latitude_override", -84.223)
+    manager.set_value("mesh.latitude_override", -71.625)
     ok, messages = manager.validate()
     assert ok, messages
 

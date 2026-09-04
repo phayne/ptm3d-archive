@@ -56,7 +56,7 @@ helpers).
 Usage::
 
     python3 scripts/run_chunked_simulation.py \\
-        --config examples/moon_mm_site1_18yr.yaml \\
+        --config examples/<your-18-year-config>.yaml \\
         --total-days 6798.5 \\
         --output-dir output/mm_site1_18yr \\
         [--ram-budget-gb 384] [--chunks 4] [--resume] [--dry-run]
@@ -937,7 +937,7 @@ def main():
                 # for several minutes after a kernel hang; the previous 30/60s
                 # base was too short — three quick retries all hit the same
                 # degraded driver state on lunar 1.8M-face workloads
-                # (A03MP012 Y05_winter / Y09_summer, 2026-05-13).
+                # (lunar polar site K Y05_winter / Y09_summer, 2026-05-13).
                 cooldown = min(600, 120 * (2 ** (attempt - 1)))
                 print(f"[chunked] chunk {i:03d}: retry {attempt}/{args.retries} "
                       f"after {last_failure}; "

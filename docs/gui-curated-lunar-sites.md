@@ -10,7 +10,7 @@ Two mechanisms, in `gui/gui_core/`:
 
 | module | what it does |
 |---|---|
-| `curated_sites.py` | a table of site sets that have been RUN, with everything each one wires and everything it refuses |
+| `curated_sites.py` | a table of site sets that have been RUN, with everything each one wires and everything it refuses. **The shipped table is empty — the entries come from a local overlay; see below.** |
 | `vf_discovery.py` | for any mesh, ranks the view-factor files already sitting beside it |
 
 Neither imports Qt, so both are measurable without a window.
@@ -80,19 +80,43 @@ names the corrected one (`radiation_exchange.cpp:370`).
 `mesh.latitude_override > -900.0` makes the engine rotate the loaded mesh so its
 vertex mean lands on the given point (`ptm_thermal_sim.cpp:15634` →
 `rotateMeshToLatLon`). These DEMs are built into lunar body-frame coordinates
-and are *already* at their own latitude and longitude — measured, the A03MP026
-mesh's vertex mean sits at −84.2234, 33.5023 against a name that says
-84.223S/33.502E. Writing the rounded name back would rotate by ~0.0004°, which
+and are *already* at their own latitude and longitude — measured, one
+production core's vertex mean sits 0.0004° from the coordinates in its own file
+name. Writing the rounded name back would rotate by that much, which
 is past the engine's 1e-10 radian no-op guard, moving the core about 12 m — and
 the occluder ring is **not** rotated with it. A rotation does not change face
 areas, so the matrix's geometry-hash gate stays green throughout. Every
 production configuration for these sites leaves both keys unset; so does the
 registry, and the card shows the coordinates as text instead.
 
+### The local overlay, and why the shipped table is empty
+
+`CURATED_SITES` ships as `()`. The sites this registry was built from are lunar
+landing-site candidates — information this project does not publish — so the
+entries live **outside the repository**, in
+`~/.ptm3d/curated_sites_local.json`, beside the `machine_profile.json` this
+project already kept there. `PTM3D_CURATED_SITES_LOCAL` relocates it.
+
+The file is JSON, not an importable module: it is read at GUI start from a
+location outside the checkout, and a data file cannot become an execution path.
+Its schema is one version string plus the same fields the classes take, so a
+reader can see what it is without running it.
+
+**A broken overlay is loud.** Unreadable, malformed, duplicate-keyed, or written
+to a schema this build does not know: `local_registry_status()` records the
+fault, the loader logs a warning, and the Moon card shows the message beside the
+empty list. An overlay that failed to parse and an overlay that is not there
+both leave the table empty, and only one of them is a problem — so they must not
+read the same.
+
+With no overlay the GUI simply offers no curated lunar sites, which is correct
+for a checkout that has no site artifacts either.
+
 ### Local-only entries
 
-The A3GT artifacts are hundreds of gigabytes and are **not distributed** with
-PTM3D. Every entry is marked `local_only` with the working tree it needs, and
+The artifacts an overlay names are hundreds of gigabytes and are **not
+distributed** with PTM3D. Every entry is marked `local_only` with the working
+tree it needs, and
 its status is computed from the disk in front of the user. On another machine
 the entry is still listed, says the files are not there, and **writes nothing** —
 it does not emit paths and leave the launch check to discover them. A set that
@@ -103,26 +127,29 @@ is a run that starts and is wrong.
 
 Where several matrices for one site exist, the entry names the ones it does not
 use and why — the same discipline as the Bennu tier's superseded-kernel note.
-For A03MP026 that includes the July matrix the project map names first
+For one site that includes a July matrix the project map names first
 (2,484,716,524 nonzeros, no provenance sidecar, built before the FC-08
-symmetrization-divisor fix). The three curated sites are all on the **same**
+symmetrization-divisor fix). The curated sites should all be on the **same**
 matrix generation, which is what the GEN-2 campaign ran; mixing generations
-across a table of sites would be three runs on two physics with nothing saying
+across a table of sites would be several runs on two physics with nothing saying
 so.
 
 ### Adding a site
 
 1. Run the set to completion and check the output. An entry is a claim that this
    happened, not that the files exist.
-2. Add a `CuratedSite` to `CURATED_SITES` with every number **read off the
-   files**: face counts from the PLY headers, rows/nonzeros/geometry hash from
-   the CSR, and the stub's format and emptiness from its 80 bytes.
+2. Add an entry to the local overlay with every number **read off the files**:
+   face counts from the PLY headers, rows/nonzeros/geometry hash from the CSR,
+   and the stub's format and emptiness from its 80 bytes. Put it in
+   `BUILTIN_CURATED_SITES` **only** if its coordinates, identifier and terrain
+   are all publishable and a user could obtain its artifacts.
 3. List what the entry does **not** use, and why, in `superseded`.
-4. Run `python3 src/python/tests/test_gui_curated_sites.py`. It re-reads every
-   number, re-measures the mesh's position from its own vertices, checks the
-   provenance sidecar against the matrix beside it, and emits a configuration
-   through the engine's `--validate-config`. Checks whose files are absent
-   **skip by name** rather than passing.
+4. Run `python3 src/python/tests/test_gui_curated_sites.py`. The machinery
+   checks run against synthetic fixture sites (`src/python/tests/
+   synthetic_sites.py`) and run everywhere; the disk-anchored ones re-read every
+   number off your overlay's files, re-measure the mesh's position from its own
+   vertices, and check the provenance sidecar against the matrix beside it.
+   Checks with no overlay to look at **skip by name** rather than passing.
 
 ## Finding a matrix that is already on disk
 

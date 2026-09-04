@@ -129,7 +129,7 @@ def _hidden(widget):
 def test_the_cube_count_is_the_tools_own_rule():
     from gui_core import flux_cubes as fc
     # MEASURED: `ptm_flux_cube_geom --spacing 25 --radius 500` places 1,257
-    # cubes, on the A03MP026 site core and on the shipped 80N crater alike --
+    # cubes, on a curated site core and on the shipped 80N crater alike --
     # it is a property of the lattice, not of the mesh.
     assert fc.lattice_cube_count(25.0, 500.0) == 1257, (
         f"{fc.lattice_cube_count(25.0, 500.0)} cubes at the documented 25 m / "
@@ -191,7 +191,7 @@ def test_the_fast_count_agrees_with_the_tools_double_loop_everywhere():
 def test_the_product_size_matches_two_delivered_files():
     """The estimate is checked against real files, not against its own algebra.
 
-    Both delivered A03MP026 products, 1,257 cubes at 29 and at 720 output
+    Both delivered lunar polar products, 1,257 cubes at 29 and at 720 output
     steps. The formula is short by the provenance JSON blob each file carries
     (1,119 and 1,120 bytes), which is not modeled -- so the estimate is a floor
     about a kilobyte below the file, and it must stay one.
@@ -1677,7 +1677,30 @@ def _flow_card(mode="local", run_type="time_series"):
     return manager, card
 
 
-def _select_curated(card, key="A03MP026"):
+#: The core the facet-scale numbers in this file were measured on, exhaustively
+#: and once. It guards those arms rather than selecting anything: the curated
+#: site itself comes from the local overlay and may be a different mesh.
+MEASURED_CORE_FACES = 2397890
+
+
+def _curated_key():
+    """The key of the first curated site whose files are on THIS disk.
+
+    Resolved rather than named. The curated table ships empty -- its real
+    entries are landing-site candidates supplied by a local overlay
+    (``gui_core.curated_sites``, "The local overlay") -- so a hard-coded key
+    here would name a site the registry no longer has, and every arm below it
+    would skip on the one machine that can actually run them.
+    """
+    from gui_core.curated_sites import CURATED_SITES, site_status
+    for entry in CURATED_SITES:
+        if site_status(entry).ready:
+            return entry.key
+    raise Skip("no curated site's files are on this disk; the curated-site "
+               "arms need a local site overlay and its artifacts")
+
+
+def _select_curated(card, key=None):
     """Pick a curated site through the COMBO, as a click does, and prove the
     selection landed.
 
@@ -1691,6 +1714,7 @@ def _select_curated(card, key="A03MP026"):
     quietly and they do not fail on somebody else's laptop.
     """
     from gui_core.curated_sites import curated_site, site_status
+    key = key or _curated_key()
     entry = curated_site(key, body="Moon")
     if entry is None:
         raise Skip(f"{key} is not in this build's curated-site registry")
@@ -1708,7 +1732,7 @@ def _select_curated(card, key="A03MP026"):
     return card
 
 
-def _curated_card(key="A03MP026"):
+def _curated_card(key=None):
     """A flow-opened Moon local-mesh card with the curated site selected."""
     manager, card = _flow_card()
     _select_curated(card, key)
@@ -1728,7 +1752,7 @@ def _assert_options_visible(card, where):
 def test_pauls_curated_site_sequence_shows_the_options():
     """PAUL'S REPORT, 2026-08-31, driven exactly as he described it.
 
-    Moon card -> Local mesh -> the curated site A03MP026 -> tick the box.
+    Moon card -> Local mesh -> a curated site -> tick the box.
     Every essential option must be on screen afterwards. Before the fix this
     passed only because the site had already satisfied `engine_support` by the
     time the box was clicked; the arm below it is the one that failed.
@@ -1934,13 +1958,14 @@ def test_the_card_claims_no_provenance_for_a_setting_it_cannot_know():
 
 
 def test_the_curated_mesh_reads_its_own_facet_scale():
-    """The height and the cube count ON A03MP026, against the real PLY.
+    """The height and the cube count on the curated core, against the real PLY.
 
     ⛔ 0.35 m IS THE WRONG NUMBER for this mesh, and it is wrong in a way
     worth recording: it is `sqrt(mean face area)` = 3.4596 m, and the layout
     tool's length scale is the MEDIAN EQUIVALENT EDGE
     `sqrt(4A/sqrt(3))` (`flux_cube_geom.cpp:873`). Measured exhaustively over
-    all 2,397,890 faces of the delivered PLY: median equivalent edge
+    all 2,397,890 faces of the delivered PLY (see MEASURED_CORE_FACES):
+    median equivalent edge
     3.0453 m, median area 4.0156 m^2, mean area 11.9691 m^2 -- a distribution
     skewed 3:1, which is why the two disagree by 14%. The card's sampled
     estimate lands at 3.0441 m, 0.04% off the exhaustive answer, so the
@@ -1948,17 +1973,29 @@ def test_the_curated_mesh_reads_its_own_facet_scale():
     """
     from gui_core import flux_cubes as fc
     from gui_core.facet_scale import facet_scale
+    from gui_core.curated_sites import curated_site
     manager, card = _curated_card()
+
+    # The numbers below were measured exhaustively on ONE mesh. Confirm the
+    # site this machine's overlay supplied is that mesh before asserting them:
+    # a different curated core would fail these arms for a reason that has
+    # nothing to do with the code under test.
+    entry = curated_site(_curated_key(), body="Moon")
+    if entry.mesh.faces != MEASURED_CORE_FACES:
+        raise Skip(f"the curated core on this disk has {entry.mesh.faces:,} "
+                   f"faces; the facet-scale numbers in this arm were measured "
+                   f"on a {MEASURED_CORE_FACES:,}-face core")
+
     card.widgets["flux_cubes.enabled"].click()
 
     scale = facet_scale(manager.get_config(), card._project_root())
     assert scale.median_edge_m is not None, scale.detail
     assert abs(scale.median_edge_m - 3.0453) < 0.02, (
-        f"the median equivalent edge of the curated MP026 mesh moved: "
+        f"the median equivalent edge of the curated mesh moved: "
         f"{scale.median_edge_m} m, measured exhaustively as 3.0453 m")
     geometry = fc.auto_geometry(manager.get_config(), card._project_root())
     assert abs(geometry.height_m - 0.3045) < 0.002, (
-        f"the automatic cube height on MP026 is {geometry.height_m} m; the "
+        f"the automatic cube height is {geometry.height_m} m; the "
         f"tool's rule gives 0.1 x 3.0453 m = 0.3045 m")
     assert "30.4 cm" in card.flux_height.text(), card.flux_height.text()
 
@@ -2109,7 +2146,7 @@ def test_every_moon_mode_offers_the_group_in_every_run_type():
 #
 # Paul, on a freshly relaunched GUI whose `git log` shows the merged fix:
 #
-#   (1) with the curated A03MP026 site, NO flux-cube options appear before OR
+#   (1) with a curated site, NO flux-cube options appear before OR
 #       after clicking the checkbox;
 #   (2) with a manually imported mesh, the options are visible BEFORE ticking
 #       the box and DISAPPEAR when it is checked.
@@ -2196,7 +2233,7 @@ def _on_screen(card, widget):
 def _sized_card(width, height, path):
     """A Moon local-mesh card in a window of a given size, scrolled to the top.
 
-    `path` is "curated" (the A03MP026 picker, which writes a long provenance
+    `path` is "curated" (the curated-site picker, which writes a long provenance
     note above the group) or "manual" (the shipped crater in the file field).
     """
     manager, panel = _panel()
@@ -2379,9 +2416,10 @@ def test_the_reveal_does_not_scroll_a_card_nobody_touched():
 
 def _site_wiring_pairs(card):
     from gui_core.curated_sites import curated_site, site_wiring
-    entry = curated_site("A03MP026", body="Moon")
-    if entry is None:
-        raise Skip("A03MP026 is not in the curated registry")
+    key = _curated_key()
+    entry = curated_site(key, body="Moon")
+    if entry is None:                                     # pragma: no cover
+        raise Skip(f"{key} is not in the curated registry")
     return site_wiring(entry)
 
 
@@ -2399,7 +2437,7 @@ def test_the_curated_note_is_one_line_at_pauls_window():
     assert note.height() <= 40, (
         f"the curated-site note renders {note.height()} px tall at "
         f"{PAUL_W} px wide; it was 216 px and the ruling was one line")
-    assert "A03MP026" in note.text(), note.text()
+    assert _curated_key() in note.text(), note.text()
 
 
 def test_the_details_expander_starts_closed_and_holds_the_provenance():
@@ -2585,7 +2623,7 @@ def _real_window():
 
 
 def _window_curated_card():
-    """Moon / local / curated A03MP026, inside the real window."""
+    """Moon / local / a curated site, inside the real window."""
     win = _real_window()
     panel = win.config_panel
     manager = panel.config_manager

@@ -125,7 +125,7 @@ def main():
     m = np.nanmedian(rr)
     if 0.9 <= m <= 1.1:
         print("  Outcome A: the two view-factor rows AGREE.")
-        print("  NOTE (2026-08-19): against the ORIGINAL MP026 matrix this ratio was 0.51 and")
+        print("  NOTE (2026-08-19): against the ORIGINAL site A matrix this ratio was 0.51 and")
         print("  outcome B held. The cause was found in the OFFLINE ASSEMBLER -- entries were")
         print("  divided by the hit count instead of by 2, inflating far-field view factors by")
         print("  up to exactly 2x (fixed on fix/vf-assembler-divisor). Against the re-assembled")

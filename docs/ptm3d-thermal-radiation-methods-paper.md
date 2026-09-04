@@ -603,7 +603,7 @@ diurnal-mean equilibrium temperature is very low (and clamped by a
 sanity floor in the cold-start formula (8)), the equilibration phase
 converges to a different fixed point than iteration 0 reached, and
 the subsequent output cycle inherits the offset. In our tests on
-the lunar polar Mons Mouton site this produced a systematic surface
+the lunar polar site this produced a systematic surface
 temperature offset of order $30\thinspace\mathrm{K}$ relative to iteration 0
 on the majority of re-equilibrated faces.
 
@@ -756,7 +756,7 @@ chase a small set of outliers.
 
 Table 2 shows the iteration-by-iteration behavior of the selector
 and convergence criteria on a representative production window
-(Mons Mouton site, 1.80-million-face core+ring mesh, 30
+(a lunar polar site, 1.80-million-face core+ring mesh, 30
 day output window at hourly cadence, full radiation coupling).
 The first selection (row $k=1$, driven by the iteration-0 indirect
 flux) flags 27% of faces — the cold, shadowed portion of the mesh
@@ -836,7 +836,7 @@ and reused across windows on the same site.
 
 **Table 3.** Time decomposition of a single 30-day production
 window at hourly cadence on a 1.8-million-face lunar polar mesh
-(Mons Mouton site, two equilibration orbits, full
+(a lunar polar site, two equilibration orbits, full
 radiation coupling). View-factor construction is amortized across
 the eight windows of a site.
 
@@ -856,7 +856,7 @@ batches — independent face columns and independent time steps,
 respectively — across all available GPU devices concurrently. On
 the four-die workstation the thermal solver runs $2.82\times$ faster
 with all four dies enabled (234 s on one die, 83 s on four for the
-4.8-million-face Mons Mouton mesh at one-day cadence), and the
+4.8-million-face lunar polar site mesh at one-day cadence), and the
 radiosity time-marching loop scales similarly. The end-to-end
 speedup of a complete coupled solve is a more modest
 $1.2$–$1.4\times$, because for the lunar workload the CPU-bound

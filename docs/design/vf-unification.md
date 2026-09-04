@@ -361,9 +361,9 @@ from the surviving raw sweeps, no re-sweep and no rebuild:
 | product | faces | facet | near-field mass share | RAW sweep vs engine M2 | estimator bias alone | worst face |
 |---|---|---|---|---|---|---|
 | moon3d fig8-hybrid core | 140,091 | 172 m | 20.34% | −22.50% | **+0.62%** | +0.033 K |
-| A3GT A03MP026 core | 2,397,890 | 2.00 m | 6.33% | −23.95% | **+0.73%** | +0.020 K |
-| A3GT A03N1016 core | 1,798,135 | 2.04 m | 8.67% | −35.78% | **+1.42%** | +0.057 K |
-| A3GT A03SP010 core | 8,746 | 56.8 m | 6.63% | −22.92% | **+1.14%** | +0.014 K |
+| A3GT lunar polar site A core | 2,397,890 | 2.00 m | 6.33% | −23.95% | **+0.73%** | +0.020 K |
+| A3GT lunar polar site B core | 1,798,135 | 2.04 m | 8.67% | −35.78% | **+1.42%** | +0.057 K |
+| A3GT lunar polar site C core | 8,746 | 56.8 m | 6.63% | −22.92% | **+1.14%** | +0.014 K |
 
 The raw column and the bias column are different questions. The raw difference conflates the
 estimator's near-field bias (positive) with the sweep's occlusion and its `keps` = 0.2 self-relief

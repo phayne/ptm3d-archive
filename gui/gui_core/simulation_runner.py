@@ -36,7 +36,7 @@ class SimulationThread(QThread):
 
     Everything the engine writes is teed to ``<output directory>/engine.log``
     as well as to the console. Until 2026-09-02 a GUI-launched run left NO
-    engine output anywhere on disk: verifying the MP026 flux-cube run meant
+    engine output anywhere on disk: verifying the site A flux-cube run meant
     reconstructing which view-factor matrix had been loaded from the product's
     own header, because the engine's ``ROUTE = ...`` banner and its
     coupling-convergence report existed only in a widget that the next launch

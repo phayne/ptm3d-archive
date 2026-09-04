@@ -468,7 +468,7 @@ def test_resolve_engine_names_the_build_command_when_absent():
 
 # ------------------------------------------------------------------ the log
 # A GUI-launched run left NO engine stdout or stderr anywhere on disk. On
-# 2026-09-02 the MP026 flux-cube run had to be verified without its
+# 2026-09-02 a lunar polar flux-cube run had to be verified without its
 # `[PTM_HMATRIX_VF_REPLACE] ROUTE = ...` banner and without its
 # coupling-convergence report, because the only place either had ever existed
 # was a console widget that the next launch clears.

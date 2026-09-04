@@ -15,7 +15,7 @@ millimeter to a centimeter. Measured on the meshes this project actually runs:
 
     sunlit_radcore_r50                  140,091 faces     237 m     ON
     haworth_radcore_r32c                 99,665 faces     181 m     ON
-    A3GT A03MP026 3 km core           2,397,890 faces    3.46 m     ON
+    A3GT 3 km polar core              2,397,890 faces    3.46 m     ON
     moon3d_c...NEW_500k_clean           509,337 faces    1.96 mm    OFF
 
 The boundaries below are Ada's proposal from `docs/design/gui-update-plan.md`
@@ -53,7 +53,7 @@ FACET_SCALE_WARN_BELOW_M = 1.0
 BEAMING_BODIES = ("Moon",)
 #: Above this face count, sample rather than sum every triangle. The plan
 #: (section 4.4) proposed 5,000,000; measurement moved it down. Summing all
-#: 2,397,890 faces of the A3GT A03MP026 core took 9.9 s in this reader, which is
+#: 2,397,890 faces of the A3GT lunar polar site A core took 9.9 s in this reader, which is
 #: not something to do on the GUI thread every time a field changes. Sampling
 #: 5,000 evenly spaced faces of the same mesh reproduces the documented 3.46 m.
 _AREA_SAMPLE_ABOVE = 200_000
@@ -84,7 +84,7 @@ class FacetScale:
     The mean alone fails open on a MULTI-RESOLUTION mesh, which is not a
     contrived case: `scripts/a3gt_v2_extended_mesh.py` builds the production
     A3GT v2 mesh as one PLY whose resolution falls off from the center, and
-    measured on the real A03MP026 3 km core the mean is 3.47 m while the 5th
+    measured on the real lunar polar site A 3 km core the mean is 3.47 m while the 5th
     percentile is 0.71 m -- a factor of 4.9. Construct the extreme and the mean
     hides it completely: 99% of facets at 1 mm plus 1% at 1 m reports 70.7 cm,
     passing a rule written to refuse millimeter facets with margin.
@@ -686,7 +686,7 @@ def beaming_policy(config, project_root=None):
     #
     # Measured on the real meshes, sqrt(mean) vs sqrt(5th percentile):
     #   sunlit_radcore_r50   234 m  /  169 m   (ratio 1.4, near-uniform)
-    #   A3GT A03MP026 core  3.47 m  / 0.708 m  (ratio 4.9, multi-resolution)
+    #   A3GT lunar polar site A core  3.47 m  / 0.708 m  (ratio 4.9, multi-resolution)
     #   A3GT ring            146 m  / 25.1 m   (ratio 5.8, by construction)
     # None has a millimeter-scale subpopulation, so no validated mesh is newly
     # refused; the A3GT core moves from allow to the acknowledgment tier, which

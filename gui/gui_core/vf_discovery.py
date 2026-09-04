@@ -178,7 +178,7 @@ def known_defective_view_factors():
 #: ``radiation_exchange.cpp:399`` greps for), and the ordinary provenance
 #: sidecar, whose ``radiance_prune_eps`` is 0.0 for an unpruned matrix. Both
 #: are read. Neither catches a pruned matrix that shipped with NO sidecar at
-#: all -- ``A03MP026_rad1e3_vf.csr`` is exactly that, 787,161,229 nonzeros
+#: all -- ``polar_site_A_rad1e3_vf.csr`` is exactly that, 787,161,229 nonzeros
 #: against the full matrix's 2,484,716,524 and nothing on disk beside it -- so
 #: the registry's own superseded list below is what covers that case, and a
 #: pruned matrix nobody has recorded anywhere is still offered. Said plainly
@@ -192,8 +192,8 @@ def superseded_view_factors():
     ``gui_core.curated_sites`` already carries, per site, every matrix in the
     same directory that a curated entry deliberately does not wire, each with
     its reason. Not consulting it here was a measured defect rather than a
-    missed nicety: in the real A03MP026 directory both
-    ``A03MP026_corrected_vf_divisor2.csr`` and ``..._v3.csr`` reach the
+    missed nicety: in the real lunar polar site A directory both
+    ``polar_site_A_corrected_vf_divisor2.csr`` and ``..._v3.csr`` reach the
     provenance-verified tier -- their sidecars are identical on every field
     this module ranks on -- so an alphabetical tie-break put the SUPERSEDED
     one first and "Use this file" wired it.
@@ -683,7 +683,7 @@ def _same_mesh(recorded, wired):
        provenance sidecar records the mesh under
        ``<repo>/data/dem/a3gt_v2/``, and every production configuration loads
        it from ``~/projects/a3gt/meshes/``. Measured 2026-08-31, those two
-       copies of ``A03MP026_84.223S_33.502E_R3km_linear.ply`` are
+       copies of ``polar_site_A_R3km_linear.ply`` are
        byte-identical (md5 ``a256fbc7…``) -- so rung 1 alone would have
        refused every genuine match this project has.
     3. **neither** -- the sidecar belongs to a different mesh, or to a copy
@@ -790,7 +790,7 @@ class DiscoveryResult:
         """Offerable candidates, best evidence first, then by name.
 
         THE SUPERSEDED FLAG COMES BEFORE THE RANK, and it has to. Measured in
-        the real A03MP026 directory: ``..._corrected_vf_divisor2.csr`` and
+        the real lunar polar site A directory: ``..._corrected_vf_divisor2.csr`` and
         ``..._corrected_vf_v3.csr`` both reach the provenance-verified tier --
         their sidecars agree on the estimator, the ray count, the geometry hash
         and the mesh, and differ only in a timestamp and a nonzero count that

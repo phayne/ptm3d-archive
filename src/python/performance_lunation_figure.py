@@ -2,7 +2,7 @@
 """
 Computational performance scaling for a 1-lunation PTM3D run with full
 radiation coupling, anchored on the May 2026 A3GT v2 production batch
-(A03MM022, Mons Mouton, 1,797,769 faces, 30-day output window, hourly
+(lunar polar site L, a lunar polar site, 1,797,769 faces, 30-day output window, hourly
 cadence, 2-orbit equilibration).
 
 Two panels:
@@ -38,7 +38,7 @@ embarrassingly parallel in face index. Small departures from N^1
 come from the BVH (~N log N for the build, < N for the lookups)
 and from cache effects at the high-N end.
 
-Anchor measurements (A03MM022 production run, 2026-05-13):
+Anchor measurements (lunar polar site L production run, 2026-05-13):
   N = 1.80e6 faces; wall = 15m 30s per window; 4-die W6800X Duo,
   48-thread CPU OpenMP.
 
@@ -64,7 +64,7 @@ PROJECT_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_OUT = PROJECT_ROOT / "docs" / "figures" / "v2" / "performance_lunation.png"
 
 
-# -- Anchor: measured A03MM022 production wall times (per window) --
+# -- Anchor: measured lunar polar site L production wall times (per window) --
 # Wall times in seconds. Source: orchestrator_FIXED.log + per-window
 # logs from the 2026-05-13 batch. View-factor wall is per-site (built
 # once, cached, reused across the 8 windows), so the per-window cost
@@ -191,11 +191,11 @@ def make_figure(out_path: Path) -> None:
     ax_wall.plot(N, n2_ref, color="#cc6633", linewidth=1.0,
                  linestyle=":", label=r"$\mathcal{O}(N^{2})$")
 
-    # Anchor marker at A03MM022 measured total
+    # Anchor marker at lunar polar site L measured total
     ax_wall.scatter([ANCHOR_N], [anchor_total],
                     s=70, color="k", marker="*", zorder=5,
                     edgecolor="white", linewidth=0.8,
-                    label="A03MM022 measured")
+                    label="lunar polar site L measured")
 
     ax_wall.set_xscale("log")
     ax_wall.set_yscale("log")
@@ -246,7 +246,7 @@ def make_figure(out_path: Path) -> None:
     ax_cost.plot(N, n2_ref_c, color="#cc6633", linewidth=1.0,
                  linestyle=":", label=r"$\mathcal{O}(N^{2})$")
 
-    # Anchor at A03MM022 measured total cost
+    # Anchor at lunar polar site L measured total cost
     ax_cost.scatter([ANCHOR_N], [anchor_cost],
                     s=70, color="k", marker="*", zorder=5,
                     edgecolor="white", linewidth=0.8)

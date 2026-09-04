@@ -138,7 +138,7 @@ struct Policy {
     ///   "refuse"   -- give up the GPU rung (radiosity runs on the CPU)
     /// Default is "separate" (Paul's ruling, 2026-08-22): both orderings remove
     /// the co-residency the wedges died in, but on a large-matrix site the
-    /// refusal costs a MEASURED +77.5 min/window (A3GT A03N1016: 108.9 min on
+    /// refusal costs a MEASURED +77.5 min/window (A3GT lunar polar site B: 108.9 min on
     /// the CPU radiosity rung against 31.4 on the GPU pool, 8 windows each)
     /// while the separation costs a derived +7-10 min. See
     /// docs/gpu-wedge-guardrails.md "Two ways to treat a thin margin".
@@ -209,7 +209,7 @@ enum class MarginVerdict {
  *   "refuse"   (default, and what shipped on 2026-08-22) -- below
  *              gpu.min_vram_margin_gib the GPU rung is given up and radiosity
  *              falls to the CPU. Simple and safe, and on a large-matrix site
- *              very expensive: measured on A3GT A03N1016, the CPU radiosity
+ *              very expensive: measured on A3GT lunar polar site B, the CPU radiosity
  *              rung cost 108.9 min/window against 31.4 min on the GPU pool
  *              (8 windows each, gen-1 vs gen-2) -- about +78 min/window.
  *

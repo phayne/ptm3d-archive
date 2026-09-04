@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A3GT v2 — DEM-coverage filter for the candidate landing-sites CSV.
 
-Reads the CUI candidate-sites CSV (ellipse_id, Region, x_m, y_m, lon_deg,
+Reads the candidate-sites CSV (ellipse_id, Region, x_m, y_m, lon_deg,
 lat_deg) and a GeoTIFF DEM, and partitions sites into:
   - "in":      full ROI of radius `--roi-km` fits inside the DEM bounds.
   - "partial": site center is inside the DEM but the ROI extends past
@@ -30,13 +30,13 @@ sphere (verified 2026-05-06 against `mm-sfs-dem.tif`).
 Examples:
     # legacy single-DEM
     python3 scripts/a3gt_v2_site_filter.py \\
-        --csv .../CUI_2026_a3gt_landing-sites.csv \\
+        --csv <candidate-sites>.csv \\
         --dem .../mm-sfs-dem.tif --roi-km 5 \\
         --output output/a3gt_v2/site_manifest.json
 
     # catalog / multi-DEM mosaic + extended-ROI coverage
     python3 scripts/a3gt_v2_site_filter.py \\
-        --csv .../CUI_2026_a3gt_landing-sites.csv \\
+        --csv <candidate-sites>.csv \\
         --catalog output/a3gt_v2/dem_catalog.json \\
         --roi-km 3 --extended-roi-km 15 \\
         --output output/a3gt_v2/site_manifest.json
@@ -365,7 +365,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--csv", required=True, type=Path,
-                   help="CUI candidate-sites CSV.")
+                   help="Candidate-sites CSV.")
     p.add_argument("--dem", type=Path,
                    help="Single GeoTIFF DEM (legacy mode; not needed with "
                         "--catalog).")

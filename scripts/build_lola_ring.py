@@ -5,10 +5,10 @@ a coarse LOLA annulus [R_core, R_ext] around the site, Delaunay-triangulated
 in the south-polar-stereo plane, written in the exact dtm PLY schema
 (binary_le; dbl x,y,z / flt nx,ny,nz / dbl lat,lon,elev; faces uchar+int*3),
 in the selenocentric frame XYZ = (R+elev)*spherical(lat,lon) — verified to
-0.000 m against MP026's dtm-built ring.
+0.000 m against site A's dtm-built ring.
 
-  python3 build_lola_ring.py --lola <LOLA.tif> --site-lat -84.223 \
-      --site-lon 33.502 --r-core-km 3 --r-ext-km 81.6712 \
+  python3 build_lola_ring.py --lola <LOLA.tif> --site-lat -85.0 \
+      --site-lon 30.0 --r-core-km 3 --r-ext-km 81.6712 \
       --max-points 80000 --core-ply core.ply --out ring.ply
 
 The inner hole is registered to the core mesh's ACTUAL outer boundary

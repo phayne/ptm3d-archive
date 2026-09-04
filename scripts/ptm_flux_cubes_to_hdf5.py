@@ -60,7 +60,7 @@ ZENITH_TIR_CAVEAT = (
 ENGINEER_SUMMARY = (
     "This is a passive, component-resolved incident-irradiance product (W/m^2, no albedo, no "
     "emissivity, no cube material applied) on six axis-aligned faces at 1,257 points on a 25 m "
-    "lattice over a 500 m radius at A03MP026, computed against the CORRECTED v3 view-factor "
+    "lattice over a 500 m radius at lunar polar site A, computed against the CORRECTED v3 view-factor "
     "matrix (divisor2 + cull; see matrix_generation). Validated for the *sunlit and "
     "terrain-dominated* load regime: direct solar, terrain-scattered visible, terrain thermal IR "
     "and Earthshine are each independently reproduced against the model's own fields -- 7.4e-15 "
@@ -83,7 +83,7 @@ ENGINEER_SUMMARY = (
     "cube was correct and is what exposed it).")
 
 MATRIX_NOTE = (
-    "Built against A03MP026_corrected_vf_v3.csr (divisor2 + cull), nnz 2,216,190,708. Effect of "
+    "Built against polar_site_A_corrected_vf_v3.csr (divisor2 + cull), nnz 2,216,190,708. Effect of "
     "the correction on this product, measured against the same window run on the pre-fix matrix: "
     "direct, primary_refl and primary_ir are EXACTLY unchanged (0 samples moved); terrain_ir mean "
     "-0.30% (summer) / -0.29% (winter); total mean -0.05%. The bulk effect is small because the "
@@ -278,7 +278,7 @@ def read_face_stat_bin(path, expect_faces=None, expect_source=""):
     ``np.fromfile(path, dtype=float32)``, which reads the 4-byte face-count
     HEADER as if it were the first face's value and shifts every face by one
     index -- PTM-06's bug class, recurring in a script written after PTM-06 was
-    fixed in `ptm_qa.py`. On the MP026 product it reported "2397891 faces" for a
+    fixed in `ptm_qa.py`. On the site A product it reported "2397891 faces" for a
     2,397,890-face mesh, and every temperature it then reduced belonged to the
     face before it. The consumer here takes a median over 2.4M faces, so the
     delivered number was unharmed; the next consumer need not be.

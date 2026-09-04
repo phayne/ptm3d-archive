@@ -38,6 +38,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "python" / "tests"))
 sys.path.insert(0, str(REPO_ROOT / "gui"))
 
 
@@ -363,7 +364,7 @@ def test_the_format_is_read_from_the_magic_number_and_not_the_extension():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         mesh = _ply(tmp / "site.ply", 1799459)
-        # Byte for byte the shape of A03MA001.hmat, read 2026-08-31.
+        # Byte for byte the shape of a real banked .hmat, read 2026-08-31.
         legacy = _vffm(tmp / "legacy.hmat", rows=1799459, nnz=0, version=1)
         assert legacy.read_bytes()[:4] == b"MFFV", (
             "fixture problem: the on-disk spelling of the sparse magic is "
@@ -447,32 +448,55 @@ def test_a_truncated_csr_is_refused_rather_than_offered():
         assert "truncated" in result.refusals[0].refusal
 
 
-def test_the_five_orphaned_matrices_are_refused_by_name():
+def test_the_orphaned_matrices_are_refused_by_name():
     """PTM-312: loadable, correctly dimensioned, and known to be wrong.
 
     Nothing in these files says so -- current layout, right face count -- and
     the sweeps that would let them be rebuilt were in ``/tmp`` and are gone.
     A discovery mechanism that ranked them like anything else would be the
     quiet path back to a defect that is already on the ledger.
+
+    Driven off SYNTHETIC registry entries, because the real ones live in a
+    local overlay outside this repository (``gui_core.curated_sites``, "The
+    local overlay") and the rule has to be checked on every machine, not only
+    the one that has them.
     """
+    import synthetic_sites
+    from gui_core import curated_sites
     vf = _discovery()
-    from gui_core.curated_sites import DEFECTIVE_VIEW_FACTORS, NOT_CURATED
-    defective = vf.known_defective_view_factors()
-    assert len(defective) == 5, defective
-    assert defective == DEFECTIVE_VIEW_FACTORS, (
-        "the search must read the registry's table, not keep a second copy: "
-        "two lists of which matrices are defective is one list that goes "
-        "stale")
-    assert len(NOT_CURATED) == len(DEFECTIVE_VIEW_FACTORS), (
-        "the excluded sites and the distrusted matrices are the same five "
-        "facts and must not drift apart")
+    with tempfile.TemporaryDirectory() as fixture_root:
+        payload = synthetic_sites.install(curated_sites, fixture_root)
+        try:
+            expected = payload["defective_view_factors"]
+            defective = vf.known_defective_view_factors()
+            assert defective == expected, (
+                "the search must read the registry's table, not keep a second "
+                "copy: two lists of which matrices are defective is one list "
+                "that goes stale")
+            assert defective, "the fixture registers no defective matrices"
+            assert len(curated_sites.NOT_CURATED) == len(defective), (
+                "the excluded sites and the distrusted matrices are the same "
+                "facts and must not drift apart")
+            name = sorted(defective)[0]
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                mesh = _ply(tmp / "site.ply", 64)
+                _csr(tmp / name, rows=64, nnz=8)
+                result = vf.discover_view_factors(mesh, project_root=tmp)
+                assert not result.matches, "a PTM-312 matrix was offered"
+                assert "PTM-312" in result.refusals[0].refusal
+        finally:
+            synthetic_sites.restore(curated_sites)
+
+    # And with no overlay at all the search must be EMPTY rather than carrying
+    # a stale built-in copy of somebody's local denylist.
     with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        mesh = _ply(tmp / "site.ply", 64)
-        _csr(tmp / "A03MP016_corrected_vf.csr", rows=64, nnz=8)
-        result = vf.discover_view_factors(mesh, project_root=tmp)
-        assert not result.matches, "a PTM-312 matrix was offered"
-        assert "PTM-312" in result.refusals[0].refusal
+        curated_sites.reload_registry(Path(tmp) / "absent.json")
+        try:
+            assert vf.known_defective_view_factors() == {}
+            assert vf.superseded_view_factors() == {}
+        finally:
+            curated_sites.reload_registry()
 
 
 def test_a_pruned_matrix_is_refused_with_its_own_receipt():
@@ -480,7 +504,7 @@ def test_a_pruned_matrix_is_refused_with_its_own_receipt():
 
     The fixture uses ``radiance_prune_eps_Wm2``, which is the receipt's real
     key -- the same string ``radiation_exchange.cpp:399`` greps for, and the
-    one in ``A03MP026_rad_demo.csr.prune_receipt.json`` on this machine. An
+    one in a real ``*_rad_demo.csr.prune_receipt.json`` on this machine. An
     earlier draft of both the module and this fixture used the PROVENANCE
     sidecar's key, ``radiance_prune_eps``, and agreed with itself: the refusal
     printed "eps=?" against every real receipt and no test could see it.
@@ -533,7 +557,7 @@ def test_a_prune_recorded_only_in_the_provenance_sidecar_is_still_caught():
 def test_a_matrix_this_project_calls_superseded_never_sorts_first():
     """Measured, and it is why this rule exists.
 
-    In the real A03MP026 directory ``..._corrected_vf_divisor2.csr`` and
+    In one real site directory ``..._corrected_vf_divisor2.csr`` and
     ``..._corrected_vf_v3.csr`` BOTH reach the provenance-verified tier: their
     sidecars agree on the estimator, the ray count, the geometry hash and the
     mesh, and differ only in a timestamp and a nonzero count that nothing here
@@ -703,7 +727,7 @@ CHECKS = [
     test_the_format_is_read_from_the_magic_number_and_not_the_extension,
     test_an_identical_mesh_copy_elsewhere_still_counts_as_this_mesh,
     test_a_truncated_csr_is_refused_rather_than_offered,
-    test_the_five_orphaned_matrices_are_refused_by_name,
+    test_the_orphaned_matrices_are_refused_by_name,
     test_a_pruned_matrix_is_refused_with_its_own_receipt,
     test_a_prune_recorded_only_in_the_provenance_sidecar_is_still_caught,
     test_a_matrix_this_project_calls_superseded_never_sorts_first,

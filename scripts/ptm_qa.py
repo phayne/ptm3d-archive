@@ -61,7 +61,7 @@ except ModuleNotFoundError:  # actionable instead of a bare traceback
 #
 # PTM-462: this threshold is only meaningful on faces that receive NO indirect
 # flux. Applied to every never-lit face it fails valid radiation-coupled runs --
-# measured on the MP026 flux-cube run (2,397,890 faces, corrected VF v3): 10,707
+# measured on the site A flux-cube run (2,397,890 faces, corrected VF v3): 10,707
 # never-lit faces, std 8.17 K, of which the 9 with identically zero indirect flux
 # have std 0.0020 K and the other 10,698 track their own indirect flux. Worse, it
 # fails in the WRONG DIRECTION: with an EMPTY view-factor matrix every never-lit
@@ -76,7 +76,7 @@ INVERSION_TOL_K = 0.5
 SIGMA = 5.670374419e-8     # Stefan-Boltzmann, W m-2 K-4
 #: Emissivity used to invert absorbed flux into an equilibrium temperature. The
 #: value the built-in bodies use. T_eq scales as eps^(-1/4), so the whole range
-#: 0.85-1.00 moves the bracket by under 3%; measured on MP026 the below-bracket
+#: 0.85-1.00 moves the bracket by under 3%; measured on site A the below-bracket
 #: count is 0 for every eps in that range and for every internal-flux choice
 #: from 0 to the lunar 0.018 W/m^2, i.e. the gate does not turn on this number.
 DEFAULT_EMISSIVITY = 0.95
@@ -88,7 +88,7 @@ UNFORCED_FLUX_W = 0.0
 #: Fraction of forced never-lit faces allowed above the bracket before it is
 #: worth a warning. Above the high end is NOT energy-forbidden -- it is a face
 #: still cooling from a season when it was lit, the same lag that makes the
-#: inversion check below a WARN on a short window. Measured on MP026: 9 of
+#: inversion check below a WARN on a short window. Measured on site A: 9 of
 #: 10,694, 0.08%. A shuffled copy of the same field gives 6.0%.
 LAG_FRAC_WARN = 0.01
 
@@ -276,7 +276,7 @@ def _never_lit_checks(r, run, args, valid, tv, never):
 
     The original check was one line -- ``std(Tmin) <= 3 K`` over every face with
     ``direct_solar_max == 0`` -- and it was right about the run it was calibrated
-    on and wrong about every radiation-coupled one. On the MP026 flux-cube run it
+    on and wrong about every radiation-coupled one. On the site A flux-cube run it
     measured 8.17 K and failed a product that 57 other checks passed. The scatter
     was real and it was PHYSICS: those faces are lit by neighboring terrain, they
     have different neighbors, so they sit at different temperatures.
@@ -289,12 +289,12 @@ def _never_lit_checks(r, run, args, valid, tv, never):
 
     * faces with NO indirect flux must still agree with each other -- the
       original detector, on the population it was calibrated for
-      (Chimaera 623: broken 18.00 K, fixed 0.96 K; MP026's 9 unforced faces:
+      (Chimaera 623: broken 18.00 K, fixed 0.96 K; site A's 9 unforced faces:
       0.0020 K);
     * faces WITH indirect flux must sit inside their own closed-form
       equilibrium bracket, and may never sit below it.
 
-    Measured on MP026's 10,694 forced never-lit faces, and on scrambled copies
+    Measured on site A's 10,694 forced never-lit faces, and on scrambled copies
     of the same field (the same seeds, so the comparison is like for like):
 
         field                              inside    below the low end
@@ -1188,6 +1188,31 @@ def cmd_precommit_selftest(args):
 
 
 # ------------------------------------------------------------------ selftest
+def _registered_run(name):
+    """A locally registered run directory, or None.
+
+    Reads ``~/.ptm3d/test_fixtures.json`` through the suite's own helper when
+    it is importable, so there is one place that answers "where is that run on
+    this machine" rather than two that can disagree.
+    """
+    tests_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "src", "python", "tests")
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    try:
+        import local_fixtures
+    except ImportError as exc:
+        # Say so. A helper that answered "not registered" when the real answer
+        # was "I could not look" is how a dropped case reads as a deliberate
+        # one.
+        print(f"NOTE: the local test-fixture helper could not be imported "
+              f"from {tests_dir} ({exc}); registered runs are unavailable.")
+        return None
+    path = local_fixtures.optional_fixture(name)
+    return path if path is not None and os.path.isdir(str(path)) else None
+
+
 def cmd_selftest(args):
     E = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science"
     C = f"{E}/thermal/623chimaera"
@@ -1215,10 +1240,6 @@ def cmd_selftest(args):
           "--ext", "TEMP_K", "--max-frames", "3", "--out", "/tmp/_qa_noise.json"], 0),
         # Cross-body generality: the coherence gate must NOT cry wolf on healthy runs from
         # other bodies, meshes, and code paths. Moon3D also proves the inversion precondition.
-        ("cross-body: A3GT lunar 1.8M-face production run must PASS",
-         ["thermal", os.path.expanduser("~/Research/moon/artemis/a3gt/"
-                                        "sites_v2_3km_corering_postfix/A03MP026"),
-          "--out", "/tmp/_qa_a3gt.json"], 0),
         ("cross-body: Moon3D global 509k must PASS (5 'inversions' are a short-window artifact)",
          ["thermal", os.path.expanduser("~/dev/heat3d/moon3d_verify/radoff"),
           "--out", "/tmp/_qa_moon3d.json"], 0),
@@ -1227,6 +1248,21 @@ def cmd_selftest(args):
           "--derived", f"{E}/camera/623chimaera/flyby/anim",
           "--ext", "TEMP_K", "--max-frames", "3", "--out", "/tmp/_qa_noop.json"], 1),
     ]
+    # The cross-body A3GT run is a real production output, and its path names a
+    # site this project does not publish -- so it is REGISTERED locally rather
+    # than written here (src/python/tests/local_fixtures.py). Dropping it is
+    # PRINTED: a selftest that quietly ran one case fewer is a selftest whose
+    # tally means nothing.
+    a3gt_run = _registered_run("lunar_radiation_run")
+    if a3gt_run is not None:
+        cases.insert(-1, (
+            "cross-body: a large lunar production run must PASS",
+            ["thermal", str(a3gt_run), "--out", "/tmp/_qa_a3gt.json"], 0))
+    else:
+        print("NOTE: the cross-body lunar production case was DROPPED -- no "
+              "'lunar_radiation_run' is registered in "
+              "~/.ptm3d/test_fixtures.json. This selftest ran one case fewer.")
+
     bad = 0
     for title, argv, want in cases:
         print("\n" + "=" * 78 + f"\n{title}\n  expect exit {want}\n" + "-" * 78)

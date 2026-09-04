@@ -28,7 +28,7 @@ of the site center". That kept triangles whose inward-most vertex protruded
 up to ~130 m inside R_core, laying coarse ring surface on top of the core's
 own terrain; at grazing polar sun the overlapping lip cast a hard, spurious,
 near-permanent shadow on core edge faces (the >50 K discontinuous cold rim
-seen at A03MP026/N1016/SP010). The ring never enters a view-factor matrix, so
+seen at sites A, B and C). The ring never enters a view-factor matrix, so
 re-clipping it never requires a VF rebuild.
 """
 

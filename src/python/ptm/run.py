@@ -300,7 +300,7 @@ class EngineProcess:
 
     ``log_path`` tees every line the child writes to a file, in addition to the
     callbacks, which are untouched. A GUI-launched run used to leave NO engine
-    stdout or stderr anywhere on disk: after the 2026-09-02 MP026 flux-cube run
+    stdout or stderr anywhere on disk: after the 2026-09-02 site A flux-cube run
     the ``[PTM_HMATRIX_VF_REPLACE] ROUTE = ...`` banner and the whole
     coupling-convergence report were simply gone, and which view-factor matrix
     had been used had to be reconstructed from the product's own header. The
