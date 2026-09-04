@@ -254,7 +254,7 @@ the radiation coupling is a small physical perturbation.
 Figure B.6 reports the computational cost of a complete 1-lunation
 PTM3D run on lunar polar terrain, broken down by component, as a
 function of mesh face count.  The model is anchored on the
-a Mons Mouton production run: a
+a lunar polar site production run: a
 $1.8\times 10^{6}$-face linear-density mesh with 2 equilibration
 orbits at the body-independent cadence of §4 and a 30-day output
 window at 1-hour cadence, with full inter-face radiation coupling

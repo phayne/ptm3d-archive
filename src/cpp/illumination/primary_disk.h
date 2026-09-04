@@ -148,14 +148,14 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 //   accuracy  the fitted law gives worst |dV| = 0.49 * 128^-0.65 = 0.021 (the
 //             measured 0.0175 above is inside it). The full primary flux on
 //             the coldest lunar PSR face is 0.087 W/m^2 -- 0.046 IR + 0.041
-//             reflected, measured over 48 MS3 A03MP026 frames -- which lifts
+//             reflected, measured over 48 lunar polar frames -- which lifts
 //             that face from the 24.04 K geothermal floor to 37.36 K. A 2.1 %
 //             error in the GEOMETRIC visibility factor is therefore worth
 //             <= 0.163 K there, and less on every warmer face, against a 0.1 K
 //             equilibration target and a ~1 K documented spin-up bias. Paul
 //             accepted that bar on 2026-08-14.
 //
-//   cost      the escalation was 91.5 % of the illumination phase on the MS3
+//   cost      the escalation was 91.5 % of the illumination phase on the
 //             lunar polar production config (profiler, 2026-08-14), and
 //             accounted for 102 % of that phase's 5.5x slowdown since July.
 //             Cost is linear in N over the escalated faces, so this is where
@@ -166,7 +166,7 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 // than Earth's, and a Europa DEM patch escalates ~24 % of its faces against the
 // Moon's ~7 %. It was measured rather than assumed, 512 -> 128 end to end over
 // 48 frames at production equilibration: worst face-frame |dT| 0.025 K on the
-// MS3 lunar polar patch, 0.0025 K on the Europa Pwyll patch, 8e-6 K on a Europa
+// lunar polar patch, 0.0025 K on the Europa Pwyll patch, 8e-6 K on a Europa
 // ico6 global. Europa comes out TEN TIMES quieter than the Moon despite the
 // wider disk, because dT/dF = 1/(4 eps sigma T^3) is ~20x smaller at Europa's
 // ~100 K than at a 37 K lunar PSR floor -- the binding case is cold, not big.
@@ -201,7 +201,7 @@ constexpr double PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021;
 // PRIMARY_DISK_SAMPLES above is ONE number for every face on every body. It was
 // fixed by the single hardest face in the fleet -- the coldest lunar PSR floor,
 // where the whole primary flux is worth 13 K -- and then charged to all
-// 2,397,890 faces of an A3GT production mesh. Measured on the A03MP026 window,
+// 2,397,890 faces of an A3GT production mesh. Measured on the lunar polar site A window,
 // current main: 571,917 faces per epoch escalate to 128 rays, 82.8 M
 // primary-disk rays per epoch = 34.5x the entire direct-solar shadow-ray budget,
 // ~900 s of a 2,772 s window. The flux those rays resolve peaks at 0.087 W/m^2.
@@ -397,7 +397,7 @@ inline uint32_t primaryDiskSamplesForAllowedError(double allowed_dv) {
 // <cos theta> that costs rays; the horizon clip A is closed-form and free.
 // V is a function of (mesh, apparent position of the primary), and the primary
 // barely moves in the body-fixed frame of a tidally locked satellite -- Earth
-// librates ~0.057 deg per timestep on the 949-step MS3 lunation against a
+// librates ~0.057 deg per timestep on the 949-step lunar lunation against a
 // 0.95 deg disk radius, Jupiter ~0.09 deg against a 5.98 deg one (both
 // MEASURED, see the primary-position census below). Recomputing V every step
 // re-answers a question whose input moved by a few percent of its own scale.

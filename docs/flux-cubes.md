@@ -39,13 +39,13 @@ it, and writes it into the file header, so any number in a delivered product can
 override the factors, and the file header records `height_factor = 0` to say so.
 
 > **Coarse-mesh sites need the override.** The factor is a fraction of the *local facet size*, so
-> it only means "just above the ground" where the mesh is fine. A03MP026 has a dedicated
+> it only means "just above the ground" where the mesh is fine. lunar polar site A has a dedicated
 > high-resolution SfS core (median equivalent edge 1.083 m in the grid region) and resolves to
-> **h = 0.1083 m**. A03SP010 has only the generic 80 m/px LOLA base and an 8,746-face core; there
+> **h = 0.1083 m**. lunar polar site C has only the generic 80 m/px LOLA base and an 8,746-face core; there
 > a 0.1x height is **meters above the ground**, which is a different instrument entirely. Set
 > `height_m` explicitly at such sites.
 
-Measured at A03MP026 (2,397,890-face core, 724,593 faces inside the 500 m grid disk):
+Measured at lunar polar site A (2,397,890-face core, 724,593 faces inside the 500 m grid disk):
 
 | quantity | value |
 |---|---|
@@ -67,7 +67,7 @@ At a **site-relative height of 0.1 x the local facet edge, a large `f_max` on th
 the intended behavior, not a defect.** The whole point of putting the cube ~11 cm above a ~1.1 m
 facet is that the nadir face becomes a near-unity-view-factor sensor of the facet beneath it.
 
-Measured at A03MP026, `h = 0.1083 m`, 65,536 rays per patch:
+Measured at lunar polar site A, `h = 0.1083 m`, 65,536 rays per patch:
 
 | face | min | p05 | p50 | p95 | max |
 |---|---|---|---|---|---|
@@ -151,7 +151,7 @@ independently rotated half-rows:
 
 which bounds the flux disagreement directly: `|E_a - E_b| <= splithalf_tv * max_j B_j`.
 
-### Measured budget sweep (A03MP026, production grid, 8 threads, nice +10)
+### Measured budget sweep (lunar polar site A, production grid, 8 threads, nice +10)
 
 Split-half TV, p50 per face orientation:
 
@@ -197,7 +197,7 @@ folded into `f_sky`: the ring has no thermal solution, so it has no radiosity to
 calling it "sky" would silently delete a real IR source from the budget.
 
 **The design expected `f_ring ~ 0` at a 500 m grid inside a 3 km core. Measured, it is not.**
-At A03MP026 with the 27.3 km ring:
+At lunar polar site A with the 27.3 km ring:
 
 | face | median f_ring | max over all patches |
 |---|---|---|
@@ -398,9 +398,9 @@ The distinction is not pedantic, because the two answer different questions:
 
 `scripts/flux_cube_strata.py` reports the `window_dark` stratum and refuses to call it PSR.
 
-### Whether a genuine PSR is even reachable at A03MP026
+### Whether a genuine PSR is even reachable at lunar polar site A
 
-Measured directly from the campaign's own `cogs/A03MP026/psr_mask.tif` (1 m polar-stereographic;
+Measured directly from the campaign's own `cogs/polar_site_A/psr_mask.tif` (1 m polar-stereographic;
 the mask is 0/1 at 99.87% of valid pixels, the remaining 0.13% being the COG's linear-interpolation
 boundary, so both a strict and an inclusive count are given):
 
@@ -449,7 +449,7 @@ are keyed by name — the flux-cube analog of the engine's existing `locations:`
 
 ```
 ptm_flux_cube_geom --core <core.ply> --ring <ring.ply> \
-    --center-lat -84.223 --center-lon 33.502 \
+    --center-lat -85.0 --center-lon 30.0 \
     --spacing 25 --radius 500 \
     --locations pads.csv --out site.fcg
 ```
@@ -550,7 +550,7 @@ the *binding side faces*, and the zenith is under-sampled at that budget.
 ### Shadow-probe spread is tied to DEM resolution, not hardware scale
 `edge_m` defaults to 0.1 × the local facet scale, so the spatial probe spread is set by mesh
 resolution rather than by the size of the object being modeled (the design recommended a fixed
-0.30 m avionics-box scale). At A03MP026 that gives edge 0.108 m. Note also that the **nadir face
+0.30 m avionics-box scale). At lunar polar site A that gives edge 0.108 m. Note also that the **nadir face
 therefore sits at h − edge/2 = 0.054 m above the surface**, not at h. Use the per-entry `edge_m`
 override (§12) when the hardware scale is known.
 

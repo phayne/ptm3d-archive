@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A GUI-launched run must leave the engine's own output on disk.
 
-Until 2026-09-02 it did not. Verifying the MP026 flux-cube run that day meant
+Until 2026-09-02 it did not. Verifying a lunar polar flux-cube run that day meant
 reconstructing which view-factor matrix had been loaded from the product's own
 binary header, because the engine's ``[PTM_HMATRIX_VF_REPLACE] ROUTE = ...``
 banner and its whole coupling-convergence report had only ever existed in a
@@ -62,7 +62,7 @@ print("Simulation completed in 0.010 seconds (10 ms)", flush=True)
 sys.exit(0)
 """
 
-#: The line the MP026 verification could not find anywhere on disk. It is the
+#: The line that verification could not find anywhere on disk. It is the
 #: whole point of the file, so it is what the arm looks for.
 ROUTE_LINE = "[PTM_HMATRIX_VF_REPLACE] ROUTE ="
 
@@ -130,7 +130,7 @@ def test_a_launched_run_writes_the_engine_log_beside_its_output():
         f"disk. Console lines were {seen['info']}")
     text = log.read_text()
     assert ROUTE_LINE in text, (
-        f"the one line the MP026 verification went looking for is not in the "
+        f"the one line that verification went looking for is not in the "
         f"log:\n{text}")
     assert "Mesh created with 642 vertices" in text, text
     assert "engine exit status 0" in text, text

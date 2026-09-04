@@ -74,7 +74,7 @@ namespace gpu {
 ///     survivable here.
 ///   - Every long production run that DID survive kept dispatches under ~2.5 s:
 ///     the standing mitigation is `PTM_MAX_TIMESTEPS_PER_DISPATCH=50`, which is
-///     ~2.5 s at 509k faces, and the 2026-08-14 MS3 lunar run's single
+///     ~2.5 s at 509k faces, and the 2026-08-14 lunar run's single
 ///     dispatches measured 2.0-2.9 s.
 ///   - The historical wedge trio (2026-07-16..20) were all multi-thousand-step
 ///     single dispatches (1560-8000 steps), i.e. tens of seconds.

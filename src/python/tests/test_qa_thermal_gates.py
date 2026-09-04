@@ -3,7 +3,7 @@
 
 The gate used to be one line -- ``std(Tmin) <= 3 K`` over every face with
 ``direct_solar_max == 0`` -- calibrated on 623 Chimaera, a run with no
-radiation coupling at all. It then FAILED the 2026-09-02 MP026 flux-cube
+radiation coupling at all. It then FAILED the 2026-09-02 lunar polar flux-cube
 product, which 57 independent checks passed: 10,707 never-lit faces at
 std 8.17 K, of which the 9 receiving zero indirect flux sit at std 0.0020 K and
 the other 10,698 track the indirect flux their neighbors send them. The
@@ -33,6 +33,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import local_fixtures                                     # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 QA = REPO_ROOT / "scripts" / "ptm_qa.py"
 
@@ -46,7 +49,9 @@ T_GEO = 24.0428
 EMA = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science")
 CHIMAERA_BROKEN = EMA / "thermal/623chimaera/flyby_preTerminatorFix_20260704_142231"
 CHIMAERA_GOOD = EMA / "thermal/623chimaera/flyby"
-MP026 = Path.home() / "Projects/ptm/output/mp026_test"
+#: A finished, radiation-coupled lunar polar run. Registered locally rather
+#: than named here -- see src/python/tests/local_fixtures.py.
+LUNAR_RUN_FIXTURE = "lunar_radiation_run"
 
 _SCRATCH = None
 
@@ -186,7 +191,7 @@ def _forced_field(n_unforced=12, n_forced=80, n_lit=40, temper=lambda t, i: t):
 
 
 def test_a_radiation_coupled_run_whose_faces_track_their_flux_passes():
-    """THE MP026 SHAPE, synthesized: wide scatter, entirely explained."""
+    """THE REAL RUN'S SHAPE, synthesized: wide scatter, entirely explained."""
     tmin, direct, lo, hi = _forced_field()
     run = make_run("bands_good", tmin, direct, lo, hi, radiation=True)
     rc, rep, _ = run_qa(run)
@@ -298,17 +303,18 @@ def test_the_archived_good_chimaera_field_still_passes():
     assert c["status"] == "PASS" and rc == 0, c
 
 
-def test_the_mp026_flux_cube_run_passes():
+def test_the_real_flux_cube_run_passes():
     """⭐ REAL DATA, THE RUN THAT PROVOKED THIS. 57/57 other checks agreed."""
-    _require(MP026, "the MP026 flux-cube run")
-    rc, rep, _ = run_qa(MP026)
+    run = local_fixtures.fixture_path(LUNAR_RUN_FIXTURE, Skip)
+    _require(run, "the lunar polar flux-cube run")
+    rc, rep, _ = run_qa(run)
     unforced = check(rep, "unforced never-lit face coherence")
     below = check(rep, "not colder than their own equilibrium")
     assert unforced["status"] == "PASS", unforced
     assert below["status"] == "PASS", below
     assert below["measured"].startswith("0 of "), (
-        f"MP026 must have NO face below its own equilibrium: {below}")
-    assert rc == 0, f"MP026 must pass (exit {rc})"
+        f"the run must have NO face below its own equilibrium: {below}")
+    assert rc == 0, f"the run must pass (exit {rc})"
 
 
 TESTS = [
@@ -321,7 +327,7 @@ TESTS = [
     test_the_bracket_verdict_does_not_turn_on_the_assumed_emissivity,
     test_the_archived_broken_chimaera_field_still_fails,
     test_the_archived_good_chimaera_field_still_passes,
-    test_the_mp026_flux_cube_run_passes,
+    test_the_real_flux_cube_run_passes,
 ]
 
 

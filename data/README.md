@@ -33,7 +33,7 @@ citations in each subdirectory README) alongside the software.
 | `meshes/` | tutorial crater meshes (shipped) + the Moon3D global mesh (fetched) | shipped / `fetch_data.py --dataset moon3d-mesh` |
 | `spice/` | mission trajectory SPKs (Artemis-2, Clipper EGA) | shipped (small) |
 | `horizons_cache/` | small-body ephemerides from JPL Horizons | self-populates on first use; the 3 committed bodies are provenance only (see its README) |
-| `locations/`, `diviner_seasonal/`, `a3gt_sites.geojson` | small analysis inputs | shipped |
+| `locations/`, `diviner_seasonal/` | small analysis inputs | shipped |
 | `external/` | placeholder paths used by internal study configs | not distributed (see its README) |
 
 **Data location override:** set `PTM_DATA_ROOT=/path/to/data` to keep the

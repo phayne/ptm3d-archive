@@ -427,7 +427,7 @@ public:
     // uploader consumes, because float32 IS the device format. (It used to
     // widen that CSR into a float64 ViewFactorMatrix replica for an fp64-only
     // uploader that narrowed it straight back -- nnz*12 host bytes, 26.6 GB on
-    // A03MP026's v3 matrix and 42.5 GB on A03N1016's, with no reader.)
+    // lunar polar site A's v3 matrix and 42.5 GB on lunar polar site B's, with no reader.)
     //
     // The CPU operator stays installed throughout, so declining the GPU needs no
     // repair; releaseVfReplaceGpuOperator() just drops the nomination. Both are

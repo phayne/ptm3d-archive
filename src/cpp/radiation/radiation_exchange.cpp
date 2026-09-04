@@ -833,7 +833,7 @@ void RadiositySolver::initGPU() {
     // the GPU thermal pool, which allocates its own per-device working set
     // (~0.77 GiB at gpu_batch_size=100000, n_layers=23, 961 steps) on the very
     // dies that hold the CSR replica, while the replica stays resident for the
-    // whole window. Nothing in either path knows about the other. A3GT A03N1016
+    // whole window. Nothing in either path knows about the other. A3GT lunar polar site B
     // passed this check with 0.63 GiB of nominal margin -- less than the thermal
     // solver's own ask -- and that promotion happened by accident: the FC-08
     // divisor fix shrank the matrix 8.4% and carried it across the threshold

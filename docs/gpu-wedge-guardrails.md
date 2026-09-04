@@ -95,7 +95,7 @@ replica, and which the fit check does not count.
 Cost: under the default ordering a thin-band site keeps the GPU rung and pays
 the separation (~+7-10 min/window, derived). What it would cost to *lose* the
 rung instead — the `refuse` ordering, and what happens below the hard floor
-either way — is large on a big matrix. **Measured on A3GT A03N1016**
+either way — is large on a big matrix. **Measured on A3GT lunar polar site B**
 (1,798,135 faces, 3.5 G nnz), eight standard windows per generation:
 
 | rung | windows | mean wall | range |
@@ -130,7 +130,7 @@ triggers:
 | below `min_vram_margin_gib` | keep the GPU rung, **but only when the two pools are on disjoint dies** | give up the GPU rung |
 | refuses only below | `hard_min_vram_margin_gib` (default 0.25 GiB) | — |
 | escape below the hard floor | this host's own VRAM record shows it already committed a replica this large | — |
-| cost for A03N1016 (+0.64 GiB) | **+7-10 min/window** (derived) | **+78 min/window** (measured) |
+| cost for lunar polar site B (+0.64 GiB) | **+7-10 min/window** (derived) | **+78 min/window** (measured) |
 | removes co-residency? | yes, by separating the dies | yes, by removing the GPU rung |
 
 `separate` never waives the floor on a rung where the separation could not
@@ -141,7 +141,7 @@ would be a guardrail that reports itself active while doing nothing, which is
 the failure this whole page exists to remove.
 
 **The default is `separate`.** Both orderings remove the condition the wedges
-died in; they differ by a factor of ten in price. On an A03N1016-class site the
+died in; they differ by a factor of ten in price. On a site-B-class site the
 refusal is a 109 min window against ~39 min, i.e. ~16.3 h against ~5.9 h for
 that site's nine windows. Set `gpu.thin_margin_policy: refuse` when you would
 rather lose the GPU radiosity rung than run one at all on a thin margin.
@@ -251,7 +251,7 @@ in the default state, with the pools separated, and at one device.
    min/window** on an A3GT-scale site. The GPU rung is given up only below the
    0.25 GiB hard floor, or on a rung that cannot be separated at all, or if you
    set `gpu.thin_margin_policy: refuse` (which costs a measured +78 min/window
-   on A03N1016).
+   on lunar polar site B).
 2. **The two pools may be moved onto disjoint devices** whenever the margin is
    below `gpu.placement_margin_gib` (4.0), even if the floor is not in play.
 3. **The re-thermal pool is hoisted once** instead of rebuilt per coupling

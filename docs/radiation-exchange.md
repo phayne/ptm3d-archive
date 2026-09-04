@@ -539,7 +539,7 @@ is read, and it is *not* the Jacobi iteration count: every solve also pays one f
 matvec to turn the converged radiosity into absorbed flux, and the band-separated GPU
 route used to pay it twice per timestep. `PTM_RAD_COST_REPORT` counts dispatches.
 
-| route | A3GT A03MP026 (2.485e9 nnz) | moon3d 509k (4.95e8 nnz) |
+| route | A3GT lunar polar site A (2.485e9 nnz) | moon3d 509k (4.95e8 nnz) |
 |---|---|---|
 | CPU (fused width-2 Jacobi) | 2.000 traversals/solve | 2.792 |
 | GPU, unfused + absolute criterion | 7.000 | 9.927 |
@@ -583,7 +583,7 @@ work should target the gather (column ordering, blocking) rather than the traver
 count.
 
 **Campaign impact — DERIVED, not measured.** Folding g(N=4) into the measured
-A03MP026 window profile (99.19-min CPU window, radiosity 67.4 %, per-window GPU
+lunar polar site A window profile (99.19-min CPU window, radiosity 67.4 %, per-window GPU
 setup penalty +46.3 s at N=4) over 472 windows:
 
 | arm | window (min) | campaign (days) |
@@ -1011,7 +1011,7 @@ mesh (or from its view-factor provenance sidecar's `total_area_m2 / n_faces`), n
 |---|---|---|---|---|
 | `sunlit_radcore_r50` (50 km core) | 140,091 | 7845 km² | **237 m** | **ON** — 5 orders above the roughness scale |
 | `haworth_radcore_r32c` (32 km core) | 99,665 | 3279 km² | **181 m** | **ON** |
-| A3GT `A03MP026` 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
+| A3GT lunar polar site A 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
 | `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** — the mesh *is* at the roughness scale |
 
 The 509k `moon3d` mesh is a simulated crater roughly **1.6 m across** whose facets are ~2 mm. It
@@ -1159,7 +1159,7 @@ one shared $D_j$ array rather than a copy of every active pair:
 |---|---|---|---|---|---|
 | `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **4.33–5.53 GiB** | ~4 MB |
 | `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 4.3–5.5 GiB (est.) | ~4 MB |
-| A3GT 3 km site (A03MP026) | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **18.8–23.9 GiB (est.)** | ~22 MB |
+| A3GT 3 km polar site A | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **18.8–23.9 GiB (est.)** | ~22 MB |
 
 (For comparison, the 2026-08-24 code needed 5.05–6.45 GiB and 21.9–27.9 GiB in the pair-list
 column, and a ~2.4 GB / ~8 GB Gate-2 transient on top.) The estimates apply the **measured** r50

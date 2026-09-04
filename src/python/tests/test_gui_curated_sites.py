@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The lunar-site tier: a set that ran, or nothing at all.
 
-**Why this file exists.** An A3GT site is three files -- a core terrain, a
+**Why this file exists.** A curated site is three files -- a core terrain, a
 shadow-only occluder ring, and a view-factor matrix built for that terrain --
 and every way of getting the combination wrong produces a run that FINISHES.
 The campaign this registry is drawn from produced, at various times: a matrix
@@ -21,8 +21,18 @@ So the checks here are not "does the table parse". They are:
     nothing
   * what a selection emits parses in the ENGINE, with the environment intact
 
-A machine without ``~/projects/a3gt`` skips the disk-anchored checks BY NAME
-rather than passing them vacuously.
+**Two registries, on purpose.** The shipped table is empty -- the real entries
+are landing-site candidates and live in a local overlay outside this repository
+(``gui_core.curated_sites``, "The local overlay"). So the checks split:
+
+  * MACHINERY checks run against SYNTHETIC fixture sites (``synthetic_sites``),
+    written to a temporary directory and loaded through the overlay's own
+    reader. They run everywhere, including on a checkout with no overlay, which
+    is more coverage than the hard-coded table gave -- those checks used to
+    skip entirely on any machine without the artifacts.
+  * DISK-ANCHORED checks ("every recorded number is re-read off its own file")
+    run against the real overlay when one is installed, and skip BY NAME when
+    it is not, rather than passing vacuously.
 
 Run directly::
 
@@ -31,6 +41,7 @@ Run directly::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -42,6 +53,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
+sys.path.insert(0, str(REPO_ROOT / "src" / "python" / "tests"))
 sys.path.insert(0, str(REPO_ROOT / "gui"))
 
 
@@ -55,6 +67,45 @@ def _sites():
     except ImportError as exc:                            # pragma: no cover
         raise Skip(f"the GUI's site registry is unavailable here ({exc})")
     return curated_sites
+
+
+@contextlib.contextmanager
+def _synthetic():
+    """The machinery checks' registry: invented sites, on real temp files.
+
+    Yields ``(module, payload)`` with the synthetic overlay loaded, and puts
+    the machine's own overlay back afterwards whatever happens -- these tests
+    run in one process and a fixture left installed would make every later
+    check read the wrong table.
+    """
+    import synthetic_sites
+    sites = _sites()
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = synthetic_sites.install(sites, tmp)
+        try:
+            yield sites, payload
+        finally:
+            synthetic_sites.restore(sites)
+
+
+def _real_overlay():
+    """The module with the machine's own overlay, or a named skip.
+
+    The subject of the disk-anchored checks is whether the registry has drifted
+    from artifacts ON THIS DISK. With no overlay there are no artifacts to have
+    drifted from, and a synthetic stand-in would be checking the fixture
+    generator against itself.
+    """
+    sites = _sites()
+    sites.reload_registry()
+    status = sites.local_registry_status()
+    if not status.ok:
+        raise Skip(f"the local site overlay is faulty: {status.summary()}")
+    if not sites.CURATED_SITES:
+        raise Skip(f"no local lunar-site overlay on this machine "
+                   f"({status.path}), so there are no real artifacts to "
+                   f"re-measure the registry against")
+    return sites
 
 
 def _on_disk(entry):
@@ -126,7 +177,7 @@ def test_every_recorded_number_is_re_read_off_its_own_file():
     A registry that has drifted from its files is worse than no registry: it
     reads as checked.
     """
-    sites = _sites()
+    sites = _real_overlay()
     checked = []
     for entry in sites.CURATED_SITES:
         _on_disk(entry)
@@ -183,7 +234,7 @@ def test_the_provenance_sidecar_agrees_with_the_matrix_it_describes():
     match the matrix beside it -- otherwise the strongest identity check this
     project has is a file that agrees with nothing.
     """
-    sites = _sites()
+    sites = _real_overlay()
     checked = 0
     for entry in sites.CURATED_SITES:
         _on_disk(entry)
@@ -216,7 +267,7 @@ def test_the_mesh_really_sits_where_the_registry_says_it_does():
     the recorded coordinates, the registry's whole reason for writing the
     not-placed sentinel would have changed and somebody has to look.
     """
-    sites = _sites()
+    sites = _real_overlay()
     try:
         import numpy
     except ImportError as exc:                            # pragma: no cover
@@ -278,21 +329,27 @@ def test_selecting_a_site_never_asks_the_engine_to_move_the_mesh():
 
     Every production configuration for these sites leaves both keys unset.
     """
-    sites = _sites()
-    for entry in sites.CURATED_SITES:
-        wiring = dict(sites.site_wiring(entry))
-        assert wiring["mesh.latitude_override"] == sites.NOT_PLACED, (
-            f"{entry.key}: the wiring writes latitude "
-            f"{wiring['mesh.latitude_override']!r}, which the engine reads as "
-            f"'rotate this mesh'")
-        assert wiring["mesh.longitude_override"] == sites.NOT_PLACED
-        assert sites.NOT_PLACED < -900.0, (
-            "the sentinel has to be below the engine's own -900 threshold")
+    with _synthetic() as (sites, _payload):
+        assert sites.CURATED_SITES, "the fixture registry is empty"
+        for entry in sites.CURATED_SITES:
+            wiring = dict(sites.site_wiring(entry))
+            assert wiring["mesh.latitude_override"] == sites.NOT_PLACED, (
+                f"{entry.key}: the wiring writes latitude "
+                f"{wiring['mesh.latitude_override']!r}, which the engine reads "
+                f"as 'rotate this mesh'")
+            assert wiring["mesh.longitude_override"] == sites.NOT_PLACED
+            assert sites.NOT_PLACED < -900.0, (
+                "the sentinel has to be below the engine's own -900 threshold")
 
 
 def test_the_wiring_is_the_whole_set_or_nothing():
     """A partial set is the failure mode, not a lesser version of success."""
-    sites = _sites()
+    with _synthetic() as (sites, _payload):
+        assert sites.CURATED_SITES, "the fixture registry is empty"
+        _assert_whole_wiring(sites)
+
+
+def _assert_whole_wiring(sites):
     for entry in sites.CURATED_SITES:
         wiring = dict(sites.site_wiring(entry))
         assert wiring["mesh.import_file"] == entry.mesh.path
@@ -314,8 +371,21 @@ def test_the_registry_refuses_the_matrices_it_says_it_refuses():
     Each superseded artifact is named with a reason. This checks the reasons
     are about real files -- and, for the ones that still exist, that NONE of
     them is what any entry actually wires.
+
+    Run against BOTH registries: the synthetic one proves the rule is enforced
+    at all, and the machine's own overlay proves this machine's entries obey
+    it. The second is the one that catches a refusal that has rotted.
     """
-    sites = _sites()
+    with _synthetic() as (sites, _payload):
+        _assert_refusals_hold(sites, minimum=5)
+    try:
+        sites = _real_overlay()
+    except Skip:
+        return
+    _assert_refusals_hold(sites, minimum=1)
+
+
+def _assert_refusals_hold(sites, minimum):
     wired = set()
     for entry in sites.CURATED_SITES:
         wired.add(entry.view_factors.replace_csr)
@@ -334,7 +404,7 @@ def test_the_registry_refuses_the_matrices_it_says_it_refuses():
                     f"entry does not say it was removed on purpose. A "
                     f"refusal for a path that no longer exists is a refusal "
                     f"nobody can check.")
-    assert named >= 5, (
+    assert named >= minimum, (
         "the superseded list is the part of this registry that keeps somebody "
         "from picking the bigger file in the same folder; it should not be "
         f"nearly empty (found {named})")
@@ -342,7 +412,18 @@ def test_the_registry_refuses_the_matrices_it_says_it_refuses():
 
 def test_the_pruned_experiments_are_refused_and_their_receipts_say_why():
     """Their own receipts record MEASURED failure, in this project's words."""
-    sites = _sites()
+    with _synthetic() as (sites, _payload):
+        assert _count_failing_receipts(sites) >= 1, (
+            "the fixture set has no prune receipt, so this check has no "
+            "subject")
+    try:
+        sites = _real_overlay()
+    except Skip:
+        return
+    _count_failing_receipts(sites)
+
+
+def _count_failing_receipts(sites):
     checked = 0
     for entry in sites.CURATED_SITES:
         for item in entry.superseded:
@@ -354,23 +435,32 @@ def test_the_pruned_experiments_are_refused_and_their_receipts_say_why():
             assert "FAIL" in body.upper(), (
                 f"{receipt} does not record a failure, and the registry says "
                 f"it does")
-    if not checked:
-        raise Skip("no prune receipt is on this machine")
+    return checked
 
 
-def test_the_five_orphaned_sites_are_not_curated_and_say_why():
+def test_the_orphaned_sites_are_not_curated_and_say_why():
     """PTM-312. The meshes survive; the matrices beside them do not.
 
     They are not curated, they must not become curated by accident, and the
-    reason has to travel with the fact -- otherwise the next person sees five
-    A3GT sites with meshes and matrices on disk and no explanation for their
-    absence from a table full of A3GT sites.
+    reason has to travel with the fact -- otherwise the next person sees sites
+    with meshes and matrices on disk and no explanation for their absence from
+    a table full of their neighbors.
     """
-    sites = _sites()
-    assert set(sites.NOT_CURATED) == {"A03MP016", "A03MP037", "A03MP038",
-                                      "A03MP039", "A03MP040"}
+    with _synthetic() as (sites, payload):
+        assert set(sites.NOT_CURATED) == set(payload["not_curated"]), (
+            "the overlay's not-curated table did not reach the module intact")
+        _assert_orphans_hold(sites)
+    try:
+        sites = _real_overlay()
+    except Skip:
+        return
+    _assert_orphans_hold(sites)
+
+
+def _assert_orphans_hold(sites):
     keys = {e.key for e in sites.CURATED_SITES}
-    assert not (keys & set(sites.NOT_CURATED))
+    assert not (keys & set(sites.NOT_CURATED)), (
+        "a site is both curated and explicitly not curated")
     for site, why in sites.NOT_CURATED.items():
         assert "PTM-312" in why, f"{site}'s exclusion cites no ledger row"
         assert sites.curated_site(site) is None, (
@@ -384,8 +474,11 @@ def test_a_machine_without_the_files_is_told_so_and_gets_no_wiring():
     be visible, honest, and inert -- not a set of paths handed to the launch
     check to discover.
     """
-    sites = _sites()
-    entry = sites.CURATED_SITES[0]
+    with _synthetic() as (sites, _payload):
+        _assert_absent_machine_refuses(sites, sites.CURATED_SITES[0])
+
+
+def _assert_absent_machine_refuses(sites, entry):
     with tempfile.TemporaryDirectory() as tmp:
         moved = sites.CuratedSite(
             key=entry.key, name=entry.name, body=entry.body,
@@ -420,34 +513,29 @@ def test_a_machine_without_the_files_is_told_so_and_gets_no_wiring():
 
 def test_a_cloud_placeholder_in_the_set_refuses_the_whole_site():
     """Reading one blocks the run. It is a refusal, not a warning."""
-    sites = _sites()
-    entry = sites.CURATED_SITES[0]
-    real_stat = sites.os.stat
+    with _synthetic() as (sites, _payload):
+        entry = sites.CURATED_SITES[0]
+        real_stat = sites.os.stat
 
-    class _Evicted:
-        def __init__(self, real):
-            self.st_size = real.st_size
-            self.st_blocks = 0
+        class _Evicted:
+            def __init__(self, real):
+                self.st_size = real.st_size
+                self.st_blocks = 0
 
-    def fake_stat(path, *args, **kwargs):
-        result = real_stat(path, *args, **kwargs)
-        if str(path) == entry.mesh.path:
-            return _Evicted(result)
-        return result
+        def fake_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if str(path) == entry.mesh.path:
+                return _Evicted(result)
+            return result
 
-    try:
-        real_stat(entry.mesh.path)
-    except OSError:
-        raise Skip(f"{entry.key}'s mesh is not on this machine")
-
-    sites.os.stat = fake_stat
-    try:
-        status = sites.site_status(entry)
-    finally:
-        sites.os.stat = real_stat
-    assert not status.ready and status.dataless
-    assert "cloud placeholder" in status.summary()
-    assert "Nothing has been written" in status.summary()
+        sites.os.stat = fake_stat
+        try:
+            status = sites.site_status(entry)
+        finally:
+            sites.os.stat = real_stat
+        assert not status.ready and status.dataless
+        assert "cloud placeholder" in status.summary()
+        assert "Nothing has been written" in status.summary()
 
 
 def test_a_truncated_matrix_is_caught_by_the_registrys_own_arithmetic():
@@ -458,7 +546,6 @@ def test_a_truncated_matrix_is_caught_by_the_registrys_own_arithmetic():
     check.
     """
     sites = _sites()
-    entry = sites.CURATED_SITES[0]
     with tempfile.TemporaryDirectory() as tmp:
         stub = Path(tmp) / "b.vf"
         stub.write_bytes(b"\0" * 80)
@@ -483,45 +570,55 @@ def test_a_truncated_matrix_is_caught_by_the_registrys_own_arithmetic():
 
 
 def test_the_provenance_text_names_the_ring_that_was_not_chosen():
-    """A03MP026 has three rings and the campaign used two of them, for two
+    """A site can have three rings, and a campaign use two of them, for two
     different jobs. A card that showed only the one it wired would leave the
     user unable to reconcile it with the project's own notes -- which name the
     other one in the same breath as this matrix.
     """
-    sites = _sites()
-    entry = sites.curated_site("A03MP026")
-    assert entry is not None
-    text = " ".join(sites.wiring_provenance(entry))
-    assert "27.3108" in text, text
-    assert "81.6712" in text, (
-        "the ring used for the offline sweep has to be named, or the entry "
-        "reads as if it disagreed with the project's own record")
-    assert "NOT used" in text
-    assert "not placed" in text, (
-        "the placement decision is the least obvious thing this entry does "
-        "and it has to be on the card")
+    with _synthetic() as (sites, _payload):
+        entry = sites.curated_site("SYN-ALPHA01")
+        assert entry is not None
+        text = " ".join(sites.wiring_provenance(entry))
+        assert "27 km" in text, text
+        assert "81 km" in text, (
+            "the ring used for the offline sweep has to be named, or the "
+            "entry reads as if it disagreed with the project's own record")
+        assert "NOT used" in text
+        assert "not placed" in text, (
+            "the placement decision is the least obvious thing this entry "
+            "does and it has to be on the card")
 
 
 def test_the_coarse_site_declares_its_resolution_gap():
-    """Slater Plain is 200x coarser and it is a data gap, not an omission."""
-    sites = _sites()
-    entry = sites.curated_site("A03SP010")
-    assert entry is not None
-    text = " ".join(sites.wiring_provenance(entry))
-    assert "LOLA" in text and "200x" in text, text
-    assert entry.mesh.faces < sites.curated_site("A03MP026").mesh.faces / 100
+    """A 200x coarser site is a data gap, not an omission, and must say so."""
+    with _synthetic() as (sites, _payload):
+        entry = sites.curated_site("SYN-GAMMA03")
+        assert entry is not None
+        text = " ".join(sites.wiring_provenance(entry))
+        assert "LOLA" in text and "200x" in text, text
+        assert entry.mesh.faces < \
+            sites.curated_site("SYN-ALPHA01").mesh.faces / 100
 
 
 def test_the_lookup_will_not_match_one_site_for_another():
-    """An A3GT key is exact. A fuzzy match wires the wrong polar site."""
-    sites = _sites()
-    assert sites.curated_site("A03MP026") is not None
-    assert sites.curated_site("MP026") is not None
-    assert sites.curated_site("a03mp026") is not None
-    assert sites.curated_site("A03MP02") is None
-    assert sites.curated_site("A03MP0261") is None
-    assert sites.curated_site("A03MP016") is None
-    assert sites.curated_site("A03MP026", body="Europa") is None
+    """A site key is exact. A fuzzy match wires the wrong polar site.
+
+    The near-miss arms are the point: a prefix, a suffix, a sibling key and a
+    right key on the wrong body all have to miss. Two polar sites in one
+    catalog are tens of kilometers apart with different illumination, and the
+    wrong one resolves to a run that completes.
+    """
+    with _synthetic() as (sites, _payload):
+        assert sites.curated_site("SYN-ALPHA01") is not None
+        assert sites.curated_site("ALPHA01") is not None, "alias lookup"
+        assert sites.curated_site("syn-alpha01") is not None, "case folding"
+        assert sites.curated_site("synalpha01") is not None, "punctuation"
+        assert sites.curated_site("SYN-ALPHA0") is None, "prefix must miss"
+        assert sites.curated_site("SYN-ALPHA011") is None, "suffix must miss"
+        assert sites.curated_site("SYN-BETA02") is not None
+        assert sites.curated_site("SYN-ORPHAN01") is None, (
+            "a not-curated key must not resolve to an entry")
+        assert sites.curated_site("SYN-ALPHA01", body="Europa") is None
 
 
 # --------------------------------------------------------------------------
@@ -547,18 +644,20 @@ def test_a_curated_selection_emits_a_config_the_engine_accepts():
     PARSES and the engine accepts every key the site wrote. It does not run
     the site, and it does not load the matrix.
     """
-    sites = _sites()
     exe = _engine()
     from gui_core.config_manager import ConfigManager
 
-    entry = None
-    for candidate in sites.CURATED_SITES:
-        if sites.site_status(candidate).ready:
-            entry = candidate
-            break
-    if entry is None:
-        raise Skip("no curated site's files are on this machine")
+    # The SYNTHETIC set, deliberately. What this proves is that the keys a
+    # selection emits parse in the engine -- which is about the key names, not
+    # about any one site's terrain. The engine never opens these files here
+    # (`--validate-config` does not load a mesh), so a fixture is a faithful
+    # subject and the check runs on every machine instead of only this one.
+    with _synthetic() as (sites, _payload):
+        entry = sites.CURATED_SITES[0]
+        _assert_engine_accepts(sites, entry, exe, ConfigManager)
 
+
+def _assert_engine_accepts(sites, entry, exe, ConfigManager):
     manager = ConfigManager()
     for key, value in sites.site_wiring(entry):
         manager.set_value(key, value)
@@ -602,21 +701,21 @@ def test_the_emitted_environment_reaches_the_launch_plan_unchanged():
     of adding to it would silently strip the recommended illumination fixes,
     and this is where that would show.
     """
-    sites = _sites()
     from gui_core.config_manager import ConfigManager
     from gui_core.preflight import RECOMMENDED_ENGINE_ENV, engine_env_plan
 
-    entry = sites.CURATED_SITES[0]
-    manager = ConfigManager()
-    for key, value in sites.site_wiring(entry):
-        manager.set_value(key, value)
-    table, source = engine_env_plan(manager.get_config())
-    assert table.get("PTM_HMATRIX_VF_REPLACE") == \
-        entry.view_factors.replace_csr, table
-    for name, value in RECOMMENDED_ENGINE_ENV.items():
-        assert table.get(name) == value, (
-            f"{name} was lost between the picker and the launch plan")
-    assert "engine_env" in source
+    with _synthetic() as (sites, _payload):
+        entry = sites.CURATED_SITES[0]
+        manager = ConfigManager()
+        for key, value in sites.site_wiring(entry):
+            manager.set_value(key, value)
+        table, source = engine_env_plan(manager.get_config())
+        assert table.get("PTM_HMATRIX_VF_REPLACE") == \
+            entry.view_factors.replace_csr, table
+        for name, value in RECOMMENDED_ENGINE_ENV.items():
+            assert table.get(name) == value, (
+                f"{name} was lost between the picker and the launch plan")
+        assert "engine_env" in source
 
 
 def test_the_moon_card_offers_the_sites_and_refuses_an_absent_one():
@@ -624,8 +723,10 @@ def test_the_moon_card_offers_the_sites_and_refuses_an_absent_one():
 
     The refusal path is the one worth exercising, because it is the one that
     runs on every machine that is not this one.
+
+    The card is built INSIDE the fixture: its combo is populated once, at
+    construction, from whatever the registry holds then.
     """
-    sites = _sites()
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     try:
         import PyQt6
@@ -640,39 +741,170 @@ def test_the_moon_card_offers_the_sites_and_refuses_an_absent_one():
     from gui_core.config_manager import ConfigManager
     from gui_panels.body_cards_panel import MoonCard
 
-    manager = ConfigManager()
-    card = MoonCard(manager, route=None)
-    card._active = True
-    card._mode = "local"
-    try:
-        offered = [card.site_combo.itemData(i)
-                   for i in range(card.site_combo.count())]
-        assert offered[0] == "", "the first entry must be 'none'"
-        assert set(offered[1:]) == {e.key for e in sites.CURATED_SITES}, offered
-
-        # A site whose files are absent: select it and confirm the card wrote
-        # nothing and put itself back to none.
-        entry = sites.CURATED_SITES[0]
-        real_isdir = sites.os.path.isdir
-
-        def fake_isdir(path):
-            return False if str(path) == entry.local_root else real_isdir(path)
-
-        sites.os.path.isdir = fake_isdir
+    with _synthetic() as (sites, _payload):
+        manager = ConfigManager()
+        card = MoonCard(manager, route=None)
+        card._active = True
+        card._mode = "local"
         try:
-            index = offered.index(entry.key)
-            card.site_combo.setCurrentIndex(index)
+            offered = [card.site_combo.itemData(i)
+                       for i in range(card.site_combo.count())]
+            assert offered[0] == "", "the first entry must be 'none'"
+            assert set(offered[1:]) == {e.key for e in sites.CURATED_SITES}, \
+                offered
+
+            # A site whose files are absent: select it and confirm the card
+            # wrote nothing and put itself back to none.
+            entry = sites.CURATED_SITES[0]
+            real_isdir = sites.os.path.isdir
+
+            def fake_isdir(path):
+                if str(path) == entry.local_root:
+                    return False
+                return real_isdir(path)
+
+            sites.os.path.isdir = fake_isdir
+            try:
+                index = offered.index(entry.key)
+                card.site_combo.setCurrentIndex(index)
+            finally:
+                sites.os.path.isdir = real_isdir
+            assert card.site_combo.currentIndex() == 0, (
+                "a site that cannot be backed must not stay selected")
+            assert not str(manager.get_value("mesh.import_file", "") or ""), (
+                "a refused site wrote a mesh path anyway")
+            assert "Nothing was written" in card.site_note.text(), \
+                card.site_note.text()
         finally:
-            sites.os.path.isdir = real_isdir
-        assert card.site_combo.currentIndex() == 0, (
-            "a site that cannot be backed must not stay selected")
-        assert not str(manager.get_value("mesh.import_file", "") or ""), (
-            "a refused site wrote a mesh path anyway")
-        assert "Nothing was written" in card.site_note.text(), \
-            card.site_note.text()
-    finally:
-        card.deleteLater()
-        del app
+            card.deleteLater()
+    del app
+
+
+def test_a_checkout_with_no_overlay_offers_no_curated_sites():
+    """The shipped state: an empty table, and a card that says nothing extra.
+
+    The registry ships empty because its real entries are landing-site
+    candidates kept outside this repository. This pins that: with the overlay
+    pointed at a path that does not exist, there are no entries, no
+    not-curated rows, no defective-matrix rows, and the Moon card offers only
+    "(none)".
+    """
+    sites = _sites()
+    with tempfile.TemporaryDirectory() as tmp:
+        absent = Path(tmp) / "no_overlay_here.json"
+        status = sites.reload_registry(absent)
+        try:
+            assert status.ok, "an ABSENT overlay is not a fault"
+            assert not status.present
+            assert sites.CURATED_SITES == (), sites.CURATED_SITES
+            assert sites.NOT_CURATED == {}
+            assert sites.DEFECTIVE_VIEW_FACTORS == {}
+            assert sites.curated_sites_for_body("Moon") == ()
+            assert "normal state" in status.summary(), status.summary()
+        finally:
+            sites.reload_registry()
+
+
+def test_a_broken_overlay_is_loud_and_does_not_look_like_an_absent_one():
+    """The failure this design could most easily have: a silent empty table.
+
+    An overlay that is present but unparseable, or written to a schema this
+    build does not read, ends with the same empty table as no overlay at all.
+    Only one of the two is a fault, so they must not read the same.
+    """
+    sites = _sites()
+    with tempfile.TemporaryDirectory() as tmp:
+        cases = {
+            "not_json.json": "{ this is not json",
+            "wrong_schema.json":
+                json.dumps({"schema": "ptm3d.curated_sites_local/99",
+                            "sites": []}),
+            "not_an_object.json": json.dumps([1, 2, 3]),
+            "bad_entry.json": json.dumps({
+                "schema": sites.LOCAL_REGISTRY_SCHEMA,
+                "sites": [{"key": "SYN-BROKEN01", "body": "Moon"}]}),
+            "duplicate_key.json": json.dumps({
+                "schema": sites.LOCAL_REGISTRY_SCHEMA,
+                "sites": [_minimal_entry("SYN-DUP01"),
+                          _minimal_entry("SYN-DUP01")]}),
+        }
+        try:
+            for name, text in cases.items():
+                path = Path(tmp) / name
+                path.write_text(text)
+                status = sites.reload_registry(path)
+                assert not status.ok, f"{name} was accepted and must not be"
+                assert status.present, f"{name} exists and must be reported so"
+                assert "could not be used" in status.summary(), status.summary()
+                assert "not an empty overlay" in status.summary(), (
+                    f"{name}'s message does not distinguish itself from having "
+                    f"no overlay: {status.summary()}")
+                assert sites.CURATED_SITES == (), (
+                    f"{name} contributed entries despite failing to load")
+        finally:
+            sites.reload_registry()
+
+
+def _minimal_entry(key):
+    """The smallest mapping ``site_from_mapping`` accepts, for the loader arms."""
+    return {
+        "key": key, "body": "Moon",
+        "mesh": {"path": "/nowhere/core.ply", "faces": 4,
+                 "latitude_deg": -12.345, "longitude_deg": 210.987},
+        "occluder": {"path": "/nowhere/ring.ply", "faces": 2},
+        "view_factors": {"replace_csr": "/nowhere/m.csr",
+                         "base_stub": "/nowhere/b.vf", "n_faces": 4,
+                         "nnz": 1, "geomhash": 1.0},
+    }
+
+
+def test_the_overlay_reaches_the_card_when_it_is_broken():
+    """A fault in a file the user cannot see must appear where they are.
+
+    ``local_registry_status`` is only useful if something shows it. The Moon
+    card's site note is where an empty combo gets explained, so that is where
+    a broken overlay has to land.
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        import PyQt6
+    except ImportError as exc:                            # pragma: no cover
+        raise Skip(f"PyQt6 is unavailable here ({exc})")
+    plug = Path(PyQt6.__file__).parent / "Qt6" / "plugins"
+    os.environ.setdefault("QT_PLUGIN_PATH", str(plug))
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plug / "platforms"))
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+
+    from gui_core.config_manager import ConfigManager
+    from gui_panels.body_cards_panel import MoonCard
+
+    sites = _sites()
+    with tempfile.TemporaryDirectory() as tmp:
+        broken = Path(tmp) / "broken.json"
+        broken.write_text("{ not json at all")
+        sites.reload_registry(broken)
+        try:
+            manager = ConfigManager()
+            card = MoonCard(manager, route=None)
+            try:
+                assert card.site_combo.count() == 1, (
+                    "a broken overlay must contribute no sites")
+                # THROUGH load_card(). Asserting straight after the constructor
+                # passed while the behavior was broken: `load_card` runs on
+                # every config load and card activation, and it used to
+                # overwrite this note with the ordinary "no curated site" text.
+                card.load_card()
+                note = card.site_note.text()
+                assert "could not be used" in note, note
+                assert str(broken) in note, (
+                    f"the card does not name the file the user has to fix: "
+                    f"{note}")
+            finally:
+                card.deleteLater()
+        finally:
+            sites.reload_registry()
+    del app
 
 
 def _offscreen_card():
@@ -789,7 +1021,7 @@ CHECKS = [
     test_the_wiring_is_the_whole_set_or_nothing,
     test_the_registry_refuses_the_matrices_it_says_it_refuses,
     test_the_pruned_experiments_are_refused_and_their_receipts_say_why,
-    test_the_five_orphaned_sites_are_not_curated_and_say_why,
+    test_the_orphaned_sites_are_not_curated_and_say_why,
     test_a_machine_without_the_files_is_told_so_and_gets_no_wiring,
     test_a_cloud_placeholder_in_the_set_refuses_the_whole_site,
     test_a_truncated_matrix_is_caught_by_the_registrys_own_arithmetic,
@@ -799,6 +1031,9 @@ CHECKS = [
     test_a_curated_selection_emits_a_config_the_engine_accepts,
     test_the_emitted_environment_reaches_the_launch_plan_unchanged,
     test_the_moon_card_offers_the_sites_and_refuses_an_absent_one,
+    test_a_checkout_with_no_overlay_offers_no_curated_sites,
+    test_a_broken_overlay_is_loud_and_does_not_look_like_an_absent_one,
+    test_the_overlay_reaches_the_card_when_it_is_broken,
     test_the_search_result_survives_being_used,
     test_the_refusals_stay_on_screen_next_to_the_selection,
 ]

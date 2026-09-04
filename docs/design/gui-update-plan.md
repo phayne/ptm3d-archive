@@ -17,7 +17,7 @@ not estimated; §1.1 lists the probes and how to rerun them.
 >    `thermophysical.constant_thermal_inertia` is annotated in that list as handler-wired and is
 >    not an orphan. Eight were deleted, two got controls.
 > 2. **§4.4's sampling threshold moved from 5,000,000 faces to 200,000.** Summing all 2,397,890
->    faces of the A3GT `A03MP026` core took 9.9 s in the reader, on the GUI thread, per field
+>    faces of the A3GT lunar polar site A core took 9.9 s in the reader, on the GUI thread, per field
 >    change; sampling 5,000 takes 0.6 s and lands within 0.6% of the documented 3.46 m.
 > 3. **§4.4's criterion is now the FINE END of the mesh, not `sqrt(mean face area)`.** The mean
 >    is dominated by the largest facets: 99% of facets at 1 mm plus 1% at 1 m reports 10 cm and
@@ -233,7 +233,7 @@ Among the injected keys: `radiation.use_gpu: true` and `radiation.max_coupling_i
 into a config that mentioned neither.
 
 The 2026-08-14 handoff recorded a worse instance on
-`~/dev/heat3d/a3gt_tutorial_ms3/ms3_tutorial_demo.yaml`: 274 lines and 185 comments reduced to
+a campaign demonstration configuration: 274 lines and 185 comments reduced to
 92 lines and 0 comments, **and `thermal.use_gpu` flipped false to true** before a live demo.
 The comment loss reproduces exactly — that file today is 92 lines with 0 comments, and a fresh
 round trip through it now changes nothing, which is what an already-flattened file should do.
@@ -405,7 +405,7 @@ millimeter to a centimeter:
 |---|---|---|---|
 | `sunlit_radcore_r50` | 140,091 | 237 m | ON |
 | `haworth_radcore_r32c` | 99,665 | 181 m | ON |
-| A3GT `A03MP026` 3 km core | 2,397,890 | 3.46 m | ON |
+| A3GT lunar polar site A 3 km core | 2,397,890 | 3.46 m | ON |
 | `moon3d_c...NEW_500k_clean` | 509,337 | **1.96 mm** | **OFF** — the mesh *is* at the roughness scale |
 
 **There is no engine-side facet-scale guard.** The engine enforces only that `beaming: true`

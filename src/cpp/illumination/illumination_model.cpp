@@ -4923,7 +4923,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // emits the same contractions and the same rounding. Carrying the flag as
     // a runtime bool instead -- three loop-invariant branches and one extra
     // captured variable, no arithmetic change whatsoever -- was enough to move
-    // illumination/primary_ir by ~1e-17 W/m^2 on 43 of 260 MS3 output files
+    // illumination/primary_ir by ~1e-17 W/m^2 on 43 of 260 lunar output files
     // under -ffast-math. Measured, twice, before this was written.
     auto sweep = [&](auto reuse_tag) {
     constexpr bool REUSE = decltype(reuse_tag)::value;
@@ -5122,7 +5122,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // "is there a hit in [tnear, tfar]" from the same triangle intersector,
         // and the scene is built RTC_SCENE_FLAG_ROBUST (:413), which is the
         // mode in which Embree guarantees they agree. VERIFIED, not assumed:
-        // every output file byte-identical across the swap on the MS3 lunar
+        // every output file byte-identical across the swap on the lunar
         // polar patch, the Europa Pwyll patch and the Europa ico6 global (see
         // the commit message for the digests).
         auto occluded = [&](const std::array<double, 3>& sd) {

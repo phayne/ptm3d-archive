@@ -12,7 +12,7 @@ Reads the per-iter trace from a production ``ptm_thermal_sim`` log
       tolerance drawn as a horizontal reference.
 
 Companion to Table 1 in §6.3 of the PTM3D methods paper. The default
-input/output reproduces the A03MM022 lunar production-window data cited
+input/output reproduces the lunar polar site L lunar production-window data cited
 in the paper.
 """
 from __future__ import annotations
@@ -97,7 +97,7 @@ def parse_log(path: Path) -> dict:
 # Plot
 
 def make_figure(log_path: Path, out_path: Path,
-                site_label: str = "A03MM022 production window") -> None:
+                site_label: str = "lunar polar site L production window") -> None:
     info = parse_log(log_path)
     iters = info["iters"]
     if not iters:
@@ -216,7 +216,7 @@ def main():
                    default=Path("tmp/corering_val_noring.log"))
     p.add_argument("--out", type=Path,
                    default=Path("docs/figures/v2/picard_convergence.png"))
-    p.add_argument("--site-label", default="A03MM022 production window")
+    p.add_argument("--site-label", default="lunar polar site L production window")
     args = p.parse_args()
     make_figure(args.log, args.out, args.site_label)
 

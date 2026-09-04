@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The flux-cube HDF5 packager, and the engine provenance it copies.
 
-Two defects found while verifying the 2026-09-02 MP026 flux-cube product, both
+Two defects found while verifying a 2026-09-02 lunar polar flux-cube product,
+both
 of which every structural check passed:
 
 * **PTM-460** -- ``scripts/ptm_flux_cubes_to_hdf5.py`` read ``statistics/*.bin``
@@ -12,7 +13,7 @@ of which every structural check passed:
   "2397891 faces" for a 2,397,890-face mesh and nobody read the number.
 * **PTM-461** -- the engine wrote the flux-cube provenance JSON's
   ``geomhash_core`` through a default-precision ``ostream``: six significant
-  digits, so 28733826.165896364 was recorded as 28733800.0.
+  digits, so a hash of the form 31904726.165896364 was recorded as 31904700.0.
 
 Run directly::
 
@@ -34,11 +35,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src" / "python"))
 
-#: The A03MP026 core mesh's geomhash, to full double precision. The same
-#: constant the GUI's curated-site registry carries (gui/gui_core/
-#: curated_sites.py) and the value the CSR header holds; the delivered product
-#: recorded 28733800.0 instead.
-MP026_GEOMHASH = 28733826.165896364
+#: A SYNTHETIC geometry hash, invented for this suite. Real hashes identify
+#: real meshes and this project does not publish the ones it has, so what is
+#: kept here is the PROPERTY the two defects turned on and not the number they
+#: turned on it with: a double of this magnitude whose six-significant-digit
+#: rendering loses about 26 in hash units -- under 1e-6 relative, and so INSIDE
+#: the pass's own 1e-3 match tolerance, which is the whole point of the second
+#: arm below. Substituting the real value changes no arm's outcome.
+CORE_GEOMHASH = 31904726.165896364
 
 _SCRATCH = None
 
@@ -217,7 +221,7 @@ def test_the_engine_renders_the_geomhash_at_round_trip_precision():
     """COMPILE THE ENGINE'S OWN LINE and check what it prints.
 
     The two lines are lifted verbatim out of ptm_thermal_sim.cpp, wrapped in a
-    main() with the real MP026 hash substituted for the member, compiled and
+    main() with a hash substituted for the member, compiled and
     run. If someone drops the `setprecision(17)` the source text changes and
     this fails with the six-digit value it printed instead.
     """
@@ -230,7 +234,7 @@ def test_the_engine_renders_the_geomhash_at_round_trip_precision():
             "int main(){ const double gh = %.17g;\n"
             "  std::ostringstream %s;\n  %s\n"
             "  std::cout << %s.str() << std::endl; return 0; }\n"
-            % (MP026_GEOMHASH, name, body, name))
+            % (CORE_GEOMHASH, name, body, name))
     d = scratch() / "gh_probe"
     d.mkdir(exist_ok=True)
     (d / "probe.cpp").write_text(prog)
@@ -243,30 +247,30 @@ def test_the_engine_renders_the_geomhash_at_round_trip_precision():
                              f"compile in isolation:\n{r.stderr}")
     out = subprocess.run([str(d / "probe")], capture_output=True, text=True,
                          timeout=60).stdout.strip()
-    assert float(out) == MP026_GEOMHASH, (
+    assert float(out) == CORE_GEOMHASH, (
         f"the engine renders the geomhash as {out!r}, which reads back as "
-        f"{float(out)!r}, not {MP026_GEOMHASH!r}. A mesh-identity hash that "
+        f"{float(out)!r}, not {CORE_GEOMHASH!r}. A mesh-identity hash that "
         f"does not round-trip cannot identify a mesh.")
-    assert json.loads('{"g":' + out + '}')["g"] == MP026_GEOMHASH, \
+    assert json.loads('{"g":' + out + '}')["g"] == CORE_GEOMHASH, \
         f"{out!r} is not JSON that reads back exactly"
 
 
 def test_six_significant_digits_is_a_provenance_loss_not_a_gate_failure():
     """State the size of the defect, so nobody restates it wrongly.
 
-    The truncation is 26.17 in hash units -- 9.1e-7 relative -- which is INSIDE
+    The truncation is 26.17 in hash units -- 8.2e-7 relative -- which is INSIDE
     the pass's own 1e-3 relative match tolerance (flux_cube_pass.cpp:222). No
     gate was ever fooled. What was lost is the ability to MATCH the recorded
     hash against the full-precision constant the crew keeps for this mesh.
     """
-    six = float("%g" % MP026_GEOMHASH)
-    assert six == 28733800.0, f"six-digit rendering is {six!r}"
-    rel = abs(MP026_GEOMHASH - six) / MP026_GEOMHASH
+    six = float("%g" % CORE_GEOMHASH)
+    assert six == 31904700.0, f"six-digit rendering is {six!r}"
+    rel = abs(CORE_GEOMHASH - six) / CORE_GEOMHASH
     assert rel < 1e-3, (
         f"relative loss {rel:.3g} is NOT inside the pass's 1e-3 match "
         f"tolerance, so PTM-461 would have been a gate failure and the "
         f"'provenance-only' claim in the commit message is wrong")
-    assert six != MP026_GEOMHASH, "no loss at all; this arm has no subject"
+    assert six != CORE_GEOMHASH, "no loss at all; this arm has no subject"
 
 
 def test_the_packager_copies_the_provenance_number_at_full_precision():
@@ -277,9 +281,9 @@ def test_the_packager_copies_the_provenance_number_at_full_precision():
     except ImportError as exc:
         raise Skip(f"h5py/numpy not in this interpreter ({exc})")
     m = packager()
-    blob = '{"geomhash_core":%.17g,"n_faces_core":2397890}' % MP026_GEOMHASH
+    blob = '{"geomhash_core":%.17g,"n_faces_core":2397890}' % CORE_GEOMHASH
     meta = json.loads(blob)
-    assert meta["geomhash_core"] == MP026_GEOMHASH, \
+    assert meta["geomhash_core"] == CORE_GEOMHASH, \
         "the JSON the engine writes does not itself round-trip"
     # The packager's own copy step: every meta key becomes an `engine_*` root
     # attribute. Exercised through h5py rather than asserted about the source.
@@ -288,7 +292,7 @@ def test_the_packager_copies_the_provenance_number_at_full_precision():
         for k, v in meta.items():
             h.attrs["engine_" + k] = v
     with h5py.File(out, "r") as h:
-        assert float(h.attrs["engine_geomhash_core"]) == MP026_GEOMHASH, (
+        assert float(h.attrs["engine_geomhash_core"]) == CORE_GEOMHASH, (
             f"the packaged attribute is "
             f"{float(h.attrs['engine_geomhash_core'])!r}")
     assert hasattr(m, "read_face_stat_bin"), \

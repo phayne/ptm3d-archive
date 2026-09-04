@@ -21,7 +21,7 @@ TWO THINGS THAT WILL GIVE WRONG ANSWERS IF SKIPPED
 1. FRAME ROTATION. In a south-polar stereographic projection with lon_0 = 0,
    the site's local NORTH is the radial-outward direction, not projected +Y,
    and local EAST is perpendicular to it. The rotation equals the site
-   longitude (33.5 deg at A03MP026). Treating projected axes as ENU moves the
+   longitude (30 deg at a polar site). Treating projected axes as ENU moves the
    patch centroid by tens of meters and changes which lattice points look like
    they are on PSR -- it changed the production-lattice hit count from 1 to 0
    when this was corrected.
@@ -33,7 +33,7 @@ TWO THINGS THAT WILL GIVE WRONG ANSWERS IF SKIPPED
 
 Usage:
   python3 scripts/flux_cube_psr_probe.py --mask <site>/psr_mask.tif \\
-      --lat -84.223 --lon 33.502 --radius 500 --spacing 25
+      --lat -85.0 --lon 30.0 --radius 500 --spacing 25
 """
 
 import argparse

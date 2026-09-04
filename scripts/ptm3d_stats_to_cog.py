@@ -10,9 +10,9 @@ Example:
 
     /Users/paha3326/anaconda3/envs/europa_viz/bin/python \\
         scripts/ptm3d_stats_to_cog.py \\
-        --mesh   /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/A03MM022/mesh.ply \\
-        --stats  /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/A03MM022/statistics \\
-        --output /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/A03MM022/cog
+        --mesh   /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/<SITE>/mesh.ply \\
+        --stats  /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/<SITE>/statistics \\
+        --output /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/<SITE>/cog
 
 Default resolution is auto-estimated from face spacing. For A3GT v2 1 m/px
 meshes pass ``--resolution-m 1`` to force 1 m pixels (matches the colleague's

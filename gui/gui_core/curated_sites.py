@@ -7,28 +7,37 @@ site whose terrain mesh, shadow-only occluder ring and view-factor matrix only
 mean anything TOGETHER, and where picking two of the three by hand produces a
 run that completes and is wrong.
 
+**The shipped table is empty, and that is deliberate.** The lunar polar sites
+this registry was built from are landing-site information that is not published
+with PTM3D, so the entries live OUTSIDE the repository in a local overlay --
+see "The local overlay" below. Everything else in this module ships: the
+classes, the disk checks, the wiring, and the reasons. A machine with no
+overlay gets an empty table and a GUI that offers no curated lunar sites, which
+is the correct behavior for a checkout that has no site artifacts anyway.
+
 Why a registry rather than three file pickers
 ---------------------------------------------
 
-The A3GT lunar-polar sites are the sharpest case in this project's history.
-Every one of the following is a real, measured, silent failure from that
-campaign, and a file picker offers all of them:
+The lunar polar campaign this module came from is the sharpest case in this
+project's history. Every one of the following is a real, measured, silent
+failure from that campaign, and a file picker offers all of them:
 
-* **The occluder ring is not one ring.** A03MP026 has three
-  (``Rext20km``, ``Rext27.3108km``, ``Rext81.6712km``). Its production runs use
-  the 27.3108 km one as ``mesh.occluder_file``; its view-factor SWEEP used the
-  81.6712 km one as a ray blocker. Those are different jobs -- run-time shadow
-  BVH versus offline Monte-Carlo occlusion -- and the bigger ring is NOT the
-  better choice for the first. Nothing on disk says which is which.
-* **A matrix can be EMPTY and load clean.** The June ``view_factors.hmat``
-  for this site has ``nnz=0``: dimensions match, the loader is happy, radiation
-  exchange silently computes nothing (project map, "Trap directories").
-* **A matrix can be for the wrong mesh and still be the right SIZE.** The DEM
-  was regenerated on 12 June, after its own matrix: 2,397,890 faces against the
+* **The occluder ring is not one ring.** A site can have three
+  (a 20 km, a 27 km and an 82 km outer radius). Its production runs used the
+  27 km one as ``mesh.occluder_file``; its view-factor SWEEP used the 82 km one
+  as a ray blocker. Those are different jobs -- run-time shadow BVH versus
+  offline Monte-Carlo occlusion -- and the bigger ring is NOT the better choice
+  for the first. Nothing on disk says which is which.
+* **A matrix can be EMPTY and load clean.** One site's June
+  ``view_factors.hmat`` has ``nnz=0``: dimensions match, the loader is happy,
+  radiation exchange silently computes nothing (project map, "Trap
+  directories").
+* **A matrix can be for the wrong mesh and still be the right SIZE.** One core
+  DEM was regenerated after its own matrix: 2,397,890 faces against the
   matrix's 1,796,406. That one is caught, by the count. Two matrices that agree
   on the count are not.
 * **A matrix can be a pruned experiment whose own receipt records failure.**
-  Three sit in the same directory as the good one, and one of them says in its
+  Three sit in the same directory as one good one, and one of them says in its
   receipt: "MEASURED FAIL: PSR-floor Tmax mean 3.3 K / max 22.6 K cold ...
   Diffuse polar terrain does NOT prune safely."
 * **Rebuilding, instead of loading, is the wedge.** A multi-gigabyte matrix
@@ -36,52 +45,56 @@ campaign, and a file picker offers all of them:
   2026-07-03 and needed a reboot. That is what PTM-19 exists to prevent, and a
   wrong or missing cache path is how it happens by accident.
 
-So the entries below are not conveniences. Each is a set that RAN, to
-completion, in a campaign that was checked afterwards.
+So an entry here is not a convenience. Each is a set that RAN, to completion,
+in a campaign that was checked afterwards.
 
 The three rules, the same as the Bennu tier's
 ---------------------------------------------
 
-**Nothing is invented.** Every face count, nonzero count and geometry hash
-below was read off the file it describes on 2026-08-31, and
+**Nothing is invented.** Every face count, nonzero count and geometry hash in
+an entry is read off the file it describes, and
 ``src/python/tests/test_gui_curated_sites.py`` re-reads them. A number that
-drifts from its file fails the suite rather than being believed.
+drifts from its file fails the suite rather than being believed. That check now
+runs over whatever the overlay supplies, so an overlay that has gone stale
+against its own disk fails in exactly the same way a hard-coded table did.
 
 **Being curated never means being quiet.** A curated site says which matrix
 generation it wires, which SUPERSEDED matrices sit in the same directories, and
 what it refuses to point at and why.
 
-**Local-only entries degrade, they do not pretend.** ``~/projects/a3gt`` is not
-distributed with PTM3D -- 220 GB of DEM-derived meshes and matrices on one
-machine. Every entry here is marked ``local_only`` and its status is computed
-from the disk in front of the user, so a checkout somewhere else shows the
-entry, says the artifacts are not here, and refuses to wire it. It does not
+**Local-only entries degrade, they do not pretend.** The artifacts are hundreds
+of gigabytes of DEM-derived meshes and matrices on one machine, and are not
+distributed with PTM3D. Every entry is marked ``local_only`` and its status is
+computed from the disk in front of the user, so a checkout somewhere else shows
+the entry, says the artifacts are not here, and refuses to wire it. It does not
 write paths that do not exist and let the launch check find out.
 
-Why the ``v3`` matrices, and not the ones the project map names first
---------------------------------------------------------------------
+The local overlay
+-----------------
 
-The project map's A3GT row points at
-``prune_test/vfr_full/A03MP026/A03MP026_corrected_vf.csr`` -- the July matrix,
-19.9 GB, 2,484,716,524 nonzeros. It is real, it ran, and it is SUPERSEDED. On
-2026-08-19/20 all three sites were re-swept and re-assembled with the FC-08
-symmetrization-divisor fix, and the GEN-2 campaign ran those instead -- 9
-windows plus a merge plus 17 COGs per site, all three verified afterwards
-(``run_manifest_A03*.json`` in ``~/projects/agt_corrected_2026-08-19``, whose
-``vf_replace`` field names the ``_v3`` file for every window of every site).
+``~/.ptm3d/curated_sites_local.json`` -- beside ``machine_profile.json``, which
+is the convention this project already had for "facts about THIS computer that
+are not the repository's business". Override the path with
+``PTM3D_CURATED_SITES_LOCAL``; point it at ``/dev/null``-ish (a nonexistent
+path) to run as a fresh checkout would.
 
-Curating the July matrix for A03MP026 while curating ``_v3`` for the other two
-would ship three sites on two incompatible view-factor generations, from one
-table, with nothing saying so. The July matrix also has NO provenance sidecar,
-so the strongest identity check this project has cannot be applied to it. It is
-recorded below as superseded, in the same way Bennu's solution-76 kernel is:
-named, explained, and NOT wired.
+JSON rather than an importable Python file on purpose: the overlay is read at
+GUI start from a location outside the repository, and a data file cannot become
+an execution path. The schema is one version string plus the same fields the
+classes below take, so a reader can see what it is without running it.
+
+An overlay that is present but unreadable, or malformed, or written to a schema
+this build does not know, is a LOUD failure and not an empty table:
+:func:`local_registry_status` records it, the loader logs a warning, and the
+Moon card shows the message. The one thing this must never do is look exactly
+like "you have no overlay".
 
 No Qt, so the whole tier is measurable without a window.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -89,17 +102,26 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BUILTIN_CURATED_SITES",
     "CURATED_SITES",
     "CuratedSite",
     "CuratedSiteMesh",
     "CuratedSiteOccluder",
     "CuratedSiteViewFactors",
     "DEFECTIVE_VIEW_FACTORS",
+    "LOCAL_REGISTRY_ENV",
+    "LOCAL_REGISTRY_SCHEMA",
+    "LocalRegistry",
     "NOT_CURATED",
     "SiteStatus",
     "SupersededArtifact",
     "curated_site",
     "curated_sites_for_body",
+    "default_local_registry_path",
+    "load_local_registry",
+    "local_registry_status",
+    "reload_registry",
+    "site_from_mapping",
     "site_status",
     "site_wiring",
     "wiring_provenance",
@@ -108,9 +130,9 @@ __all__ = [
 #: The placement sentinel. ``mesh.latitude_override > -900.0`` makes the engine
 #: ROTATE the loaded mesh so its vertex-mean direction lands on the given
 #: latitude and longitude (``ptm_thermal_sim.cpp:15634`` ->
-#: ``rotateMeshToLatLon`` at :1799). Every site here is a DEM mesh already built
-#: in the lunar body frame at its own coordinates, so it must not be rotated --
-#: see :class:`CuratedSiteMesh` for what happens if it is.
+#: ``rotateMeshToLatLon`` at :1799). A DEM mesh is already built in the lunar
+#: body frame at its own coordinates, so it must not be rotated -- see
+#: :class:`CuratedSiteMesh` for what happens if it is.
 NOT_PLACED = -999.0
 
 
@@ -122,13 +144,13 @@ class CuratedSiteMesh:
     ``mesh.latitude_override``/``longitude_override``, and that is the least
     obvious decision in this module:
 
-    An A3GT core mesh is built from a south-polar-stereographic DEM into lunar
+    A polar core mesh is built from a south-polar-stereographic DEM into lunar
     body-frame Cartesian coordinates, so it is already at its own latitude and
-    longitude. Measured 2026-08-31 from the vertex mean of each PLY: A03MP026
-    lands at -84.2234, 33.5023 against a file name that says 84.223S, 33.502E.
-    Writing the rounded name back as an override therefore asks the engine to
-    rotate the mesh by about 0.0004 degrees -- past the 1e-10 radian no-op
-    guard, so it rotates -- which at 1737 km is roughly a 12 m displacement.
+    longitude. Measured from the vertex mean of one production PLY, the mesh
+    lands 0.0004 degrees from the coordinates in its own file name. Writing the
+    rounded name back as an override therefore asks the engine to rotate the
+    mesh by that much -- past the 1e-10 radian no-op guard, so it rotates --
+    which at 1737 km is roughly a 12 m displacement.
 
     And only the CORE moves. ``rotateMeshToLatLon`` takes the core mesh alone;
     the occluder ring is loaded separately and is not rotated with it, so the
@@ -136,10 +158,9 @@ class CuratedSiteMesh:
     replacement CSR's geometry-hash gate stays green through all of it. It is
     silent by construction.
 
-    Every production configuration for these sites -- July's
-    ``sites_v3_corrected/*/yaml/*.yaml`` and August's GEN-2 ``configs/*/*.yaml``
-    -- leaves both keys unset for exactly this reason. So does this registry:
-    it writes the ``-999.0`` sentinel and shows the coordinates as text.
+    Every production configuration for these sites leaves both keys unset for
+    exactly this reason. So does this registry: it writes the ``-999.0``
+    sentinel and shows the coordinates as text.
     """
 
     def __init__(self, path, faces, latitude_deg, longitude_deg,
@@ -151,8 +172,8 @@ class CuratedSiteMesh:
         self.longitude_deg = float(longitude_deg)
         self.core_radius_km = float(core_radius_km)
         #: How the terrain was derived. A LOLA-only fallback and an SfS product
-        #: are not the same resolution class, and one of the three sites here
-        #: is 200x coarser than the other two.
+        #: are not the same resolution class, and sites in one campaign can
+        #: differ by 200x because of it.
         self.source = source
         #: The vertex-mean direction actually measured from the PLY, kept so
         #: the test can re-measure it and so the card can show the difference
@@ -175,8 +196,8 @@ class CuratedSiteMesh:
 class CuratedSiteOccluder:
     """The shadow-only ring, which is an ANNULUS and not a second terrain.
 
-    ``data/dem/a3gt_v2/<SITE>_ring_Rcore<N>_Rext<M>km.ply`` has zero vertices
-    inside about ``R_core`` of the site center: it pairs with the core through
+    A ``<SITE>_ring_Rcore<N>_Rext<M>km.ply`` has zero vertices inside about
+    ``R_core`` of the site center: it pairs with the core through
     ``mesh.occluder_file`` and the two are never merged. Loading one alone
     renders a doughnut with a hole where the site is.
 
@@ -307,287 +328,223 @@ class CuratedSite:
         return f"<CuratedSite {self.key}>"
 
 
-A3GT_ROOT = "/Users/paha3326/projects/a3gt"
-A3GT_MESHES = A3GT_ROOT + "/meshes"
-A3GT_BASE_VF = A3GT_ROOT + "/base_vf"
-A3GT_VF_BUILD = A3GT_ROOT + "/vf_build"
+# ---------------------------------------------------------------------------
+# The shipped table, and the local overlay that fills it
+# ---------------------------------------------------------------------------
 
-_GEN2 = ("A3GT GEN-2, ~/projects/agt_corrected_2026-08-19 — 9 windows + merge "
-         "+ 17 COGs per site, completed and checked 2026-08-22 "
-         "(run_manifest_A03*.json names this CSR for every window)")
-
-_WHY = ("An A3GT site is three files that only mean anything together: a "
-        "high-resolution core DEM, a shadow-only occluder ring chosen from "
-        "several, and a view-factor matrix built for THAT core by an offline "
-        "referee sweep. Choosing them separately has produced, in this "
-        "project, an empty matrix that loaded clean, a matrix for a "
-        "superseded mesh, a pruned matrix whose own receipt records failure, "
-        "and a multi-gigabyte rebuild that wedged the graphics cards. The set "
-        "below is the one that ran.")
-
-
-#: The curated lunar-site table. Three entries, all machine-local.
+#: Curated sites distributed WITH PTM3D. Empty, and not by oversight.
 #:
-#: Do NOT add a site because its files exist. Add one when a campaign has run
-#: the set to completion and the numbers below can be read off the files.
-CURATED_SITES = (
-    CuratedSite(
-        key="A03MP026",
-        name="A03MP026 — Mons Mouton plateau",
-        body="Moon",
-        region="Mons Mouton plateau",
-        aliases=("MP026", "A03MP026", "mons mouton"),
-        local_only=True,
-        local_root=A3GT_ROOT,
-        why_curated=_WHY,
+#: The sites this registry was built from are lunar landing-site candidates,
+#: which is information this project does not publish, so they are supplied by
+#: the local overlay instead (module docstring, "The local overlay"). Adding an
+#: entry here means asserting it can ship: its coordinates, its identifier and
+#: its terrain are all publishable, and its artifacts are ones a user could
+#: obtain. Nothing today meets that.
+BUILTIN_CURATED_SITES = ()
+
+#: The environment variable that relocates the overlay, for tests and for a
+#: second machine profile.
+LOCAL_REGISTRY_ENV = "PTM3D_CURATED_SITES_LOCAL"
+
+#: The only schema this build reads. An overlay written to a later one is
+#: refused loudly rather than parsed on a guess.
+LOCAL_REGISTRY_SCHEMA = "ptm3d.curated_sites_local/1"
+
+
+def default_local_registry_path():
+    """``~/.ptm3d/curated_sites_local.json``, or the env override.
+
+    Beside ``machine_profile.json``: this project already put "facts about
+    THIS computer" there, and a second convention would be a second place to
+    look when the table is unexpectedly empty.
+    """
+    override = os.environ.get(LOCAL_REGISTRY_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".ptm3d" / "curated_sites_local.json"
+
+
+def _require(mapping, field, where):
+    if field not in mapping:
+        raise ValueError(f"{where} has no {field!r}")
+    return mapping[field]
+
+
+def site_from_mapping(data):
+    """Build a :class:`CuratedSite` from the overlay's (or a test's) mapping.
+
+    Public because the suite builds SYNTHETIC fixture sites through it. A test
+    that constructed the classes directly would exercise a different path from
+    the one the overlay takes, and the overlay's parsing is the part that can
+    break in the field.
+
+    Missing required fields raise :class:`ValueError` naming the entry, rather
+    than producing a half-built site: an entry that is silently short a matrix
+    path is the failure mode this whole module exists to prevent.
+    """
+    key = str(_require(data, "key", "a curated-site entry"))
+    where = f"curated site {key!r}"
+    mesh = dict(_require(data, "mesh", where))
+    occluder = dict(_require(data, "occluder", where))
+    view_factors = dict(_require(data, "view_factors", where))
+    return CuratedSite(
+        key=key,
+        name=str(data.get("name", key)),
+        body=str(_require(data, "body", where)),
+        region=str(data.get("region", "")),
+        why_curated=str(data.get("why_curated", "")),
+        local_only=bool(data.get("local_only", True)),
+        local_root=str(data.get("local_root", "")),
+        aliases=tuple(data.get("aliases", ())),
+        notes=tuple(data.get("notes", ())),
+        use_gpu=bool(data.get("use_gpu", True)),
         mesh=CuratedSiteMesh(
-            path=A3GT_MESHES + "/A03MP026_84.223S_33.502E_R3km_linear.ply",
-            faces=2397890,
-            latitude_deg=-84.223,
-            longitude_deg=33.502,
-            measured_latitude_deg=-84.2234,
-            measured_longitude_deg=33.5023,
-            core_radius_km=3.0,
-            source="SfS-derived core DEM, 3 km region of interest, Delaunay "
-                   "triangulated",
+            path=_require(mesh, "path", f"{where} mesh"),
+            faces=_require(mesh, "faces", f"{where} mesh"),
+            latitude_deg=_require(mesh, "latitude_deg", f"{where} mesh"),
+            longitude_deg=_require(mesh, "longitude_deg", f"{where} mesh"),
+            core_radius_km=mesh.get("core_radius_km", 0.0),
+            source=mesh.get("source", ""),
+            measured_latitude_deg=mesh.get("measured_latitude_deg"),
+            measured_longitude_deg=mesh.get("measured_longitude_deg"),
         ),
         occluder=CuratedSiteOccluder(
-            path=(A3GT_MESHES
-                  + "/A03MP026_84.223S_33.502E_ring_Rcore3_Rext27.3108km.ply"),
-            faces=152765,
-            r_ext_km=27.3108,
-            role="run-time shadow occluder (mesh.occluder_file)",
+            path=_require(occluder, "path", f"{where} occluder"),
+            faces=_require(occluder, "faces", f"{where} occluder"),
+            r_ext_km=occluder.get("r_ext_km", 0.0),
+            role=occluder.get("role", ""),
         ),
         view_factors=CuratedSiteViewFactors(
-            replace_csr=(A3GT_VF_BUILD
-                         + "/A03MP026/A03MP026_corrected_vf_v3.csr"),
-            base_stub=A3GT_BASE_VF + "/A03MP026_base_empty.vf",
-            n_faces=2397890,
-            nnz=2216190708,
-            geomhash=28733826.165896364,
-            generation="FC-08 corrected (symmetrization divisor = directions "
-                       "TRIED, plus back-face cull), 200,000 rays/face, "
-                       "assembled 2026-08-20",
-            provenance=(A3GT_VF_BUILD
-                        + "/A03MP026/A03MP026_corrected_vf_v3.csr"
-                          ".provenance.json"),
-            campaign=_GEN2,
-            gpu_fit="fits one W6800X die; the GEN-2 windows ran GPU radiosity "
-                    "at 35-40 min/window",
-            stub_rows=2397890,
+            replace_csr=_require(view_factors, "replace_csr", f"{where} matrix"),
+            base_stub=_require(view_factors, "base_stub", f"{where} matrix"),
+            n_faces=_require(view_factors, "n_faces", f"{where} matrix"),
+            nnz=_require(view_factors, "nnz", f"{where} matrix"),
+            geomhash=_require(view_factors, "geomhash", f"{where} matrix"),
+            generation=view_factors.get("generation", ""),
+            provenance=view_factors.get("provenance", ""),
+            campaign=view_factors.get("campaign", ""),
+            gpu_fit=view_factors.get("gpu_fit", ""),
+            stub_rows=view_factors.get("stub_rows"),
+            stub_nnz=view_factors.get("stub_nnz", 0),
         ),
-        notes=(
-            "This site has THREE occluder rings on disk. The 27.3108 km one "
-            "above is what every production configuration sets as "
-            "mesh.occluder_file. The 81.6712 km one -- which the project map "
-            "names in the same row as this matrix -- was the RAY BLOCKER for "
-            "the offline view-factor sweep, a one-off from a June 16-window "
-            "high-accuracy pass. Both are correct for their own job and "
-            "swapping them changes the shadowing of the run.",
-        ),
-        superseded=(
-            SupersededArtifact(
-                path=(A3GT_ROOT + "/prune_test/vfr_full/A03MP026/"
-                      "A03MP026_corrected_vf.csr"),
-                why=("the July generation: 19.9 GB, 2,484,716,524 nonzeros, "
-                     "built before the FC-08 symmetrization-divisor fix, so "
-                     "its far field reads up to 2x high. It has no "
-                     ".provenance.json sidecar, so its mesh identity cannot "
-                     "be checked the way the curated matrix's can. It ran two "
-                     "complete campaigns and is kept for comparison."),
-            ),
-            SupersededArtifact(
-                path=(A3GT_VF_BUILD
-                      + "/A03MP026/A03MP026_corrected_vf_divisor2.csr"),
-                why=("the intermediate step: the divisor fix WITHOUT the "
-                     "back-face cull, superseded by the _v3 file the same "
-                     "day."),
-            ),
-            SupersededArtifact(
-                path=A3GT_VF_BUILD + "/A03MP026/A03MP026_rad_demo.csr",
-                why=("a radiance-PRUNED experiment whose own receipt beside "
-                     "it records the outcome: 'MEASURED FAIL: PSR-floor Tmax "
-                     "mean 3.3 K / max 22.6 K cold ... Diffuse polar terrain "
-                     "does NOT prune safely'. A pruned matrix is not a "
-                     "cheaper version of the full one."),
-            ),
-            SupersededArtifact(
-                path=A3GT_VF_BUILD + "/A03MP026/A03MP026_rad1e3_vf.csr",
-                why="a second radiance-pruned experiment from the same study.",
-            ),
-            SupersededArtifact(
-                path=A3GT_VF_BUILD + "/A03MP026/A03MP026_corrected_vf.csr",
-                why=("the July matrix's original build location. It was "
-                     "DELETED under the rolling-VF disk policy after use; "
-                     "only its 19 MB .rowsum.npy sidecar is still there."),
-                exists_note="deleted on purpose — its absence is not a fault",
-            ),
-        ),
-    ),
-    CuratedSite(
-        key="A03N1016",
-        name="A03N1016 — Nobile Rim 1",
-        body="Moon",
-        region="Nobile Rim 1",
-        aliases=("N1016", "A03N1016", "nobile rim 1"),
-        local_only=True,
-        local_root=A3GT_ROOT,
-        why_curated=_WHY,
-        mesh=CuratedSiteMesh(
-            path=A3GT_MESHES + "/A03N1016_85.391S_32.258E_R3km_linear.ply",
-            faces=1798135,
-            latitude_deg=-85.391,
-            longitude_deg=32.258,
-            measured_latitude_deg=-85.3914,
-            measured_longitude_deg=32.2587,
-            core_radius_km=3.0,
-            source="SfS-derived core DEM, 3 km region of interest, Delaunay "
-                   "triangulated",
-        ),
-        occluder=CuratedSiteOccluder(
-            path=(A3GT_MESHES
-                  + "/A03N1016_85.391S_32.258E_ring_Rcore3_Rext37.9051km.ply"),
-            faces=152531,
-            r_ext_km=37.9051,
-            role="run-time shadow occluder AND the offline sweep's ray "
-                 "blocker — this site has one ring, used for both",
-        ),
-        view_factors=CuratedSiteViewFactors(
-            replace_csr=(A3GT_VF_BUILD
-                         + "/A03N1016/A03N1016_corrected_vf_v3.csr"),
-            base_stub=A3GT_BASE_VF + "/A03N1016_base_empty.vf",
-            n_faces=1798135,
-            nnz=3539114614,
-            geomhash=29017233.617904384,
-            generation="FC-08 corrected (symmetrization divisor = directions "
-                       "TRIED, plus back-face cull), 200,000 rays/face, "
-                       "assembled 2026-08-20",
-            provenance=(A3GT_VF_BUILD
-                        + "/A03N1016/A03N1016_corrected_vf_v3.csr"
-                          ".provenance.json"),
-            campaign=_GEN2,
-            gpu_fit="the GEN-2 windows fit one die at 26.55 GiB with 0.64 GiB "
-                    "of margin — because the FC-08 fix SHRANK this matrix. "
-                    "Its predecessor (30.9 GB, 3,865,673,362 nonzeros) did "
-                    "not fit, and all nine of its windows ran the engine's "
-                    "CPU radiosity fallback: 103-116 min/window against 35-40 "
-                    "for a matrix that fits. The cascade is clean and says so "
-                    "in the log; it is a cost, not a fault.",
-            stub_rows=1798135,
-        ),
-        notes=(
-            "Fewer faces than A03MP026 and 60% MORE nonzeros. Crater-rim "
-            "terrain sees itself; a plateau does not. Matrix size and build "
-            "cost follow concavity, not face count -- do not size this "
-            "site's successors from their face counts.",
-        ),
-        superseded=(
-            SupersededArtifact(
-                path=(A3GT_VF_BUILD
-                      + "/A03N1016/A03N1016_corrected_vf_divisor2.csr"),
-                why=("the divisor fix without the back-face cull, superseded "
-                     "the same day."),
-            ),
-            SupersededArtifact(
-                path=A3GT_VF_BUILD + "/A03N1016/A03N1016_corrected_vf.csr",
-                why=("the first build, before either FC-08 correction. This "
-                     "is the 30.9 GB matrix that did not fit a die."),
-            ),
-        ),
-    ),
-    CuratedSite(
-        key="A03SP010",
-        name="A03SP010 — Slater Plain",
-        body="Moon",
-        region="Slater Plain",
-        aliases=("SP010", "A03SP010", "slater plain"),
-        local_only=True,
-        local_root=A3GT_ROOT,
-        why_curated=_WHY,
-        mesh=CuratedSiteMesh(
-            path=A3GT_MESHES + "/A03SP010_87.130S_127.826E_R3km_linear.ply",
-            faces=8746,
-            latitude_deg=-87.130,
-            longitude_deg=127.826,
-            measured_latitude_deg=-87.1302,
-            measured_longitude_deg=127.8255,
-            core_radius_km=3.0,
-            source="LOLA-only fallback (80 m/px) — NO shape-from-shading "
-                   "product covers this site",
-        ),
-        occluder=CuratedSiteOccluder(
-            path=(A3GT_MESHES
-                  + "/A03SP010_87.130S_127.826E_ring_Rcore3_Rext89.4015km.ply"),
-            faces=151579,
-            r_ext_km=89.4015,
-            role="run-time shadow occluder AND the offline sweep's ray "
-                 "blocker — this site has one ring, used for both",
-        ),
-        view_factors=CuratedSiteViewFactors(
-            replace_csr=(A3GT_VF_BUILD
-                         + "/A03SP010/A03SP010_corrected_vf_v3.csr"),
-            base_stub=A3GT_BASE_VF + "/A03SP010_base_empty.vf",
-            n_faces=8746,
-            nnz=6868216,
-            geomhash=28244229.58147998,
-            generation="FC-08 corrected (symmetrization divisor = directions "
-                       "TRIED, plus back-face cull), 200,000 rays/face, "
-                       "assembled 2026-08-20",
-            provenance=(A3GT_VF_BUILD
-                        + "/A03SP010/A03SP010_corrected_vf_v3.csr"
-                          ".provenance.json"),
-            campaign=_GEN2,
-            gpu_fit="55 MB — it fits anywhere; the nine GEN-2 windows took "
-                    "about 2.3 minutes in total",
-            stub_rows=8746,
-        ),
-        notes=(
-            "⚠️ 8,746 faces against A03MP026's 2,397,890 — about 200x coarser, "
-            "and it is not an omission. No high-resolution DEM exists for "
-            "Slater Plain anywhere in this project: the site's own source "
-            "raster is a 125x125-pixel LOLA window, re-derived byte-identical "
-            "in 2026-08 to prove the point, and none of the shape-from-shading "
-            "products covers 87.130S/127.826E. The engine's own documented "
-            "LOLA fallback is what built this. Never present results from "
-            "this site as being at the same resolution class as the other "
-            "two.",
-        ),
-        superseded=(
-            SupersededArtifact(
-                path=(A3GT_VF_BUILD
-                      + "/A03SP010/A03SP010_corrected_vf_divisor2.csr"),
-                why=("the divisor fix without the back-face cull, superseded "
-                     "the same day."),
-            ),
-            SupersededArtifact(
-                path=A3GT_VF_BUILD + "/A03SP010/A03SP010_corrected_vf.csr",
-                why="the first build, before either FC-08 correction.",
-            ),
-        ),
-    ),
-)
+        superseded=tuple(
+            SupersededArtifact(path=_require(item, "path", f"{where} superseded"),
+                               why=item.get("why", ""),
+                               exists_note=item.get("exists_note", ""))
+            for item in data.get("superseded", ())),
+    )
 
 
-#: The five A3GT sites PTM-312 leaves without a usable matrix, and the ONE
-#: sentence that explains both of the tables below.
-_PTM312 = ("PTM-312: this site's view-factor matrix came from the offline "
-           "pipeline BEFORE the FC-08 symmetrization-divisor fix and the "
-           "back-face cull, so its far field reads up to 2x high. It could "
-           "not be re-swept with the other ten -- the raw sweep files lived "
-           "in /tmp and a reboot cleared them -- so there is no corrected "
-           "matrix to point at. Nothing in the file says any of this: it is "
-           "the current layout, its face count matches its mesh, and it "
-           "loads clean.")
+class LocalRegistry:
+    """What the overlay contributed, and what went wrong if anything did.
 
-_ORPHANED_SITES = ("A03MP016", "A03MP037", "A03MP038", "A03MP039", "A03MP040")
+    ``error`` non-empty is the state this class exists for. An overlay that is
+    present but unreadable must not look like an absent one: the table would be
+    empty either way and only one of the two is a fault.
+    """
 
-#: A3GT sites whose meshes exist and which are DELIBERATELY not curated.
+    def __init__(self, path, present, sites=(), not_curated=None,
+                 defective=None, error=""):
+        self.path = str(path)
+        self.present = bool(present)
+        self.sites = tuple(sites)
+        self.not_curated = dict(not_curated or {})
+        self.defective_view_factors = dict(defective or {})
+        self.error = error
+
+    @property
+    def ok(self):
+        return not self.error
+
+    def summary(self):
+        if self.error:
+            return (f"The local lunar-site overlay {self.path} could not be "
+                    f"used: {self.error} No curated sites were loaded from it. "
+                    f"This is a fault, not an empty overlay.")
+        if not self.present:
+            return (f"No local lunar-site overlay at {self.path}, so the "
+                    f"curated lunar-site table is empty. That is the normal "
+                    f"state for a checkout without local site artifacts.")
+        return (f"{len(self.sites)} curated lunar site"
+                f"{'' if len(self.sites) == 1 else 's'} loaded from "
+                f"{self.path}.")
+
+    def __repr__(self):                                   # pragma: no cover
+        return f"<LocalRegistry n={len(self.sites)} ok={self.ok}>"
+
+
+def load_local_registry(path=None):
+    """Read the overlay. Never raises; a fault is reported, not thrown.
+
+    Returns a :class:`LocalRegistry`. The GUI must start with a broken overlay
+    -- refusing to open the window over a stale JSON file would be a worse
+    failure than the one it is reporting -- but the fault is recorded, logged
+    at WARNING, and shown on the card, so it cannot pass for "no overlay".
+    """
+    target = Path(path).expanduser() if path else default_local_registry_path()
+    if not target.is_file():
+        return LocalRegistry(target, present=False)
+    try:
+        payload = json.loads(target.read_text())
+    except (OSError, ValueError) as exc:
+        message = f"it could not be read as JSON ({exc})."
+        logger.warning("[curated-sites] %s %s", target, message)
+        return LocalRegistry(target, present=True, error=message)
+    if not isinstance(payload, dict):
+        message = "its top level is not an object."
+        logger.warning("[curated-sites] %s %s", target, message)
+        return LocalRegistry(target, present=True, error=message)
+    schema = payload.get("schema", "")
+    if schema != LOCAL_REGISTRY_SCHEMA:
+        message = (f"it declares schema {schema!r} and this build reads "
+                   f"{LOCAL_REGISTRY_SCHEMA!r}.")
+        logger.warning("[curated-sites] %s %s", target, message)
+        return LocalRegistry(target, present=True, error=message)
+    try:
+        sites = tuple(site_from_mapping(item)
+                      for item in payload.get("sites", ()))
+    except (ValueError, TypeError, KeyError) as exc:
+        message = f"one of its entries is malformed ({exc})."
+        logger.warning("[curated-sites] %s %s", target, message)
+        return LocalRegistry(target, present=True, error=message)
+    keys = [entry.key for entry in sites]
+    if len(set(keys)) != len(keys):
+        message = "it defines the same site key twice."
+        logger.warning("[curated-sites] %s %s", target, message)
+        return LocalRegistry(target, present=True, error=message)
+    # Checked rather than coerced. `dict(x)` on a LIST of strings raises, and
+    # this function is called at MODULE IMPORT -- so a hand-edited overlay with
+    # `"not_curated": ["A", "B"]` would take the whole GUI down at startup
+    # instead of reporting a fault, which is the exact opposite of what the
+    # docstring above promises.
+    for field in ("not_curated", "defective_view_factors"):
+        value = payload.get(field, {})
+        if not isinstance(value, dict):
+            message = (f"its {field!r} is a {type(value).__name__} and has to "
+                       f"be an object of name -> reason.")
+            logger.warning("[curated-sites] %s %s", target, message)
+            return LocalRegistry(target, present=True, error=message)
+    registry = LocalRegistry(
+        target, present=True, sites=sites,
+        not_curated=payload.get("not_curated", {}),
+        defective=payload.get("defective_view_factors", {}))
+    logger.info("[curated-sites] %s", registry.summary())
+    return registry
+
+
+_LOCAL = load_local_registry()
+
+#: The curated lunar-site table: what ships, plus whatever the overlay adds.
+CURATED_SITES = BUILTIN_CURATED_SITES + _LOCAL.sites
+
+#: Sites whose meshes exist and which are DELIBERATELY not curated, mapped to
+#: the reason. Supplied by the overlay; empty without one.
 #:
 #: This is documentation with a test behind it, not a feature. Picking one of
 #: these meshes by hand does nothing special -- there is no site entry, and
 #: whatever matrices are found next to it are ranked by
 #: ``gui_core.vf_discovery`` like anybody else's.
-NOT_CURATED = {site: _PTM312 for site in _ORPHANED_SITES}
+NOT_CURATED = dict(_LOCAL.not_curated)
 
 #: Matrix FILES this project knows are defective, keyed by file name.
 #:
@@ -596,18 +553,32 @@ NOT_CURATED = {site: _PTM312 for site in _ORPHANED_SITES}
 #: like this one. ``gui_core.vf_discovery`` reads it and refuses these files
 #: outright.
 #:
-#: It lives HERE, beside the sites it belongs to, rather than in the search:
-#: this is registry data ("which artifacts does this project distrust, and
-#: why"), and the search's job is reading headers. Keeping the two together
-#: also keeps one sentence explaining both, which is what they share.
-#:
 #: Keyed by BASENAME rather than by absolute path deliberately. These matrices
 #: are machine-local, so an absolute path here would be a path that exists on
-#: one computer; the names are unique to the A3GT catalog and travel with the
-#: file if somebody copies it. A denylist that only recognized the original
-#: location would go quiet exactly when the file moved.
-DEFECTIVE_VIEW_FACTORS = {f"{site}_corrected_vf.csr": _PTM312
-                          for site in _ORPHANED_SITES}
+#: one computer; the names are unique to their catalog and travel with the file
+#: if somebody copies it. A denylist that only recognized the original location
+#: would go quiet exactly when the file moved.
+DEFECTIVE_VIEW_FACTORS = dict(_LOCAL.defective_view_factors)
+
+
+def local_registry_status():
+    """The overlay's load result, for the card and the suite."""
+    return _LOCAL
+
+
+def reload_registry(path=None):
+    """Re-read the overlay and rebind the module tables. Returns the result.
+
+    For tests and for a user who has just installed an overlay: the alternative
+    is telling them to restart the GUI, and a registry that can only be loaded
+    once is a registry nobody can check against a fixture.
+    """
+    global _LOCAL, CURATED_SITES, NOT_CURATED, DEFECTIVE_VIEW_FACTORS
+    _LOCAL = load_local_registry(path)
+    CURATED_SITES = BUILTIN_CURATED_SITES + _LOCAL.sites
+    NOT_CURATED = dict(_LOCAL.not_curated)
+    DEFECTIVE_VIEW_FACTORS = dict(_LOCAL.defective_view_factors)
+    return _LOCAL
 
 
 def _fold(text):
@@ -618,9 +589,9 @@ def curated_site(name="", body=""):
     """The site entry for this name, or None.
 
     Matched on the site key and its aliases, case-folded and
-    punctuation-insensitive, and on nothing looser. An A3GT key is an exact
+    punctuation-insensitive, and on nothing looser. A site key is an exact
     catalog identifier; a fuzzy match here would wire one polar site's terrain
-    under another's name, and the two are tens of kilometers apart with
+    under another's name, and two such sites are tens of kilometers apart with
     different illumination.
     """
     folded = _fold(name)
@@ -713,7 +684,7 @@ class SiteStatus:
         entry = self.entry
         if not self.machine_has_root and entry.local_only:
             return (f"{entry.key}'s files are not on this computer. This site "
-                    f"is curated from a local A3GT working tree "
+                    f"is curated from a local working tree "
                     f"({entry.local_root}) that PTM3D does not distribute -- "
                     f"hundreds of gigabytes of DEM-derived meshes and "
                     f"view-factor matrices. Nothing has been written to your "

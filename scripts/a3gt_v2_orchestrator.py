@@ -56,9 +56,25 @@ from typing import Any, Iterable
 REPO = Path(os.environ.get(
     "PTM_A3GT_REPO", str(Path(__file__).resolve().parents[1])))
 sys.path.insert(0, str(REPO / "scripts"))
-# Legacy single-DEM fallback (used only when the manifest is NOT catalog mode).
-DEFAULT_DEM = Path(
-    "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/DEM/a3gt/mons-mouton/mm-sfs-dem.tif")
+# Legacy single-DEM fallback, used only when the manifest is NOT catalog mode.
+# It was an absolute path to one machine's copy of one campaign's regional DEM;
+# that DEM is not distributed with PTM3D, so the path comes from the
+# environment now and is None when unset. `require_default_dem()` below is what
+# every non-catalog caller goes through, so an unset fallback FAILS with the
+# variable's name rather than reaching GDAL as a missing file.
+DEFAULT_DEM = (Path(os.environ["PTM_A3GT_DEM"]).expanduser()
+               if os.environ.get("PTM_A3GT_DEM") else None)
+
+
+def require_default_dem():
+    """The legacy single-DEM fallback, or a refusal that says what to set."""
+    if DEFAULT_DEM is None:
+        raise SystemExit(
+            "This manifest is not in catalog mode, so the orchestrator needs "
+            "the legacy single regional DEM, and there is no built-in default: "
+            "set PTM_A3GT_DEM=/path/to/dem.tif (or use a catalog-mode manifest, "
+            "which carries a per-site DEM).")
+    return DEFAULT_DEM
 # dtm_to_ply_delaunay is now built from this repository
 # (src/cpp/tools/dtm_to_ply_delaunay.cpp -> build/bin/). Prefer that copy: it
 # is on local disk, so it cannot hit OneDrive's on-demand fetch, and it is the
@@ -146,12 +162,12 @@ def site_mesh_path(site: dict, roi_radius_km: float = 5.0,
     """Per-site mesh PLY path.
 
     Legacy (single-DEM / non-extended): keeps the historical name
-    ``A03MM022_85.218S_31.850E_R{N}km_linear.ply`` so existing production
+    ``polar_site_L_85.218S_31.850E_R{N}km_linear.ply`` so existing production
     meshes are still found/skipped.
 
     Extended (physics-horizon): encodes both radii + the density exponent so
     extended and legacy meshes never collide:
-    ``A03MM022_85.218S_31.850E_Rcore3_Rext11.57_p1.5.ply``.
+    ``polar_site_L_85.218S_31.850E_Rcore3_Rext11.57_p1.5.ply``.
     """
     base = (f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
             f"{site['lon_deg']:.3f}E_")
@@ -208,7 +224,7 @@ def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
     no C++ change); ``mesh_path`` is the extended-name PLY. Both default to
     the legacy single-DEM behavior when omitted."""
     ply = mesh_path or site_mesh_path(site, roi_radius_km=roi_km)
-    dem = dem_override or DEFAULT_DEM
+    dem = dem_override or require_default_dem()
     MESH_DIR.mkdir(parents=True, exist_ok=True)
 
     if ply.exists() and ply.stat().st_size > 1_000_000 and read_n_faces(ply) > 0:
@@ -501,7 +517,7 @@ def resolve_site_dem(site: dict, manifest: dict, catalog: dict | None,
     (the 1 m SfS forces the whole LOLA extent to a 1 m grid). Raises
     ValueError if no canonical DEM is usable (caller → graceful skip)."""
     if catalog is None:
-        return DEFAULT_DEM
+        return require_default_dem()
     from dem_vrt import build_site_vrt
     x, y = float(site["x_m"]), float(site["y_m"])
     pad = max(2000.0, 0.05 * clip_radius_km * 1000.0)   # circle->bbox + proj pad
@@ -785,7 +801,7 @@ def order_sites(sites: list[dict], order_file: Path | None) -> list[dict]:
 #
 # HARD GUARD: a base VF is only accepted if it is BOTH dimension-matched
 # AND small (<= --vf-base-max-mb). 2026-07-23 audit of the 49-site pool
-# found 21 sites (Cabeus-B / Nobile Rim 1 / Nobile Rim 2) whose only
+# found 21 sites (a further lunar polar site / a lunar polar crater rim / a second lunar polar crater rim) whose only
 # existing view_factors.hmat (from the superseded sites_v2_3km_rad_corering
 # generation) is 1.4-4.9 GB -- exactly the multi-GB-VF-on-full-core+ring-mesh
 # profile that hard-wedged the GPU on 2026-07-03. Loading one of those as a
@@ -812,7 +828,7 @@ def read_hmat_dims_and_blocks(path: Path) -> tuple[int, int, int] | None:
     """Return (n_rows, n_cols, num_blocks) from a .hmat file's 32-byte
     header. num_blocks==0 is Ada's "truly empty" base VF signature (matches
     the current HMATRIX_MAGIC/VERSION=2 layout -- confirmed via direct hex
-    dump of A03MP026_base_empty.vf, 2026-07-23)."""
+    dump of polar_site_A_base_empty.vf, 2026-07-23)."""
     import struct
     try:
         with open(path, "rb") as f:
@@ -1049,12 +1065,12 @@ def main() -> int:
                         "cached mesh/ring filenames. 2026-07-23 incident: a "
                         "hand-trimmed schedule file changed sun_elev_min_deg "
                         "(4.2127 vs the full schedule's 4.1884 deg for "
-                        "A03MP026) and therefore R_ext (27.1522 vs the cached "
+                        "lunar polar site A) and therefore R_ext (27.1522 vs the cached "
                         "27.3108 km) -- a cache-miss that fell through to the "
                         "catalog-based VRT rebuild path (dem_catalog_lola.json "
                         "is an empty stub, dem_root=_empty_demroot -- that "
                         "fallback is non-functional for ANY site, not an "
-                        "A03MP026-specific bug) and failed loudly with a "
+                        "lunar polar site A-specific bug) and failed loudly with a "
                         "relative-path GDAL open error. --window-filter is the "
                         "fix: always plan against the untouched schedule.")
     args = p.parse_args()
@@ -1172,7 +1188,7 @@ def main() -> int:
         # sites). Stops the campaign cleanly (resumable) instead of filling
         # the disk mid-unattended-run.
         #
-        # 2026-07-23 finding: a SINGLE A03MP026 CSR build+delete+GPU-window
+        # 2026-07-23 finding: a SINGLE lunar polar site A CSR build+delete+GPU-window
         # cycle left ~90 GB locked in local Time Machine snapshots (hourly
         # auto-snapshots capturing the churn) even though the live files on
         # disk accounted for only ~13 GB -- `shutil.disk_usage().free`
@@ -1323,7 +1339,7 @@ def main() -> int:
         # silently corrupting site_is_composited()'s resume state for the
         # REAL full-schedule campaign run later (it would see this site as
         # permanently "done" with only 1 of 8 windows ever having run).
-        # 2026-07-23 incident: exactly this happened on A03MP026's first
+        # 2026-07-23 incident: exactly this happened on lunar polar site A's first
         # --window-filter run; caught before the real campaign launched.
         if args.window_filter:
             print(f"  [{sid}] --window-filter active ({args.window_filter}) -- "

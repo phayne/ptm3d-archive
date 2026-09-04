@@ -81,14 +81,14 @@ int main(int argc, char** argv) {
           gg::enforceVramMargin(nvidia) == gg::wedgeProneDriver(nvidia));
 
     // ---- thin-margin ORDERING: separate (default) vs refuse ---------------
-    // A03N1016's real geometry: the replica fits by +0.64 GiB against a 2.0
+    // lunar polar site B's real geometry: the replica fits by +0.64 GiB against a 2.0
     // GiB floor. Under the DEFAULT ("separate", Paul's ruling 2026-08-22) that
     // site keeps the GPU radiosity rung behind disjoint dies at a derived
     // +7-10 min/window; under the explicit "refuse" it loses the rung, which
     // MEASURED 108.9 min/window against 31.4 on the GPU pool. These cases pin
     // which verdict each ordering produces.
     using V = gg::MarginVerdict;
-    const double n1016 = 0.64;
+    const double site_b_margin_gib = 0.64;
 
     // The BUILT-IN default, before anything sets it. config_parser.h carries
     // the same string; the generated engine-config table is what keeps those
@@ -99,22 +99,22 @@ int main(int argc, char** argv) {
           gg::Policy().hard_min_vram_margin_gib == 0.25);
 
     resetPolicy("auto", 4.0, 2.0, true);          // default thin-margin policy
-    check("DEFAULT: N1016's +0.64 GiB KEEPS the GPU rung when separated",
-          gg::judgeVramMargin(n1016, /*separated=*/true, false, amd)
+    check("DEFAULT: site B's +0.64 GiB KEEPS the GPU rung when separated",
+          gg::judgeVramMargin(site_b_margin_gib, /*separated=*/true, false, amd)
               == V::WaiveSeparation);
     check("DEFAULT: the same margin still refuses when NOT separated",
-          gg::judgeVramMargin(n1016, false, false, amd) == V::Refuse);
+          gg::judgeVramMargin(site_b_margin_gib, false, false, amd) == V::Refuse);
 
     resetPolicy("auto", 4.0, 2.0, true, "refuse");
-    check("explicit refuse: N1016's +0.64 GiB loses the GPU rung even when "
+    check("explicit refuse: site B's +0.64 GiB loses the GPU rung even when "
           "separated",
-          gg::judgeVramMargin(n1016, /*separated=*/true, false, amd) == V::Refuse);
+          gg::judgeVramMargin(site_b_margin_gib, /*separated=*/true, false, amd) == V::Refuse);
 
     resetPolicy("auto", 4.0, 2.0, true, "separate", 0.25);
-    check("separate: N1016's +0.64 GiB KEEPS the GPU rung when separated",
-          gg::judgeVramMargin(n1016, true, false, amd) == V::WaiveSeparation);
+    check("separate: site B's +0.64 GiB KEEPS the GPU rung when separated",
+          gg::judgeVramMargin(site_b_margin_gib, true, false, amd) == V::WaiveSeparation);
     check("separate: the same margin still refuses when NOT separated",
-          gg::judgeVramMargin(n1016, false, false, amd) == V::Refuse);
+          gg::judgeVramMargin(site_b_margin_gib, false, false, amd) == V::Refuse);
     check("separate: below the hard floor with no host history -> refuse",
           gg::judgeVramMargin(0.10, true, false, amd) == V::Refuse);
     check("separate: below the hard floor but this host carried it before "
@@ -132,11 +132,11 @@ int main(int argc, char** argv) {
     resetPolicy("auto", 4.0, 2.0, false);         // default thin-margin policy
     check("DEFAULT: a thin margin on a non-enforcing platform is ADVISORY, "
           "not a refusal",
-          gg::judgeVramMargin(n1016, false, false, amd)
+          gg::judgeVramMargin(site_b_margin_gib, false, false, amd)
               == (gate_amd ? V::Refuse : V::Advisory));
     resetPolicy("auto", 4.0, 2.0, false, "refuse");
     check("explicit refuse: the platform gate still comes first",
-          gg::judgeVramMargin(n1016, false, false, amd)
+          gg::judgeVramMargin(site_b_margin_gib, false, false, amd)
               == (gate_amd ? V::Refuse : V::Advisory));
 
     // ---- placement: shared / disjoint / auto ------------------------------

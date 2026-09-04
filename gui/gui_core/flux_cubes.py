@@ -422,7 +422,7 @@ _NAME_BYTES = 32             # kNameLen
 def product_bytes(n_cubes, n_steps, has_names=False):
     """Bytes in `flux_cubes/flux_cubes.fcb`, from the documented layout.
 
-    CHECKED, NOT DERIVED. Against the two delivered A03MP026 products:
+    CHECKED, NOT DERIVED. Against the two delivered lunar polar site A products:
 
         1,257 cubes x  29 steps ->  11,018,709 here, file  11,019,828
         1,257 cubes x 720 steps -> 269,011,160 here, file 269,012,280

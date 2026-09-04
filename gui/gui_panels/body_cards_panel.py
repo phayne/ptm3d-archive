@@ -52,7 +52,8 @@ from gui_core.body_cards import (GENERIC_MESH_SHAPE, WINDOW_UNIT_DAYS,
                                  WINDOW_UNIT_DIURNAL, WINDOW_UNIT_ORBITAL,
                                  WINDOW_UNITS, window_unit_days)
 from gui_core.config_manager import ConfigManager
-from gui_core.curated_sites import curated_site, curated_sites_for_body
+from gui_core.curated_sites import (curated_site, curated_sites_for_body,
+                                    local_registry_status)
 from gui_panels.config_panel import (BaseConfigTab, CollapsibleSection,
                                      get_tooltip)
 
@@ -1575,7 +1576,7 @@ class BodyCard(BaseConfigTab):
         # NOTHING IS PRE-SELECTED. A combo whose first row is already chosen
         # makes "Use this file" a one-click wiring of whatever happened to sort
         # first, and sort order is not evidence -- measured in the real
-        # A03MP026 directory, where two matrices reach the same tier and the
+        # lunar polar site A directory, where two matrices reach the same tier and the
         # superseded one has the alphabetically earlier name.
         combo.addItem(f"({len(self._vf_candidates)} found — choose one)"
                       if self._vf_candidates else "(none found)", None)
@@ -2256,7 +2257,7 @@ class BodyCard(BaseConfigTab):
         Measured on `fb78c9f` at Paul's own saved window width (2559 px, from
         `com.ptm3d.PTM3DSimulator.plist`), Moon local mesh, real `click()`:
 
-            curated A03MP026, viewport 1023 px -- the switch is at y=1000 and
+            curated lunar polar site A, viewport 1023 px -- the switch is at y=1000 and
             the three placement controls the click reveals land at y=1049,
             1078 and 1110. ALL THREE OUTSIDE THE VIEWPORT. The user ticks the
             box and the screen does not change.
@@ -2947,6 +2948,15 @@ class MoonCard(BodyCard):
         self.site_details.add_widget(self.site_details_text)
         self.site_details.setVisible(False)
         grid.addWidget(self.site_details, 2, 0, 1, 2)
+        # A BROKEN LOCAL OVERLAY MUST NOT LOOK LIKE AN ABSENT ONE. The curated
+        # entries live outside the repository (gui_core.curated_sites, "The
+        # local overlay"), so an empty list is the normal state for most
+        # checkouts -- which is exactly why an overlay that failed to parse
+        # has to say so here. Both states end with one item in the combo, and
+        # only one of them is a fault.
+        overlay = local_registry_status()
+        if not overlay.ok:
+            self.site_note.setText(overlay.summary())
 
         self.add_file_field(grid, 3, "Terrain mesh:", "mesh.import_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
@@ -3155,10 +3165,22 @@ class MoonCard(BodyCard):
             return
         entry = self._current_site()
         if entry is None:
-            note.setText(
-                "No curated site: the terrain, the surrounding ring and the "
-                "view-factor cache below are yours to set. A curated site "
-                "fills all three from a set that has run to completion.")
+            # ⛔ A BROKEN OVERLAY MUST SURVIVE THIS. The curated entries come
+            # from a local file outside the repository, and when that file
+            # fails to parse the registry contributes nothing -- so `entry` is
+            # None here for a reason that is a FAULT, and this line used to
+            # overwrite the fault with the ordinary "no curated site" text on
+            # every `load_card`. The user was then told, accurately and
+            # uselessly, that they had not picked a site.
+            overlay = local_registry_status()
+            if not overlay.ok:
+                note.setText(overlay.summary())
+            else:
+                note.setText(
+                    "No curated site: the terrain, the surrounding ring and "
+                    "the view-factor cache below are yours to set. A curated "
+                    "site fills all three from a set that has run to "
+                    "completion.")
             self._set_site_details(None)
             return
         from gui_core.curated_sites import (site_status, site_wiring,

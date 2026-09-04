@@ -66,7 +66,7 @@ R_EXT_HARD_CAP_KM = 20.0
 # Apples-to-apples vs the 3 km-only/900 K production baseline (radial profile,
 # 2-3 km annulus = 4.76 m). The earlier 11.567 km / aggregate-median pick was
 # discarded after the radial profile showed a 900 K extended core regresses
-# the outer ROI. Budget sweep on A03MM022 (p=1.5):
+# the outer ROI. Budget sweep on lunar polar site L (p=1.5):
 #   1.0 M -> 2.00 M faces, 2-3 km = 6.25 m
 #   1.1 M -> 2.20 M faces, 2-3 km = 5.82 m
 #   1.4 M -> 2.80 M faces, 2-3 km = 4.95 m  <-- chosen (meets the user's

@@ -32,6 +32,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "gui"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import local_fixtures                                            # noqa: E402
 
 import numpy as np                                                # noqa: E402
 
@@ -360,14 +363,24 @@ def test_the_point_cap_strides_and_says_which_sample_is_drawn():
 
 
 def test_the_real_a3gt_core_is_capped_not_refused():
-    """A 1.8M-face production core previews as points, and reads correctly."""
-    core = Path("/Users/paha3326/projects/a3gt/meshes/"
-                "A03CB001_83.561S_-68.169E_R3km_linear.ply")
-    if not core.exists():
-        pytest.skip(f"{core} is not on this disk. This arm did NOT run.")
+    """A 1.8M-face production core previews as points, and reads correctly.
+
+    The mesh is REGISTERED, not named: production core meshes are site
+    artifacts this project does not publish, so the path lives in
+    ``~/.ptm3d/test_fixtures.json`` (``src/python/tests/local_fixtures.py``).
+    Unregistered is a named skip -- this arm's whole value is that it reads a
+    real multi-million-face PLY, and a synthetic stand-in would not be one.
+    """
+    core = local_fixtures.optional_fixture("large_lunar_core_mesh")
+    if core is None or not core.is_file():
+        pytest.skip("no 'large_lunar_core_mesh' is registered in "
+                    f"{local_fixtures.fixtures_path()}, or it is not on this "
+                    "disk. This arm did NOT run.")
     preview = read_mesh_preview(core, body="Moon")
     assert not preview.refusal, preview.refusal
-    assert preview.n_faces_total == 1797825
+    assert preview.n_faces_total > 1_000_000, (
+        f"the registered core has {preview.n_faces_total:,} faces; this arm "
+        f"is about a mesh past the preview cap")
     assert preview.n_faces_total > PREVIEW_FACE_CAP
     assert preview.mode == "points"
     assert preview.elevation_source == "file"

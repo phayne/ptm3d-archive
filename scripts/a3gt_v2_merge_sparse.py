@@ -177,7 +177,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--site-dir", required=True, type=Path,
-                   help="Per-site root, e.g. output/a3gt_v2/A03MM022/")
+                   help="Per-site root, e.g. output/a3gt_v2/<SITE>/")
     p.add_argument("--merge-bin", type=Path, default=None,
                    help="Path to ptm_merge_chunks (default: auto-detect).")
     p.add_argument("--keep-chunks", action="store_true",

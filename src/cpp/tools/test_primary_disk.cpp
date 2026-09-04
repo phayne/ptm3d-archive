@@ -510,8 +510,8 @@ static void testPerFaceBudget() {
 
     // (e) the ladder must never demote the face the cap was chosen for. On the
     //     Moon (eps 0.95, Qb 0.018 -> T_floor 24.043 K) at the measured peak
-    //     primary flux of 0.087 W/m^2 -- 0.046 IR + 0.041 reflected over 48 MS3
-    //     A03MP026 frames -- the strict V = 0 rule is STRICTER than the
+    //     primary flux of 0.087 W/m^2 -- 0.046 IR + 0.041 reflected over
+    //     48 lunar polar frames -- the strict V = 0 rule is STRICTER than the
     //     inherited constant, so that face keeps every ray it has today.
     const double sigma = 5.670374419e-8;
     const double es_moon = 0.95 * sigma, qb_moon = 0.018;
@@ -645,7 +645,7 @@ static void testTerrainReuseBudget() {
     // standards are printed on purpose: the worst case is what the N budget was
     // set against, so it is what this gate enforces.
     std::printf("     measured worst face-frame |dT| and PRIMARY RAYS REMOVED\n"
-                "     (2026-08-15; Moon MS3 A03MP026 100.6 M face-frames at the 1.0 h\n"
+                "     (2026-08-15; Moon polar 100.6 M face-frames at the 1.0 h\n"
                 "     production cadence, Europa Pwyll DEM 1.36 M at 1.78 h):\n");
     std::printf("       %-7s %-11s %-9s %-11s %-9s\n",
                 "f", "Moon |dT|", "rays", "Europa |dT|", "rays");

@@ -3,8 +3,8 @@
 Schematic figure illustrating direct illumination and surface-to-surface
 radiation exchange in PTM3D.
 
-Renders an oblique 3D view of a ~500 m × 500 m region of the A03MM022
-(Mons Mouton) crater interior + rim, with triangle edges shown and
+Renders an oblique 3D view of a ~500 m × 500 m region of a lunar
+polar crater interior + rim, with triangle edges shown and
 faces colored by peak direct solar flux.  Two example triangles are
 highlighted: one in deep shadow (PSR floor) and one on a sunlit wall.
 Three labeled arrows show:
@@ -21,6 +21,7 @@ Output:
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 import struct
@@ -39,16 +40,18 @@ from ptm_pubstyle import apply_style, DOUBLE_W
 PROJECT_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_OUT = PROJECT_ROOT / "docs" / "figures" / "v2" / "radiation_exchange_schematic.png"
 
-MESH_PATH = Path(
-    "/Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/A03MP010/mesh.ply"
-)
-STATS_DIR = Path(
-    "/Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/A03MP010/statistics"
-)
+#: The run this figure is drawn from. It used to be two absolute paths naming
+#: one campaign's site; the site is not published with PTM3D, so the run is an
+#: ARGUMENT now. `--run-dir` supplies both halves (`mesh.ply` and
+#: `statistics/`), or `--mesh`/`--stats` supply them separately. There is no
+#: default: a placeholder path would fail at read time with "no such file"
+#: instead of saying what it wanted.
+MESH_PATH = None
+STATS_DIR = None
 
 
 def load_ply(path: Path):
-    """A03MM022 mesh.ply: 6 doubles/vertex (x,y,z,nx,ny,nz) + face record
+    """Site mesh.ply: 6 doubles/vertex (x,y,z,nx,ny,nz) + face record
     of (uchar count, 3 int32, 2 float32 lat/lon)."""
     with open(path, "rb") as f:
         n_verts = n_faces = None
@@ -80,6 +83,24 @@ def load_stats_bin(path: Path) -> np.ndarray:
 
 
 def main():
+    global MESH_PATH, STATS_DIR
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-dir", type=Path,
+                        help="A finished run directory: its mesh.ply and "
+                             "statistics/ are used.")
+    parser.add_argument("--mesh", type=Path,
+                        help="The mesh PLY, if not --run-dir/mesh.ply.")
+    parser.add_argument("--stats", type=Path,
+                        help="The statistics directory, if not "
+                             "--run-dir/statistics.")
+    args, _rest = parser.parse_known_args()
+    MESH_PATH = args.mesh or (args.run_dir / "mesh.ply" if args.run_dir else None)
+    STATS_DIR = args.stats or (args.run_dir / "statistics" if args.run_dir
+                               else None)
+    if MESH_PATH is None or STATS_DIR is None:
+        sys.exit("This figure is drawn from a finished run, and there is no "
+                 "default. Pass --run-dir <dir>, or --mesh and --stats.")
+
     apply_style()
 
     # ---- Load mesh + per-face direct solar flux max ----

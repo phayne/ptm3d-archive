@@ -276,7 +276,7 @@ def arm4(binpath, workdir, n_rays, fails):
     diagnostic actually reveals it, so the disclosure cannot quietly stop
     working.
 
-    A03MP026 is an irregular Delaunay triangulation and does not show this
+    lunar polar site A is an irregular Delaunay triangulation and does not show this
     (measured nadir f_max p50 = 0.85), but a regularly-gridded DEM might.
     """
     L, cell = 50.0, 1.0
