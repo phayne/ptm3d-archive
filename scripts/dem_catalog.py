@@ -8,7 +8,7 @@ catalog is consumed by ``a3gt_v2_site_filter.py`` (catalog/association mode)
 to pick the best DEM(s) per landing site and build per-site VRT mosaics.
 
 One entry per DEM tile (directory-keyed; multi-tile regions such as
-``<region>_2/`` contribute every tile). Per entry we record projected
+``nobile_rim_2/`` contribute every tile). Per entry we record projected
 extent, native resolution, CRS (and whether it is the canonical lunar
 south-polar-stereographic frame), whole-DEM elevation/valid statistics
 (from the GDAL ``.aux.xml`` sidecar when present), an area-based
@@ -94,7 +94,7 @@ def _tool(name: str) -> str:
 def find_dem_tifs(root: Path) -> list[Path]:
     """Return every SfS elevation .tif under ``root`` (maxdepth 2), sorted.
 
-    Multi-tile regions (a region directory holding several tiles)
+    Multi-tile regions (e.g. ``nobile_rim_2/`` with nr2 + dm2-box{1,2,3})
     contribute one path per tile.
     """
     out: list[Path] = []

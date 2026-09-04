@@ -2881,7 +2881,7 @@ std::unique_ptr<HMatrixBlock> HMatrixViewFactor::buildBlock(
     // represent genuine nearby interactions that matter for accuracy.
     //
     // OUT-OF-CORE MODE: see the matching quadtree comment for rationale.
-    // 5000 is a middle ground: covers a polar rim site's ~5809 avg faces/node, and
+    // 5000 is a middle ground: covers Nobile's ~5809 avg faces/node, and
     // avoids the 315-GB-at-11% blowup seen on 4M Amundsen at cap=10000.
     // Env PTM_HMATRIX_SPARSE_CAP overrides this for OOM tuning: a smaller cap
     // skips (zeros) larger nearby blocks instead of doing the O(n²) sparse
