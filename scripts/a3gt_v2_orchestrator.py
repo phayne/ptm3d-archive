@@ -801,7 +801,7 @@ def order_sites(sites: list[dict], order_file: Path | None) -> list[dict]:
 #
 # HARD GUARD: a base VF is only accepted if it is BOTH dimension-matched
 # AND small (<= --vf-base-max-mb). 2026-07-23 audit of the 49-site pool
-# found 21 sites (a further lunar polar site / Nobile Rim 1 / Nobile Rim 2) whose only
+# found 21 sites (Cabeus-B / Nobile Rim 1 / Nobile Rim 2) whose only
 # existing view_factors.hmat (from the superseded sites_v2_3km_rad_corering
 # generation) is 1.4-4.9 GB -- exactly the multi-GB-VF-on-full-core+ring-mesh
 # profile that hard-wedged the GPU on 2026-07-03. Loading one of those as a
