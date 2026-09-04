@@ -573,3 +573,24 @@ set_target_properties(test_grid_convergence
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Damped-thermal-wave-at-depth analytic gate. The Ingersoll-equivalent for the
+# solution BELOW the surface: test_bowl_crater gates radiation at the surface
+# and nothing gated conduction at depth against a closed form. Also produces
+# the U2 max/min interpolation-commutation measurement that decision D8 (depth
+# product architecture) rests on. Links `thermal` so it drives the SHIPPING
+# Profile::update_T on the SHIPPING adaptive grid -- a stale libthermal would
+# be scored, not skipped. No mesh, no view factors, no SPICE, no GPU: safe to
+# run while a production job owns the devices.
+add_executable(test_thermal_wave_depth test_thermal_wave_depth.cpp)
+target_link_libraries(test_thermal_wave_depth
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_thermal_wave_depth
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
