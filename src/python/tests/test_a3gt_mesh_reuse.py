@@ -45,7 +45,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from a3gt_v2_orchestrator import (            # noqa: E402
-    mesh_reuse_reason, parse_ply_header, read_csr_n_faces, read_n_faces,
+    MeshVFMismatch, build_mesh, mesh_reuse_reason, parse_ply_header,
+    read_csr_n_faces, read_n_faces,
 )
 
 #: The real artifacts from the site that triggered this. Local campaign data,
@@ -128,10 +129,8 @@ def check_sp010_real_mesh_is_accepted_and_old_floor_rejected_it():
         "the old floor would have ACCEPTED this mesh, so this test no longer "
         "discriminates -- check SP010_BYTES/OLD_FLOOR_BYTES")
 
-    # The new rule accepts it, including against its own pinned VF.
+    # The new rule accepts it.
     assert mesh_reuse_reason(SP010_MESH) is None, mesh_reuse_reason(SP010_MESH)
-    r = mesh_reuse_reason(SP010_MESH, expected_faces=SP010_FACES)
-    assert r is None, f"real SP010 mesh refused against its own VF: {r}"
 
 
 def check_sp010_csr_header_agrees_with_the_mesh():
@@ -142,7 +141,6 @@ def check_sp010_csr_header_agrees_with_the_mesh():
     assert n_csr == SP010_FACES, f"CSR header says {n_csr}, expected {SP010_FACES}"
     if SP010_MESH.is_file():
         assert read_n_faces(SP010_MESH) == n_csr, "mesh and CSR disagree"
-        assert mesh_reuse_reason(SP010_MESH, expected_faces=n_csr) is None
 
 
 # --------------------------------------------------------------------------
@@ -202,27 +200,42 @@ def check_missing_file_is_refused():
 # 3. THE VF-DIMENSION HALF
 # --------------------------------------------------------------------------
 
-def check_wrong_face_count_for_the_pinned_vf_is_refused():
-    """A complete, large, valid mesh is still refused if the VF disagrees.
+def check_vf_mismatch_refuses_and_does_NOT_rebuild_over_the_mesh():
+    """A mesh/VF face-count mismatch skips the site; it never rebuilds.
 
     This is the case a size floor can never see: the mesh passes every
     size/parse test and is simply the wrong geometry for the matrix the run
-    would load. The engine aborts on it (radiation_exchange.cpp); the
-    orchestrator should not have started the window.
+    would load. Rebuilding cannot fix it -- the CSR is the fixed, multi-hour
+    artifact -- and would destroy the only copy of the geometry. So build_mesh
+    must raise rather than invoke the converter, and the file must be
+    byte-identical afterwards.
     """
     with tempfile.TemporaryDirectory() as td:
-        ply = _write_ply(Path(td) / "m.ply", 4420, SP010_FACES)
-        assert mesh_reuse_reason(ply) is None
-        reason = mesh_reuse_reason(ply, expected_faces=2_397_890)
-        assert reason is not None, "a mesh/VF face-count mismatch was accepted"
-        assert "8,746" in reason and "2,397,890" in reason, reason
+        ply = Path(td) / "A03XX999_00.000S_0.000E_R3km_linear.ply"
+        _write_ply(ply, 4420, SP010_FACES)
+        assert mesh_reuse_reason(ply) is None, "fixture should be valid"
+        before = ply.read_bytes()
+        site = {"ellipse_id": "A03XX999", "lat_deg": -87.0, "lon_deg": 127.0}
+        try:
+            build_mesh(site, dry_run=False, roi_km=3.0, mesh_path=ply,
+                       dem_override=Path("/nonexistent/dem.vrt"),
+                       expected_faces=2_397_890)
+        except MeshVFMismatch as exc:
+            msg = str(exc)
+            assert "8,746" in msg and "2,397,890" in msg, msg
+            assert "Not rebuilding" in msg, msg
+        else:
+            raise AssertionError(
+                "build_mesh accepted a mesh/VF mismatch instead of refusing")
+        assert ply.read_bytes() == before, (
+            "the mesh was modified while refusing a VF mismatch")
 
 
 def check_no_vf_means_no_face_count_constraint():
     """With no pinned VF, the mesh is judged on its own validity alone."""
     with tempfile.TemporaryDirectory() as td:
         ply = _write_ply(Path(td) / "m.ply", 100, 200)
-        assert mesh_reuse_reason(ply, expected_faces=None) is None
+        assert mesh_reuse_reason(ply) is None
 
 
 def check_unreadable_csr_yields_none_not_a_crash():
@@ -231,6 +244,68 @@ def check_unreadable_csr_yields_none_not_a_crash():
         short = Path(td) / "short.csr"
         short.write_bytes(b"\x01\x02")
         assert read_csr_n_faces(short) is None
+
+
+def check_an_hmat_vf_is_not_mistaken_for_a_csr():
+    """An .hmat/.vf file must not be read as a face count.
+
+    vf_replace_path() accepts `<site>.vf` as a corrected-VF candidate, and a
+    `.vf` here is the H-matrix format whose first four bytes are the magic
+    ('TAMH' on disk). Believed as an int32 that is ~1.2e9 faces -- which would
+    declare EVERY cached mesh mismatched and rebuild all of them, recreating
+    the exact mass-rebuild this change exists to prevent.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        stub = Path(td) / "A03XX999.vf"
+        # The real 80-byte base-VF stub layout: magic, version, rows, cols, ...
+        stub.write_bytes(b"TAMH" + struct.pack("<i", 2)
+                         + struct.pack("<2q", SP010_FACES, SP010_FACES)
+                         + b"\x00" * 56)
+        assert len(stub.read_bytes()) == 80
+        got = read_csr_n_faces(stub)
+        assert got is None, (
+            f"an H-matrix .vf was read as a face count of {got}")
+
+    # And the general structural guard: a plausible n with a file far too
+    # small to be that CSR is refused too.
+    with tempfile.TemporaryDirectory() as td:
+        fake = Path(td) / "fake.csr"
+        fake.write_bytes(struct.pack("<i", 2_397_890) + b"\x00" * 64)
+        assert read_csr_n_faces(fake) is None, (
+            "a too-small file was accepted as a 2.4M-face CSR")
+
+
+def check_real_hmat_stub_on_disk_is_rejected():
+    """The same, against the real committed stub rather than a fixture."""
+    stub = Path("/Users/paha3326/projects/a3gt/base_vf/A03SP010_base_empty.vf")
+    if not stub.is_file():
+        raise Skip(f"{stub} not present")
+    assert read_csr_n_faces(stub) is None, (
+        "the real A03SP010 base-VF stub was read as a face count")
+
+
+def check_scalar_face_property_disables_the_size_check():
+    """A face property we cannot size must not yield an under-estimate.
+
+    Under-estimating `need` would let a genuinely truncated PLY (from any
+    writer that adds face colors, say) pass the truncation test and be reused.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ply = Path(td) / "colored.ply"
+        header = (
+            "ply\nformat binary_little_endian 1.0\n"
+            "element vertex 3\n"
+            "property double x\nproperty double y\nproperty double z\n"
+            "element face 2\n"
+            "property list uchar int vertex_indices\n"
+            "property uchar red\n"
+            "end_header\n").encode("ascii")
+        ply.write_bytes(header + b"\x00" * (3 * 24 + 2 * 14))
+        info = parse_ply_header(ply)
+        assert info is not None and info["n_faces"] == 2, info
+        assert info["face_record_bytes"] is None, (
+            "sized a face record that carries an unaccounted scalar property")
+        assert mesh_reuse_reason(ply) is None, "a complete file was refused"
 
 
 # --------------------------------------------------------------------------
@@ -284,9 +359,12 @@ CHECKS = [
     check_zero_face_ply_is_refused,
     check_unparsable_file_is_refused,
     check_missing_file_is_refused,
-    check_wrong_face_count_for_the_pinned_vf_is_refused,
+    check_vf_mismatch_refuses_and_does_NOT_rebuild_over_the_mesh,
     check_no_vf_means_no_face_count_constraint,
     check_unreadable_csr_yields_none_not_a_crash,
+    check_an_hmat_vf_is_not_mistaken_for_a_csr,
+    check_real_hmat_stub_on_disk_is_rejected,
+    check_scalar_face_property_disables_the_size_check,
     check_other_campaign_meshes_still_reused,
     check_header_parse_reports_the_real_layout,
 ]
