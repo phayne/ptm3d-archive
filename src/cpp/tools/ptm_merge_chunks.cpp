@@ -92,10 +92,22 @@ bool write_float32_array(const fs::path& p, const std::vector<float>& data) {
 
 // Combine max/min/sum/count across N chunks for one datatype.
 // Writes <outdir>/statistics/<name>_{max,avg,min}.bin.
+//
+// `strict` changes what a MISSING component means.
+//   false (the five fixed datatypes): all four side files or nothing. A
+//         thermal-only run has no illumination statistics at all, and skipping
+//         that quietly is the documented behavior.
+//   true  (subsurface depth maps): the components present are whatever
+//         output.map_depth_stats asked for, so "avg is absent" is normal and
+//         "avg is present in chunk 0 and absent in chunk 3" is a defect. Each
+//         component is merged independently and any disagreement between chunks
+//         is an ERROR, because the alternative is a merged product that quietly
+//         drops a map the chunks all carried.
 bool merge_one_datatype(const std::string& name,
                         const std::vector<fs::path>& chunk_dirs,
                         const fs::path& outdir,
-                        uint32_t expected_N) {
+                        uint32_t expected_N,
+                        bool strict = false) {
     std::vector<float>   merged_max, merged_min;
     std::vector<double>  merged_sum;
     std::vector<uint64_t> merged_count;
@@ -103,6 +115,37 @@ bool merge_one_datatype(const std::string& name,
     merged_min.assign(expected_N, std::numeric_limits<float>::max());
     merged_sum.assign(expected_N, 0.0);
     merged_count.assign(expected_N, 0u);
+
+    auto components = [&](const fs::path& cd, bool& has_avg, bool& has_max,
+                          bool& has_min) {
+        const fs::path stats = cd / "statistics";
+        const fs::path raw   = stats / "_raw";
+        has_max = fs::exists(stats / (name + "_max.bin"));
+        has_min = fs::exists(stats / (name + "_min.bin"));
+        has_avg = fs::exists(raw / (name + "_sum.bin")) &&
+                  fs::exists(raw / (name + "_count.bin"));
+    };
+
+    bool want_avg = false, want_max = false, want_min = false;
+    components(chunk_dirs.front(), want_avg, want_max, want_min);
+    if (strict && !(want_avg || want_max || want_min)) {
+        std::cerr << "[merge] ERROR: " << name << " has no mergeable component in "
+                  << chunk_dirs.front() << "\n";
+        return false;
+    }
+    // An `_avg.bin` MAP with no `_raw` sum/count behind it is a chunked run
+    // that was not given `output.write_raw_stats: true`. Averages cannot be
+    // merged from the per-chunk averages alone (the chunks need not carry equal
+    // sample counts), so the honest answer is to refuse -- not to merge max and
+    // min, drop the average, and report success.
+    if (strict && !want_avg &&
+        fs::exists(chunk_dirs.front() / "statistics" / (name + "_avg.bin"))) {
+        std::cerr << "[merge] ERROR: " << name << " has a per-chunk _avg.bin but no "
+                     "statistics/_raw/" << name << "_{sum,count}.bin to merge it "
+                     "from. Re-run the chunks with output.write_raw_stats: true; an "
+                     "average cannot be recovered from per-chunk averages alone.\n";
+        return false;
+    }
 
     bool any_loaded = false;
     for (const auto& cd : chunk_dirs) {
@@ -113,28 +156,43 @@ bool merge_one_datatype(const std::string& name,
         const fs::path p_sum   = raw   / (name + "_sum.bin");
         const fs::path p_count = raw   / (name + "_count.bin");
 
-        // If any of the four files is missing in any chunk, the datatype
-        // wasn't computed (e.g. illumination on a thermal-only run);
-        // skip this datatype for the whole merge.
-        if (!fs::exists(p_max) || !fs::exists(p_min) ||
-            !fs::exists(p_sum) || !fs::exists(p_count)) {
-            return true;  // not an error — just nothing to merge
+        bool has_avg, has_max, has_min;
+        components(cd, has_avg, has_max, has_min);
+        if (!strict) {
+            // If any of the four files is missing in any chunk, the datatype
+            // wasn't computed (e.g. illumination on a thermal-only run);
+            // skip this datatype for the whole merge.
+            if (!has_max || !has_min || !has_avg) {
+                return true;  // not an error — just nothing to merge
+            }
+        } else if (has_avg != want_avg || has_max != want_max ||
+                   has_min != want_min) {
+            std::cerr << "[merge] ERROR: " << name << " carries a different set of "
+                         "statistics in " << cd << " than in "
+                      << chunk_dirs.front() << " (avg/max/min present: "
+                      << has_avg << has_max << has_min << " vs "
+                      << want_avg << want_max << want_min
+                      << "). The chunks were not run with the same "
+                         "output.map_depth_stats; refusing to merge.\n";
+            return false;
         }
 
         uint32_t N;
         std::vector<float>   max_arr, min_arr;
         std::vector<double>  sum_arr;
         std::vector<uint32_t> count_arr;
-        if (!read_float32_array(p_max,  N, max_arr) || N != expected_N) return false;
-        if (!read_float32_array(p_min,  N, min_arr) || N != expected_N) return false;
-        if (!read_double_array (p_sum,  N, sum_arr) || N != expected_N) return false;
-        if (!read_uint32_array (p_count,N, count_arr) || N != expected_N) return false;
+        if (want_max && (!read_float32_array(p_max,  N, max_arr) || N != expected_N)) return false;
+        if (want_min && (!read_float32_array(p_min,  N, min_arr) || N != expected_N)) return false;
+        if (want_avg && (!read_double_array (p_sum,  N, sum_arr) || N != expected_N)) return false;
+        if (want_avg && (!read_uint32_array (p_count,N, count_arr) || N != expected_N)) return false;
 
         for (uint32_t i = 0; i < expected_N; ++i) {
-            if (max_arr[i] > merged_max[i]) merged_max[i] = max_arr[i];
-            if (min_arr[i] < merged_min[i]) merged_min[i] = min_arr[i];
-            merged_sum[i]   += sum_arr[i];
-            merged_count[i] += count_arr[i];
+            if (want_max && max_arr[i] > merged_max[i]) merged_max[i] = max_arr[i];
+            if (want_min && min_arr[i] < merged_min[i]) merged_min[i] = min_arr[i];
+            if (want_avg) {
+                merged_sum[i]   += sum_arr[i];
+                merged_count[i] += count_arr[i];
+            }
         }
         any_loaded = true;
     }
@@ -158,14 +216,49 @@ bool merge_one_datatype(const std::string& name,
     fs::path stats_out = outdir / "statistics";
     fs::create_directories(stats_out);
     bool ok = true;
-    ok &= write_float32_array(stats_out / (name + "_max.bin"), merged_max);
-    ok &= write_float32_array(stats_out / (name + "_avg.bin"), merged_avg);
-    ok &= write_float32_array(stats_out / (name + "_min.bin"), merged_min);
+    if (want_max) ok &= write_float32_array(stats_out / (name + "_max.bin"), merged_max);
+    if (want_avg) ok &= write_float32_array(stats_out / (name + "_avg.bin"), merged_avg);
+    if (want_min) ok &= write_float32_array(stats_out / (name + "_min.bin"), merged_min);
     if (ok) {
         std::cout << "[merge] " << name << ": merged " << chunk_dirs.size()
                   << " chunks  (" << expected_N << " faces)\n";
     }
     return ok;
+}
+
+// ---- Subsurface depth-map discovery ---------------------------------------
+//
+// The depth field names encode the resolved depth (`temperature_z0p050m`), so
+// they are a property of the RUN, not a compile-time list. Discover them from a
+// chunk's own statistics directory rather than re-deriving them from a config
+// the merge tool does not read.
+std::vector<std::string> discover_depth_fields(const fs::path& chunk_dir) {
+    std::vector<std::string> out;
+    const fs::path stats = chunk_dir / "statistics";
+    std::error_code ec;
+    if (!fs::is_directory(stats, ec)) return out;
+    const std::string prefix = "temperature_z";
+    // ⛔ ALL THREE suffixes, de-duplicated -- not just `_max.bin`.
+    // `output.map_depth_stats` is a free subset, so a run asked for
+    // `[avg, min]` writes no `_max.bin` at all. Anchoring on one suffix made
+    // discovery return nothing for that run, the whole depth product vanish
+    // from the merged directory, and the tool still print success.
+    for (const auto& entry : fs::directory_iterator(stats, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        for (const char* suffix : { "_max.bin", "_min.bin", "_avg.bin" }) {
+            const std::string suf(suffix);
+            if (name.size() <= prefix.size() + suf.size()) continue;
+            if (name.compare(name.size() - suf.size(), suf.size(), suf) != 0)
+                continue;
+            std::string field = name.substr(0, name.size() - suf.size());
+            if (std::find(out.begin(), out.end(), field) == out.end())
+                out.push_back(field);
+            break;
+        }
+    }
+    return out;
 }
 
 // ---- Ice-stability merge --------------------------------------------------
@@ -368,6 +461,61 @@ int main(int argc, char** argv) {
         if (!merge_one_datatype(dt, chunk_dirs, outdir, expected_N)) {
             std::cerr << "[merge] ERROR merging " << dt << "\n";
             ok = false;
+        }
+    }
+
+    // Subsurface temperature maps (output.map_depths_m). The field names are
+    // per-run, not a fixed list, so they are DISCOVERED from chunk 0 and then
+    // required to be identical in every other chunk. A chunk that asked for a
+    // different depth set is a refusal, not a partial merge: averaging one
+    // window at 0.05 m with another at 0.06 m would produce a file whose name
+    // is true of neither.
+    {
+        std::vector<std::string> depth_fields = discover_depth_fields(chunk_dirs.front());
+        std::sort(depth_fields.begin(), depth_fields.end());
+        for (size_t i = 1; i < chunk_dirs.size(); ++i) {
+            std::vector<std::string> other = discover_depth_fields(chunk_dirs[i]);
+            std::sort(other.begin(), other.end());
+            if (other != depth_fields) {
+                std::cerr << "[merge] ERROR: chunk " << chunk_dirs[i]
+                          << " carries a DIFFERENT set of subsurface depth maps from "
+                             "chunk 0 (" << other.size() << " vs "
+                          << depth_fields.size() << " fields). The chunks were not "
+                             "run with the same output.map_depths_m; refusing to "
+                             "merge them into one product.\n";
+                ok = false;
+                depth_fields.clear();
+                break;
+            }
+        }
+        for (const auto& df : depth_fields) {
+            if (!merge_one_datatype(df, chunk_dirs, outdir, expected_N,
+                                    /*strict=*/true)) {
+                std::cerr << "[merge] ERROR merging " << df << "\n";
+                ok = false;
+            }
+        }
+        if (!depth_fields.empty()) {
+            // Carry the z-manifest through. It describes the depths, weights and
+            // error budget, all of which are chunk-invariant; without it the
+            // merged directory would hold maps whose depths are only readable
+            // from their file names, at three decimals.
+            const fs::path src = chunk_dirs.front() / "statistics" / "depth_map_z.json";
+            if (fs::exists(src)) {
+                std::error_code ec;
+                fs::copy_file(src, outdir / "statistics" / "depth_map_z.json",
+                              fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    std::cerr << "[merge] WARNING: could not copy depth_map_z.json: "
+                              << ec.message() << "\n";
+                }
+            } else {
+                std::cerr << "[merge] WARNING: chunk 0 has subsurface depth maps but "
+                             "no statistics/depth_map_z.json; the merged product will "
+                             "not say which grid nodes they came from.\n";
+            }
+            std::cout << "[merge] subsurface depth maps: " << depth_fields.size()
+                      << " field(s) merged\n";
         }
     }
 

@@ -534,6 +534,30 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.output.depths_file = getWithDefault(output, "depths_file", config.output.depths_file);
             config.output.skip_time_series = getWithDefault(output, "skip_time_series", config.output.skip_time_series);
             config.output.write_raw_stats = getWithDefault(output, "write_raw_stats", config.output.write_raw_stats);
+            // Subsurface depth-map product. Two sequences, so they are read
+            // with direct node access rather than getWithDefault.
+            //
+            // NOTE for whoever adds the next one: write the subscript out at
+            // every use. Binding it as `const auto& d = output["key"];` makes
+            // src/python/ptm/engine_config.py classify the key as a SECTION
+            // declaration and drop it from the parity table -- while still
+            // reporting "engine_defaults.py is current". That false green cost
+            // a review cycle on 2026-09-05 (owed ledger row
+            // PTM-ENGINECONFIG-ALIAS-DROPS-KEY).
+            if (output["map_depths_m"]) {
+                config.output.map_depths_m.clear();
+                for (const auto& item : output["map_depths_m"]) {
+                    config.output.map_depths_m.push_back(item.as<double>());
+                }
+            }
+            config.output.map_depth_snap_to_node = getWithDefault(
+                output, "map_depth_snap_to_node", config.output.map_depth_snap_to_node);
+            if (output["map_depth_stats"]) {
+                config.output.map_depth_stats.clear();
+                for (const auto& item : output["map_depth_stats"]) {
+                    config.output.map_depth_stats.push_back(item.as<std::string>());
+                }
+            }
             config.output.skip_mesh = getWithDefault(output, "skip_mesh", config.output.skip_mesh);
         }
 
@@ -1081,6 +1105,17 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "skip_time_series" << YAML::Value << config.output.skip_time_series;
         if (config.output.write_raw_stats)
             out << YAML::Key << "write_raw_stats" << YAML::Value << config.output.write_raw_stats;
+        // Depth-map product: emitted only when it is ON, so a saved config that
+        // never asked for it stays textually identical to one from before this
+        // feature existed.
+        if (!config.output.map_depths_m.empty()) {
+            out << YAML::Key << "map_depths_m" << YAML::Value << YAML::Flow
+                << config.output.map_depths_m;
+            out << YAML::Key << "map_depth_snap_to_node" << YAML::Value
+                << config.output.map_depth_snap_to_node;
+            out << YAML::Key << "map_depth_stats" << YAML::Value << YAML::Flow
+                << config.output.map_depth_stats;
+        }
         if (config.output.skip_mesh)
             out << YAML::Key << "skip_mesh" << YAML::Value << config.output.skip_mesh;
         out << YAML::EndMap;
@@ -1373,6 +1408,9 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  location_data: \"\"                   # Custom location data\n";
     out << "  skip_time_series: false             # Skip per-step binary files (saves disk; statistics still computed)\n";
     out << "  write_raw_stats: false              # Write merge-friendly raw stats (statistics/_raw/*.bin) for chunked runs\n";
+    out << "  map_depths_m: []                    # Mesh-wide temperature maps AT DEPTH (m). [] = off (byte-neutral)\n";
+    out << "  map_depth_snap_to_node: true        # Snap each depth to the nearest grid node (off-node interpolation costs ~0.195 K at A=160 K)\n";
+    out << "  map_depth_stats: [avg, max, min]    # Which statistics to write per depth\n";
     out << "  skip_mesh: false                    # Skip writing mesh.ply (used by chunked workflow on chunks 1+)\n\n";
 
     out << "# ========== Advanced Options ==========\n";
