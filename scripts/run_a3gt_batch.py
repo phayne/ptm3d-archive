@@ -282,8 +282,9 @@ def build_mesh(site: Site, log_path: Path, dry_run: bool,
         # Same rule as a3gt_v2_orchestrator: a mesh is reusable because it is
         # VALID, not because it is big. This driver carried its own copy of the
         # `st_size > 1_000_000` floor, which rejects a legitimately coarse
-        # LOLA-fallback core mesh (A03SP010's is 379,264 bytes / 8,746 faces)
-        # and forces the rebuild that stopped the 2026-09-03 campaign. Imported
+        # LOLA-fallback core mesh (379,264 bytes / 8,746 faces, the size five
+        # of the campaign's sites carry) and forces the rebuild that stopped
+        # the 2026-09-03 campaign. Imported
         # rather than re-implemented so the two drivers cannot drift apart
         # again. This driver pins no corrected VF, so validity is the whole
         # check here.

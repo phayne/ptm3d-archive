@@ -78,6 +78,26 @@ jobs:
       - name: Docs check -- GitHub-renderable math
         run: python3 scripts/check_github_math.py
 
+      # Landing-site identifiers. The real gate is
+      # src/python/tests/test_tracked_tree_hygiene.py, which compares the
+      # tracked tree against a deny list of the actual terms -- and that list
+      # deliberately lives OUTSIDE the repository, so on a runner the check
+      # SKIPS. A skip in CI is indistinguishable from a pass, and in September
+      # 2026 a pull request merged 61 site-identifier hits straight through it.
+      # These two steps are the half that CAN run here, because they carry no
+      # identifiers at all, only their SHAPE (catalog form, site-filename
+      # coordinate field). Strictly weaker than the deny list and not a
+      # replacement for it -- but it catches the way these come back, pasted in
+      # whole as a path or a fixture name, and it cannot skip.
+      # Self-test first, same reason as the American English pair above: it
+      # pins the exit codes, including exit 2 when git cannot answer, so a
+      # checker that reports clean with nothing to scan cannot ship.
+      - name: Site-identifier shape checker self-test
+        run: python3 scripts/test_check_site_id_patterns.py
+
+      - name: Tracked tree carries no landing-site identifier shapes
+        run: python3 scripts/check_site_id_patterns.py
+
       # PyQt6 imports QtCore from a shared library that wants these on the
       # bare runner image. The GUI is never displayed here -- the parity test
       # imports gui_core to read the config writer, nothing more.
