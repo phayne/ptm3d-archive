@@ -45,6 +45,7 @@
 #include "../thermal/thermal_model.h"
 #include "../thermal/eq_certificate.h"
 #include "../thermal/thermal_state_io.h"
+#include "../thermal/state_identity.h"
 #include <memory>
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
@@ -793,6 +794,141 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
 // returns -1.0, Profile falls back to planet.H, and nothing moves.
 static inline double refGridHOverride(const thermal::Config& config) {
     return config.getPropertyDouble("refgrid_H", -1.0);
+}
+
+// ---------------------------------------------------------------------------
+// THE RUN'S OWN IDENTITY, for the PTMT v2 checkpoint trailer.
+// ---------------------------------------------------------------------------
+// ONE definition, filled by main() once the ET grid and the resolved Planet
+// both exist, and read by every checkpoint writer and reader in this file. The
+// alternative -- each write site deriving the epoch and the hashes for itself
+// -- is how the format got three inline copies of its own header (PTM-76).
+//
+// The depth grid is deliberately NOT here: it is per-solver (the GPU has
+// z_grid, CpuStateCheckpoint builds a reference Profile), and the two are
+// required to agree already or no cross-backend restore would pass its shape
+// check. Each writer supplies its own z[] and the trailer records what that
+// writer actually integrated on.
+//
+// `filled` is false on any path that never reaches main()'s grid construction
+// (--validate-config, the standalone tools). A writer that finds it false emits
+// a v1 file and SAYS SO, rather than banking a trailer full of sentinels that
+// a later restore would treat as "not recorded" without knowing why.
+struct RunStateIdentity {
+    bool   filled = false;
+    double et_first         = std::numeric_limits<double>::quiet_NaN();
+    double et_last          = std::numeric_limits<double>::quiet_NaN();
+    double output_cadence_s = std::numeric_limits<double>::quiet_NaN();
+    double refgrid_H        = std::numeric_limits<double>::quiet_NaN();
+    int    grid_m = -1, grid_n = -1, grid_b = -1;
+    double mesh_geomhash    = std::numeric_limits<double>::quiet_NaN();
+    std::uint64_t config_identity_hash = 0;
+    std::string body_name;
+    std::string identity_text;      // the canonical rendering that was hashed
+    bool   coupled_run = false;
+    bool   coupling_select_dt_positive = false;
+    // thermal.state_restore_allow_mismatch. The whole restore POLICY lives
+    // here with the identity so the CPU and GPU paths cannot pick up different
+    // opt-out lists -- which is the class of divergence that made the format
+    // need one owner in the first place.
+    std::vector<std::string> allow_mismatch;
+};
+static RunStateIdentity g_run_state_identity;
+
+// Build the trailer a writer should attach, on THIS writer's depth grid.
+// Returns false when the run identity was never filled, in which case the
+// caller writes a v1 file and reports that it did.
+static bool buildStateTrailer(const double* z, std::size_t n_layers,
+                              thermal::state_io::Trailer& out) {
+    const RunStateIdentity& id = g_run_state_identity;
+    if (!id.filled || z == nullptr || n_layers == 0) return false;
+    out = thermal::state_io::Trailer();
+    out.z.assign(z, z + n_layers);
+    out.et_seconds       = id.et_last;
+    out.output_cadence_s = id.output_cadence_s;
+    out.refgrid_H        = id.refgrid_H;
+    out.grid_m           = id.grid_m;
+    out.grid_n           = id.grid_n;
+    out.grid_b           = id.grid_b;
+    out.mesh_geomhash    = id.mesh_geomhash;
+    // w0_* stay NaN. See the W(0) note at the top of thermal_state_io.h --
+    // this engine version does not measure it, and a field that is sometimes a
+    // measurement is worse than one that is never one.
+    out.config_identity_hash = id.config_identity_hash;
+    out.body_name        = id.body_name;
+    out.engine_git_sha   = PTM_BUILD_GIT_SHA;
+    out.flags            = 0;
+    if (id.coupling_select_dt_positive)
+        out.flags |= thermal::state_io::flag::kCouplingSelectDtPositive;
+    return true;
+}
+
+// The live side of the same comparison, for a restore.
+static thermal::state_io::Identity runRestoreIdentity(const double* z,
+                                                      std::size_t n_layers) {
+    const RunStateIdentity& id = g_run_state_identity;
+    thermal::state_io::Identity out;
+    if (z != nullptr && n_layers > 0) out.z.assign(z, z + n_layers);
+    if (!id.filled) return out;
+    out.et_first         = id.et_first;
+    out.output_cadence_s = id.output_cadence_s;
+    out.refgrid_H        = id.refgrid_H;
+    out.grid_m           = id.grid_m;
+    out.grid_n           = id.grid_n;
+    out.grid_b           = id.grid_b;
+    out.mesh_geomhash    = id.mesh_geomhash;
+    out.config_identity_hash = id.config_identity_hash;
+    out.body_name        = id.body_name;
+    out.coupled_run      = id.coupled_run;
+    return out;
+}
+
+// Apply a restore verdict to a log stream and say what happens next. Returns
+// true when the run may continue. ONE renderer, so the GPU restore and the CPU
+// restore cannot report the same verdict differently.
+static bool reportRestoreVerdict(const char* tag, const std::string& path,
+                                 thermal::state_io::TrailerStatus status,
+                                 const std::string& trailer_err,
+                                 const thermal::state_io::RestoreVerdict& v) {
+    using thermal::state_io::TrailerStatus;
+    if (status == TrailerStatus::Absent) {
+        std::cout << tag << "   format PTMT v1 (no identity trailer). "
+                  << v.unverified.size()
+                  << " quantities are UNVERIFIED by this restore:\n";
+        for (const std::string& u : v.unverified)
+            std::cout << tag << "     - " << u << "\n";
+        std::cout << tag << "   Re-bank this state on the current engine to get "
+                     "a v2 trailer and real guards.\n";
+    } else if (status == TrailerStatus::Ok) {
+        std::cout << tag << "   format PTMT v2, identity trailer verified "
+                     "(CRC32 over the whole file).\n";
+        if (!trailer_err.empty())
+            std::cout << tag << "   NOTE: " << trailer_err << "\n";
+        for (const std::string& u : v.unverified)
+            std::cout << tag << "   unverified: " << u << "\n";
+    }
+    for (const std::string& w : v.warnings)
+        std::cerr << tag << " WARNING: " << w << "\n";
+    if (status == TrailerStatus::Malformed) {
+        std::cerr << "\n" << tag << " FATAL: " << trailer_err << "\n"
+                  << tag << "   Refusing to restore '" << path
+                  << "'. A checkpoint whose own trailer does not verify is not "
+                     "a checkpoint.\n" << std::endl;
+        return false;
+    }
+    if (!v.ok()) {
+        std::cerr << "\n" << tag << " FATAL: this checkpoint does not belong to "
+                     "this run. " << v.refusals.size()
+                  << " identity clause(s) failed:\n";
+        for (const std::string& r : v.refusals)
+            std::cerr << tag << "   - " << r << "\n";
+        std::cerr << tag << "   Restoring it anyway would report an "
+                     "unintegrated gap, or another run's physics, as this "
+                     "run's result. Refusing.\n"
+                  << tag << "   File: " << path << "\n" << std::endl;
+        return false;
+    }
+    return true;
 }
 
 // PTM-53 rule-7 tripwire. applyConfiguredThermo() bumps this every time it
@@ -2886,6 +3022,10 @@ struct CpuStateCheckpoint {
     std::string out_path;
     std::string tag;
     std::atomic<size_t> refusals{0};
+    // The reference depth grid this checkpoint is written on / restored onto.
+    // Kept so finish() can attach a v2 trailer describing the grid the solver
+    // actually used, rather than rebuilding a Profile and hoping it matches.
+    std::vector<double> ref_z;
 
     // Returns false if the run must abort. Prints the reason itself.
     bool begin(const std::string& in_path, const std::string& out_path_in,
@@ -2915,6 +3055,8 @@ struct CpuStateCheckpoint {
         // top of thermal/thermal_state_io.h.
         const std::string fp = thermal::state_io::gridFingerprint(
             ref_profile.z().data(), n_layers);
+        ref_z.assign(ref_profile.z().begin(),
+                     ref_profile.z().begin() + static_cast<long>(n_layers));
 
         if (want_in) {
             std::string err;
@@ -2932,12 +3074,23 @@ struct CpuStateCheckpoint {
                       << " layers, "
                       << (loaded.size() * sizeof(float)) / (1024.0 * 1024.0)
                       << " MiB)\n"
-                      << tag << "   live grid " << fp
-                      << "; the checkpoint does NOT record the grid it was "
-                         "written on, so z[], the body and the thermophysical "
-                         "properties are UNVERIFIED -- only the "
-                      << n_faces << "x" << n_layers << " shape was checked."
-                      << std::endl;
+                      << tag << "   live grid " << fp << std::endl;
+
+            // The v2 identity guards. Same reader, same renderer and the same
+            // verdict as the GPU restore path -- one implementation, so the two
+            // backends cannot disagree about whether a state is admissible.
+            thermal::state_io::Trailer tr;
+            std::string t_err;
+            const auto st = thermal::state_io::readTrailer(in_path, tr, t_err);
+            thermal::state_io::RestoreVerdict verdict;
+            thermal::state_io::checkRestore(
+                st == thermal::state_io::TrailerStatus::Ok ? &tr : nullptr, st,
+                runRestoreIdentity(ref_z.data(), n_layers),
+                g_run_state_identity.allow_mismatch, verdict);
+            if (!reportRestoreVerdict(tag.c_str(), in_path, st, t_err, verdict)) {
+                loaded.clear();
+                return false;
+            }
         }
         if (want_out) {
             assembled.assign(n_layers * n_faces,
@@ -2990,8 +3143,12 @@ struct CpuStateCheckpoint {
             return false;
         }
         std::string err;
+        thermal::state_io::Trailer tr;
+        const bool have_trailer =
+            buildStateTrailer(ref_z.data(), n_layers, tr);
         if (!thermal::state_io::write(out_path, n_faces, n_layers,
-                                      assembled, err)) {
+                                      assembled, have_trailer ? &tr : nullptr,
+                                      err)) {
             std::cerr << "\n" << tag << " FATAL: " << err << ".\n"
                       << "  thermal.final_state_file was requested; a chunked "
                          "workflow cannot hand state over without it."
@@ -3001,7 +3158,12 @@ struct CpuStateCheckpoint {
         std::cout << tag << " Wrote final T(z) checkpoint: " << out_path
                   << " (" << n_faces << " faces x " << n_layers << " layers, "
                   << (assembled.size() * sizeof(float)) / (1024.0 * 1024.0)
-                  << " MiB)" << std::endl;
+                  << " MiB, "
+                  << (have_trailer ? "PTMT v2 with identity trailer"
+                                   : "PTMT v1 -- NO identity trailer: this run "
+                                     "never resolved its epoch grid, so the "
+                                     "state cannot describe itself")
+                  << ")" << std::endl;
         return true;
     }
 };
@@ -7359,9 +7521,23 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << " MiB)\n"
                   << "[GPU Thermal]   live grid "
                   << thermal::state_io::gridFingerprint(z_grid.data(), n_layers)
-                  << "; the checkpoint does NOT record the grid it was written "
-                     "on, so only the " << n_faces << "x" << n_layers
-                  << " shape was checked.\n";
+                  << "\n";
+
+        // The v2 identity guards -- the same reader, comparator and renderer
+        // the CPU restore uses (CpuStateCheckpoint::begin).
+        thermal::state_io::Trailer tr;
+        std::string t_err;
+        const auto st = thermal::state_io::readTrailer(initial_state_file, tr,
+                                                       t_err);
+        thermal::state_io::RestoreVerdict verdict;
+        thermal::state_io::checkRestore(
+            st == thermal::state_io::TrailerStatus::Ok ? &tr : nullptr, st,
+            runRestoreIdentity(z_grid.data(), n_layers),
+            g_run_state_identity.allow_mismatch, verdict);
+        if (!reportRestoreVerdict("[GPU Thermal]", initial_state_file, st,
+                                  t_err, verdict)) {
+            return false;
+        }
     }
 
     // A warm-start chunk is one that resumes from a checkpoint. It forces
@@ -9130,14 +9306,23 @@ post_batch_loop:
     // (thermal/thermal_state_io.h), so the bytes are produced in one place.
     if (dump_final_state) {
         std::string st_err;
+        thermal::state_io::Trailer tr;
+        const bool have_trailer = buildStateTrailer(z_grid.data(), n_layers, tr);
         if (!thermal::state_io::write(final_state_file, n_faces, n_layers,
-                                      assembled_final_T, st_err)) {
+                                      assembled_final_T,
+                                      have_trailer ? &tr : nullptr, st_err)) {
             std::cerr << "[GPU Thermal] WARNING: " << st_err << "\n";
         } else {
             std::cout << "[GPU Thermal] Wrote final T(z) checkpoint: "
                       << final_state_file << " ("
                       << (assembled_final_T.size() * sizeof(float)) / (1024.0*1024.0)
-                      << " MiB)\n";
+                      << " MiB, "
+                      << (have_trailer
+                              ? "PTMT v2 with identity trailer"
+                              : "PTMT v1 -- NO identity trailer: this run never "
+                                "resolved its epoch grid, so the state cannot "
+                                "describe itself")
+                      << ")\n";
         }
     }
 
@@ -17433,6 +17618,133 @@ int main(int argc, char** argv) {
             thermal_config.setProperty("hapke_albedo_w", planet.hapke_albedo_w);
         }
 
+        // ====================================================================
+        // The run's own identity, for the PTMT v2 checkpoint trailer.
+        // ====================================================================
+        // Filled HERE and nowhere else: this is the first point at which the
+        // resolved Planet, the fully-forwarded thermal_config, the mesh and the
+        // ET grid all exist at once. Every checkpoint writer and reader in this
+        // file reads it (buildStateTrailer / runRestoreIdentity), so the CPU and
+        // GPU paths cannot form different answers to "what run is this".
+        //
+        // ⚠️ POSITION IS LOAD-BEARING. This block sits immediately BEFORE the
+        // "last write to thermal_config" marker below, so it hashes the
+        // FINISHED object. An earlier draft sat ~180 lines above the
+        // `use_hapke_albedo` / `hapke_albedo_w` forwarding and therefore hashed
+        // the albedo law as always-off: a Hapke checkpoint and a Hayne
+        // checkpoint produced the SAME hash and restored into each other in
+        // silence. If a later change adds a `setProperty` after this point,
+        // move this block down with it.
+        {
+            RunStateIdentity& id = g_run_state_identity;
+
+            // The epoch a restored column is ASSUMED to be valid at is this
+            // run's first integrated step; the epoch a written column IS valid
+            // at is its last. A warm start forces equilibration_orbits = 0
+            // upstream, so for the case that matters external_ets.front() is
+            // output frame 0 -- exactly where the previous chunk's look-ahead
+            // checkpoint was taken.
+            if (!external_ets.empty()) {
+                id.et_first = external_ets.front();
+                id.et_last  = external_ets.back();
+            }
+            if (output_steps > 0 && post_eq_days_needed > 0.0) {
+                id.output_cadence_s =
+                    (post_eq_days_needed * ptm_thermal::constants::SECONDS_PER_DAY)
+                    / static_cast<double>(output_steps);
+            }
+
+            id.refgrid_H = refGridHOverride(thermal_config);
+            id.grid_m    = thermal_config.m;
+            id.grid_n    = thermal_config.n;
+            id.grid_b    = thermal_config.b;
+            id.body_name = body_name_for_config;
+
+            // Mesh identity: the same area-hash FORMULA the view-factor
+            // pipeline gates on (radiation/vf_dump_sparse.cpp:302-310), taken
+            // over this mesh's areas in its own native length unit. It is not
+            // compared against a VF file's hash -- a VF and a checkpoint are
+            // different objects -- so the unit only has to be consistent
+            // between a write and a restore, and it is: both sides are this
+            // engine, on this mesh.
+            if (mesh && !mesh->faces.empty()) {
+                std::vector<double> areas;
+                areas.reserve(mesh->faces.size());
+                for (const auto& tri : mesh->faces) {
+                    if (tri[0] < 0 || tri[1] < 0 || tri[2] < 0) {
+                        areas.push_back(0.0);
+                        continue;
+                    }
+                    const size_t i0 = static_cast<size_t>(tri[0]);
+                    const size_t i1 = static_cast<size_t>(tri[1]);
+                    const size_t i2 = static_cast<size_t>(tri[2]);
+                    if (i0 >= mesh->vertices.size() ||
+                        i1 >= mesh->vertices.size() ||
+                        i2 >= mesh->vertices.size()) {
+                        areas.push_back(0.0);
+                        continue;
+                    }
+                    const auto& a = mesh->vertices[i0];
+                    const auto& b = mesh->vertices[i1];
+                    const auto& c = mesh->vertices[i2];
+                    const double ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+                    const double vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+                    const double cx = uy*vz - uz*vy;
+                    const double cy = uz*vx - ux*vz;
+                    const double cz = ux*vy - uy*vx;
+                    areas.push_back(0.5 * std::sqrt(cx*cx + cy*cy + cz*cz));
+                }
+                id.mesh_geomhash = thermal::state_id::meshGeomHash(areas);
+            }
+
+            // The physics hash, over the resolved main-scope Planet -- which
+            // already carries the Hapke gate (resolved at the "Hapke albedo
+            // gate" block above) and every scalar override. That is the same
+            // object the PTM-53 forwarding sends to the solvers, so the hash
+            // covers what they will actually run.
+            id.identity_text = thermal::state_id::text(planet, thermal_config,
+                                                       id.refgrid_H);
+            id.config_identity_hash = thermal::state_id::hashOf(id.identity_text);
+
+            id.coupled_run = enable_radiation_exchange;
+            id.coupling_select_dt_positive = (rad_coupling_select_dt > 0.0);
+            id.allow_mismatch = sim_config.thermal.state_restore_allow_mismatch;
+            id.filled = true;
+
+            // Print the identity whenever a checkpoint is in play, so the two
+            // ends of a hand-off can be diffed from the logs without re-running
+            // either. Silent otherwise: this is provenance, not a banner.
+            if (!sim_config.thermal.initial_state_file.empty() ||
+                !sim_config.thermal.final_state_file.empty()) {
+                std::ios_base::fmtflags cf(std::cout.flags());
+                std::streamsize cp = std::cout.precision();
+                std::cout << std::defaultfloat << std::setprecision(17);
+                std::cout << "[state-id] config identity hash 0x" << std::hex
+                          << id.config_identity_hash << std::dec
+                          << "  body " << id.body_name
+                          << "  grid m/n/b " << id.grid_m << "/" << id.grid_n
+                          << "/" << id.grid_b << "\n"
+                          << "[state-id] mesh geomhash " << id.mesh_geomhash
+                          << "  refgrid_H " << id.refgrid_H << "\n"
+                          << "[state-id] ET first " << id.et_first
+                          << "  ET last " << id.et_last
+                          << "  output cadence " << id.output_cadence_s << " s\n"
+                          << "[state-id] the hash covers the resolved "
+                             "thermophysical scalars and the depth-grid "
+                             "parameters ONLY -- NOT per-face albedo / thermal-"
+                             "inertia / H maps, NOT a per-face Qb mask, and NOT "
+                             "the view factors. See thermal/state_identity.h.\n";
+                if (!id.allow_mismatch.empty()) {
+                    std::cout << "[state-id] thermal.state_restore_allow_mismatch "
+                                 "DOWNGRADES these restore guards to warnings:";
+                    for (const auto& s : id.allow_mismatch) std::cout << " " << s;
+                    std::cout << "\n";
+                }
+                std::cout.flags(cf);
+                std::cout.precision(cp);
+            }
+        }
+
         // Last write to thermal_config. Everything below this line only READS
         // it, so from here on the object is the run's operative thermal
         // configuration and any later consumer -- notably the per-location
@@ -20441,6 +20753,38 @@ int main(int argc, char** argv) {
                     bool ok = (f_nl > 0) &&
                               thermal::state_io::read(spath, num_faces, f_nl,
                                                       merged, st_err);
+
+                    // Carry the v2 identity trailer THROUGH the read-modify-
+                    // write. This is the site the mandatory `trailer` argument
+                    // on write() exists for: the state was banked minutes ago
+                    // by this same run and already describes itself, so
+                    // re-writing it without the trailer would silently
+                    // DOWNGRADE the checkpoint to v1 and hand the next chunk a
+                    // file with no epoch and no grid.
+                    thermal::state_io::Trailer keep_tr;
+                    std::string tr_err;
+                    const bool have_tr =
+                        ok && (thermal::state_io::readTrailer(spath, keep_tr,
+                                                              tr_err) ==
+                               thermal::state_io::TrailerStatus::Ok);
+                    if (ok && !have_tr && !tr_err.empty()) {
+                        std::cerr << "[PTM-57] WARNING: the iter-0 checkpoint's "
+                                     "identity trailer did not verify -- "
+                                  << tr_err
+                                  << ". The re-archived state will be written "
+                                     "as PTMT v1, without an epoch or a depth "
+                                     "grid.\n";
+                    }
+                    // Record what the re-archive actually did, so a restore is
+                    // never left to infer it (BUGS.md PTM-57).
+                    auto stamp_coupling_flags = [&](bool all_patched) {
+                        keep_tr.flags |=
+                            thermal::state_io::flag::kPostCouplingComplete;
+                        if (all_patched)
+                            keep_tr.flags |=
+                                thermal::state_io::flag::kAllFacesPatched;
+                    };
+
                     if (rad_final_T.empty()) {
                         // Reachable now that the CPU solvers write checkpoints
                         // too: the coupled end-of-window T(z) hand-off exists
@@ -20458,8 +20802,24 @@ int main(int argc, char** argv) {
                                   << "; the archived state stays PRE-COUPLING and the next"
                                      " chunk will cold-start its radiation-fed faces.\n";
                     } else if (n_touched == 0) {
+                        // The bytes are already right, but the FLAG that says
+                        // so is not: without this re-write the next restore
+                        // reads bit0 clear and warns that a coupled column is
+                        // pre-coupling. Rewrite the same body with the flags
+                        // stamped; the write is atomic, so the worst case is
+                        // the file that is already there.
                         std::cout << "[PTM-57] No face was re-thermal'd; the checkpoint is"
                                      " already the coupled state." << std::endl;
+                        if (have_tr) {
+                            stamp_coupling_flags(/*all_patched=*/true);
+                            if (!thermal::state_io::write(spath, num_faces, f_nl,
+                                                          merged, &keep_tr,
+                                                          st_err)) {
+                                std::cerr << "[PTM-57] WARNING: " << st_err
+                                          << "; the archived state's coupling "
+                                             "flags stay UNSET.\n";
+                            }
+                        }
                     } else {
                         for (size_t f = 0; f < num_faces; ++f) {
                             if (!rad_final_touched[f]) continue;
@@ -20468,14 +20828,19 @@ int main(int argc, char** argv) {
                                     rad_final_T[l * num_faces + f];
                             }
                         }
+                        if (have_tr) stamp_coupling_flags(n_touched == num_faces);
                         if (!thermal::state_io::write(spath, num_faces, f_nl,
-                                                      merged, st_err)) {
+                                                      merged,
+                                                      have_tr ? &keep_tr : nullptr,
+                                                      st_err)) {
                             std::cerr << "[PTM-57] WARNING: " << st_err
                                       << "; the archived state stays PRE-COUPLING.\n";
                         } else {
                             std::cout << "[PTM-57] Re-archived POST-coupling T(z) checkpoint: "
                                       << n_touched << "/" << num_faces
                                       << " faces carry the coupled column -> " << spath
+                                      << (have_tr ? " (PTMT v2, coupling flags stamped)"
+                                                  : " (PTMT v1)")
                                       << std::endl;
                         }
                     }
