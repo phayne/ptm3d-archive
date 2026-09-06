@@ -369,6 +369,26 @@ set_target_properties(test_state_io
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Thermal-state checkpoint INSPECTOR -- "what is this checkpoint". Links
+# `thermal` for two reasons: the optional --body grid block builds a real
+# thermal::Profile (so the depth grid reported is the SOLVER's, not a
+# re-derivation), and eqQbFromState/eqGridSkinDepth live there. Reading the
+# format itself goes through state_io::probe/read, so this tool can never
+# become a second implementation of the format -- which is the defect
+# thermal_state_io.h was created to end. No mesh, no VF, no SPICE, no GPU.
+add_executable(ptm_state_info ptm_state_info.cpp)
+target_link_libraries(ptm_state_info
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(ptm_state_info
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Equilibration spin-up estimator gate. Checks tau1 against the analytic
 # quarter-wave slab, the ln(1/target) scaling of n_req, and that an
 # unreachable target returns NO cycle count.
@@ -551,5 +571,26 @@ target_link_libraries(test_grid_convergence
 )
 set_target_properties(test_grid_convergence
     PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Damped-thermal-wave-at-depth analytic gate. The Ingersoll-equivalent for the
+# solution BELOW the surface: test_bowl_crater gates radiation at the surface
+# and nothing gated conduction at depth against a closed form. Also produces
+# the U2 max/min interpolation-commutation measurement that decision D8 (depth
+# product architecture) rests on. Links `thermal` so it drives the SHIPPING
+# Profile::update_T on the SHIPPING adaptive grid -- a stale libthermal would
+# be scored, not skipped. No mesh, no view factors, no SPICE, no GPU: safe to
+# run while a production job owns the devices.
+add_executable(test_thermal_wave_depth test_thermal_wave_depth.cpp)
+target_link_libraries(test_thermal_wave_depth
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_thermal_wave_depth
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
