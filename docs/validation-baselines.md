@@ -51,22 +51,125 @@ what the engine looked like when someone last cared.
 
 ## 2. The current baselines
 
-### 2.1 The CPU baseline: `postmerge-baseline-2026-08-24` at `51bf168`
+### 2.1 The current baseline: `postmerge-baseline-2026-09-05` at `c137564`
 
-Cut after the view-factor accuracy arc (pull requests #118 through #124) landed
-on `main`. It blesses **fifteen arms** at commit **`51bf168`** — the five
-portable CPU arms, the two `vfbuild` arms, and the eight GPU arms — and it
-**supersedes** the two 2026-08-15 tags for those arms without replacing them:
-the tags are untouched, the 2026-08-15 bank stays on disk, and the two
-site-local flagship arms are still 2026-08-15's, unre-run.
+**Location — and it is protected, deliberately:**
 
 ```
-~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json
-~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu_archnative.json
-~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json
+~/projects/ptm-validation-bank-2026-09-05/
+    baseline_manifest_2026-09-05.json     the manifest (schema 3)
+    runs/<arm>/statistics/                the banked output BYTES, 394 files
+    inputs/crater80N_{coupled,hmat,sparse}.vf   the view-factor matrices the arms load
+    DO-NOT-DELETE.md                      what this directory is, and why it must not be swept
 ```
 
-One arm of that bank has since been superseded on its own, by a data change
+⛔ **Never delete this directory without Paul's explicit word.** Its predecessor
+(`postmerge-baseline-2026-08-24`, at `~/projects/ada_postmerge_2026-08-24/`)
+was removed in a routine disk cleanup on 2026-09-03 because nothing on disk
+said it was load-bearing, taking the corrected `crater80N_sparse.vf` with it and
+leaving the project with no executable regression gate at all. Two things now
+stand against a repeat: the `DO-NOT-DELETE.md` above, and
+`ptm_validate_baseline.py`, which **refuses to write anywhere beneath a
+directory carrying that marker**.
+
+Cut on `origin/main` **`c137564`** (the merge of `feat/state-depth-starter`,
+pull request #171). It blesses the same **fifteen arms** as its predecessor —
+the five portable CPU arms, the two `vfbuild` arms, and the eight GPU arms —
+394 files, all on **one binary**:
+
+| | |
+|---|---|
+| Engine commit | `c13756483aed9c65198e7407dec03881e2daa872`, read from each arm's own `provenance.txt` |
+| `ptm_thermal_sim` md5 | `90c7c8ebc557af30e6a0a24ed0c08270` |
+| Build | the canonical `./rebuild.sh` configuration: `PTM_ENABLE_GPU=ON`, `GPU_BACKEND=OPENCL`, `PTM_ARCH_NATIVE=ON`, `BUILD_SHARED_LIBS=ON`, `CMAKE_BUILD_TYPE=Release` |
+| Embree | `~/opt/embree-4.3.3-avx512`, md5 `7e229da52bb90938741bba6d8666f3c7`, max ISA **AVX512** |
+| Threads | `OMP_NUM_THREADS=48`, recorded per arm |
+| Bowl-crater gate at this commit | `PASS: 16 of 16 verdicts (0 skipped, 4 latitudes)`; analytic `F_sky` error **0.492713%** against a 1% tolerance, the same value recorded at `ecf635a` |
+
+⛔ **This bank is NOT byte-comparable to the 2026-08-15 or 2026-08-24 banks on
+any lunar arm, and the reason is the toolchain, not the physics.** Those were
+cut against Homebrew's **SSE2** Embree (md5 `e0b68a29…`); `rebuild.sh` has
+owned the build configuration since 2026-09-02 and selects the widest-ISA
+Embree it can find, which on this host is the multi-ISA AVX512 build. Section 6
+measures that swap at 75 of 260 files and 0.00907 K on a lunar site run. This
+bank records what an operator on this machine *actually gets today*; comparing
+it to an older bank answers a different question, and `verify` says so before
+it prints any byte verdict.
+
+**⚠️ What this bank does NOT cover, stated because its predecessor covered
+more.** `postmerge-baseline-2026-08-24` carried three manifests — `PTM_ARCH_NATIVE`
+`OFF`, `ON`, and a separate GPU build. This one has a single configuration. So
+there is **no ISA twin and no CPU-only-build twin on `c137564`**: a byte
+difference read from a `--portable` or `--cpu-only` build against this bank is
+unattributable until such a twin is cut. `verify` reports the build-flag
+difference loudly rather than letting it pass, but reporting it is not
+covering it. Cutting the twin is one build and one command:
+
+```
+./rebuild.sh --portable                     # into build/, PTM_ARCH_NATIVE=OFF
+python3 scripts/ptm_validate_baseline.py run  --repo . --binary build/bin/ptm_thermal_sim \
+    --run-root <scratch>/runs --inputs-dir ~/projects/ptm-validation-bank-2026-09-05/inputs
+python3 scripts/ptm_validate_baseline.py bank --repo . --binary build/bin/ptm_thermal_sim \
+    --tag postmerge-baseline-2026-09-05-portable \
+    --bank-dir ~/projects/ptm-validation-bank-2026-09-05-portable \
+    --out baseline_manifest_portable.json --arm <name>=<rundir> ...
+```
+
+**Prerequisite: the SPICE kernels.** Three arms (`asteroid_bennu_spice_cpu`,
+`europa_diurnal_cpu`, and every lunar arm) need `data/kernels/{lsk,pck,spk,fk}`,
+which is **gitignored, 1.2 GB, and therefore absent from every fresh worktree**.
+Without it each arm dies on `FATAL: SPICE initialization failed for body
+'Moon'`. `run` and `verify --rerun` check for this before they burn a run and
+name the fix. Link them from a checkout that has them rather than
+re-downloading per worktree:
+
+```
+python3 scripts/fetch_kernels.py --link-from ~/Projects/ptm
+```
+
+That checks every pinned sha256 **before** it links, labels the two files with
+no pinned hash (`spk/jup365.bsp`, and the `pck/pck00010.tpc` + `pck/gm_de431.tpc`
+extras) as `UNPINNED` rather than as verified, and refuses to overwrite a real
+file with a link.
+
+**The bank is self-contained and read-only.** It holds the output bytes, not a
+path to them, and it holds the three view-factor matrices the arms load
+(`crater80N_coupled.vf` and `crater80N_hmat.vf` are byte-identical, md5
+`7e93d2a16b1e7cf9c8a825f26dcf64ea`, 36,341,754 bytes; `crater80N_sparse.vf` md5
+`8e5fbe76247e42d63f7189e4ba23784d`, 15,621,908 bytes). Its manifest is schema
+`ptm3d-validation-baseline/3`, which additionally records **each arm's recipe**
+— the config and the command-line overrides — so `verify --rerun` can replay
+the suite out of the bank itself rather than out of a script somebody has to
+still have.
+
+#### Round-trip evidence for this bank, 2026-09-05
+
+| Check | Result |
+|---|---|
+| The 15 arms, run and banked | 394 files; every arm's log confirmed the intended dispatch rung (`Multi-GPU dispatch across 2/4 device(s)`, `ACTIVE RUNG: single-GPU` versus `multi-GPU pool`, `[rad-skip-eq]`/`[rad-select-window]` live, the two `vfbuild` arms BUILDING not loading) — checked by the runner, not by eye |
+| A fresh copy of the bank verified against the manifest | **394/394 byte-identical, 15 arms, `VERDICT: BYTE-IDENTICAL`, exit 0** |
+| A copy of the bank with **one bit flipped** in `moon_crater80N_gputhermal_n4/statistics/temperature_max.bin` (same file length) | **393/394, `DIFFERS moon_crater80N_gputhermal_n4: 31/32`, names the file, `VERDICT: MISMATCH`, exit 1** — the other 14 arms still `IDENTICAL` |
+| `verify` with no `--arm` and no `--rerun` | **exit 2, no verdict printed at all** (section 5) |
+| `verify --arm <name>=<the banked directory>` | **exit 2**, refused as a self-comparison |
+
+The one-flipped-bit arm is the load-bearing one. A gate that has never been
+observed to fail is not known to be a gate.
+
+The predecessor bank, `postmerge-baseline-2026-08-24` at `51bf168`, is **GONE
+from disk** — the whole `~/projects/ada_postmerge_2026-08-24/` directory,
+including the manifests below, which are recorded here only so that a reference
+to them is recognizable as a reference to something that no longer exists:
+
+```
+~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json          GONE
+~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu_archnative.json  GONE
+~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json          GONE
+```
+
+The rest of this section records what that bank measured, which remains the
+attribution history for the arms even though its bytes are unrecoverable.
+
+One arm of that bank had been superseded on its own, by a data change
 rather than a code change:
 
 ```
@@ -347,29 +450,62 @@ Two traps worth stating outright:
 
 ## 5. Running the suite
 
-`scripts/ptm_validate_baseline.py` does the digesting and comparing. It never
-runs the simulator, so it is safe on a machine with no GPU.
+`scripts/ptm_validate_baseline.py` has four subcommands: `run` executes the
+arms, `bank` digests them into a manifest, `verify` compares against one, and
+`equivalence` compares two run directories directly. The arm set itself lives
+in `scripts/validation_arms.json` — tracked, so a clone has it.
+
+⛔ **A bare `verify --manifest M` used to compare the baseline with itself.**
+With no `--arm` it resolved the runs to compare as the manifest's own recorded
+run directories, re-digested the banked runs, and reported `330/330 files
+byte-identical`, `VERDICT: BYTE-IDENTICAL`, on every arm, from any tree, at any
+commit — including GPU arms this very document calls unreproducible. That was
+the command printed here until 2026-09-05 and the one the `ptm-validate` skill
+called the fast path. **It now exits 2 and prints no verdict at all.** So does
+any `--arm` that points at a banked directory. If you find that command written
+down anywhere, it is stale; the tool will tell you so rather than pass.
 
 ```
+# THE ONE-COMMAND GATE: run every banked arm fresh and compare it (section 2.1).
+# --keep leaves the fresh runs behind for inspection; omit it and they go into a
+# temporary directory that is removed afterwards.
+python3 scripts/ptm_validate_baseline.py verify \
+    --manifest ~/projects/ptm-validation-bank-2026-09-05/baseline_manifest_2026-09-05.json \
+    --rerun --repo . --binary build/bin/ptm_thermal_sim \
+    --run-root <a scratch directory> --keep
+
+# Or run the arms yourself, then compare what you produced.
+python3 scripts/ptm_validate_baseline.py run \
+    --repo . --binary build/bin/ptm_thermal_sim \
+    --run-root <scratch>/runs \
+    --inputs-dir ~/projects/ptm-validation-bank-2026-09-05/inputs
+python3 scripts/ptm_validate_baseline.py verify \
+    --manifest ~/projects/ptm-validation-bank-2026-09-05/baseline_manifest_2026-09-05.json \
+    --repo . --binary build/bin/ptm_thermal_sim \
+    --arm moon_crater80N_radoff_cpu=<scratch>/runs/moon_crater80N_radoff_cpu  ...
+
+# Only the CPU arms (a machine with no GPU, or a CPU-only build)
+python3 scripts/ptm_validate_baseline.py run --group cpu ...
+
 # Compare two finished run directories directly (N=1 versus N=4, CPU versus GPU)
 python3 scripts/ptm_validate_baseline.py equivalence <run_a> <run_b>
 
-# Compare a set of finished runs against the current CPU baseline (section 2.1).
-# Use the manifest whose ISA flag matches the build you are validating.
-python3 scripts/ptm_validate_baseline.py verify \
-    --manifest ~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json \
-    --repo . --binary build/bin/ptm_thermal_sim
-
-# The GPU arms (section 2.1), against a PTM_ENABLE_GPU=ON build
-python3 scripts/ptm_validate_baseline.py verify \
-    --manifest ~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json \
-    --repo . --binary build_gpu/bin/ptm_thermal_sim
-
-# The 2026-08-15 bank, for the flagship arms it still owns (section 2.2)
+# The 2026-08-15 bank, for the flagship arms it still owns (section 2.2).
+# That manifest predates schema 3, so it carries no recipes and CANNOT be
+# --rerun; produce the runs yourself and pass --arm. The tool says so.
 python3 scripts/ptm_validate_baseline.py verify \
     --manifest ~/projects/validate_rebaseline_2026-08-15/bank/baseline_manifest_flagship.json \
-    --repo . --binary build/bin/ptm_thermal_sim
+    --repo . --binary build/bin/ptm_thermal_sim --arm <name>=<rundir>
 ```
+
+`run` and `verify --rerun` do more than invoke the engine. Each arm's log is
+checked for the line its dispatch rung prints — `Multi-GPU dispatch across 2
+device(s)`, `ACTIVE RUNG: single-GPU radiosity` against `multi-GPU pool`,
+`Sparse view factors computed:` against `Loaded view factors from:` — and an
+arm that did not take its intended path is a **failure**, not a note. Before
+this was mechanical it was a habit, and a GPU arm that silently fell back to
+the CPU still wrote a full statistics directory and still compared
+byte-identical to another arm that fell back the same way.
 
 ⚠️ `verify` keys a `--binary` by its build **directory** name, so
 `build_gpu/bin/ptm_thermal_sim` and `build/bin/ptm_thermal_sim` are different
@@ -433,6 +569,36 @@ configure step prints the ISA; read them rather than assuming.
 Embree** (`test_bowl_crater.cpp`), so passing it is a do-no-harm check, never a
 discriminating test of an Embree change. The Embree-exercising bowl target is
 `bowl_crater_ptm`.
+
+### The engine's own libraries, and what an executable md5 does not cover
+
+The canonical build is `BUILD_SHARED_LIBS=ON`, so `ptm_thermal_sim` is a thin
+driver and the physics lives in `libthermal.dylib`, `libillumination_model.dylib`,
+`libptm_gpu.dylib` and their siblings. **A thermal-only change therefore moves
+`libthermal.dylib` and leaves the executable's md5 untouched.** `otool -L`
+reports all of them as `@rpath/...`, which `os.path.exists` cannot resolve, so
+until 2026-09-05 the manifest recorded `md5: null` for every one of them and the
+provenance block was blind to exactly the code most likely to change. `bank` now
+resolves `@rpath` through the binary's own `LC_RPATH` entries and records each
+library's md5. Quote the dylib md5 alongside the executable's, or a "no change"
+claim is not one.
+
+⛔ **Do not compare a dylib md5 across two worktrees.** Two builds of identical
+source at different absolute paths produce dylibs that differ in exactly **48
+bytes** — the `LC_UUID` and an `LC_RPATH` carrying the build directory — at the
+same file size. Measured 2026-09-04 and again 2026-09-05 on `libthermal.dylib`:
+`022838ab…` against `82de252e…`, 270,312 bytes each, `cmp -l` reports 48
+differing bytes. The manifest therefore records **two** digests per library:
+
+| Field | Semantics |
+|---|---|
+| `md5` | the whole file. The strict comparison, and the right one when both builds live at the **same path** |
+| `text_md5` | the `__TEXT,__text` section only, address column dropped. Invariant to `LC_UUID` and `LC_RPATH`, so it is the right one **across worktrees** |
+
+On the 48-byte case above the two `text_md5` values are equal
+(`96237b973279b7de3b4eb68df0d6c7f8`), which is what makes "same code, built
+elsewhere" a statement the tool can make rather than a claim the operator has to
+be trusted on. `verify` prints which of the two it is.
 
 ### `PTM_ARCH_NATIVE` — the flag that cost a month
 

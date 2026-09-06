@@ -1,0 +1,148 @@
+{
+  "schema": "ptm3d-validation-suite/1",
+  "description": [
+    "The arm set that docs/validation-baselines.md section 3 describes in prose.",
+    "It lives here, in tracked source, because until 2026-09-05 the only",
+    "executable copy of it was an untracked shell script under ~/projects that",
+    "no clone had and no cleanup spared. `ptm_validate_baseline.py run` reads",
+    "this file, `bank` copies each recipe into the manifest, and",
+    "`verify --rerun` replays the recipe out of the manifest -- so a bank is",
+    "reproducible from itself, not from a script somebody has to still have."
+  ],
+  "inputs": {
+    "crater80N_coupled.vf": {
+      "consumed_by": ["moon_crater80N_coupled_cpu"],
+      "config": "examples/tutorial04_crater80N_coupled.yaml",
+      "args": ["--rad-view-factor-file", "{self}"],
+      "note": "H-matrix, built once and then LOADED by the arm, so the arm is inert to a view-factor change (that is what the two vfbuild arms are for)."
+    },
+    "crater80N_hmat.vf": {
+      "consumed_by": ["moon_crater80N_gputhermal_n1", "moon_crater80N_gputhermal_n2", "moon_crater80N_gputhermal_n4"],
+      "config": "examples/validation/baseline_crater80N_gputhermal.yaml",
+      "args": ["--rad-view-factor-file", "{self}", "--gpu-devices", "1"],
+      "note": "HMAT v2. The format carries no physics provenance stamp, so a stale cache loads silently -- check the md5 the manifest records, never the version."
+    },
+    "crater80N_sparse.vf": {
+      "consumed_by": ["moon_crater80N_radgpu_n1", "moon_crater80N_radgpu_n2", "moon_crater80N_radgpu_n4", "moon_crater80N_radgpu_gray_n1", "moon_crater80N_radgpu_gray_n4"],
+      "config": "examples/validation/baseline_crater80N_radgpu.yaml",
+      "args": ["--rad-view-factor-file", "{self}", "--rad-gpu-devices", "1"],
+      "note": "VFFM v2 sparse. v1 files from the 2026-07 zero-occlusion window contain no occlusion at all; v2 announces itself on load."
+    }
+  },
+  "arms": {
+    "moon_crater80N_coupled_cpu": {
+      "group": "cpu",
+      "config": "examples/tutorial04_crater80N_coupled.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_coupled.vf}"],
+      "covers": "CPU thermal, H-matrix view factors, CPU two-band radiosity, the coupling loop",
+      "log_must_match": ["Loaded view factors from:"],
+      "log_must_not_match": ["Sparse view factors computed:"]
+    },
+    "moon_crater80N_radoff_cpu": {
+      "group": "cpu",
+      "config": "examples/tutorial04_crater80N_radoff.yaml",
+      "args": [],
+      "covers": "Illumination plus CPU thermal with radiation disabled"
+    },
+    "asteroid_bennu_spice_cpu": {
+      "group": "cpu",
+      "config": "examples/quickstart_asteroid_bennu.yaml",
+      "args": [],
+      "kernels": "bennu",
+      "covers": "Generic-body thermophysics on a real SPICE ephemeris and an imported facet shape"
+    },
+    "asteroid_keplerian_cpu": {
+      "group": "cpu",
+      "config": "examples/quickstart_asteroid_diurnal.yaml",
+      "args": [],
+      "covers": "Generic-body thermophysics on the analytic Keplerian propagator"
+    },
+    "europa_diurnal_cpu": {
+      "group": "cpu",
+      "config": "examples/quickstart_europa_diurnal.yaml",
+      "args": [],
+      "kernels": "europa",
+      "covers": "Europa built-in body, primary-body infrared and reflected light, a full eclipse inside the output window"
+    },
+    "moon_crater80N_vfbuild_sparse": {
+      "group": "cpu",
+      "config": "examples/validation/baseline_crater80N_vfbuild_sparse.yaml",
+      "args": [],
+      "covers": "The SPARSE view-factor builder, matrix BUILT not loaded",
+      "log_must_match": ["Sparse view factors computed:"],
+      "log_must_not_match": ["Loaded view factors from:"]
+    },
+    "moon_crater80N_vfbuild_hmatrix": {
+      "group": "cpu",
+      "config": "examples/validation/baseline_crater80N_vfbuild_hmatrix.yaml",
+      "args": [],
+      "covers": "The H-MATRIX builder including its ACA low-rank compression, matrix BUILT not loaded",
+      "log_must_match": ["Building H-matrix view factor"],
+      "log_must_not_match": ["Loaded view factors from:"]
+    },
+    "moon_crater80N_gputhermal_n1": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_gputhermal.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_hmat.vf}", "--gpu-devices", "1"],
+      "covers": "GPU persistent-kernel thermal solver, single device, two-phase cadence",
+      "log_must_match": ["\\[rad-skip-eq\\]", "\\[rad-select-window\\]"],
+      "log_must_not_match": ["Multi-GPU dispatch across", "STOOD DOWN"]
+    },
+    "moon_crater80N_gputhermal_n2": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_gputhermal.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_hmat.vf}", "--gpu-devices", "2"],
+      "covers": "The multi-GPU THERMAL pool at 2 devices",
+      "log_must_match": ["Multi-GPU dispatch across 2 device\\(s\\)"],
+      "log_must_not_match": ["STOOD DOWN"]
+    },
+    "moon_crater80N_gputhermal_n4": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_gputhermal.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_hmat.vf}", "--gpu-devices", "4"],
+      "covers": "The multi-GPU THERMAL pool at 4 devices",
+      "log_must_match": ["Multi-GPU dispatch across 4 device\\(s\\)"],
+      "log_must_not_match": ["STOOD DOWN"]
+    },
+    "moon_crater80N_radgpu_n1": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_radgpu.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_sparse.vf}", "--rad-gpu-devices", "1"],
+      "covers": "GPU radiosity solver, single device",
+      "log_must_match": ["ACTIVE RUNG: single-GPU radiosity"],
+      "log_must_not_match": ["Forcing the CPU"]
+    },
+    "moon_crater80N_radgpu_n2": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_radgpu.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_sparse.vf}", "--rad-gpu-devices", "2"],
+      "covers": "The multi-GPU RADIOSITY pool at 2 devices",
+      "log_must_match": ["ACTIVE RUNG: multi-GPU pool, 2 device\\(s\\)"],
+      "log_must_not_match": ["Forcing the CPU"]
+    },
+    "moon_crater80N_radgpu_n4": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_radgpu.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_sparse.vf}", "--rad-gpu-devices", "4"],
+      "covers": "The multi-GPU RADIOSITY pool at 4 devices",
+      "log_must_match": ["ACTIVE RUNG: multi-GPU pool, 4 device\\(s\\)"],
+      "log_must_not_match": ["Forcing the CPU"]
+    },
+    "moon_crater80N_radgpu_gray_n1": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_radgpu_gray.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_sparse.vf}", "--rad-gpu-devices", "1"],
+      "covers": "Gray (non-band-separated) radiosity, single device",
+      "log_must_match": ["ACTIVE RUNG: single-GPU radiosity"],
+      "log_must_not_match": ["Forcing the CPU"]
+    },
+    "moon_crater80N_radgpu_gray_n4": {
+      "group": "gpu",
+      "config": "examples/validation/baseline_crater80N_radgpu_gray.yaml",
+      "args": ["--rad-view-factor-file", "{input:crater80N_sparse.vf}", "--rad-gpu-devices", "4"],
+      "covers": "Gray radiosity on the pool. N=1 versus N>1 MAY legitimately differ here: the single-GPU path clears warm_start only in two-band mode while the pool clears it unconditionally.",
+      "log_must_match": ["ACTIVE RUNG: multi-GPU pool, 4 device\\(s\\)"],
+      "log_must_not_match": ["Forcing the CPU"]
+    }
+  }
+}
