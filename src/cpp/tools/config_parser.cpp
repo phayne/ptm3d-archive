@@ -462,6 +462,39 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
             config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
             config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
+            // Per-field opt-out for the PTMT v2 restore guards. A scalar is
+            // accepted as a one-element list so `epoch` and `[epoch]` mean the
+            // same thing; anything that is neither is a REFUSAL, not a silent
+            // empty list, because an ignored safety opt-out reads exactly like
+            // an honored one.
+            // Read WITHOUT a `const auto& alias = thermal["..."]` binding.
+            // src/python/ptm/engine_config.py's extractor treats that exact
+            // shape as a SECTION declaration and drops the key from the parity
+            // table -- silently, still reporting "engine_defaults.py is
+            // current". See the ledger row PTM-ENGINECONFIG-ALIAS-DROPS-KEY.
+            if (thermal["state_restore_allow_mismatch"]) {
+                config.thermal.state_restore_allow_mismatch.clear();
+                if (thermal["state_restore_allow_mismatch"].IsSequence()) {
+                    for (const auto& v : thermal["state_restore_allow_mismatch"])
+                        config.thermal.state_restore_allow_mismatch.push_back(v.as<std::string>());
+                } else if (thermal["state_restore_allow_mismatch"].IsScalar()) {
+                    config.thermal.state_restore_allow_mismatch.push_back(
+                        thermal["state_restore_allow_mismatch"].as<std::string>());
+                } else if (thermal["state_restore_allow_mismatch"].IsNull()) {
+                    // `state_restore_allow_mismatch:` with nothing after it, or
+                    // an explicit `~`/`null`. yaml-cpp's operator bool() is
+                    // IsDefined(), so a Null node reaches here TRUTHY while
+                    // being neither a sequence nor a scalar. It is the most
+                    // natural spelling of "no opt-outs" and must mean the
+                    // default, not a fatal parse error.
+                } else {
+                    throw std::runtime_error(
+                        "thermal.state_restore_allow_mismatch must be a list of "
+                        "field names (or one name), e.g. [epoch]. It is a "
+                        "safety opt-out; a value this parser cannot read must "
+                        "not be treated as an empty list.");
+                }
+            }
             config.thermal.checkpoint_lookahead_steps = getWithDefault(thermal, "checkpoint_lookahead_steps", config.thermal.checkpoint_lookahead_steps);
             config.thermal.checkpoint_every_output_steps = getWithDefault(thermal, "checkpoint_every_output_steps", config.thermal.checkpoint_every_output_steps);
             config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
@@ -1043,6 +1076,13 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "final_state_file" << YAML::Value << config.thermal.final_state_file;
         if (config.thermal.checkpoint_lookahead_steps != 0)
             out << YAML::Key << "checkpoint_lookahead_steps" << YAML::Value << config.thermal.checkpoint_lookahead_steps;
+        if (!config.thermal.state_restore_allow_mismatch.empty()) {
+            out << YAML::Key << "state_restore_allow_mismatch"
+                << YAML::Value << YAML::Flow << YAML::BeginSeq;
+            for (const auto& s : config.thermal.state_restore_allow_mismatch)
+                out << s;
+            out << YAML::EndSeq;
+        }
         if (config.thermal.compute_ice_stability) {
             out << YAML::Key << "compute_ice_stability" << YAML::Value << config.thermal.compute_ice_stability;
             out << YAML::Key << "ice_stability" << YAML::Value << YAML::BeginMap;
@@ -1383,7 +1423,11 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  integration_offset_steps: 0         # Offset steps for integration\n";
     out << "  checkpoint_lookahead_steps: 0       # Extra output steps integrated past the export window,\n";
     out << "                                      # so final_state_file lands on the NEXT window's first\n";
-    out << "                                      # epoch (chunked runs set 1; not exported, not reduced)\n\n";
+    out << "                                      # epoch (chunked runs set 1; not exported, not reduced)\n";
+    out << "  state_restore_allow_mismatch: []    # Per-field opt-out for the checkpoint identity guards:\n";
+    out << "                                      # depth_grid mesh config body grid_m grid_n grid_b\n";
+    out << "                                      # refgrid_H epoch. Names one clause and makes it a\n";
+    out << "                                      # warning instead of a refusal; there is no blanket force\n\n";
     
     out << "# ========== Illumination ==========\n";
     out << "illumination:\n";

@@ -242,6 +242,23 @@ struct SimulationConfig {
         std::string initial_state_file = "";
         std::string final_state_file   = "";
 
+        // Per-field opt-out for the PTMT v2 identity guards
+        // (thermal/thermal_state_io.h checkRestore). Each entry NAMES one
+        // clause and downgrades it from a refusal to a loud warning:
+        //   depth_grid  mesh  config  body  grid_m  grid_n  grid_b
+        //   refgrid_H   epoch
+        // There is deliberately no blanket "force": switching every guard off
+        // at once is the warn-instead-of-refuse policy that made PTM-76
+        // possible, wearing a different name. The batch-completion-partial
+        // refusal cannot be reached from here at all.
+        //
+        // `epoch` is the one most likely to be reached for, and the one to
+        // reach for most carefully: a cross-season warm start, measured on one
+        // lunar polar site, moved temperature_min by 5.75 K rms / 49.9 K max
+        // and shifted the ice-stability depth product by 19.3 percentage
+        // points, and no gate in the QA battery saw it.
+        std::vector<std::string> state_restore_allow_mismatch;
+
         // Checkpoint handoff look-ahead, in OUTPUT steps. 0 (default) = the
         // state written to final_state_file is the state at the LAST exported
         // frame. 1 = the run integrates one extra grid point PAST the exported
