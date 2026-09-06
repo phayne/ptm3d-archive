@@ -40,6 +40,15 @@ continued with an HTTP Range request on the next run; completed files whose
 size matches the server's are skipped. SHA-256 of every completed file is
 printed (and checked against a pinned value where one is recorded below).
 
+A git WORKTREE is the case this script did not cover until 2026-09-05.
+`data/kernels/{lsk,pck,spk,fk}` is gitignored (1.2 GB), so every fresh worktree
+starts with the metakernels and none of the kernels they name, and every
+simulation in it dies with `FATAL: SPICE initialization failed`. Re-downloading
+1.2 GB per worktree is the wrong answer when a verified copy is already on the
+same disk, so `--link-from <repo>` symlinks them from an existing checkout --
+after checking each pinned sha256, so a link is only ever made to bytes this
+script would have accepted from NAIF.
+
 Usage:
     python3 scripts/fetch_kernels.py                 # auto: core + whatever the .tm files name
     python3 scripts/fetch_kernels.py --bodies moon   # force Moon/Mercury core only
@@ -47,6 +56,7 @@ Usage:
     python3 scripts/fetch_kernels.py --bodies bennu  # force core + Bennu ephemeris
     python3 scripts/fetch_kernels.py --bodies all
     python3 scripts/fetch_kernels.py --dest /path/to/kernels
+    python3 scripts/fetch_kernels.py --link-from ~/Projects/ptm   # worktree: link, do not download
 """
 
 import argparse
@@ -290,6 +300,100 @@ def verify(dest, expected_sha):
     return True
 
 
+def link_from(src_root, dest, kernels):
+    """Symlink already-downloaded kernels from another checkout into `dest`.
+
+    For the gitignored-1.2-GB-per-worktree problem in the module docstring.
+    Three properties, each of which was a way to get this wrong:
+
+    1. **Every pinned kernel is hashed before it is linked.** A link is a claim
+       that these are the right bytes; making that claim without checking is
+       how a corrupt or superseded file propagates into every worktree that
+       borrows it. A mismatch refuses the link for that file and fails the run.
+    2. **Files the pinned table does not know about are linked too, and said
+       out loud.** `pck/pck00010.tpc` and `pck/gm_de431.tpc` are on this
+       machine, are named by shipped metakernels, and are in no table here --
+       linking only the pinned five would leave a worktree that still cannot
+       run and would give no hint why. They are linked with their sha256
+       printed and an explicit UNPINNED label, because "verified" and
+       "copied" must not look alike.
+    3. **Nothing is clobbered.** An existing regular file or directory at the
+       destination stops the run; an existing symlink already pointing at the
+       same target is left alone and reported. Silently replacing a real file
+       with a link to somebody else's copy is not a repair.
+
+    Returns True when every requested kernel ended up resolvable in `dest`.
+    """
+    src = os.path.join(src_root, "data", "kernels")
+    if not os.path.isdir(src):
+        print(f"ERROR: --link-from {src_root} has no data/kernels directory.")
+        return False
+    if os.path.realpath(src) == os.path.realpath(dest):
+        print(f"ERROR: --link-from source and destination are the same "
+              f"directory ({os.path.realpath(dest)}). Nothing to do.")
+        return False
+
+    wanted = {(sub, name): sha for sub, name, _url, sha in kernels}
+    ok = True
+
+    # Pass 1: the kernels the caller asked for, pinned-hash checked.
+    for (sub, name), sha in sorted(wanted.items()):
+        s = os.path.join(src, sub, name)
+        d = os.path.join(dest, sub, name)
+        if not os.path.exists(s):
+            print(f"MISSING in source: {sub}/{name}")
+            print(f"  {src_root} does not have it either. Fetch it there first:")
+            print(f"    python3 scripts/fetch_kernels.py   # in {src_root}")
+            ok = False
+            continue
+        digest = sha256_of(s)
+        if sha and digest != sha:
+            print(f"REFUSING to link {sub}/{name}: sha256 {digest}")
+            print(f"  does not match the pinned {sha}.")
+            print(f"  The source copy is corrupt or was replaced. Do not "
+                  f"borrow it; fetch a fresh one.")
+            ok = False
+            continue
+        label = "verified" if sha else "UNPINNED (no hash in this script's table)"
+        ok = _link_one(s, d, f"{sub}/{name}", digest, label) and ok
+
+    # Pass 2: everything else the source has under the kernel subdirectories.
+    for sub in ("lsk", "pck", "spk", "fk"):
+        sdir = os.path.join(src, sub)
+        if not os.path.isdir(sdir):
+            continue
+        for name in sorted(os.listdir(sdir)):
+            if (sub, name) in wanted or name.startswith("."):
+                continue
+            s = os.path.join(sdir, name)
+            if not os.path.isfile(s):
+                continue
+            ok = _link_one(s, os.path.join(dest, sub, name), f"{sub}/{name}",
+                           sha256_of(s),
+                           "UNPINNED (not in this script's table; linked "
+                           "because a shipped metakernel may name it)") and ok
+    return ok
+
+
+def _link_one(src_file, dest_file, label, digest, note):
+    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+    if os.path.islink(dest_file):
+        if os.path.realpath(dest_file) == os.path.realpath(src_file):
+            print(f"  {label}: already linked to the same file — left alone")
+            return True
+        print(f"ERROR: {dest_file} is a symlink to something else "
+              f"({os.path.realpath(dest_file)}). Remove it deliberately; this "
+              f"script will not repoint an existing link.")
+        return False
+    if os.path.exists(dest_file):
+        print(f"ERROR: {dest_file} already exists as a real file. Not "
+              f"replacing it with a link — if you meant to, delete it first.")
+        return False
+    os.symlink(os.path.realpath(src_file), dest_file)
+    print(f"  linked {label}  sha256={digest}  [{note}]")
+    return True
+
+
 def select_kernels(bodies, dest):
     """Return the kernels to fetch for the requested --bodies mode.
 
@@ -332,18 +436,28 @@ def main():
                          "bennu.tm is present; moon = core only; europa adds "
                          "jup365.bsp, bennu adds sb-101955-118_long.bsp, all "
                          "adds both -- unconditionally")
+    ap.add_argument("--link-from", metavar="REPO", default=None,
+                    help="symlink the kernels from another PTM3D checkout's "
+                         "data/kernels instead of downloading them, after "
+                         "checking each pinned sha256. For git worktrees, "
+                         "where data/kernels is gitignored and re-fetching "
+                         "1.2 GB per worktree is absurd.")
     args = ap.parse_args()
 
     kernels = select_kernels(args.bodies, args.dest)
 
     print(f"Kernel directory: {args.dest}")
-    ok = True
-    for subdir, name, url, sha in kernels:
-        outdir = os.path.join(args.dest, subdir)
-        os.makedirs(outdir, exist_ok=True)
-        dest = os.path.join(outdir, name)
-        print(f"[{subdir}/{name}] <- {url}")
-        ok = download(url, dest, sha) and ok
+    if args.link_from:
+        print(f"Linking from: {args.link_from}  (no downloads)")
+        ok = link_from(args.link_from, args.dest, kernels)
+    else:
+        ok = True
+        for subdir, name, url, sha in kernels:
+            outdir = os.path.join(args.dest, subdir)
+            os.makedirs(outdir, exist_ok=True)
+            dest = os.path.join(outdir, name)
+            print(f"[{subdir}/{name}] <- {url}")
+            ok = download(url, dest, sha) and ok
 
     tm_present = [f for f in ("moon.tm", "europa.tm", "mercury.tm", "bennu.tm")
                   if os.path.exists(os.path.join(args.dest, f))]
@@ -375,7 +489,8 @@ def main():
           "(PATH_VALUES = 'data/kernels'); run ptm_thermal_sim from the "
           "repository root, or edit PATH_VALUES to an absolute path.")
     if not ok:
-        print("\nOne or more kernels FAILED to download/verify — see above.")
+        verb = "link/verify" if args.link_from else "download/verify"
+        print(f"\nOne or more kernels FAILED to {verb} — see above.")
         return 1
     print("\nAll kernels present and verified.")
     return 0
