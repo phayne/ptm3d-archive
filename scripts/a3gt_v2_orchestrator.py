@@ -138,6 +138,146 @@ def fmt_duration(seconds: float) -> str:
     return f"{h}h {m}m"
 
 
+# PLY scalar type -> byte width, for the binary-body size arithmetic below.
+_PLY_TYPE_BYTES = {
+    "char": 1, "int8": 1, "uchar": 1, "uint8": 1,
+    "short": 2, "int16": 2, "ushort": 2, "uint16": 2,
+    "int": 4, "int32": 4, "uint": 4, "uint32": 4, "float": 4, "float32": 4,
+    "double": 8, "float64": 8,
+}
+
+
+def parse_ply_header(ply: Path) -> dict | None:
+    """Parse a PLY header into the numbers needed to size-check the body.
+
+    Returns ``{format, header_bytes, n_vertices, vertex_stride, n_faces,
+    face_record_bytes}``, or None if the header does not parse. ``*_stride`` /
+    ``face_record_bytes`` are None when the layout is not fixed-width (an
+    ascii file, or a property type we do not know), which the caller treats as
+    "cannot size-check", not as "invalid".
+    """
+    try:
+        with open(ply, "rb") as f:
+            head = f.read(65536)
+    except Exception:
+        return None
+    end = head.find(b"end_header")
+    if end < 0:
+        return None
+    # The header ends at the newline that terminates the end_header line.
+    nl = head.find(b"\n", end)
+    if nl < 0:
+        return None
+    info: dict = {"format": None, "header_bytes": nl + 1, "n_vertices": 0,
+                  "vertex_stride": 0, "n_faces": 0, "face_record_bytes": None}
+    element = None
+    unknown = False
+    for raw in head[:end].decode(errors="replace").splitlines():
+        tok = raw.strip().split()
+        if not tok:
+            continue
+        if tok[0] == "format" and len(tok) >= 2:
+            info["format"] = tok[1]
+        elif tok[0] == "element" and len(tok) >= 3:
+            element = tok[1]
+            try:
+                count = int(tok[2])
+            except ValueError:
+                return None
+            if element == "vertex":
+                info["n_vertices"] = count
+            elif element == "face":
+                info["n_faces"] = count
+        elif tok[0] == "property" and element == "vertex" and len(tok) >= 3:
+            if tok[1] == "list":
+                unknown = True          # a list on vertices: not fixed-width
+            else:
+                w = _PLY_TYPE_BYTES.get(tok[1])
+                if w is None:
+                    unknown = True
+                else:
+                    info["vertex_stride"] += w
+        elif tok[0] == "property" and element == "face":
+            if tok[1] == "list" and len(tok) >= 5:
+                if info["face_record_bytes"] is not None:
+                    # A second list on the face element (e.g. per-face texture
+                    # coordinates). We only know how to size the first.
+                    unknown = True
+                    continue
+                cw = _PLY_TYPE_BYTES.get(tok[2])
+                iw = _PLY_TYPE_BYTES.get(tok[3])
+                if cw is None or iw is None:
+                    unknown = True
+                else:
+                    # Triangles: one count + three indices. A mesh with any
+                    # non-triangular face is larger than this, so using it as
+                    # the expected size can only under-estimate -- it never
+                    # rejects a complete file.
+                    info["face_record_bytes"] = cw + 3 * iw
+            else:
+                # A scalar face property (e.g. `property uchar red`) adds bytes
+                # per face that we are not accounting for. Rather than
+                # under-estimate the expected size -- which would let a
+                # truncated file pass -- decline to size-check at all.
+                unknown = True
+    if unknown or not str(info["format"] or "").startswith("binary"):
+        info["vertex_stride"] = None
+        info["face_record_bytes"] = None
+    return info
+
+
+class MeshVFMismatch(RuntimeError):
+    """A valid core mesh whose face count is not the pinned VF's dimension.
+
+    Deliberately NOT a reason to rebuild. Rebuilding cannot fix it -- the CSR
+    is the fixed artifact, and it took hours of Monte Carlo to assemble -- and
+    a rebuild would overwrite the only copy of the geometry on disk. The site
+    is skipped instead, leaving both files untouched for a human to reconcile.
+    """
+
+
+def mesh_reuse_reason(ply: Path) -> str | None:
+    """Why an existing core-mesh PLY is not VALID; None means it is.
+
+    This replaces a bare ``st_size > 1_000_000`` floor. File size is not
+    validity, and the floor was wrong in the direction that costs a campaign:
+    A03SP010's real, correct, VF-paired LOLA core mesh is a legitimate
+    379,264-byte / 8,746-face PLY, so the floor classified it as incomplete,
+    forced an unplanned rebuild, and the 56-window ring-fix campaign stopped
+    at 48/56 when the rebuild refused (2026-09-03).
+
+    What the floor was standing in for is checked directly instead:
+
+      1. the PLY header parses and declares at least one face;
+      2. the file is actually long enough to hold the vertices and faces that
+         header declares -- the real failure mode (a truncated or half-written
+         PLY) that a size floor only ever approximated.
+
+    Mesh/VF identity is deliberately NOT part of this answer: a mesh can be
+    perfectly valid and still be the wrong geometry for a pinned VF, and those
+    two cases call for opposite responses (rebuild vs. refuse). See
+    ``MeshVFMismatch`` and ``build_mesh``.
+    """
+    if not ply.exists():
+        return "does not exist"
+    info = parse_ply_header(ply)
+    if info is None:
+        return "PLY header does not parse"
+    n = int(info["n_faces"])
+    if n <= 0:
+        return "PLY header declares no faces"
+    stride, frec = info["vertex_stride"], info["face_record_bytes"]
+    if stride is not None and frec is not None:
+        need = (int(info["header_bytes"]) + int(info["n_vertices"]) * stride
+                + n * frec)
+        size = ply.stat().st_size
+        if size < need:
+            return (f"truncated: {size:,} bytes, but its header declares "
+                    f"{info['n_vertices']:,} vertices and {n:,} faces "
+                    f"(>= {need:,} bytes)")
+    return None
+
+
 def read_n_faces(ply: Path) -> int:
     try:
         with open(ply, "rb") as f:
@@ -153,6 +293,65 @@ def read_n_faces(ply: Path) -> int:
     except Exception:
         pass
     return 0
+
+
+#: HMATRIX_MAGIC (0x484D4154) as it appears on disk, little-endian. An .hmat /
+#: base-.vf stub starts with this; vf_replace_path() will happily hand us one,
+#: because it accepts `<site>.vf` as a corrected-VF candidate.
+_HMAT_MAGIC_BYTES = b"TAMH"
+
+
+def read_csr_n_faces(csr: Path) -> int | None:
+    """Face count a corrected-VF CSR was built for, or None if it is not one.
+
+    Mirrors the engine's own gate in ``radiation_exchange.cpp`` (the
+    PTM_HMATRIX_VF_REPLACE loader): the header is ``int32 n, float64
+    geomhash, int64 indptr[n+1], int64 nnz, ...``. Only ``n`` is read here --
+    the engine still applies the stronger geomhash test at run time; this is
+    the cheap pre-flight half, so a wrong-mesh pairing is caught before a
+    window starts rather than after the VF upload.
+
+    The first four bytes are NOT taken on trust. ``vf_replace_path`` accepts a
+    ``<site>.vf`` candidate, and a ``.vf`` here is the H-matrix format, whose
+    first four bytes are the magic -- read as an int32 that is ~1.2e9. Believed,
+    it would declare every cached mesh mismatched and rebuild all of them,
+    which is precisely the campaign-stopping mass-rebuild this check exists to
+    prevent. So the file must also be structurally large enough to BE the CSR
+    its header claims, and anything else returns None (no constraint) loudly.
+    """
+    import struct
+    try:
+        size = csr.stat().st_size
+        with open(csr, "rb") as f:
+            head = f.read(4)
+    except Exception as exc:
+        print(f"  [vf] WARNING: cannot read a face count from {csr.name} "
+              f"({exc}); the mesh will be judged on its own validity only.",
+              file=sys.stderr)
+        return None
+    why = None
+    n = 0
+    if len(head) != 4:
+        why = "is shorter than a header"
+    elif head == _HMAT_MAGIC_BYTES:
+        why = "is an H-matrix/.vf file, not a referee CSR"
+    else:
+        n = int(struct.unpack("<i", head)[0])
+        if n <= 0:
+            why = f"declares {n} faces"
+        else:
+            # int32 n + float64 geomhash + int64 indptr[n+1] + int64 nnz.
+            need = 4 + 8 + 8 * (n + 1) + 8
+            if size < need:
+                why = (f"declares {n:,} faces but is only {size:,} bytes "
+                       f"(a real CSR needs >= {need:,})")
+    if why is not None:
+        print(f"  [vf] WARNING: {csr.name} {why}; not using it as a mesh "
+              f"face-count reference. The mesh will be judged on its own "
+              f"validity only, and the engine's geomhash gate remains the "
+              f"backstop.", file=sys.stderr)
+        return None
+    return n
 
 
 def site_mesh_path(site: dict, roi_radius_km: float = 5.0,
@@ -216,21 +415,49 @@ def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
                core_frac: float = 0.05, max_points: int = 2_500_000,
                density_exp: float = 1.0,
                dem_override: Path | None = None,
-               mesh_path: Path | None = None) -> Path:
+               mesh_path: Path | None = None,
+               expected_faces: int | None = None) -> Path:
     """Build a 1 m/px-center / N km-ROI / density-falloff PLY for a site.
 
     Reuses the existing dtm_to_ply_delaunay binary. ``dem_override`` is the
     per-site VRT mosaic in catalog mode (GDAL opens a .vrt transparently, so
     no C++ change); ``mesh_path`` is the extended-name PLY. Both default to
-    the legacy single-DEM behavior when omitted."""
+    the legacy single-DEM behavior when omitted. ``expected_faces`` is the
+    face count the site's pinned corrected VF was built for, when it has one.
+
+    Raises ``MeshVFMismatch`` if the mesh is valid but is not that VF's
+    geometry -- before a rebuild, and again after one."""
     ply = mesh_path or site_mesh_path(site, roi_radius_km=roi_km)
     dem = dem_override or require_default_dem()
     MESH_DIR.mkdir(parents=True, exist_ok=True)
 
-    if ply.exists() and ply.stat().st_size > 1_000_000 and read_n_faces(ply) > 0:
+    def _check_against_vf(where: str) -> None:
+        if expected_faces is None:
+            return
         n = read_n_faces(ply)
-        print(f"  [{site['ellipse_id']}] mesh present ({ply.name}, {n:,} faces) — skip")
-        return ply
+        if n != expected_faces:
+            raise MeshVFMismatch(
+                f"{ply.name} has {n:,} faces but this site's corrected VF was "
+                f"built for {expected_faces:,} ({where}). Not rebuilding over "
+                f"it: a rebuild cannot change the CSR, and would destroy the "
+                f"only copy of this geometry. Reconcile the mesh and the VF by "
+                f"hand, then re-run.")
+
+    if ply.exists():
+        reason = mesh_reuse_reason(ply)
+        if reason is None:
+            # Valid. Now: is it the geometry the pinned VF was built for? If
+            # not, refuse the site -- do NOT rebuild over it (see MeshVFMismatch).
+            _check_against_vf("cached mesh")
+            n = read_n_faces(ply)
+            print(f"  [{site['ellipse_id']}] mesh present ({ply.name}, "
+                  f"{n:,} faces) — skip")
+            return ply
+        # Rebuilding over an existing mesh is never a quiet housekeeping step:
+        # it can replace the exact geometry a multi-hour corrected VF was
+        # built against. Say which mesh, and why it was rejected.
+        print(f"  [{site['ellipse_id']}] WARNING: cached mesh {ply.name} is "
+              f"NOT reusable ({reason}) — rebuilding it", file=sys.stderr)
 
     cmd = [
         str(DTM_TOOL),
@@ -260,6 +487,10 @@ def build_mesh(site: dict, *, dry_run: bool, roi_km: float = 5.0,
     if ret.returncode != 0:
         sys.exit(f"  [{site['ellipse_id']}] mesh build FAILED (exit {ret.returncode}); "
                  f"see {log_path}")
+    # A fresh build is not automatically the VF's geometry either -- if the DEM
+    # or the sampling parameters have moved since the CSR was assembled, the new
+    # mesh mismatches too, and the window must not start.
+    _check_against_vf("freshly rebuilt mesh")
     n = read_n_faces(ply)
     print(f"  [{site['ellipse_id']}] mesh built in {fmt_duration(dt)}: "
           f"{n:,} faces ({ply.stat().st_size / (1024*1024):.1f} MB)")
@@ -574,7 +805,29 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
         standard production R3km SfS mesh (thermal/radiation/output, no
         crop); the **ring** is a coarse LOLA annulus passed to the sim as
         ``mesh.occluder_file`` (shadow-ray BVH only).
-    ``(None, None)`` if the site must be skipped (no usable DEM)."""
+    ``(None, None)`` if the site must be skipped (no usable DEM, or a core
+    mesh that is not the geometry this site's pinned corrected VF was built
+    for -- see ``MeshVFMismatch``)."""
+    try:
+        return _plan_and_build_mesh(site, manifest, catalog, schedule, args)
+    except MeshVFMismatch as e:
+        # One site's mesh/VF pairing is broken. Skip that site; do not take the
+        # rest of the campaign down with it, and do not touch either file.
+        print(f"  [{site['ellipse_id']}] SKIP: {e}", file=sys.stderr)
+        return None, None
+
+
+def _plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
+                         schedule: dict | None, args
+                         ) -> tuple[Path | None, Path | None]:
+    # Face count this site's pinned corrected VF was built for, when it has
+    # one. A cached core mesh that disagrees with it is the wrong geometry for
+    # the matrix the run will load, so it must not be reused; and one that
+    # agrees is reusable no matter how small the file is.
+    vf_csr = vf_replace_path(getattr(args, "vf_replace_dir", None),
+                             site["ellipse_id"])
+    expect_faces = read_csr_n_faces(vf_csr) if vf_csr is not None else None
+
     if not args.extended:
         try:
             dem = resolve_site_dem(site, manifest, catalog, args.dry_run,
@@ -588,7 +841,8 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
                            core_frac=args.roi_core_frac,
                            max_points=args.roi_max_points,
                            density_exp=args.density_exp,
-                           dem_override=dem), None)
+                           dem_override=dem,
+                           expected_faces=expect_faces), None)
 
     # --- core + occluder-ring architecture ---
     ep = extended_params_for(site, schedule, args)
@@ -625,7 +879,8 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
                            core_frac=args.roi_core_frac,
                            max_points=args.roi_max_points,
                            density_exp=args.density_exp,
-                           dem_override=core_dem)
+                           dem_override=core_dem,
+                           expected_faces=expect_faces)
     # Empty-SfS-core fallback: resolve_site_dem can succeed (a covering SfS
     # DEM exists) yet the dtm tool emits a 0-face PLY when SfS pixels are
     # too sparse / holed inside R_core. Catch that and retry with a LOLA-
@@ -647,7 +902,8 @@ def plan_and_build_mesh(site: dict, manifest: dict, catalog: dict | None,
                                core_frac=args.roi_core_frac,
                                max_points=args.roi_max_points,
                                density_exp=args.density_exp,
-                               dem_override=core_dem)
+                               dem_override=core_dem,
+                               expected_faces=expect_faces)
         if read_n_faces(Path(core_mesh)) == 0:
             print(f"  [{site['ellipse_id']}] SKIP: LOLA core also produced "
                   f"0 faces", file=sys.stderr)

@@ -278,11 +278,24 @@ def build_mesh(site: Site, log_path: Path, dry_run: bool,
     ply = mesh_path(site, roi_radius_km, roi_core_frac, roi_max_points)
     MESH_DIR.mkdir(parents=True, exist_ok=True)
 
-    if ply.exists() and ply.stat().st_size > 1_000_000 and read_n_faces(ply) > 0:
-        n_faces = read_n_faces(ply)
-        print(f"  [{site.tag}] mesh already present "
-              f"({ply.name}, {n_faces:,} faces) — skipping mesh build")
-        return ply
+    if ply.exists():
+        # Same rule as a3gt_v2_orchestrator: a mesh is reusable because it is
+        # VALID, not because it is big. This driver carried its own copy of the
+        # `st_size > 1_000_000` floor, which rejects a legitimately coarse
+        # LOLA-fallback core mesh (A03SP010's is 379,264 bytes / 8,746 faces)
+        # and forces the rebuild that stopped the 2026-09-03 campaign. Imported
+        # rather than re-implemented so the two drivers cannot drift apart
+        # again. This driver pins no corrected VF, so validity is the whole
+        # check here.
+        from a3gt_v2_orchestrator import mesh_reuse_reason
+        reason = mesh_reuse_reason(ply)
+        if reason is None:
+            n_faces = read_n_faces(ply)
+            print(f"  [{site.tag}] mesh already present "
+                  f"({ply.name}, {n_faces:,} faces) — skipping mesh build")
+            return ply
+        print(f"  [{site.tag}] WARNING: cached mesh {ply.name} is NOT reusable "
+              f"({reason}) — rebuilding it", file=sys.stderr)
 
     cmd = [
         str(DTM_TOOL),
