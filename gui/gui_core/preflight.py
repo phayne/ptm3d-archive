@@ -247,6 +247,9 @@ class PreflightReport:
     #: whichever one the reader had in mind.
     depth_map_line: str = ""
     depth_map_series_line: str = ""
+    #: Banking finished facet groups: how much this run will bank. Empty
+    #: whenever the feature is off, which is the default.
+    batch_checkpoint_line: str = ""
     #: `gui_core.flux_cubes.LayoutPlan` when the run needs its cube layout
     #: prepared before launch, else None. The launcher CARRIES IT OUT -- it
     #: builds the layout if the plan says build, and either way writes the
@@ -280,6 +283,8 @@ class PreflightReport:
             out.append(f"DEPTH-MAPS: {self.depth_map_line}")
         if self.depth_map_series_line:
             out.append(f"DEPTH-MAPS: {self.depth_map_series_line}")
+        if self.batch_checkpoint_line:
+            out.append(f"BATCH-CHECKPOINT: {self.batch_checkpoint_line}")
         for w in self.warnings:
             out.append(f"WARNING: {w}")
         for i in self.info:
@@ -1643,6 +1648,28 @@ def run_preflight(config, find_executable, project_root=None,
     report.info.extend(depth_findings.info)
     report.depth_map_line = depth_findings.line
     report.depth_map_series_line = depth_findings.series_line
+
+    # -- Banking finished facet groups ----------------------------------------
+    # Silent when the feature is off, so a configuration that does not use it
+    # is never asked to read about it.
+    #
+    # The directory is resolved with the ABSOLUTE output directory, not the one
+    # written in the file: a relative output path in a configuration launched
+    # from anywhere else would otherwise be scanned in the wrong place, and
+    # "nothing is banked here" is precisely the message that must not be wrong.
+    from gui_core import batch_checkpoint as _bc
+    batch_findings = _bc.preflight_findings(
+        config,
+        n_faces=expected_face_count(config),
+        n_frames=positive_int((config.get("simulation") or {}).get(
+            "timesteps")),
+        output_directory=str(resolve_path(
+            (config.get("output") or {}).get("directory", "") or ".",
+            project_root)))
+    report.errors.extend(batch_findings.errors)
+    report.warnings.extend(batch_findings.warnings)
+    report.info.extend(batch_findings.info)
+    report.batch_checkpoint_line = batch_findings.line
 
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)
