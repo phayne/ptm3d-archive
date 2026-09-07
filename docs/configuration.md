@@ -715,6 +715,20 @@ resolve to the same name are refused rather than silently overwriting.
 **`[]` is off and is byte-neutral.** Turning the product on changes no other
 output file; that is an acceptance test of the feature, not a side effect.
 
+**Both list keys must be written as YAML lists, and the engine refuses anything
+else.** `map_depths_m: 0.05` and `map_depths_m: "0.05, 0.25"` are scalars, and a
+scalar iterates as an empty sequence — before 2026-09-06 that produced a
+complete run, exit 0, with no depth maps and nothing in the log; the scalar form
+of `map_depth_stats` reached a refusal that reported the list as *empty* when the
+user had in fact named a statistic. Both now stop the run at config load with a
+message naming the fix. `map_depths_m:` with nothing after it stays legal and
+means the same as `[]` — off. Nothing is coerced: a quoted `"a, b"` is one value,
+not two.
+
+**A depth below the deepest solved node is refused naming `thermal.thermal_b`,**
+which is the YAML key. The engine's own field for it is `grid_b`; the two are
+different strings and only the first is something you can put in a config file.
+
 **Snap to node, and why it is on by default.** A depth between two grid nodes is
 sampled by linear interpolation, and the interpolation error is not small: at a
 lunar-equatorial diurnal amplitude *A* = 160 K it is ~0.195 K for an

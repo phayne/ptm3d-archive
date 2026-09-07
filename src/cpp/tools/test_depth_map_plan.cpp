@@ -79,6 +79,33 @@ void checkRefused(const Request& req, const std::vector<double>& z,
     std::cout << "  ok    " << what << "\n        -> " << refusal << "\n";
 }
 
+// The negative half of a refusal arm: the request must still fail, and the
+// message must NOT contain a string. Needed because "names the fix" is only
+// half the property -- a message can name the right knob AND the wrong one in
+// the same sentence, and `find(must_contain) != npos` cannot see that.
+void checkRefusalLacks(const Request& req, const std::vector<double>& z,
+                       const std::string& must_not_contain,
+                       const std::string& what) {
+    Plan p;
+    std::string refusal;
+    std::vector<std::string> warn;
+    const bool ok = buildPlan(req, z.data(), static_cast<int>(z.size()), 0.0,
+                              0, false, p, refusal, warn);
+    ++g_checks;
+    if (ok) {
+        ++g_failed;
+        std::cout << "  FAIL  " << what << " -- was ACCEPTED, expected a refusal\n";
+        return;
+    }
+    if (refusal.find(must_not_contain) != std::string::npos) {
+        ++g_failed;
+        std::cout << "  FAIL  " << what << " -- the message still contains '"
+                  << must_not_contain << "': " << refusal << "\n";
+        return;
+    }
+    std::cout << "  ok    " << what << "\n";
+}
+
 // A small, deliberately NON-uniform grid: uniform spacing would make several
 // of these checks pass for the wrong reason (the g1-from-dz[i] falsification in
 // test_thermal_wave_depth is exactly that trap).
@@ -373,8 +400,21 @@ int main() {
                      "negative depth");
         checkRefused(baseRequest({std::nan("")}, true), z, "non-finite",
                      "non-finite depth");
-        checkRefused(baseRequest({1.5}, true), z, "thermal.grid_b",
-                     "depth below the deepest node names thermal.grid_b (D9)");
+        // ⛔ `thermal.thermal_b`, NOT `thermal.grid_b`. The C++ FIELD is
+        // `config.thermal.grid_b`; the YAML KEY the parser reads is
+        // `thermal_b` (config_parser.cpp: getWithDefault(thermal, "thermal_b",
+        // config.thermal.grid_b)). The refusal shipped naming the field, so it
+        // told the reader to increase a key that does not exist and that the
+        // engine would silently ignore if they added it
+        // (PTM-DEPTHMAP-REFUSAL-NAMES-A-NONEXISTENT-KEY). Both directions are
+        // asserted: the old spelling is not a substring of the new one, so the
+        // negative arm is what fails if it ever comes back.
+        checkRefused(baseRequest({1.5}, true), z, "thermal.thermal_b",
+                     "depth below the deepest node names the YAML key "
+                     "thermal.thermal_b (D9)");
+        checkRefusalLacks(baseRequest({1.5}, true), z, "thermal.grid_b",
+                          "that refusal does NOT name the C++ field "
+                          "thermal.grid_b, which is not a config key");
         checkRefused(baseRequest({0.05, 0.05}, true), z, "twice",
                      "duplicate requested depths are refused, not deduped");
         checkRefused(baseRequest({0.051, 0.052}, true), z, "resolve to",

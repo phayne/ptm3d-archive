@@ -430,6 +430,27 @@ jobs:
           grep -q '\[test_equilibration_dt\] PASS' eq_dt.log \
             || { echo '::error::test_equilibration_dt printed no PASS verdict'; exit 1; }
 
+      # The depth-map pair. Neither was wired to anything: `test_depth_map_plan`
+      # gates every refusal in thermal/depth_map_plan.h, and `test_config_shape`
+      # gates the YAML list-shape refusals in ConfigParser::loadFromYAML -- the
+      # ones that stop `map_depths_m: 0.05` from being a complete, silent,
+      # subsurface-free run. Both are seconds, need no mesh, no SPICE and no GPU.
+      # A refusal nothing ever fires is a refusal that does not exist, so the
+      # verdict line is grepped as well as the exit status.
+      - name: Build + run depth-map plan test
+        run: |
+          cmake --build build --target test_depth_map_plan -j2
+          ./build/bin/test_depth_map_plan | tee depth_map_plan.log
+          grep -q '^PASS' depth_map_plan.log \
+            || { echo '::error::test_depth_map_plan printed no PASS verdict'; exit 1; }
+
+      - name: Build + run config YAML shape test
+        run: |
+          cmake --build build --target test_config_shape -j2
+          ./build/bin/test_config_shape | tee config_shape.log
+          grep -q '^test_config_shape: PASS' config_shape.log \
+            || { echo '::error::test_config_shape printed no PASS verdict'; exit 1; }
+
       - name: Build + run exosphere unit test
         run: |
           cmake --build build --target test_exosphere_physics -j2 || \

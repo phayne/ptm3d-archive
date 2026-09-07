@@ -949,10 +949,13 @@ def test_the_launch_check_refuses_a_product_over_the_ceiling():
 def test_a_depth_list_that_is_not_a_list_is_refused_and_does_not_crash():
     """⛔ MEASURED on the engine, and the measurement changed the design.
 
-    A hand-edited `map_depths_m: 0.05` -- a forgotten pair of brackets -- makes
-    the engine complete the run, exit 0, and write NO subsurface maps, saying
-    nothing at all. So this is refused here, where somebody is reading, even
-    though the run itself would succeed.
+    A hand-edited `map_depths_m: 0.05` -- a forgotten pair of brackets -- USED
+    TO make the engine complete the run, exit 0, and write NO subsurface maps,
+    saying nothing at all. The engine refuses it at config load now
+    (PTM-DEPTHMAP-SCALAR-SILENT-OFF, config_parser.cpp), and this refusal stays
+    here as well: it is answered beside the control that caused it rather than
+    after a queued run has been dispatched, and a run started from an older
+    binary still behaves the old way.
 
     The second half matters as much: `list(0.05)` RAISES. This is reached from
     a Qt slot, where an escaping exception is not an error message -- PyQt6
@@ -974,8 +977,9 @@ def test_a_depth_list_that_is_not_a_list_is_refused_and_does_not_crash():
         assert problems, f"map_depths_m: {value!r} was accepted in silence"
         findings = dm.preflight_findings(config, n_faces=1000, n_frames=10)
         assert not findings.ok, (
-            f"map_depths_m: {value!r} passed the launch check; the run would "
-            f"finish with no subsurface product and no message")
+            f"map_depths_m: {value!r} passed the launch check; the engine "
+            f"stops on it at config load, and an older binary finishes with "
+            f"no subsurface product and no message")
 
     # ...and the whole application survives it, from load to save.
     manager = ConfigManager()
@@ -993,8 +997,15 @@ def test_a_depth_list_that_is_not_a_list_is_refused_and_does_not_crash():
 
 def test_a_statistic_list_that_is_not_a_list_is_refused():
     """⛔ MEASURED: `map_depth_stats: avg` and a bare `map_depth_stats:` BOTH
-    stop the engine ("output.map_depth_stats is empty", exit 1). Reading the
-    null as "all three" would tick three boxes for a run that will not start.
+    stop the engine, exit 1. Reading the null as "all three" would tick three
+    boxes for a run that will not start.
+
+    They stop it for DIFFERENT reasons, and until 2026-09-06 they reported the
+    same one: the scalar reached "output.map_depth_stats is empty", which is a
+    misdiagnosis of a file that plainly named a statistic
+    (PTM-DEPTHMAP-STATS-SCALAR-MISDIAGNOSED). The scalar is now refused at
+    config load as a shape error; the null still reaches the empty-list clause,
+    where that sentence is true.
     """
     from gui_core import depth_maps as dm
     scalar = {"output": {"map_depths_m": [0.05], "map_depth_stats": "avg"},
