@@ -148,6 +148,7 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `initial_state_file` | string | `""` | Load a per-face `T(z)` checkpoint and skip equilibration (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
 | `final_state_file` | string | `""` | Write a per-face `T(z)` checkpoint at the end of the run |
 | `checkpoint_lookahead_steps` | int | 0 | Extra output steps integrated past the export window, so `final_state_file` is the state at the NEXT window's first epoch (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
+| `state_restore_allow_mismatch` | list | `[]` | Per-field opt-out for the checkpoint identity guards. Names one or more of `depth_grid`, `mesh`, `config`, `body`, `grid_m`, `grid_n`, `grid_b`, `refgrid_H`, `epoch` and downgrades that clause from a refusal to a warning. There is no blanket force |
 | `checkpoint_every_output_steps` | int | 0 | Mid-run checkpoint cadence (0 = chunk boundaries only) |
 | `eq_indirect_source` | string | `auto` | Where the equilibration phase gets its indirect flux: `auto` estimates it from the coupling loop's first sweep, `converged` from its converged sweep (better and ~1.9× the wall clock), `off` is the pre-2026-08 behavior ([radiation-exchange.md §7.7](radiation-exchange.md)) |
 | `eq_indirect_passes` | int | 1 | How many times that estimate is refreshed and the equilibration repeated. Must be ≥ 1. A second `auto` pass is that estimator's knee but the poorest value on offer — spend on `eq_indirect_source: converged` first ([radiation-exchange.md §7.7](radiation-exchange.md)) |
@@ -187,12 +188,97 @@ Three things to know before relying on one.
   `float64`, so writing a checkpoint rounds each value once, at the write.
   Restoring is exact. A CPU → file → CPU round trip therefore reproduces the
   file bit-for-bit and the in-memory column to `float32` precision.
-- **The file does not record the depth grid.** It carries the shape and nothing
-  else, so a checkpoint written on one grid will load onto a different grid that
-  happens to have the same layer count. The engine prints the live grid
-  (`n_layers`, `z[0]`, `dz[0]`, `z_max`) at both the write and the restore, and
-  says in the restore message which quantities it could not verify — compare the
-  two lines when resuming across a configuration change.
+- **The write is atomic.** The engine writes a temporary file beside the
+  destination, `fsync`s it and renames it into place, so at every instant the
+  destination is either the previous complete checkpoint or the new one — never
+  a prefix of either.
+
+
+#### The v2 identity trailer
+
+A checkpoint written by this engine version is **PTMT v2**: the v1 header and
+body are unchanged byte for byte, and an *identity trailer* is appended after
+them. Every state banked before v2 existed still loads.
+
+The trailer records what the column was integrated with:
+
+| Field | What it is for |
+|---|---|
+| `z[n_layers]` | the depth grid, so a restore onto a **different** grid with the same layer count is caught |
+| `et_seconds` | the SPICE ephemeris time the column is valid at |
+| `output_cadence_s` | the writing run's output cadence |
+| `refgrid_H`, `grid_m/n/b` | the grid parameters, named individually so a mismatch report is actionable |
+| `mesh_geomhash` | a face-area hash of the mesh |
+| `config_identity_hash` | the resolved thermophysical scalars and grid parameters — see below for what it does **not** cover |
+| `body_name`, `engine_git_sha` | provenance |
+| `flags` | pre- or post-radiation-coupling, whether every face was patched, and whether the writing run had `coupling_select_dt > 0` |
+| `crc32` | a checksum over the **whole file**, so a length-correct but zero-filled cloud-sync placeholder cannot pass as a checkpoint |
+
+`ptm_state_info <file>` prints all of it, verifies the checksum, and — given
+`--body`/`--m`/`--n`/`--b` — cross-checks the depth grid the file *records*
+against the grid those settings would *build*.
+
+**What the physics hash does not cover.** Per-face maps (albedo, thermal
+inertia, `H`) and a per-face `Qb` mask change the physics face by face and are
+outside the hash; so are the view factors. Two runs that differ only in a loaded
+map can produce the same hash. `src/cpp/thermal/state_identity.h` is the single
+list of what is hashed, and the engine prints that boundary in the log whenever
+a checkpoint is in play.
+
+**`W(0)` is reserved and always written as NaN.** It is an input to a
+warm-start admissibility rule that is not shipped. Computing it needs a
+reduction over the output-window surface time series, which exists at the moment
+of the write on some solver paths and not on others, so populating it where it
+happens to be available would make a present field mean different things
+depending on which solver ran. `ptm_state_info` reports it as "not recorded".
+
+
+#### What a restore refuses
+
+A restore compares the trailer against the live run. Each clause refuses
+independently and names itself:
+
+| Clause | Behavior |
+|---|---|
+| `depth_grid` | the recorded `z[]` differs elementwise (relative 1e-12) → **refuse**, naming the first node |
+| `mesh` | `mesh_geomhash` differs → **refuse** |
+| `config` | `config_identity_hash` differs → **refuse** |
+| `body` | a different body → **refuse** |
+| `grid_m` / `grid_n` / `grid_b` / `refgrid_H` | → **refuse**, naming the knob |
+| `epoch` | see below |
+| batch-completion partial | → **refuse**, and this one is not overridable |
+
+`thermal.state_restore_allow_mismatch` takes a **list of those field names** and
+downgrades each named clause to a loud warning. There is deliberately no
+blanket force: turning every guard off at once is the warn-instead-of-refuse
+policy under a different name, and warning instead of refusing is what made the
+original checkpoint defect possible.
+
+**The epoch clause is the one that separates a hand-off from a warm start.**
+
+- The checkpoint's epoch equals this run's first integrated epoch → the states
+  **tile** the timeline. This is the chunked workflow, and it passes silently.
+- The checkpoint is **behind** by up to one output cadence → a hand-off written
+  without `checkpoint_lookahead_steps: 1`, so the restored column is one step
+  stale. The run **warns**, printing both epochs and the cadence, and continues.
+- The checkpoint is **behind** by more than that → the banked column is a state
+  that never existed at this run's epoch. The run **refuses**.
+- The checkpoint is **ahead** of this run's first epoch → the two windows
+  **overlap**: the run would re-integrate a span the column has already passed.
+  The run **refuses**, with its own message, because the advice for a stale
+  hand-off would make an overlap worse.
+
+That last case is not a formality. A cross-season warm start measured on one
+A3GT site moved `temperature_min` by 5.75 K rms and 49.9 K maximum, and shifted
+the ice-stability depth product by 19.3 percentage points — and no check in the
+QA battery detected it. Chaining is admissible only where the states tile the
+timeline, which is what `scripts/run_chunked_simulation.py` does within a
+window; across windows or seasons it is not.
+
+**A v1 file still loads.** It cannot answer any of the questions above, so the
+restore prints one line per unverified quantity, naming each, instead of
+proceeding in silence. Re-bank the state on the current engine to get real
+guards.
 
 Setting `initial_state_file` forces `equilibration_orbits` to 0 and disables the
 analytic clear-sky pre-conditioner: a restored column is a continuation, and
@@ -606,7 +692,72 @@ gpu:
 | `depths_file` | string | `""` | Depth list for location exports |
 | `skip_time_series` | bool | false | Skip per-step binaries; statistics are still computed |
 | `write_raw_stats` | bool | false | Write merge-friendly raw statistics for the chunked workflow |
+| `map_depths_m` | list of float | `[]` | Depths (m) at which to write mesh-wide temperature maps. `[]` = off |
+| `map_depth_snap_to_node` | bool | true | Snap each requested depth to the nearest solved grid node |
+| `map_depth_stats` | list of string | `[avg, max, min]` | Which statistics to write per depth |
 | `skip_mesh` | bool | false | Do not copy `mesh.ply` into the output directory |
+
+### Subsurface temperature maps (`map_depths_m`)
+
+Mesh-wide temperature statistics **at depth**, written beside the surface ones
+and reduced over the same integration window:
+
+```
+statistics/temperature_z0p050m_{avg,max,min}.bin   uint32 face count + float32 per face
+statistics/depth_map_z.json                        what was asked for, what was sampled
+statistics/_raw/temperature_z0p050m_{sum,count}.bin  (with write_raw_stats, for the chunk merge)
+```
+
+The file name carries the **resolved** depth to three decimals with `.` written
+`p`, so it is sortable, filesystem-safe and reversible. Two requests that
+resolve to the same name are refused rather than silently overwriting.
+
+**`[]` is off and is byte-neutral.** Turning the product on changes no other
+output file; that is an acceptance test of the feature, not a side effect.
+
+**Snap to node, and why it is on by default.** A depth between two grid nodes is
+sampled by linear interpolation, and the interpolation error is not small: at a
+lunar-equatorial diurnal amplitude *A* = 160 K it is ~0.195 K for an
+instantaneous value, which is over this project's 0.15 K reference floor by
+itself, and it grows with harmonic number because harmonic *h* propagates with
+skin depth `delta/sqrt(h)`. Only a depth landing **on** a node avoids it, so the
+default snaps and reports the snapped depth plus the residual. Set
+`map_depth_snap_to_node: false` to sample the depth as asked; the run then
+prints what that costs, and `depth_map_z.json` carries the per-harmonic budget.
+
+**avg, max and min do not have the same error budget.** Averaging commutes with
+interpolation in *z* exactly; max and min do not, because adjacent layers peak at
+different times. That is why `max`/`min` are accumulated **in the solver at the
+requested depth** rather than interpolated from per-layer extrema afterwards --
+the latter costs `1.229e-3 * A` and is worst at layer 0. `depth_map_z.json`
+therefore reports two separate coefficient arrays per depth, and they are not
+interchangeable: `bias_instantaneous_per_A_by_harmonic` is a rigorous upper bound
+(on a time series and, since `|max f - max g| <= max|f - g|`, on the maps too),
+while `bias_max_per_A_by_harmonic` is the smaller typical error in the max.
+
+**z = 0 is the surface product.** The `z=0` map is the same quantity as
+`statistics/temperature_{avg,max,min}.bin`, sampled at the same instants from the
+same re-evaluated surface node. On the CPU SIMD-batch path all three are
+byte-identical to their surface counterparts; on the GPU path `max` and `min` are
+byte-identical and `avg` differs by the device's float32 running-sum error
+(measured 7.6e-5 K over a 118-frame window). Use that identity as a plumbing
+check on any new run.
+
+**Which solver paths carry it.** The CPU SIMD-batch solver (the shipped default),
+the GPU persistent solver on any device count, and the GPU radiation-coupling
+selected-faces re-thermal. The **CPU scalar** path (`--no-simd-batch`) gives every
+face its own depth grid, so one set of per-depth node indices and weights cannot
+describe it; that path, and a radiation-coupled run on the CPU solver, **refuse**
+rather than sample the wrong nodes. Every refusal names the fix.
+
+**Chunked runs.** With `write_raw_stats: true`, `ptm_merge_chunks` discovers the
+depth fields from chunk 0 and refuses if any chunk carries a different depth set
+or a different statistic set. `depth_map_z.json` is carried through to the merged
+directory.
+
+**Not implemented here**, and deliberately absent rather than present-and-dead:
+a per-depth **time series** (5 depths x 1440 frames at 2.4M faces is 64 GiB, a
+disk event rather than a product) and an arch-B **native-grid** export.
 
 ## thermophysical
 

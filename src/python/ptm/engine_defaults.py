@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-185 keys across 11 sections.
+189 keys across 11 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -34,9 +34,12 @@ KEYS_WITHOUT_DEFAULT = (
     'flux_cubes.locations',
     'generic_body.shape.semi_axes_km',
     'illumination.gpu_device_ids',
+    'output.map_depth_stats',
+    'output.map_depths_m',
     'radiation.gpu_device_ids',
     'thermal.gpu_batch_size',
     'thermal.gpu_device_ids',
+    'thermal.state_restore_allow_mismatch',
 )
 
 #: {dotted YAML key: engine default}. Every key is optional -- the parser has
@@ -114,6 +117,9 @@ ENGINE_DEFAULTS = {
     'output.include_primary_ir': False,
     'output.location_data': '',
     'output.locations_file': '',
+    'output.map_depth_snap_to_node': True,
+    'output.map_depth_stats': None,
+    'output.map_depths_m': None,
     'output.series_output': '',
     'output.skip_mesh': False,
     'output.skip_time_series': False,
@@ -209,6 +215,7 @@ ENGINE_DEFAULTS = {
     'thermal.seed_anchor': 'lumped',
     'thermal.seed_anchor_refuse_two_timescale': False,
     'thermal.spinup_seed': 'physical',
+    'thermal.state_restore_allow_mismatch': None,
     'thermal.thermal_b': 15,
     'thermal.thermal_inertia_map': '',
     'thermal.thermal_m': 10,

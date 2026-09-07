@@ -98,12 +98,14 @@
 // construction -- so the probes are node MIDPOINTS, w = 0.5.
 
 #include "../thermal/thermal_model.h"
+#include "../thermal/depth_map_plan.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -798,6 +800,275 @@ int main() {
                     "       depth landing ON a node avoids either.\n",
                     worst_interp_K, A1, worst_interp_K / A1,
                     kAeq * worst_interp_K / A1, kAeq, A_meas_K, kAeq);
+    }
+
+    // ---- 6. THE SHIPPING PRODUCT PATH, end to end -------------------------
+    //
+    // Sections 3-5 score quantities THIS FILE computes for itself. That is a
+    // gate on the solver, not on the product: every arithmetic step between the
+    // solved column and statistics/temperature_z*.bin -- resolving a requested
+    // depth to (j, w), sampling a strided column, replacing the massless
+    // surface node, reducing to avg/max/min -- lived outside it. A wrong node
+    // index or a dropped surface override would have passed everything above.
+    //
+    // So this section drives the SHIPPING code:
+    //   thermal::depthmap::buildPlan      (the same call the engine makes)
+    //   thermal::depthmap::Accumulator    (the same object both solver drivers
+    //                                      fold their columns into)
+    // over the engine's own recorded period, and scores the result against the
+    // analytic reference at the RESOLVED depth, with a bound that has no fitted
+    // constant in it.
+    {
+        using namespace thermal::depthmap;
+        std::printf("\n  --- 6. the shipping depth-map product path, end to end "
+                    "---\n");
+
+        // Three probes, and the FIRST of them is load-bearing:
+        //   z = 0        the surface node, j = 0 -- the ONLY probe that enters
+        //                the surface-override branch. Without it W12 below is
+        //                vacuous, which is exactly what it was until a
+        //                falsification run (override disabled) left W12 passing.
+        //                A guard whose input is never varied is invisible.
+        //   an interior NODE (w = 0)   isolates the plumbing: no arithmetic.
+        //   the MIDPOINT of that cell (w = 0.5)  the worst case for
+        //                interpolation. z = 0 cannot exercise it at all.
+        int j_probe = 1;
+        while (j_probe + 2 < last_scored && base.z[j_probe] < 2.0 * delta) ++j_probe;
+        const double z_node = base.z[j_probe];
+        const double z_mid  = 0.5 * (base.z[j_probe] + base.z[j_probe + 1]);
+        std::printf("     probes: z=0 (the surface node, j=0), node j=%d at "
+                    "z/delta=%.3f, and the midpoint of cell [%d,%d] at "
+                    "z/delta=%.3f\n",
+                    j_probe, z_node / delta, j_probe, j_probe + 1, z_mid / delta);
+
+        Request req;
+        req.depths_m = { 0.0, z_node, z_mid };
+        req.snap_to_node = false;           // sample the midpoint as asked
+        Plan plan;
+        std::string refusal;
+        std::vector<std::string> warn;
+        const bool built = buildPlan(req, base.z.data(), base.n_nodes, delta,
+                                     /*n_faces*/ 0, /*with_raw*/ false, plan,
+                                     refusal, warn);
+        check(built, "W8: the shipping planner resolves both probe depths against "
+                     "the engine's own grid" + (built ? "" : (" -- " + refusal)));
+        if (!built) {
+            std::printf("\n=== %d/%d checks passed ===\n", g_checks - g_failed,
+                        g_checks);
+            return 1;
+        }
+        check(plan.entries[0].on_node && plan.entries[0].j == 0 &&
+                  plan.entries[0].w == 0.0,
+              "W8b: the z=0 probe resolves to (j, w) = (0, 0), i.e. the surface "
+              "node -- the one probe that reaches the override branch");
+        check(plan.entries[1].on_node && plan.entries[1].j == j_probe &&
+                  plan.entries[1].w == 0.0,
+              "W9: the node probe resolves to (j, w) = (" +
+                  std::to_string(j_probe) + ", 0) -- the plan indexes the node "
+                  "the depth actually is, not a neighbor");
+        check(!plan.entries[2].on_node && plan.entries[2].j == j_probe &&
+                  std::fabs(plan.entries[2].w - 0.5) < 1e-12,
+              "W10: the midpoint probe resolves to w = 0.5");
+
+        // Fold the engine's own recorded period through the SHIPPING
+        // accumulator, one column per epoch, exactly as a solver driver does.
+        // Face 0 uses the recorded column as-is; face 1 is fed a deliberately
+        // CORRUPTED surface node together with the correct value as the
+        // `surface_override`, which is the path the CPU SIMD driver takes (the
+        // massless surface is re-evaluated, not read out of the column). If the
+        // override were dropped, face 1 would not match face 0.
+        Accumulator acc;
+        acc.allocate(plan.size(), 2);
+        std::vector<double> col(base.n_nodes), col_bad(base.n_nodes);
+        for (int s = 0; s < base.S; ++s) {
+            for (int j = 0; j < base.n_nodes; ++j) col[j] = base.T[j][s];
+            col_bad = col;
+            col_bad[0] = -999.0;            // would be catastrophic if used
+            acc.addColumn(plan, 0, col.data(), 1);
+            const double surf_s = base.T[0][s];
+            acc.addColumn(plan, 1, col_bad.data(), 1, &surf_s);
+        }
+        check(acc.count[0] == static_cast<std::uint32_t>(base.S) &&
+                  acc.count[1] == acc.count[0],
+              "W11: the accumulator folded every sample of the recorded period");
+
+        bool override_ok = true;
+        for (std::size_t d = 0; d < plan.size(); ++d) {
+            if (acc.sum[d * 2 + 0]  != acc.sum[d * 2 + 1] ||
+                acc.vmax[d * 2 + 0] != acc.vmax[d * 2 + 1] ||
+                acc.vmin[d * 2 + 0] != acc.vmin[d * 2 + 1]) override_ok = false;
+        }
+        check(override_ok,
+              "W12: a column whose node 0 is corrupted to -999 K, folded WITH the "
+              "correct surface override, gives bit-identical avg/max/min at every "
+              "probe INCLUDING z=0 -- so the override reaches the surface node, and "
+              "the deeper probes prove it reaches nothing else");
+        // Make the falsification explicit: without the override, face 1's z=0
+        // product WOULD be -999 K. Assert that the corrupted value is not what
+        // came out, so a future refactor that quietly drops the override is
+        // caught by a check that names the failure rather than by a bit compare.
+        check(acc.vmin[0 * 2 + 1] > 0.0 && acc.vmin[0 * 2 + 0] > 0.0,
+              "W12b: and neither face's z=0 minimum is the -999 K sentinel, so the "
+              "override was genuinely consulted rather than the corruption ignored");
+
+        // --- plumbing, exact: the product equals a direct reduction ---------
+        for (std::size_t d = 0; d < plan.size(); ++d) {
+            const Entry& e = plan.entries[d];
+            double sum = 0.0, mx = -1e300, mn = 1e300;
+            for (int s = 0; s < base.S; ++s) {
+                const double v = e.on_node
+                    ? base.T[e.j][s]
+                    : (1.0 - e.w) * base.T[e.j][s] + e.w * base.T[e.j + 1][s];
+                sum += v;
+                mx = std::max(mx, v);
+                mn = std::min(mn, v);
+            }
+            // max and min are SELECTIONS -- no arithmetic -- so they must be
+            // bit-identical, and a wrong node index or a wrong weight shows up
+            // in the last bit. The SUM is a different matter: an S-term
+            // accumulation is reassociated by the vectorizer, so the two orders
+            // can differ by at most (S-1)*u*sum|x|. That bound is derived here,
+            // not chosen, and at S=768 it is ~1e-8 K on a ~1.5e5 K sum, i.e.
+            // ~1e-11 K on the average the product actually writes.
+            const double reassoc = static_cast<double>(base.S) *
+                                   std::numeric_limits<double>::epsilon() *
+                                   std::fabs(sum);
+            const bool sel_exact = (acc.vmax[d * 2 + 0] == mx) &&
+                                   (acc.vmin[d * 2 + 0] == mn);
+            const double sum_err = std::fabs(acc.sum[d * 2 + 0] - sum);
+            std::printf("     [W13] %-22s max/min bit-exact: %s   sum |d| %.3e "
+                        "(reassociation bound %.3e, = %.2e K on the average)\n",
+                        e.field.c_str(), sel_exact ? "yes" : "NO", sum_err,
+                        reassoc, sum_err / base.S);
+            check(sel_exact,
+                  "W13[" + e.field + "]: the shipping accumulator's max and min "
+                  "are BIT-IDENTICAL to a direct reduction of the interpolated "
+                  "series (they are selections; a wrong node or weight would "
+                  "move the last bit)");
+            check(sum_err <= reassoc,
+                  "W13b[" + e.field + "]: and its sum agrees to within the "
+                  "floating-point reassociation bound");
+        }
+
+        // --- physics: score the product against the analytic reference ------
+        //
+        // The bound has two parts and no fitted constant:
+        //   discretization  the scheme's own predicted error at the bracketing
+        //                   nodes, from the discrete dispersion relation used
+        //                   throughout this file;
+        //   interpolation   sum_h A_h * bias_instantaneous_per_A[h], read out of
+        //                   THE PLAN -- i.e. the very numbers written into
+        //                   statistics/depth_map_z.json. Scoring against them is
+        //                   what makes that manifest a checked claim instead of
+        //                   an unverified annotation.
+        std::vector<std::vector<cd>> pred_exp(kNHarm + 1);
+        for (int n = 1; n <= kNHarm; ++n) pred_exp[n] = predictedExponent(base, n);
+
+        std::printf("     depth      |  max: product   analytic    |err|      "
+                    "bound(disc+interp)  ratio\n");
+        for (std::size_t d = 0; d < plan.size(); ++d) {
+            const Entry& e = plan.entries[d];
+            const double zq = e.resolved_m;
+
+            // Analytic series at zq, rebuilt by superposition from the MEASURED
+            // surface harmonics (the same construction section 5 uses).
+            double ana_max = -1e300, ana_mean = 0.0;
+            for (int sidx = 0; sidx < base.S; ++sidx) {
+                double v = base.mean_z[0];
+                for (int n = 1; n <= kNHarm; ++n) {
+                    const double d_n = delta / std::sqrt(static_cast<double>(n));
+                    const cd prop = std::exp(cd(-zq / d_n, -zq / d_n));
+                    const double th = 2.0 * M_PI * n * sidx / base.S;
+                    v += std::real(base.H[n][0] * prop *
+                                   cd(std::cos(th), std::sin(th)));
+                }
+                ana_max = std::max(ana_max, v);
+                ana_mean += v;
+            }
+            ana_mean /= base.S;
+
+            // Discretization at the bracketing nodes, summed over harmonics.
+            double disc = 0.0;
+            for (int n = 1; n <= kNHarm; ++n) {
+                const double d_n = delta / std::sqrt(static_cast<double>(n));
+                const double An = std::abs(base.H[n][0]);
+                for (int jj : { e.j, std::min(e.j + 1, base.n_nodes - 1) }) {
+                    const cd sch = std::exp(-pred_exp[n][jj]);
+                    const cd tru = std::exp(cd(-base.z[jj] / d_n, -base.z[jj] / d_n));
+                    disc = std::max(disc, An * std::abs(sch - tru));
+                }
+            }
+            // Interpolation, from the plan's own published coefficients.
+            double interp_bound = 0.0;
+            for (int h = 1; h <= kBiasHarmonics; ++h) {
+                interp_bound += std::abs(base.H[h][0]) * e.bias_inst_per_A[h - 1];
+            }
+            const double bound = disc + interp_bound;
+
+            const double prod_max = acc.vmax[d * 2 + 0];
+            const double err = std::fabs(prod_max - ana_max);
+            std::printf("     %-10s |  %9.4f  %9.4f  %8.5f   %8.5f            "
+                        "%6.3f\n",
+                        e.field.c_str(), prod_max, ana_max, err, bound,
+                        (bound > 0.0) ? err / bound : 0.0);
+            check(err <= bound + 1e-4,
+                  "W14[" + e.field + "]: the max the PRODUCT would write is within "
+                  "the derived bound of the analytic max at the resolved depth "
+                  "(err " + std::to_string(err) + " K, bound " +
+                  std::to_string(bound) + " K)");
+
+            const double prod_avg = acc.sum[d * 2 + 0] / acc.count[0];
+            check(std::fabs(prod_avg - ana_mean) <= bound + 1e-4,
+                  "W15[" + e.field + "]: the avg the PRODUCT would write is within "
+                  "the same bound of the analytic mean (err " +
+                  std::to_string(std::fabs(prod_avg - ana_mean)) + " K)");
+        }
+
+        // --- snap-to-node is a real behavior change, end to end -------------
+        {
+            Request rq2 = req;
+            rq2.depths_m = { z_mid };
+            rq2.snap_to_node = true;
+            Plan p2;
+            std::string r2;
+            std::vector<std::string> w2;
+            check(buildPlan(rq2, base.z.data(), base.n_nodes, delta, 0, false, p2,
+                            r2, w2),
+                  "W16: the same midpoint request builds with snap-to-node on");
+            Accumulator a2;
+            a2.allocate(p2.size(), 1);
+            for (int sidx = 0; sidx < base.S; ++sidx) {
+                for (int j = 0; j < base.n_nodes; ++j) col[j] = base.T[j][sidx];
+                a2.addColumn(p2, 0, col.data(), 1);
+            }
+            // It snapped to ONE of the bracketing nodes; whichever it was, the
+            // product must now be that node's own series, exactly.
+            const int jn = p2.entries[0].on_node && p2.entries[0].w == 0.0
+                               ? p2.entries[0].j : p2.entries[0].j + 1;
+            double mx = -1e300;
+            for (int sidx = 0; sidx < base.S; ++sidx)
+                mx = std::max(mx, base.T[jn][sidx]);
+            check(a2.vmax[0] == mx,
+                  "W17: with snap-to-node ON the product is the SNAPPED node's own "
+                  "series, bit-for-bit -- the interpolation is genuinely bypassed, "
+                  "not merely re-weighted");
+            // "Zero" here means zero to round-off: the coefficients are
+            // differences of exponentials that cancel identically at w = 0 or
+            // w = 1, so the residue is ~1e-17, not a bit pattern.
+            double snapped_budget = 0.0;
+            for (int h = 0; h < kBiasHarmonics; ++h) {
+                snapped_budget = std::max(snapped_budget,
+                    std::max(std::fabs(p2.entries[0].bias_inst_per_A[h]),
+                             std::fabs(p2.entries[0].bias_max_per_A[h])));
+            }
+            check(snapped_budget < 1e-14,
+                  "W18: and the published error budget for the snapped depth is "
+                  "zero at every harmonic to round-off (" +
+                  std::to_string(snapped_budget) + ")");
+            check(std::fabs(p2.entries[0].residual_m) > 0.0,
+                  "W19: while the residual records how far it moved, so the snap "
+                  "cannot pass unnoticed");
+        }
     }
 
     std::printf("\n=== %d/%d checks passed ===\n", g_checks - g_failed, g_checks);

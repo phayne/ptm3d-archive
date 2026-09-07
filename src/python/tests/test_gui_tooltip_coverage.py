@@ -782,6 +782,11 @@ _POLICY_ENUMS = [
     "generic_body.ephemeris_source",
     "thermal.property_map_mode",
     "thermal.property_map_kind",
+    # Which form the temperature at depth takes. One of the two choices is a
+    # product this model does not write, and the tooltip has to say which -- a
+    # combo whose second entry is refused at launch, with no explanation on the
+    # control, is worse than no control.
+    "output.map_depth_product",
     # Which of two placement workflows the flux-cube group offers. Picking one
     # decides what the layout tool is asked to build -- a lattice or a set of
     # named points -- so each choice has to be explained by name.

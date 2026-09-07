@@ -12,6 +12,8 @@ defined in ``ptm/results.py``.
 
 from ptm.results import (  # noqa: F401
     BODY_RADII,
+    DEPTH_FIELD_RE,
+    DEPTH_MANIFEST_NAME,
     FIELD_INFO,
     NICE_RESOLUTIONS,
     POLAR_LAT_THRESHOLD,
@@ -24,15 +26,22 @@ from ptm.results import (  # noqa: F401
     _forward_polar_stereo,
     _inverse_polar_stereo,
     choose_projection,
+    depth_entries,
+    depth_of_field,
     detect_available_statistics,
     detect_body_from_mesh,
+    discover_depth_fields,
     field_catalog,
+    field_info,
     read_binary_data,
+    read_depth_manifest,
     read_ply_mesh_minimal,
 )
 
 __all__ = [
     "BODY_RADII",
+    "DEPTH_FIELD_RE",
+    "DEPTH_MANIFEST_NAME",
     "FIELD_INFO",
     "NICE_RESOLUTIONS",
     "POLAR_LAT_THRESHOLD",
@@ -43,9 +52,14 @@ __all__ = [
     "GridResolutionEstimator",
     "MeshRegridder",
     "choose_projection",
+    "depth_entries",
+    "depth_of_field",
     "detect_available_statistics",
     "detect_body_from_mesh",
+    "discover_depth_fields",
     "field_catalog",
+    "field_info",
     "read_binary_data",
+    "read_depth_manifest",
     "read_ply_mesh_minimal",
 ]

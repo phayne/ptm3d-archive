@@ -44,6 +44,7 @@ from ptm.results import (                                          # noqa: E402,
 from ptm.results import FIELD_INFO as _FIELD_INFO_ASCII            # noqa: E402
 from ptm.results import STATISTICS_FIELDS as _STATS_FIELDS_ASCII   # noqa: E402
 from ptm.results import detect_available_statistics as _detect_stats_in_dir  # noqa: E402
+from ptm.results import field_info as _results_field_info           # noqa: E402
 
 try:
     import rasterio
@@ -73,6 +74,25 @@ except ImportError:
 # is requested explicitly instead of being carried by a second copy of the dict.
 FIELD_INFO = field_catalog(_FIELD_INFO_ASCII, units_style='unicode')
 STATISTICS_FIELDS = field_catalog(_STATS_FIELDS_ASCII, units_style='unicode')
+
+
+def field_info(base_field):
+    """Label and units for a statistics field, in this module's unit spelling.
+
+    Wraps `ptm.results.field_info` so a SUBSURFACE TEMPERATURE MAP gets a label
+    and a unit here too. Those fields are named for the depth they hold, so no
+    fixed catalog can carry them; without this they reached the export dialog
+    as a bare `temperature_z0p298m` with `units = ''`, while the raster
+    exporter labeled the same file "Temperature at 0.298 m depth" in kelvin.
+
+    The fixed catalog is consulted FIRST because it is the unicode-spelled one
+    (`W/m²`, which is what this module writes into GeoTIFF and HDF5 tags). A
+    depth map is in kelvin, where the two spellings agree.
+    """
+    info = STATISTICS_FIELDS.get(base_field)
+    if info:
+        return dict(info)
+    return _results_field_info(base_field)
 
 # BODY_RADII, STAT_TYPES, STAT_LABELS, NICE_RESOLUTIONS, POLAR_LAT_THRESHOLD,
 # detect_body_from_mesh, choose_projection, _forward_polar_stereo,
@@ -230,7 +250,7 @@ class GeoTIFFExporter:
             # Statistics field with avg/max/min suffix (e.g. 'temperature_avg').
             parts = field_name.rsplit('_', 1)
             if len(parts) == 2 and parts[1] in STAT_LABELS:
-                base_info = STATISTICS_FIELDS.get(parts[0], {})
+                base_info = field_info(parts[0])
                 if base_info:
                     info = {
                         'label': f"{base_info['label']} ({STAT_LABELS[parts[1]]})",
@@ -238,7 +258,7 @@ class GeoTIFFExporter:
                     }
         if not info:
             # Scalar statistics field (e.g. 'ice_depth' — no _avg/_max/_min).
-            base_info = STATISTICS_FIELDS.get(field_name, {})
+            base_info = field_info(field_name)
             if base_info:
                 info = {
                     'label': base_info.get('label', field_name),
@@ -320,7 +340,7 @@ class GeoTIFFExporter:
             stat_type: Statistic type ('avg', 'max', 'min', or None for
                 scalar single-band fields like ice_depth).
         """
-        info = STATISTICS_FIELDS.get(base_field, {})
+        info = field_info(base_field)
         if stat_type is None:
             field_name = base_field
             units = info.get('units', '')
@@ -471,7 +491,7 @@ class HDF5Exporter:
                     'Per-face statistics computed over integration window'
                 )
                 for (base_field, stat_type), face_data in statistics_data.items():
-                    info = STATISTICS_FIELDS.get(base_field, {})
+                    info = field_info(base_field)
                     if stat_type is None:
                         # Scalar field (e.g. ice_depth): no _<stat> suffix.
                         key = base_field
@@ -498,7 +518,7 @@ class HDF5Exporter:
                 reg_stats.attrs['projection'] = regridder.projection
                 reg_stats.attrs['resolution_degrees'] = regridder.resolution
                 for (base_field, stat_type), grid_data in regridded_statistics.items():
-                    info = STATISTICS_FIELDS.get(base_field, {})
+                    info = field_info(base_field)
                     if stat_type is None:
                         key = base_field
                         description = info.get('label', base_field)
@@ -669,7 +689,7 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
         lines.append("Per-face statistics computed over the integration window:")
         lines.append("")
         for base_field, stat_type in statistics:
-            info = STATISTICS_FIELDS.get(base_field, {})
+            info = field_info(base_field)
             label = info.get('label', base_field)
             units = info.get('units', '')
             units_str = f" ({units})" if units else ""
@@ -903,9 +923,7 @@ class DataExportWorker(QThread):
                 # use the stat_type-suffixed filenames.
                 is_scalar = stat_type is None
                 if is_scalar:
-                    field_label = STATISTICS_FIELDS.get(
-                        base_field, {}
-                    ).get('label', base_field)
+                    field_label = field_info(base_field).get('label', base_field)
                     self.status_updated.emit(
                         f"Processing statistic: {field_label}..."
                     )

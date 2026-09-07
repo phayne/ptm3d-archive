@@ -19,8 +19,10 @@
 // WHAT IT CANNOT TELL YOU, and says so out loud. The v1 format records the
 // SHAPE and nothing else: no depth grid, no epoch, no body, no thermophysics,
 // no mesh identity, no coupling state. Those are BUGS.md PTM-STATE-GRID-BLIND
-// and PTM-STATE-NO-EPOCH, and they are open. This tool prints them as
-// unanswered questions rather than omitting them, because a report that is
+// and PTM-STATE-NO-EPOCH. A PTMT v2 file closes them by carrying an identity
+// trailer, which this tool prints in full and whose CRC32 it verifies over the
+// whole file. For a v1 file the questions are still unanswered, and this tool
+// prints them as unanswered rather than omitting them, because a report that is
 // silent about what it did not check reads exactly like one that checked.
 //
 // No mesh, no view factors, no SPICE, no GPU: safe to run while a production
@@ -55,10 +57,16 @@ const char* kUsage =
 "    non-finite / unphysical counts that tell an all-zero cold-start column\n"
 "    (BUGS.md PTM-78) apart from a real integrated one.\n"
 "\n"
+"    A PTMT v2 file carries an IDENTITY TRAILER -- the depth grid, the epoch,\n"
+"    the body, the grid parameters, a mesh geometry hash, a physics hash and\n"
+"    the coupling flags -- and a CRC32 over the whole file. This tool prints\n"
+"    the trailer, verifies the checksum, and (given --body) cross-checks the\n"
+"    depth grid the file RECORDS against the grid those settings would BUILD.\n"
+"\n"
 "    The v1 format records n_faces and n_layers AND NOTHING ELSE. It carries no\n"
-"    depth grid, no epoch, no body and no thermophysical properties, so this\n"
-"    tool cannot verify that a checkpoint belongs to the run you mean to\n"
-"    restore it into. It names each of those unanswered questions explicitly\n"
+"    depth grid, no epoch, no body and no thermophysical properties, so on a v1\n"
+"    file this tool cannot verify that a checkpoint belongs to the run you mean\n"
+"    to restore it into. It names each of those unanswered questions explicitly\n"
 "    rather than leaving them out of the report.\n"
 "\n"
 "    Given a body and grid parameters (--body/--m/--n/--b and the property\n"
@@ -88,8 +96,9 @@ const char* kUsage =
 "\n"
 "EXIT STATUS\n"
 "    0   every file named is a structurally valid PTMT checkpoint\n"
-"    1   at least one file is missing, malformed, truncated, or (with a grid)\n"
-"        disagrees with the reconstructed layer count\n"
+"    1   at least one file is missing, malformed, truncated, carries a trailer\n"
+"        that fails its own checksum or layout, or (with a grid) disagrees with\n"
+"        the reconstructed layer count or depth grid\n"
 "    2   usage error\n"
 "\n"
 "EXAMPLES\n"
@@ -313,6 +322,17 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        // The identity trailer, if the file has one. readTrailer() streams the
+        // whole file to verify its CRC32, so a length-correct but zero-filled
+        // cloud-sync placeholder -- which probe() and the magic check both pass
+        // -- is caught here and nowhere else.
+        thermal::state_io::Trailer tr;
+        std::string tr_err;
+        const auto tr_status = thermal::state_io::readTrailer(path, tr, tr_err);
+        const bool have_tr =
+            (tr_status == thermal::state_io::TrailerStatus::Ok);
+        if (tr_status == thermal::state_io::TrailerStatus::Malformed) ++bad;
+
         std::vector<float> T;
         if (!thermal::state_io::read(path, info.n_faces, info.n_layers, T, err)) {
             ++bad;
@@ -362,8 +382,42 @@ int main(int argc, char** argv) {
             }
         }
 
+        // The depth-grid cross-check the trailer makes possible: what the file
+        // RECORDS against what --body/--m/--n/--b would BUILD. Computed HERE,
+        // above the output branch, so it reaches the exit status in --json mode
+        // too -- a script asking this question is exactly the caller who uses
+        // --json, and a check that only runs in the human report is a check a
+        // script cannot have.
+        // The layer-count mismatch counted toward the exit status ONLY in the
+        // text branch, so `--json --body Moon --b 32` on a 23-layer file exited
+        // 0 while the same command without --json exited 1. That predates this
+        // change (the merge-base binary does it too) and is fixed here rather
+        // than left as a promise the usage text now makes and the tool does not
+        // keep. --json is the form a script uses; a check a script cannot have
+        // is not a check.
+        if (grid.built && !grid_ok) ++bad;
+
+        bool     tr_grid_checked  = false;
+        bool     tr_grid_disagree = false;
+        std::size_t tr_grid_first_bad = 0;
+        double   tr_grid_worst_rel = 0.0;
+        if (have_tr && grid.built && !tr.z.empty() &&
+            tr.z.size() == static_cast<std::size_t>(grid.n_layers)) {
+            tr_grid_checked = true;
+            tr_grid_first_bad = tr.z.size();
+            for (std::size_t l = 0; l < tr.z.size(); ++l) {
+                const double d = std::fabs(tr.z[l] - grid.z[l]);
+                const double s = std::fabs(grid.z[l]) > 0 ? std::fabs(grid.z[l]) : 1.0;
+                if (d / s > tr_grid_worst_rel) tr_grid_worst_rel = d / s;
+                if (tr_grid_first_bad == tr.z.size() && d > 1e-12 * s)
+                    tr_grid_first_bad = l;
+            }
+            tr_grid_disagree = (tr_grid_first_bad < tr.z.size());
+            if (tr_grid_disagree) ++bad;
+        }
+
         if (o.json) {
-            std::printf("{\"path\":\"%s\",\"valid\":true,\"format\":\"PTMT v1\","
+            std::printf("{\"path\":\"%s\",\"valid\":true,\"format\":\"%s\","
                         "\"magic\":\"0x%08X\",\"n_faces\":%u,\"n_layers\":%u,"
                         "\"values\":%llu,\"bytes_expected\":%llu,"
                         "\"bytes_actual\":%llu,\"bytes_extra\":%llu,"
@@ -373,7 +427,11 @@ int main(int argc, char** argv) {
                         "\"surface_min\":%.9g,\"surface_max\":%.9g,"
                         "\"surface_mean\":%.9g,\"bottom_min\":%.9g,"
                         "\"bottom_max\":%.9g,\"bottom_mean\":%.9g",
-                        jsonEscape(path).c_str(), info.magic,
+                        jsonEscape(path).c_str(),
+                        have_tr ? "PTMT v2"
+                                : (tr_status == thermal::state_io::TrailerStatus::Absent
+                                       ? "PTMT v1" : "PTMT v1 + UNREADABLE TRAILER"),
+                        info.magic,
                         info.n_faces, info.n_layers,
                         (unsigned long long)info.values,
                         (unsigned long long)info.bytes_expected,
@@ -385,6 +443,9 @@ int main(int argc, char** argv) {
                         (unsigned long long)all.n_exact_zero,
                         surf.min, surf.max, surf.mean,
                         bot.min, bot.max, bot.mean);
+            if (grid.built)
+                std::printf(",\"grid_layer_count_matches\":%s",
+                            grid_ok ? "true" : "false");
             if (grid_ok)
                 std::printf(",\"grid_body\":\"%s\",\"grid_b\":%d,"
                             "\"grid_z_max_m\":%.9g,\"grid_delta0_m\":%.9g,"
@@ -396,9 +457,67 @@ int main(int argc, char** argv) {
                             grid.delta0, grid.Qb_compiled,
                             qb_min, qb_med, qb_max,
                             (unsigned long long)qb_degenerate);
-            std::printf(",\"epoch\":null,\"depth_grid_in_file\":false,"
-                        "\"body_in_file\":null,\"mesh_id_in_file\":null,"
-                        "\"post_coupling_flag_in_file\":null}\n");
+            if (have_tr) {
+                // EVERY float64 trailer field may be NaN -- that is the
+                // format's documented "not recorded" -- and `nan` is not valid
+                // JSON. So every one of them goes through jnum(), which emits
+                // `null` instead. Guarding only some of them (which an earlier
+                // draft of this function did) produces output that parses on
+                // the files you happened to test and fails on the rest.
+                auto jnum = [](const char* key, double v) {
+                    if (std::isfinite(v)) std::printf(",\"%s\":%.17g", key, v);
+                    else                  std::printf(",\"%s\":null", key);
+                };
+                std::printf(",\"trailer\":true,\"trailer_version\":%u,"
+                            "\"trailer_bytes\":%u,\"crc32\":\"0x%08X\","
+                            "\"depth_grid_in_file\":%s,"
+                            "\"file_grid_m\":%d,\"file_grid_n\":%d,"
+                            "\"file_grid_b\":%d,"
+                            "\"config_identity_hash\":\"0x%016llX\","
+                            "\"body_in_file\":\"%s\","
+                            "\"engine_git_sha\":\"%s\",\"flags\":%u,"
+                            "\"post_coupling_complete\":%s,"
+                            "\"all_faces_patched\":%s,"
+                            "\"coupling_select_dt_positive\":%s,"
+                            "\"batch_completion_partial\":%s",
+                            tr.version_read, tr.bytes_read, tr.crc32_stored,
+                            tr.z.empty() ? "false" : "true",
+                            tr.grid_m, tr.grid_n, tr.grid_b,
+                            (unsigned long long)tr.config_identity_hash,
+                            jsonEscape(tr.body_name).c_str(),
+                            jsonEscape(tr.engine_git_sha).c_str(), tr.flags,
+                            (tr.flags & thermal::state_io::flag::kPostCouplingComplete) ? "true" : "false",
+                            (tr.flags & thermal::state_io::flag::kAllFacesPatched) ? "true" : "false",
+                            (tr.flags & thermal::state_io::flag::kCouplingSelectDtPositive) ? "true" : "false",
+                            (tr.flags & thermal::state_io::flag::kBatchCompletionPartial) ? "true" : "false");
+                jnum("file_z_min",         tr.z.empty() ? NAN : tr.z.front());
+                jnum("file_z_max",         tr.z.empty() ? NAN : tr.z.back());
+                jnum("file_refgrid_H",     tr.refgrid_H);
+                jnum("file_mesh_geomhash", tr.mesh_geomhash);
+                jnum("epoch_et_s",         tr.et_seconds);
+                jnum("output_cadence_s",   tr.output_cadence_s);
+                jnum("w0_mean",            tr.w0_mean);
+                jnum("w0_p05",             tr.w0_p05);
+                jnum("w0_p95",             tr.w0_p95);
+                if (tr_grid_checked)
+                    std::printf(",\"grid_matches_reconstruction\":%s,"
+                                "\"grid_worst_rel_diff\":%.17g",
+                                tr_grid_disagree ? "false" : "true",
+                                tr_grid_worst_rel);
+                else
+                    std::printf(",\"grid_matches_reconstruction\":null,"
+                                "\"grid_worst_rel_diff\":null");
+            } else {
+                std::printf(",\"trailer\":false,\"epoch_et_s\":null,"
+                            "\"depth_grid_in_file\":false,"
+                            "\"body_in_file\":null,\"mesh_id_in_file\":null,"
+                            "\"config_identity_hash\":null,"
+                            "\"post_coupling_flag_in_file\":null");
+                if (tr_status == thermal::state_io::TrailerStatus::Malformed)
+                    std::printf(",\"trailer_error\":\"%s\"",
+                                jsonEscape(tr_err).c_str());
+            }
+            std::printf("}\n");
             continue;
         }
 
@@ -409,8 +528,9 @@ int main(int argc, char** argv) {
         // reverse ("TMTP") because the file is little-endian, and printing
         // THAT is how this project once invented a nonexistent "MFFV" format
         // out of VFFM's magic. Say both, once, so nobody has to guess.
-        std::printf("format        PTMT v1  magic 0x%08X = '%c%c%c%c' "
+        std::printf("format        %-8s magic 0x%08X = '%c%c%c%c' "
                     "(on disk, little-endian: '%c%c%c%c')\n",
+                    have_tr ? "PTMT v2" : "PTMT v1",
                     info.magic,
                     static_cast<char>((info.magic >> 24) & 0xFF),
                     static_cast<char>((info.magic >> 16) & 0xFF),
@@ -427,10 +547,22 @@ int main(int argc, char** argv) {
         std::printf("length        %llu bytes; header rule 12 + F*L*4 = %llu",
                     (unsigned long long)info.bytes_actual,
                     (unsigned long long)info.bytes_expected);
-        if (info.bytes_extra == 0) std::printf("  -- EXACT\n");
-        else std::printf("  -- %llu TRAILING BYTES (no v1 field claims them; a\n"
-                         "              future v2 trailer would look like this)\n",
-                         (unsigned long long)info.bytes_extra);
+        if (info.bytes_extra == 0) std::printf("  -- EXACT (v1 body, no trailer)\n");
+        else if (have_tr)
+            std::printf("  + %llu-byte v2 identity trailer\n",
+                        (unsigned long long)info.bytes_extra);
+        else
+            std::printf("  -- %llu TRAILING BYTES that are NOT a readable\n"
+                        "              PTMT v2 trailer\n",
+                        (unsigned long long)info.bytes_extra);
+
+        if (tr_status == thermal::state_io::TrailerStatus::Malformed)
+            std::printf("\nTRAILER REFUSED  %s\n"
+                        "  A restore would refuse this file. Its temperature "
+                        "block is still\n"
+                        "  reported below, because reading it is how you find "
+                        "out what was lost.\n",
+                        tr_err.c_str());
 
         std::printf("\ntemperature   min %.4f  mean %.4f  max %.4f K\n",
                     all.min, all.mean, all.max);
@@ -463,7 +595,7 @@ int main(int argc, char** argv) {
 
         // ---- the reconstructed grid, and what it lets us measure ----------
         if (grid.built && !grid_ok) {
-            ++bad;
+            // `++bad` already counted above the output branch, so --json gets it.
             std::printf("\nGRID MISMATCH  body=%s m=%d n=%d b=%d builds %d layers; "
                         "this file has %u.\n"
                         "               The format does NOT record its own depth "
@@ -495,16 +627,124 @@ int main(int argc, char** argv) {
                         "  that is BUGS.md PTM-161, which was inert for a whole campaign.\n");
         }
 
+        // ---- the identity trailer, when the file carries one ---------------
+        if (have_tr) {
+            std::printf("\nIDENTITY TRAILER (READ FROM THE FILE -- not reconstructed)\n");
+            std::printf("  trailer       version %u, %u bytes, CRC32 0x%08X VERIFIED\n"
+                        "                over the whole file, so a length-correct "
+                        "zero-filled\n"
+                        "                cloud placeholder cannot pass as this "
+                        "checkpoint.\n",
+                        tr.version_read, tr.bytes_read, tr.crc32_stored);
+            if (std::isfinite(tr.et_seconds))
+                std::printf("  epoch         ET %.6f s  (the epoch this column is "
+                            "valid at)\n", tr.et_seconds);
+            else
+                std::printf("  epoch         not recorded\n");
+            if (std::isfinite(tr.output_cadence_s))
+                std::printf("  cadence       %.6f s  (the writing run's output "
+                            "cadence; one\n"
+                            "                cadence is the widest epoch gap a "
+                            "restore treats as a\n"
+                            "                stale hand-off rather than a "
+                            "different window)\n",
+                            tr.output_cadence_s);
+            std::printf("  body          %s\n",
+                        tr.body_name.empty() ? "(not recorded)"
+                                             : tr.body_name.c_str());
+            // refgrid_H < 0 is the engine's "no per-face H map was loaded, so
+            // the grid was built on the body's own H" sentinel, not a depth.
+            // Printing it as "-1 m" reads like a measurement.
+            if (std::isfinite(tr.refgrid_H) && tr.refgrid_H > 0.0)
+                std::printf("  grid          m=%d n=%d b=%d   refgrid_H %.9g m "
+                            "(median H of a loaded per-face map)\n",
+                            tr.grid_m, tr.grid_n, tr.grid_b, tr.refgrid_H);
+            else
+                std::printf("  grid          m=%d n=%d b=%d   refgrid_H unset "
+                            "(no per-face H map; the body's own H set the grid)\n",
+                            tr.grid_m, tr.grid_n, tr.grid_b);
+            if (!tr.z.empty())
+                std::printf("  depth grid    %s\n",
+                            thermal::state_io::gridFingerprint(
+                                tr.z.data(), tr.z.size()).c_str());
+            std::printf("  mesh geomhash %.17g\n", tr.mesh_geomhash);
+            std::printf("  physics hash  0x%016llX  (resolved thermophysical "
+                        "scalars + grid\n"
+                        "                parameters ONLY -- NOT per-face albedo/"
+                        "TI/H maps, NOT a\n"
+                        "                per-face Qb mask, NOT view factors. "
+                        "See\n"
+                        "                src/cpp/thermal/state_identity.h.)\n",
+                        (unsigned long long)tr.config_identity_hash);
+            std::printf("  engine        %s\n",
+                        tr.engine_git_sha.empty() ? "(not recorded)"
+                                                  : tr.engine_git_sha.c_str());
+            std::printf("  flags         0x%08X  post_coupling=%s "
+                        "all_faces_patched=%s\n"
+                        "                coupling_select_dt>0=%s "
+                        "batch_partial=%s\n",
+                        tr.flags,
+                        (tr.flags & thermal::state_io::flag::kPostCouplingComplete) ? "YES" : "no",
+                        (tr.flags & thermal::state_io::flag::kAllFacesPatched) ? "YES" : "no",
+                        (tr.flags & thermal::state_io::flag::kCouplingSelectDtPositive) ? "YES" : "no",
+                        (tr.flags & thermal::state_io::flag::kBatchCompletionPartial) ? "YES" : "no");
+            if (tr.flags & thermal::state_io::flag::kBatchCompletionPartial)
+                std::printf("  NOTE: batch_partial is set. A restore REFUSES "
+                            "this file; it covers\n"
+                            "        only the faces one device had finished.\n");
+            std::printf("  W(0) swing    NOT RECORDED by this engine version, on "
+                        "purpose. It is\n"
+                        "                an input to the warm-start "
+                        "admissibility rule, and a field\n"
+                        "                that is a measurement on some solver "
+                        "paths and a\n"
+                        "                coincidence on others is worse than "
+                        "an absent one.\n");
+
+            // The one cross-check this tool can make that nothing else does:
+            // the grid the file RECORDS against the grid the given --body/--m/
+            // --n/--b would BUILD. A disagreement here is PTM-STATE-GRID-BLIND
+            // caught in the act. Computed above the output branch so --json
+            // gets it too; only the rendering lives here.
+            if (tr_grid_checked && tr_grid_disagree) {
+                std::printf("\n  GRID DISAGREEMENT: the file's own z[] and the "
+                            "grid --body %s\n"
+                            "  m=%d n=%d b=%d builds differ from node %zu "
+                            "(%.17g vs %.17g m,\n"
+                            "  worst relative %.3g). A restore under these "
+                            "settings would REFUSE.\n",
+                            o.body.c_str(), o.m, o.n, o.b, tr_grid_first_bad,
+                            tr.z[tr_grid_first_bad], grid.z[tr_grid_first_bad],
+                            tr_grid_worst_rel);
+            } else if (tr_grid_checked) {
+                std::printf("\n  the file's own z[] MATCHES the grid --body %s "
+                            "m=%d n=%d b=%d builds\n"
+                            "  (worst relative difference %.3g).\n",
+                            o.body.c_str(), o.m, o.n, o.b, tr_grid_worst_rel);
+            }
+        }
+
         // ---- what this file CANNOT answer ---------------------------------
-        std::printf("\nNOT RECORDED BY THE v1 FORMAT (each one is an open ledger row):\n"
-                    "  depth grid z[]      no  -- a restore onto a different grid with the\n"
-                    "                             same layer count is accepted in silence\n"
-                    "                             (PTM-STATE-GRID-BLIND)\n"
-                    "  epoch / time        no  -- a wrong-epoch restore is undetectable\n"
-                    "                             (PTM-STATE-NO-EPOCH)\n"
-                    "  body, properties    no      mesh identity      no\n"
-                    "  post-coupling flag  no  -- whether this state is pre- or\n"
-                    "                             post-radiation-coupling (PTM-57)\n");
+        if (!have_tr) {
+            std::printf("\nNOT RECORDED BY THE v1 FORMAT (each one is an open ledger row):\n"
+                        "  depth grid z[]      no  -- a restore onto a different grid with the\n"
+                        "                             same layer count is accepted in silence\n"
+                        "                             (PTM-STATE-GRID-BLIND)\n"
+                        "  epoch / time        no  -- a wrong-epoch restore is undetectable\n"
+                        "                             (PTM-STATE-NO-EPOCH)\n"
+                        "  body, properties    no      mesh identity      no\n"
+                        "  post-coupling flag  no  -- whether this state is pre- or\n"
+                        "                             post-radiation-coupling (PTM-57)\n"
+                        "  Re-bank this state on the current engine to get a v2 identity\n"
+                        "  trailer, which records all of the above.\n");
+        } else {
+            std::printf("\nSTILL NOT RECORDED, even by v2:\n"
+                        "  per-face maps       no  -- albedo / thermal-inertia / H maps and a\n"
+                        "                             per-face Qb mask change the physics face\n"
+                        "                             by face and are outside the physics hash\n"
+                        "  view factors        no  -- radiation coupling identity is not banked\n"
+                        "  W(0) surface swing  no  -- see the note above\n");
+        }
         if (!grid.built)
             std::printf("  (pass --body to reconstruct the grid the engine WOULD build and\n"
                         "   get delta_0 and Qb_from_state; it is still a reconstruction,\n"
