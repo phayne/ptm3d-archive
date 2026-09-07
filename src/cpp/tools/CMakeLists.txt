@@ -613,6 +613,25 @@ set_target_properties(test_depth_map_plan
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Batch-completion partial ("PTMB") format gate -- thermal/batch_checkpoint.h.
+# Header-only and engine-free on purpose: the format, the identity fold, the
+# input digest and every refusal are checkable without a mesh, a solver or a
+# GPU, so this arm runs while a campaign owns the devices. A partial that loads
+# when it should not restores un-solved faces into a finished product, which
+# nothing downstream can detect -- so each refusal is FIRED here, not merely
+# written.
+add_executable(test_batch_checkpoint test_batch_checkpoint.cpp)
+target_link_libraries(test_batch_checkpoint
+    PRIVATE
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_batch_checkpoint
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # The YAML shape guards in ConfigParser::loadFromYAML. Links the ptm_tools
 # LIBRARY (defined above, around line 486) rather than compiling
 # config_parser.cpp a second time: the point of the test is the SHIPPED parser,

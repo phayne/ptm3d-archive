@@ -149,7 +149,11 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `final_state_file` | string | `""` | Write a per-face `T(z)` checkpoint at the end of the run |
 | `checkpoint_lookahead_steps` | int | 0 | Extra output steps integrated past the export window, so `final_state_file` is the state at the NEXT window's first epoch (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
 | `state_restore_allow_mismatch` | list | `[]` | Per-field opt-out for the checkpoint identity guards. Names one or more of `depth_grid`, `mesh`, `config`, `body`, `grid_m`, `grid_n`, `grid_b`, `refgrid_H`, `epoch` and downgrades that clause from a refusal to a warning. There is no blanket force |
-| `checkpoint_every_output_steps` | int | 0 | Mid-run checkpoint cadence (0 = chunk boundaries only) |
+| `checkpoint_every_output_steps` | int | 0 | Mid-run checkpoint cadence (0 = chunk boundaries only). **Architecturally inactive** on the GPU path — see [Batch-completion checkpointing](#batch-completion-checkpointing) |
+| `batch_checkpoint` | bool | false | Bank each *completed face batch* so an interrupted run resumes from it instead of re-integrating the window. CPU SIMD-batch solver only; every other path refuses. See [Batch-completion checkpointing](#batch-completion-checkpointing) |
+| `batch_checkpoint_dir` | string | `""` | Where the partials go. Empty = `<output.directory>/_thermal_state/partial` |
+| `batch_checkpoint_max_gib` | float | 64.0 | Refuse to start if the projected partial set exceeds this. 0 disables the check |
+| `batch_checkpoint_flush_mib` | float | 0.0 | How much completed work to accumulate before writing a partial. 0 derives it as one sixteenth of the projected set, clamped to [1, 64] MiB |
 | `eq_indirect_source` | string | `auto` | Where the equilibration phase gets its indirect flux: `auto` estimates it from the coupling loop's first sweep, `converged` from its converged sweep (better and ~1.9× the wall clock), `off` is the pre-2026-08 behavior ([radiation-exchange.md §7.7](radiation-exchange.md)) |
 | `eq_indirect_passes` | int | 1 | How many times that estimate is refreshed and the equilibration repeated. Must be ≥ 1. A second `auto` pass is that estimator's knee but the poorest value on offer — spend on `eq_indirect_source: converged` first ([radiation-exchange.md §7.7](radiation-exchange.md)) |
 | `eq_indirect_flux_file` | string | `""` | Explicit per-face `'QIND'` mean-indirect file; overrides `eq_indirect_source` |
@@ -298,6 +302,73 @@ outside the chunked workflow you do not need it.
 One case is disclosed rather than refused. With radiation coupling on a CPU
 solver, the coupled re-run keeps no `T(z)` column, so the checkpoint holds the
 **un-coupled** column on the faces the re-run touched. The run says so.
+
+
+### Batch-completion checkpointing
+
+`thermal.batch_checkpoint` bounds what an interrupted run loses. It is **off by
+default**, and byte identity with it off is its acceptance test.
+
+**Why it is not "checkpoint every N steps."** The thermal solvers are
+*batch-outer / time-inner*: each face batch runs **all** timesteps, then the
+next batch starts. There is therefore no wall-clock moment at which every face
+shares an output step, and a whole-mesh dump taken mid-run would bank faces that
+have not been solved. That is why `thermal.checkpoint_every_output_steps` warns
+instead of working, and it is not a defect to be fixed here — per-output-step
+checkpointing belongs to the CPU-first, time-outer solver on the portability
+roadmap.
+
+What a batch-outer solver *can* offer is the inverse. At a batch boundary a
+well-defined set of faces is **finished for the entire window**, so that is what
+gets banked: a self-describing partial (`PTMB`) per flush, carrying each
+completed batch's surface time series, its end-of-window `T(z)` column and its
+slice of the depth-map accumulator. On restart the engine validates the partials
+it finds, restores those batches and integrates only the rest.
+
+**What it costs.** A partial carries the surface **time series**, not just the
+column, because every statistic and every per-step product is a reduction of it.
+Per face that is `n_timesteps × 8 B` plus `n_layers × 4 B`; on a 2,397,890-face
+mesh with 1440 output steps the partial set is about **26 GiB per window**, not
+the ~210 MiB a column-only dump would take. The engine prints the exact
+projection at startup and **refuses** above `batch_checkpoint_max_gib`.
+
+**What it does NOT bound.** A run that dies *inside* a batch loses that batch's
+whole time integration — that is the granularity, by construction. And a resume
+repeats the illumination and radiation setup; only the thermal integration is
+banked. For finer blast-radius bounding the answer remains the runner's
+process-level chunk split (`scripts/run_chunked_simulation.py`), which is
+already built and already equivalent to a single shot.
+
+**Where it works, and where it refuses.** Implemented on the **CPU SIMD-batch**
+whole-mesh solver only. The GPU persistent solver, the CPU scalar solver and any
+radiation-coupled run **refuse to start** with the key set, rather than running
+with the checkpoint quietly inert:
+
+| Combination | Why it refuses |
+|---|---|
+| `thermal.use_gpu: true` | Not implemented there. The acceptance test for this feature is an abrupt kill mid-run, and killing a process with OpenCL queues in flight is the documented compute-wedge class on this workstation; a path whose resume equivalence cannot be crash-tested does not ship with the switch enabled |
+| `--no-simd-batch` | The CPU scalar solver's depth grid is **per face**, so one partial identity cannot describe the set |
+| `radiation.enabled: true` | The whole-mesh driver is entered more than once, and a partial set surviving across entries would let the second pass restore the first pass's results and call the window finished |
+
+**What a resume refuses.** Every partial carries the run's depth grid, epoch,
+output cadence, mesh geometry hash, configuration identity hash, body and engine
+SHA, plus a CRC32 over the whole file. Any mismatch refuses and names the field.
+It also carries an **input digest** — a checksum of the exact bytes that batch
+integrated (its absorbed-flux rows, its seeded column, its per-face `Q_b`). That
+is the guard that catches what the configuration hash cannot: a different albedo
+map, different view factors, or radiation on instead of off all leave
+`config_identity_hash` unchanged and all change the digest.
+
+Completeness is **computed** from the partials that validated, never taken from
+`manifest.json`. The manifest is an index: if it names a file that is missing or
+does not validate, the resume refuses; if it is merely behind the files on disk
+(a flush landed, the manifest rewrite did not) that is the normal crash tail and
+is reported. A partial can never be loaded as `thermal.initial_state_file` — it
+is a different format and fails at the magic.
+
+The crash-resume gate is `scripts/batch_checkpoint_crash_gate.py`, which
+SIGKILLs the engine at several points, resumes, and requires the finished
+outputs to be byte-identical to an uninterrupted control.
 
 
 ### Equilibration length: what the number means

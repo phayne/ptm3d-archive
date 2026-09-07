@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-189 keys across 11 sections.
+193 keys across 11 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -171,6 +171,10 @@ ENGINE_DEFAULTS = {
     'simulation.timesteps': 72,
     'thermal.analytic_seed_cycles': -1.0,
     'thermal.auto_calibrate_gpu': True,
+    'thermal.batch_checkpoint': False,
+    'thermal.batch_checkpoint_dir': '',
+    'thermal.batch_checkpoint_flush_mib': 0.0,
+    'thermal.batch_checkpoint_max_gib': 64.0,
     'thermal.checkpoint_every_output_steps': 0,
     'thermal.checkpoint_lookahead_steps': 0,
     'thermal.compute_ice_stability': False,
