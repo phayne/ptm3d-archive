@@ -150,6 +150,47 @@ public:
     void reportSurfaceBCCertificate();
 
     /**
+     * @brief Optional subsurface temperature-map accumulator, handed to the
+     * persistent kernel.
+     *
+     * Everything here is in the frame of the kernel call it is passed to: the
+     * accumulation window is expressed in the SAME timestep indices the kernel
+     * sees (relative to that call, then offset by t_offset for a self-chunked
+     * dispatch), exactly like the Schorghofer accumulator's accum_start/end.
+     *
+     * `sum`, `vmax` and `vmin` are n_depths x n_faces_active float buffers,
+     * depth-major. The caller owns sizing and INITIALIZATION: sum to 0,
+     * vmax to -INFINITY, vmin to +INFINITY. They are uploaded, accumulated
+     * into, and read back.
+     *
+     * `node_j` and `weight` are the plan's per-depth interpolation weights
+     * (thermal::depthmap::Plan). They are never derived here, because the
+     * refusal surface that produces them (a depth below the deepest node, a
+     * name collision after snapping) belongs with the plan, not with a solver.
+     */
+    struct DepthAccumIO {
+        std::vector<float>* sum  = nullptr;
+        std::vector<float>* vmax = nullptr;
+        std::vector<float>* vmin = nullptr;
+        const std::vector<int>*   node_j = nullptr;
+        const std::vector<float>* weight = nullptr;
+        int accum_start = 0;
+        int accum_end   = -1;   // -1 = n_timesteps
+        // Set to true by the solver if the accumulators could not be read back
+        // off the device. The caller MUST check it: on a failed read the host
+        // buffers keep their seeds, and a seeded buffer merges without
+        // complaint into a product whose per-face sample count is still
+        // correct -- so nothing downstream would notice an all-sentinel max
+        // map. `solvePersistent*` returns void, so this is the channel.
+        bool* readback_failed = nullptr;
+        bool valid() const {
+            return sum && vmax && vmin && node_j && weight &&
+                   !node_j->empty() && node_j->size() == weight->size();
+        }
+        std::size_t n_depths() const { return node_j ? node_j->size() : 0; }
+    };
+
+    /**
      * @brief Solve ALL timesteps in a single GPU kernel launch
      *
      * This persistent kernel approach minimizes CPU-GPU data transfer:
@@ -177,7 +218,9 @@ public:
         // (caller responsible for sizing/zeroing). Pass nullptr to disable.
         std::vector<float>* avg_E_inout = nullptr,
         int accum_start = 0,
-        int accum_end   = -1 /* -1 = n_timesteps */);
+        int accum_end   = -1 /* -1 = n_timesteps */,
+        // Optional subsurface depth-map accumulator; see DepthAccumIO.
+        const DepthAccumIO* depth = nullptr);
 
     /**
      * @brief Run n_equil_cycles of the persistent kernel using the same
@@ -213,7 +256,10 @@ public:
         // dispatches one pass per call (n_equil_cycles = 0), so a ring buffer
         // could never fill there anyway.
         const ptm::eqextrap::Options* extrap = nullptr,
-        ptm::eqextrap::Stats* extrap_stats   = nullptr);
+        ptm::eqextrap::Stats* extrap_stats   = nullptr,
+        // Optional subsurface depth-map accumulator; see DepthAccumIO. Like
+        // avg_E_inout it is accumulated ONLY during the final (output) cycle.
+        const DepthAccumIO* depth = nullptr);
 
     /**
      * @brief Set the active face count for the next call.

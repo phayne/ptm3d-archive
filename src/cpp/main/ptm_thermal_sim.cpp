@@ -46,6 +46,7 @@
 #include "../thermal/eq_certificate.h"
 #include "../thermal/thermal_state_io.h"
 #include "../thermal/state_identity.h"
+#include "../thermal/depth_map_plan.h"
 #include <memory>
 #include "../thermal/planetary_properties.h"
 #include "../thermal/thermal_property_map.h"
@@ -756,6 +757,12 @@ bool writeStatisticsBinary(
     const std::string& data_type,
     const Statistics& stats,
     size_t num_faces);
+bool writeStatisticsBinary(
+    const std::string& output_dir,
+    const std::string& data_type,
+    const Statistics& stats,
+    size_t num_faces,
+    bool want_avg, bool want_max, bool want_min);
 
 bool exportIlluminationStatisticsStreamed(
     const std::string& output_dir,
@@ -929,6 +936,285 @@ static bool reportRestoreVerdict(const char* tag, const std::string& path,
         return false;
     }
     return true;
+}
+
+// ===========================================================================
+// SUBSURFACE TEMPERATURE MAP PRODUCT (output.map_depths_m)
+//
+// Run-scope, like g_spinup_census / g_aeff_win_* above, and for the same
+// reason: the accumulator has to be reachable from the thermal drivers, the
+// radiation-coupling re-thermal and the statistics writer, and threading it
+// through four already-enormous parameter lists would add more surface than it
+// removes.
+//
+// THREAD SAFETY. Every writer owns a disjoint set of GLOBAL faces -- a CPU
+// batch, a GPU device batch, or the re-thermal's selected-face list -- and the
+// accumulator is indexed by global face, so the writes never overlap and no
+// lock is needed. That is the same property the OpenCL kernel relies on when
+// it says "each face owns its column".
+//
+// COVERAGE IS CHECKED, NOT ASSUMED. `covered[f]` is set the first time a face
+// is folded in. The writer REFUSES to emit a depth product if any face is
+// still unset, because the alternative is a map with holes that reads as
+// 0 K or -inf and looks like physics.
+// ===========================================================================
+namespace {
+
+struct DepthMapRun {
+    thermal::depthmap::Request     request;
+    thermal::depthmap::Plan        plan;
+    thermal::depthmap::Accumulator acc;
+    std::vector<std::uint8_t>      covered;
+    // The plan's weights in the layout the OpenCL kernel wants.
+    std::vector<int>   node_j;
+    std::vector<float> weight;
+    // Accumulation window, in ABSOLUTE output-step indices. This is the
+    // STATISTICS window, not the output window: matching it is what makes the
+    // z = 0 map reproduce statistics/temperature_*.bin instead of merely
+    // resembling it.
+    int win_start = 0;
+    int win_end   = 0;
+    // The number of output frames every face must contribute. Checked at the
+    // write, not assumed: a path that ADDS where it should REPLACE shows up
+    // here as a face counted twice, and nothing else in the product would.
+    // That is not hypothetical -- the whole-mesh GPU solver is entered twice
+    // on a radiation-coupled run, and the first version of this feature
+    // averaged both windows together.
+    int expected_samples = 0;
+    std::string solver_path = "(none)";
+    std::string grid_fingerprint;
+    std::string warned_paths;      // paths that ran but could not accumulate
+    size_t n_faces = 0;
+    bool requested = false;        // stage A accepted the request
+    bool active = false;           // stage B resolved it against the real grid
+    bool with_raw = false;
+};
+
+}  // namespace
+
+static DepthMapRun g_depth_map;
+
+static inline bool depthMapOn() {
+    return g_depth_map.active && !g_depth_map.plan.empty();
+}
+
+// Resolve the request against the run's reference depth grid. Returns false and
+// fills `err` on any refusal; the caller aborts. Called EARLY (before the
+// illumination phase) so a bad depth list costs seconds, not hours.
+// STAGE A -- everything that does NOT need the depth grid, run before the
+// illumination phase so a misspelled statistic or a duplicated depth costs
+// seconds instead of hours. The grid-dependent clauses (too deep, file-name
+// collision after snapping, projected size) cannot run here: `thermal_config`
+// is not populated until roughly a thousand lines later, so a Profile built
+// now would be a DEFAULT MOON column regardless of what the run configures.
+// Building the plan here refused a legitimate 0.60 m request on a grid_b: 32
+// run against the default grid's 0.47 m bottom -- measured, not supposed.
+static bool depthMapValidateRequest(const std::vector<double>& depths_m,
+                                    bool snap_to_node,
+                                    const std::vector<std::string>& stat_names,
+                                    size_t n_faces, bool with_raw,
+                                    int win_start, int win_steps,
+                                    std::string& err) {
+    g_depth_map = DepthMapRun{};
+    if (depths_m.empty()) return true;   // off, and byte-neutral
+
+    thermal::depthmap::Request req;
+    req.depths_m = depths_m;
+    req.snap_to_node = snap_to_node;
+    req.stats.clear();
+    for (const std::string& s : stat_names) {
+        thermal::depthmap::Stat st;
+        if (!thermal::depthmap::statFromName(s, st)) {
+            err = "output.map_depth_stats contains '" + s +
+                  "', which is not a statistic this engine writes. Use any subset "
+                  "of [avg, max, min] -- the same three the surface products carry.";
+            return false;
+        }
+        req.stats.push_back(st);
+    }
+    if (!thermal::depthmap::validateRequest(req, err)) return false;
+
+    g_depth_map.request  = req;
+    g_depth_map.with_raw = with_raw;
+    g_depth_map.n_faces  = n_faces;
+    g_depth_map.win_start = win_start;
+    g_depth_map.win_end   = win_start + win_steps;
+    g_depth_map.expected_samples = win_steps;
+    g_depth_map.requested = true;
+    return true;
+}
+
+// STAGE B -- the grid-bound build. Called once `thermal_config` is populated
+// (the `thermal_config_populated` marker) and before the solve, so the plan is
+// resolved against the grid the solver will actually integrate.
+static bool depthMapPrepare(const thermal::Config& config, std::string& err) {
+    if (!g_depth_map.requested) return true;
+    const thermal::depthmap::Request& req = g_depth_map.request;
+    const size_t n_faces  = g_depth_map.n_faces;
+    const bool   with_raw = g_depth_map.with_raw;
+
+    // The reference grid, derived exactly as CpuStateCheckpoint and every
+    // solver derive it (including refgrid_H, so a per-face property map does
+    // not put the plan on a different grid from the solve).
+    thermal::Planet ref_planet(config.getProperty("planet", "Moon"));
+    applyConfiguredThermo(ref_planet, config);
+    thermal::Profile ref_profile(ref_planet, 0.0, config, false,
+                                 refGridHOverride(config));
+    const auto& z = ref_profile.z();
+    const int n_layers = static_cast<int>(ref_profile.nlayers);
+
+    // The SURFACE (lattice) diurnal skin depth, the same expression the
+    // equilibration seed uses. It is only an error-budget scale: it is reported
+    // in depth_map_z.json and never enters the product.
+    double cp_for_skin = ref_planet.cp0;
+    {
+        double T_pow = 200.0;
+        for (size_t j = 0; j < ref_planet.cpCoeff.size(); ++j) {
+            cp_for_skin += ref_planet.cpCoeff[j] * T_pow;
+            T_pow *= 200.0;
+        }
+        if (cp_for_skin < 100.0) cp_for_skin = 600.0;
+    }
+    double skin_m = 0.0;
+    if (ref_planet.rhos > 0.0 && cp_for_skin > 0.0 && ref_planet.day > 0.0) {
+        skin_m = thermal::skinDepth(ref_planet.day,
+                                    ref_planet.ks / (ref_planet.rhos * cp_for_skin));
+    }
+
+    std::vector<std::string> warnings;
+    if (!thermal::depthmap::buildPlan(req, z.data(), n_layers, skin_m,
+                                      n_faces, with_raw, g_depth_map.plan, err,
+                                      warnings)) {
+        return false;
+    }
+    for (const std::string& w : warnings) {
+        std::cerr << "[depth-map] WARNING: " << w << "\n";
+    }
+
+    g_depth_map.grid_fingerprint =
+        thermal::state_io::gridFingerprint(z.data(), static_cast<size_t>(n_layers));
+    g_depth_map.node_j.reserve(g_depth_map.plan.size());
+    g_depth_map.weight.reserve(g_depth_map.plan.size());
+    for (const auto& e : g_depth_map.plan.entries) {
+        g_depth_map.node_j.push_back(e.j);
+        g_depth_map.weight.push_back(static_cast<float>(e.w));
+    }
+    g_depth_map.acc.allocate(g_depth_map.plan.size(), n_faces);
+    g_depth_map.covered.assign(n_faces, 0u);
+    g_depth_map.active = true;
+
+    std::cout << "\n[depth-map] Subsurface temperature maps requested at "
+              << g_depth_map.plan.size() << " depth(s), "
+              << g_depth_map.plan.stats.size() << " statistic(s), over absolute "
+                 "output steps [" << g_depth_map.win_start << ","
+              << g_depth_map.win_end << ")\n";
+    for (const auto& e : g_depth_map.plan.entries) {
+        std::cout << "  requested " << e.requested_m << " m -> "
+                  << e.resolved_m << " m";
+        if (e.residual_m != 0.0) std::cout << "  (snapped, residual "
+                                           << e.residual_m << " m)";
+        std::cout << "  node " << e.j << " w=" << e.w
+                  << "  file " << e.field << "_*.bin\n";
+    }
+    std::cout << "  projected size: "
+              << (thermal::depthmap::estimateBytes(g_depth_map.plan, n_faces,
+                                                   with_raw) / (1024.0 * 1024.0))
+              << " MiB\n";
+    return true;
+}
+
+// The grid the SOLVER built must be the grid the plan was built on. Anything
+// else means the plan's (j, w) index a different column from the one being
+// integrated -- a wrong-depth map that no output would betray.
+static bool depthMapVerifyGrid(const double* z, size_t n_layers,
+                               const char* path_name) {
+    if (!depthMapOn()) return true;
+    bool same = (n_layers == g_depth_map.plan.z.size());
+    if (same) {
+        for (size_t i = 0; i < n_layers; ++i) {
+            if (z[i] != g_depth_map.plan.z[i]) { same = false; break; }
+        }
+    }
+    if (!same) {
+        std::cerr << "\n[depth-map] FATAL: the depth grid used by " << path_name
+                  << " is not the grid output.map_depths_m was resolved against ("
+                  << n_layers << " layers vs " << g_depth_map.plan.z.size()
+                  << "; fingerprints "
+                  << thermal::state_io::gridFingerprint(z, n_layers) << " vs "
+                  << g_depth_map.grid_fingerprint << ").\n"
+                     "  The per-depth node indices and weights would address a "
+                     "different column from the one being solved.\n"
+                     "  Refusing to write a depth map rather than write a wrong "
+                     "one.\n";
+        return false;
+    }
+    g_depth_map.solver_path = path_name;
+    return true;
+}
+
+// Fold one GPU batch's float32 accumulators into the run-scope (float64) one.
+// `replace` is for the radiation-coupling re-thermal, which re-integrates a
+// face and must REPLACE its contribution rather than add a second copy.
+//
+// PRECISION, stated rather than discovered: the device sums in float32, so the
+// depth AVERAGE carries the float32 running-sum error of the window -- bounded
+// by ~n*ulp(sum)/2, i.e. <= 0.01 K worst case over a 1440-step window at 400 K
+// and ~2e-4 K in practice. The MAX and MIN are exact selections and carry none.
+// The CPU SIMD path accumulates the same quantity in float64. That is the same
+// asymmetry the solvers themselves have, and it is what the CPU-vs-GPU
+// agreement figure in depth_map_z.json is for.
+static bool depthMapMergeBatch(const std::vector<float>& bsum,
+                               const std::vector<float>& bmax,
+                               const std::vector<float>& bmin,
+                               size_t batch_start, size_t batch_n,
+                               std::uint32_t n_samples,
+                               const std::vector<int>* global_face_of = nullptr,
+                               bool replace = false) {
+    if (!depthMapOn()) return true;
+    const size_t D = g_depth_map.plan.size();
+    const size_t want = D * batch_n;
+    if (bsum.size() != want || bmax.size() != want || bmin.size() != want) {
+        std::cerr << "[depth-map] FATAL: a GPU batch returned "
+                  << bsum.size() << "/" << bmax.size() << "/" << bmin.size()
+                  << " accumulator elements, expected " << want << " ("
+                  << D << " depths x " << batch_n << " faces). The solver's "
+                     "active face count is not this batch's face count; the "
+                     "merge would read the wrong faces.\n";
+        return false;
+    }
+    auto& acc = g_depth_map.acc;
+    for (size_t b = 0; b < batch_n; ++b) {
+        const size_t gf = global_face_of
+                              ? static_cast<size_t>((*global_face_of)[batch_start + b])
+                              : (batch_start + b);
+        if (gf >= acc.n_faces) {
+            std::cerr << "[depth-map] FATAL: batch face index " << gf
+                      << " is outside the mesh (" << acc.n_faces << " faces).\n";
+            return false;
+        }
+        if (replace) acc.resetFace(gf);
+        for (size_t d = 0; d < D; ++d) {
+            const size_t src = d * batch_n + b;
+            const size_t dst = d * acc.n_faces + gf;
+            acc.sum[dst] += static_cast<double>(bsum[src]);
+            const double hi = static_cast<double>(bmax[src]);
+            const double lo = static_cast<double>(bmin[src]);
+            if (hi > acc.vmax[dst]) acc.vmax[dst] = hi;
+            if (lo < acc.vmin[dst]) acc.vmin[dst] = lo;
+        }
+        acc.count[gf] += n_samples;
+        g_depth_map.covered[gf] = 1u;
+    }
+    return true;
+}
+
+// How many output steps a kernel call covering local indices [lo, hi) will
+// actually fold in, given the call's own step count. Both GPU call sites use
+// this so neither can invent its own clamp.
+static inline int depthMapSamplesInCall(int lo, int hi, int n_steps_in_call) {
+    const int a = std::max(0, lo);
+    const int b = std::min(n_steps_in_call, hi);
+    return (b > a) ? (b - a) : 0;
 }
 
 // PTM-53 rule-7 tripwire. applyConfiguredThermo() bumps this every time it
@@ -3965,6 +4251,29 @@ static bool refuseEqStopOnCertificate(const thermal::Config& config,
     return true;
 }
 
+// The depth-map twin of refuseEqStopOnCertificate, and it exists for the same
+// reason: a product asked for and not produced must stop the run where the
+// unsupported path is ENTERED, not be inferred from a flag read a thousand
+// lines earlier in main(). The early guard in main() is a courtesy that saves
+// the illumination phase; THIS is the guarantee.
+//
+// Both CPU scalar paths give every face its own depth grid (generateAdaptiveGrid
+// per face), so one set of per-depth node indices and weights cannot describe
+// them all -- reusing the reference grid's there is BUGS.md PTM-76 exactly.
+static bool refuseDepthMapOnPath(const char* path_name) {
+    if (!depthMapOn()) return false;
+    std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set, but this run "
+                 "entered the " << path_name << " path.\n"
+                 "  That path builds a SEPARATE depth grid for every face, so the "
+                 "single set of per-depth node indices and weights this product "
+                 "resolved against the shared reference grid does not describe "
+                 "it.\n"
+                 "  Refusing rather than sampling the wrong nodes (BUGS.md "
+                 "PTM-76). Use the CPU SIMD-batch solver (the shipped default) "
+                 "or the GPU solver, or drop output.map_depths_m.\n";
+    return true;
+}
+
 static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config& config) {
     double v;
     // ---- generic bodies: repair the placeholder-resolved Planet -------------
@@ -4085,6 +4394,7 @@ bool runThermalModelsForAllFacesStreamed(
     const std::string& final_state_file)
 {
     if (refuseEqStopOnCertificate(config, "streamed CPU")) return false;
+    if (refuseDepthMapOnPath("streamed CPU scalar")) return false;
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
         return false;
@@ -4330,6 +4640,7 @@ bool runThermalModelsForAllFaces(
     const std::string& initial_state_file,
     const std::string& final_state_file) {
     if (refuseEqStopOnCertificate(config, "CPU scalar")) return false;
+    if (refuseDepthMapOnPath("CPU scalar (--no-simd-batch)")) return false;
 
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
@@ -5116,6 +5427,15 @@ bool runThermalModelsForAllFacesBatchSoA(
     const int n_layers = ref_profile.nlayers;
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
+
+    // Subsurface depth-map product: this path shares ONE z[] across every face
+    // in every batch, so the plan's (j, w) are valid for all of them -- but
+    // that is checked, not assumed.
+    if (!depthMapVerifyGrid(ref_profile.z().data(),
+                            static_cast<size_t>(n_layers),
+                            "cpu_simd_batch")) {
+        return false;
+    }
 
     // BUGS.md PTM-SIGSEGV-450LAYER: the CPU SIMD batch path's ThermalBatchSoA
     // stack-allocates every per-layer array at a fixed size
@@ -6121,6 +6441,29 @@ bool runThermalModelsForAllFacesBatchSoA(
                     (*surface_temps_out)[start_face + f][0] = batch.getSurfaceTemp(f);
                 }
             }
+            // REPLACE, not add: this driver can be entered more than once in a
+            // radiation-coupled run, and surface_temps is overwritten each
+            // time. Done here, before the first fold of this batch, so a
+            // re-entry starts from a clean face rather than averaging two
+            // windows together.
+            if (depthMapOn()) {
+                for (int f = 0; f < faces_in_batch; ++f)
+                    g_depth_map.acc.resetFace(start_face + f);
+            }
+            // Depth product, same frame, same instant. Row 0's surface node IS
+            // batch.T[0*BS+f] (getSurfaceTemp returns exactly that), so no
+            // override is needed here -- unlike every row below.
+            if (depthMapOn() && g_depth_map.win_start <= 0 &&
+                0 < g_depth_map.win_end) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    g_depth_map.acc.addColumn(g_depth_map.plan, start_face + f,
+                                              &batch.T[f], BS);
+                }
+            }
+            if (depthMapOn()) {
+                for (int f = 0; f < faces_in_batch; ++f)
+                    g_depth_map.covered[start_face + f] = 1u;
+            }
             // Main-loop substepping with linear flux interpolation.
             // The effective dt ceiling is set by thermal-diffusion accuracy at
             // the finest depth layer (Fourier number ~0.5 to avoid CN's
@@ -6169,6 +6512,27 @@ bool runThermalModelsForAllFacesBatchSoA(
                     for (int f = 0; f < faces_in_batch; ++f) {
                         (*surface_temps_out)[start_face + f][t + 1] =
                             thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                    }
+                }
+                // Depth product for frame t+1, folded at the SAME instant and
+                // from the SAME column. Node 0 is the re-evaluated surface, not
+                // batch.T[0*BS+f]: the two differ by one substep of forcing
+                // epoch, and a z = 0 map built on the raw node would fail to
+                // reproduce statistics/temperature_*.bin for a reason that has
+                // nothing to do with depth.
+                if (depthMapOn() && (t + 1) >= g_depth_map.win_start &&
+                    (t + 1) < g_depth_map.win_end) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        // Reuse the value just stored rather than re-solving the
+                        // surface Newton: it is the same number by construction,
+                        // and calling it twice would double a ten-iteration
+                        // solve per face per step for no gain.
+                        const double surf =
+                            surface_temps_out
+                                ? (*surface_temps_out)[start_face + f][t + 1]
+                                : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                        g_depth_map.acc.addColumn(
+                            g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf);
                     }
                 }
             }
@@ -7960,6 +8324,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // output timesteps were accumulated.
     }
 
+    // ----- Subsurface depth-map product setup -----
+    // Both GPU paths (single device and the multi-GPU pool) put every face on
+    // this ONE reference grid, so the plan's per-depth (j, w) apply to all of
+    // them -- verified rather than assumed.
+    if (!depthMapVerifyGrid(z_grid.data(), n_layers, "gpu_persistent")) {
+        return false;
+    }
+    // The accumulation window in the frame the KERNEL sees. On a two-phase run
+    // the output cycle is its own kernel call whose local step 0 is absolute
+    // step `equilibration_steps`; on a single-phase run local == absolute. Both
+    // are computed here so the two call sites cannot each invent their own.
+    const int depth_local_two_phase_start = g_depth_map.win_start - equilibration_steps;
+    const int depth_local_two_phase_end   = g_depth_map.win_end   - equilibration_steps;
+
     // ----- Per-batch worker (shared by serial and multi-GPU paths) -----
     // The lambda contains everything that runs after a ThermalOpenCLSolver is
     // initialized for one batch: host-side prep + uploads + persistent
@@ -8285,6 +8663,31 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             batch_avg_E_ptr = &batch_avg_E;
         }
 
+        // Per-batch depth-map accumulator, the same shape as batch_avg_E above.
+        // Depth-major, n_depths x batch_n; the sentinels are what make "this
+        // face contributed nothing" distinguishable from "this face was cold".
+        std::vector<float> batch_dsum, batch_dmax, batch_dmin;
+        gpu::opencl::ThermalOpenCLSolver::DepthAccumIO depth_io;
+        gpu::opencl::ThermalOpenCLSolver::DepthAccumIO* depth_io_ptr = nullptr;
+        bool depth_readback_failed = false;
+        if (depthMapOn()) {
+            const size_t nD = g_depth_map.plan.size();
+            batch_dsum.assign(nD * batch_n, 0.0f);
+            batch_dmax.assign(nD * batch_n, -std::numeric_limits<float>::max());
+            batch_dmin.assign(nD * batch_n,  std::numeric_limits<float>::max());
+            depth_io.sum = &batch_dsum;
+            depth_io.vmax = &batch_dmax;
+            depth_io.vmin = &batch_dmin;
+            depth_io.node_j = &g_depth_map.node_j;
+            depth_io.weight = &g_depth_map.weight;
+            depth_io.readback_failed = &depth_readback_failed;
+            depth_io_ptr = &depth_io;
+        }
+        // How many output steps THIS batch actually folded in. Set at the call
+        // site that ran, and left at -1 by any path that did not accumulate, so
+        // the merge below can refuse instead of guessing.
+        int depth_samples_this_batch = -1;
+
         if (two_phase) {
             if (GPU_DEBUG_OUTPUT || batch_idx == 0) {
                 // Report PASSES (equil_cycles + 1) — the number the kernel
@@ -8365,11 +8768,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                           << out_dt << "s)" << std::endl;
             }
             auto flux_out = prepare_flux(equilibration_steps, output_steps);
+            // Two-phase: this call's LOCAL step 0 is absolute step
+            // equilibration_steps, so the depth window is shifted by it.
+            if (depth_io_ptr) {
+                depth_io.accum_start = depth_local_two_phase_start;
+                depth_io.accum_end   = depth_local_two_phase_end;
+            }
             solver.solvePersistentMultipleCycles(flux_out, output_temps,
                                                  output_steps, out_dt, 0,
                                                  batch_avg_E_ptr,
                                                  /*accum_start*/ 0,
-                                                 /*accum_end*/   output_steps);
+                                                 /*accum_end*/   output_steps,
+                                                 /*extrap*/ nullptr,
+                                                 /*extrap_stats*/ nullptr,
+                                                 depth_io_ptr);
+            depth_samples_this_batch = depthMapSamplesInCall(
+                depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
             // ---- Single-phase (legacy dt, and EVERY warm-start chunk) ----
             // Two defects used to live on exactly this branch (BUGS.md PTM-78,
@@ -8434,11 +8848,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                  " re-thermal would start from a zero column\n";
                 }
             }
+            // Single-phase: LOCAL == ABSOLUTE, so the depth window is used
+            // as it stands.
+            if (depth_io_ptr) {
+                depth_io.accum_start = g_depth_map.win_start;
+                depth_io.accum_end   = g_depth_map.win_end;
+            }
             solver.solvePersistentMultipleCycles(flux_all, output_temps,
                                                  total_time_steps, dt, 0,
                                                  batch_avg_E_ptr,
                                                  /*accum_start*/ equilibration_steps,
-                                                 /*accum_end*/   total_time_steps);
+                                                 /*accum_end*/   total_time_steps,
+                                                 /*extrap*/ nullptr,
+                                                 /*extrap_stats*/ nullptr,
+                                                 depth_io_ptr);
+            depth_samples_this_batch = depthMapSamplesInCall(
+                g_depth_map.win_start, g_depth_map.win_end, total_time_steps);
         }
 
         if (ice_acc) {
@@ -8446,6 +8871,40 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 const float* src = batch_avg_E.data() + layer * batch_n;
                 float*       dst = ice_acc->sum_E.data() + layer * n_faces + batch_start;
                 std::copy(src, src + batch_n, dst);
+            }
+        }
+
+        // Fold this batch's depth accumulator into the run-scope one.
+        if (depthMapOn()) {
+            if (depth_readback_failed) {
+                std::cerr << "[depth-map] FATAL: batch " << batch_idx
+                          << " could not read its depth accumulator back off the "
+                             "device. The host buffer still holds its seed, which "
+                             "would merge silently into an all-sentinel map with a "
+                             "correct-looking sample count.\n";
+                return false;
+            }
+            if (depth_samples_this_batch < 0) {
+                std::cerr << "[depth-map] FATAL: batch " << batch_idx
+                          << " ran a GPU thermal path that did not carry the depth"
+                             " accumulator. Refusing to write a depth product with"
+                             " a hole in it.\n";
+                return false;
+            }
+            // REPLACE, not add. The whole-mesh solver can be ENTERED MORE
+            // THAN ONCE in a radiation-coupled run (measured: two full
+            // Phase-1/Phase-2 passes on the 80N crater arm), and
+            // surface_temps is overwritten each time, so the depth product
+            // must be too. Adding blended iteration 0's window with the
+            // coupled one into a single average -- max and min would still
+            // have looked right, because they are idempotent under a
+            // duplicate contribution and only the mean is not.
+            if (!depthMapMergeBatch(batch_dsum, batch_dmax, batch_dmin,
+                                    batch_start, batch_n,
+                                    static_cast<std::uint32_t>(depth_samples_this_batch),
+                                    /*global_face_of*/ nullptr,
+                                    /*replace=*/true)) {
+                return false;
             }
         }
 
@@ -8982,6 +9441,31 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             batch_avg_E_ptr = &batch_avg_E;
         }
 
+        // Per-batch depth-map accumulator, the same shape as batch_avg_E above.
+        // Depth-major, n_depths x batch_n; the sentinels are what make "this
+        // face contributed nothing" distinguishable from "this face was cold".
+        std::vector<float> batch_dsum, batch_dmax, batch_dmin;
+        gpu::opencl::ThermalOpenCLSolver::DepthAccumIO depth_io;
+        gpu::opencl::ThermalOpenCLSolver::DepthAccumIO* depth_io_ptr = nullptr;
+        bool depth_readback_failed = false;
+        if (depthMapOn()) {
+            const size_t nD = g_depth_map.plan.size();
+            batch_dsum.assign(nD * batch_n, 0.0f);
+            batch_dmax.assign(nD * batch_n, -std::numeric_limits<float>::max());
+            batch_dmin.assign(nD * batch_n,  std::numeric_limits<float>::max());
+            depth_io.sum = &batch_dsum;
+            depth_io.vmax = &batch_dmax;
+            depth_io.vmin = &batch_dmin;
+            depth_io.node_j = &g_depth_map.node_j;
+            depth_io.weight = &g_depth_map.weight;
+            depth_io.readback_failed = &depth_readback_failed;
+            depth_io_ptr = &depth_io;
+        }
+        // How many output steps THIS batch actually folded in. Set at the call
+        // site that ran, and left at -1 by any path that did not accumulate, so
+        // the merge below can refuse instead of guessing.
+        int depth_samples_this_batch = -1;
+
         if (two_phase) {
             // ---- Two-phase GPU execution ----
             // Phase 1: equilibration with coarse dt (temperatures persist on GPU)
@@ -9055,11 +9539,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                           << out_dt << "s)" << std::endl;
             }
             auto flux_out = prepare_flux(equilibration_steps, output_steps);
+            // Two-phase: this call's LOCAL step 0 is absolute step
+            // equilibration_steps, so the depth window is shifted by it.
+            if (depth_io_ptr) {
+                depth_io.accum_start = depth_local_two_phase_start;
+                depth_io.accum_end   = depth_local_two_phase_end;
+            }
             solver.solvePersistentMultipleCycles(flux_out, output_temps,
                                                  output_steps, out_dt, 0,
                                                  batch_avg_E_ptr,
                                                  /*accum_start*/ 0,
-                                                 /*accum_end*/   output_steps);
+                                                 /*accum_end*/   output_steps,
+                                                 /*extrap*/ nullptr,
+                                                 /*extrap_stats*/ nullptr,
+                                                 depth_io_ptr);
+            depth_samples_this_batch = depthMapSamplesInCall(
+                depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
             // ---- Single-phase (legacy dt, and EVERY warm-start chunk) ----
             // Accumulator runs only on the FINAL cycle, and only for relative
@@ -9107,11 +9602,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                  " re-thermal would start from a zero column\n";
                 }
             }
+            // Single-phase: LOCAL == ABSOLUTE, so the depth window is used
+            // as it stands.
+            if (depth_io_ptr) {
+                depth_io.accum_start = g_depth_map.win_start;
+                depth_io.accum_end   = g_depth_map.win_end;
+            }
             solver.solvePersistentMultipleCycles(flux_all, output_temps,
                                                  total_time_steps, dt, 0,
                                                  batch_avg_E_ptr,
                                                  /*accum_start*/ equilibration_steps,
-                                                 /*accum_end*/   total_time_steps);
+                                                 /*accum_end*/   total_time_steps,
+                                                 /*extrap*/ nullptr,
+                                                 /*extrap_stats*/ nullptr,
+                                                 depth_io_ptr);
+            depth_samples_this_batch = depthMapSamplesInCall(
+                g_depth_map.win_start, g_depth_map.win_end, total_time_steps);
         }
 
         // Copy this batch's accumulator into the global ice_acc buffer.
@@ -9120,6 +9626,40 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 const float* src = batch_avg_E.data() + layer * batch_n;
                 float*       dst = ice_acc->sum_E.data() + layer * n_faces + batch_start;
                 std::copy(src, src + batch_n, dst);
+            }
+        }
+
+        // Fold this batch's depth accumulator into the run-scope one.
+        if (depthMapOn()) {
+            if (depth_readback_failed) {
+                std::cerr << "[depth-map] FATAL: batch " << batch_idx
+                          << " could not read its depth accumulator back off the "
+                             "device. The host buffer still holds its seed, which "
+                             "would merge silently into an all-sentinel map with a "
+                             "correct-looking sample count.\n";
+                return false;
+            }
+            if (depth_samples_this_batch < 0) {
+                std::cerr << "[depth-map] FATAL: batch " << batch_idx
+                          << " ran a GPU thermal path that did not carry the depth"
+                             " accumulator. Refusing to write a depth product with"
+                             " a hole in it.\n";
+                return false;
+            }
+            // REPLACE, not add. The whole-mesh solver can be ENTERED MORE
+            // THAN ONCE in a radiation-coupled run (measured: two full
+            // Phase-1/Phase-2 passes on the 80N crater arm), and
+            // surface_temps is overwritten each time, so the depth product
+            // must be too. Adding blended iteration 0's window with the
+            // coupled one into a single average -- max and min would still
+            // have looked right, because they are idempotent under a
+            // duplicate contribution and only the mean is not.
+            if (!depthMapMergeBatch(batch_dsum, batch_dmax, batch_dmin,
+                                    batch_start, batch_n,
+                                    static_cast<std::uint32_t>(depth_samples_this_batch),
+                                    /*global_face_of*/ nullptr,
+                                    /*replace=*/true)) {
+                return false;
             }
         }
 
@@ -9423,6 +9963,15 @@ bool runThermalForSelectedFaces_GPU(
                                        refGridHOverride(config));
     const auto& z_grid = reference_profile.z();
     const size_t n_layers = z_grid.size();
+    // This is the THIRD path that folds columns into the depth accumulator, and
+    // it rebuilds its own Profile. Verify it landed on the grid the plan's
+    // (j, w) were resolved against -- the two whole-mesh drivers already do,
+    // and a divergence here would index a different column with nothing in the
+    // output to betray it.
+    if (!depthMapVerifyGrid(z_grid.data(), n_layers,
+                            "gpu_selected_faces_rethermal")) {
+        return false;
+    }
     // No seed banner here: this path never seeds. It is warm-started from
     // post_eq_T_state (uploadAllTemps), so the spin-up seed does not reach it.
     const size_t n_faces_total = mesh->faces.size();
@@ -9754,11 +10303,39 @@ bool runThermalForSelectedFaces_GPU(
         // n_out timesteps at dt_out, and captures surface T per step.
         // TODO(ice-stability): rad-coupling re-thermal does not update
         // ice_acc->sum_E for selected faces; ice_depth.bin reflects
-        // only iter-0's flux BC on the re-thermal'd faces.
+        // only iter-0's flux BC on the re-thermal'd faces. (Owed ledger row
+        // PTM-ICEACC-RETHERMAL-STALE. The depth product below does NOT have
+        // this hole -- it is recomputed and REPLACED for every selected face.)
         std::vector<float> output_temps;
+        std::vector<float> rt_dsum, rt_dmax, rt_dmin;
+        gpu::opencl::ThermalOpenCLSolver::DepthAccumIO rt_depth;
+        gpu::opencl::ThermalOpenCLSolver::DepthAccumIO* rt_depth_ptr = nullptr;
+        bool rt_readback_failed = false;
+        if (depthMapOn()) {
+            const size_t nD = g_depth_map.plan.size();
+            rt_dsum.assign(nD * batch_n, 0.0f);
+            rt_dmax.assign(nD * batch_n, -std::numeric_limits<float>::max());
+            rt_dmin.assign(nD * batch_n,  std::numeric_limits<float>::max());
+            rt_depth.sum = &rt_dsum;
+            rt_depth.vmax = &rt_dmax;
+            rt_depth.vmin = &rt_dmin;
+            rt_depth.node_j = &g_depth_map.node_j;
+            rt_depth.weight = &g_depth_map.weight;
+            rt_depth.readback_failed = &rt_readback_failed;
+            // This call's LOCAL step 0 is absolute step t_offset.
+            rt_depth.accum_start = g_depth_map.win_start - t_offset;
+            rt_depth.accum_end   = g_depth_map.win_end   - t_offset;
+            rt_depth_ptr = &rt_depth;
+        }
         solver.solvePersistentMultipleCycles(flux_out, output_temps,
                                              n_out, dt_out,
-                                             /*n_equil_cycles=*/0);
+                                             /*n_equil_cycles=*/0,
+                                             /*avg_E_inout*/ nullptr,
+                                             /*accum_start*/ 0,
+                                             /*accum_end*/ -1,
+                                             /*extrap*/ nullptr,
+                                             /*extrap_stats*/ nullptr,
+                                             rt_depth_ptr);
 
         // Hand the POST-COUPLING end-of-window column back to the caller so a
         // chunk checkpoint archives the coupled state, not iter-0's un-coupled
@@ -9826,11 +10403,50 @@ bool runThermalForSelectedFaces_GPU(
                          " UN-COUPLED temperature (legacy PTM-54 behavior)"
                       << std::endl;
         }
+        // That legacy mode splices two different integrations into one frame
+        // series, and the depth accumulator has no way to express the split:
+        // it would carry the re-thermal's value at every step while
+        // temperature_*.bin carried iter-0's at the first few. Refuse rather
+        // than ship a depth map that silently disagrees with the surface map it
+        // sits beside.
+        if (depthMapOn() && kReThermalWarmupSkip > 0) {
+            std::cerr << "\n[depth-map] FATAL: PTM_RETHERMAL_WARMUP_SKIP="
+                      << kReThermalWarmupSkip << " keeps iteration 0's UN-COUPLED"
+                         " surface temperature for the first output step(s), but the"
+                         " depth accumulator records the re-thermal's value at every"
+                         " step. The z=0 map would not match temperature_*.bin and"
+                         " the deeper maps would carry a different window from the"
+                         " surface.\n"
+                         "  Unset PTM_RETHERMAL_WARMUP_SKIP (the shipped default is"
+                         " 0), or drop output.map_depths_m.\n";
+            return false;
+        }
         for (size_t f = 0; f < batch_n; ++f) {
             const int face_idx = face_indices[batch_start + f];
             for (int t = kReThermalWarmupSkip; t < n_out; ++t) {
                 surface_temps[face_idx][t_offset + t] =
                     static_cast<double>(output_temps[t * batch_n + f]);
+            }
+        }
+
+        // Depth product for the re-thermal'd faces: REPLACE, never add. These
+        // faces' iteration-0 contribution is now superseded, exactly as their
+        // surface temperatures were replaced immediately above; adding would
+        // average an uncoupled window with a coupled one and look plausible.
+        if (depthMapOn()) {
+            if (rt_readback_failed) {
+                std::cerr << "[depth-map] FATAL: the coupling re-thermal could not "
+                             "read its depth accumulator back off the device; the "
+                             "selected faces' maps would keep their seed.\n";
+                return false;
+            }
+            if (!depthMapMergeBatch(rt_dsum, rt_dmax, rt_dmin,
+                                    batch_start, batch_n,
+                                    static_cast<std::uint32_t>(
+                                        depthMapSamplesInCall(rt_depth.accum_start,
+                                                              rt_depth.accum_end, n_out)),
+                                    &face_indices, /*replace=*/true)) {
+                return false;
             }
         }
 
@@ -12482,67 +13098,63 @@ Statistics computeTemperatureStatistics(
     return stats;
 }
 
-// Function to write statistics binary files
+// Function to write statistics binary files.
+//
+// `want_avg/max/min` exist for the depth-map product, which can be asked for a
+// SUBSET of the three (output.map_depth_stats). Every pre-existing caller uses
+// the three-argument overload below and is unchanged: one writer, one format,
+// so the surface products and the depth products cannot drift apart -- which
+// they would the moment the depth maps got a writer of their own.
 bool writeStatisticsBinary(
     const std::string& output_dir,
     const std::string& data_type,
     const Statistics& stats,
-    size_t num_faces) {
-    
+    size_t num_faces,
+    bool want_avg,
+    bool want_max,
+    bool want_min) {
+
     try {
         // Create statistics subdirectory
         std::string stats_dir = output_dir + "/statistics";
         std::filesystem::create_directories(stats_dir);
-        
-        // Write average
-        std::string avg_file = stats_dir + "/" + data_type + "_avg.bin";
-        std::ofstream avg_out(avg_file, std::ios::binary);
-        if (!avg_out.is_open()) {
-            std::cerr << "Failed to open " << avg_file << std::endl;
-            return false;
-        }
+
         uint32_t count = static_cast<uint32_t>(num_faces);
-        avg_out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
-        for (size_t f = 0; f < num_faces; f++) {
-            float val = static_cast<float>(stats.avg[f]);
-            avg_out.write(reinterpret_cast<const char*>(&val), sizeof(float));
-        }
-        avg_out.close();
-        
-        // Write maximum
-        std::string max_file = stats_dir + "/" + data_type + "_max.bin";
-        std::ofstream max_out(max_file, std::ios::binary);
-        if (!max_out.is_open()) {
-            std::cerr << "Failed to open " << max_file << std::endl;
-            return false;
-        }
-        max_out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
-        for (size_t f = 0; f < num_faces; f++) {
-            float val = static_cast<float>(stats.max[f]);
-            max_out.write(reinterpret_cast<const char*>(&val), sizeof(float));
-        }
-        max_out.close();
-        
-        // Write minimum
-        std::string min_file = stats_dir + "/" + data_type + "_min.bin";
-        std::ofstream min_out(min_file, std::ios::binary);
-        if (!min_out.is_open()) {
-            std::cerr << "Failed to open " << min_file << std::endl;
-            return false;
-        }
-        min_out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
-        for (size_t f = 0; f < num_faces; f++) {
-            float val = static_cast<float>(stats.min[f]);
-            min_out.write(reinterpret_cast<const char*>(&val), sizeof(float));
-        }
-        min_out.close();
-        
+        auto write_one_field = [&](const char* suffix,
+                                   const std::vector<double>& values) -> bool {
+            std::string file = stats_dir + "/" + data_type + "_" + suffix + ".bin";
+            std::ofstream out(file, std::ios::binary);
+            if (!out.is_open()) {
+                std::cerr << "Failed to open " << file << std::endl;
+                return false;
+            }
+            out.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
+            for (size_t f = 0; f < num_faces; f++) {
+                float val = static_cast<float>(values[f]);
+                out.write(reinterpret_cast<const char*>(&val), sizeof(float));
+            }
+            out.close();
+            return true;
+        };
+
+        if (want_avg && !write_one_field("avg", stats.avg)) return false;
+        if (want_max && !write_one_field("max", stats.max)) return false;
+        if (want_min && !write_one_field("min", stats.min)) return false;
         return true;
 
     } catch (const std::exception& e) {
         std::cerr << "Exception writing statistics: " << e.what() << std::endl;
         return false;
     }
+}
+
+bool writeStatisticsBinary(
+    const std::string& output_dir,
+    const std::string& data_type,
+    const Statistics& stats,
+    size_t num_faces) {
+    return writeStatisticsBinary(output_dir, data_type, stats, num_faces,
+                                 true, true, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -12880,6 +13492,134 @@ bool writeIceStabilityRaw(
 }
 
 // Implement streamed illumination statistics export (no large allocations)
+// ---------------------------------------------------------------------------
+// Write the subsurface temperature maps.
+//
+// One file set per resolved depth, in the SAME format as the surface products
+// (uint32 face count + float32 per face), so every existing reader --
+// src/python/ptm/results.py, scripts/ptm3d_stats_to_cog.py, the GUI -- can open
+// them without a new code path. Plus statistics/depth_map_z.json, which is what
+// makes a snapped depth impossible to mistake for the requested one.
+//
+// COVERAGE IS CHECKED. A face that no solver folded in would otherwise ship as
+// the -inf/+inf sentinel or a 0/0 average, both of which render as a plausible
+// map. Refuse instead.
+// ---------------------------------------------------------------------------
+static bool depthMapWrite(const std::string& output_dir, bool write_raw) {
+    if (!depthMapOn()) return true;
+    auto& acc = g_depth_map.acc;
+    if (!acc.ready()) {
+        std::cerr << "[depth-map] FATAL: the accumulator was never allocated; no "
+                     "solver path filled it. Refusing to write.\n";
+        return false;
+    }
+
+    size_t n_uncovered = 0, n_wrong_count = 0, first_bad = 0;
+    std::uint32_t worst_count = 0;
+    const std::uint32_t want = static_cast<std::uint32_t>(g_depth_map.expected_samples);
+    for (size_t f = 0; f < acc.n_faces; ++f) {
+        if (!g_depth_map.covered[f]) {
+            if (n_uncovered + n_wrong_count == 0) first_bad = f;
+            ++n_uncovered;
+        } else if (want > 0 && acc.count[f] != want) {
+            if (n_uncovered + n_wrong_count == 0) first_bad = f;
+            ++n_wrong_count;
+            if (acc.count[f] > worst_count) worst_count = acc.count[f];
+        }
+    }
+    if (n_uncovered || n_wrong_count) {
+        std::cerr << "\n[depth-map] FATAL: the depth accumulator does not cover the "
+                     "mesh exactly once -- " << n_uncovered
+                  << " face(s) were never integrated by a path that carries it, and "
+                  << n_wrong_count << " face(s) contributed a number of samples other "
+                     "than the " << want << " output frames in the window (worst "
+                  << worst_count << "; first bad face " << first_bad << " of "
+                  << acc.n_faces << ", which holds " << acc.count[first_bad]
+                  << ").\n"
+                     "  A face counted twice means a solver path ADDED where it should "
+                     "have REPLACED, which blends two integrations into one average "
+                     "while leaving max and min looking perfectly normal.\n"
+                     "  Refusing to write.\n";
+        return false;
+    }
+
+    const size_t F = acc.n_faces;
+    bool ok = true;
+    for (size_t d = 0; d < g_depth_map.plan.size(); ++d) {
+        const auto& e = g_depth_map.plan.entries[d];
+        Statistics st;
+        st.avg.assign(F, 0.0);
+        st.max.assign(F, 0.0);
+        st.min.assign(F, 0.0);
+        st.sum.assign(F, 0.0);
+        st.count.assign(F, 0u);
+        for (size_t f = 0; f < F; ++f) {
+            const size_t i = d * F + f;
+            st.sum[f]   = acc.sum[i];
+            st.count[f] = acc.count[f];
+            st.avg[f]   = acc.sum[i] / static_cast<double>(acc.count[f]);
+            st.max[f]   = acc.vmax[i];
+            st.min[f]   = acc.vmin[i];
+        }
+        bool want_avg = false, want_max = false, want_min = false;
+        for (thermal::depthmap::Stat s : g_depth_map.plan.stats) {
+            if (s == thermal::depthmap::Stat::Avg) want_avg = true;
+            if (s == thermal::depthmap::Stat::Max) want_max = true;
+            if (s == thermal::depthmap::Stat::Min) want_min = true;
+        }
+        if (!writeStatisticsBinary(output_dir, e.field, st, F,
+                                   want_avg, want_max, want_min)) {
+            std::cerr << "[depth-map] failed to write " << e.field << "\n";
+            ok = false;
+            continue;
+        }
+        // The merge-friendly raw side files carry the per-face SUM and COUNT,
+        // which reconstruct the average and nothing else -- so they are only
+        // written when the average was asked for. max/min merge directly from
+        // the maps themselves (ptm_merge_chunks takes the max of the maxima).
+        if (write_raw && want_avg && !writeRawStatsBinary(output_dir, e.field, st, F)) {
+            std::cerr << "[depth-map] failed to write raw stats for " << e.field << "\n";
+            ok = false;
+        }
+    }
+
+    // The z-manifest. Written last, so its presence means the maps beside it
+    // were written too.
+    try {
+        std::filesystem::create_directories(output_dir + "/statistics");
+        std::ostringstream win;
+        win << "[" << g_depth_map.win_start << "," << g_depth_map.win_end << ")";
+        std::ofstream js(output_dir + "/statistics/depth_map_z.json");
+        if (!js) {
+            std::cerr << "[depth-map] failed to open depth_map_z.json\n";
+            ok = false;
+        } else {
+            js << thermal::depthmap::toJson(g_depth_map.plan,
+                                            g_depth_map.grid_fingerprint, F,
+                                            win.str(), g_depth_map.solver_path);
+            if (!js.good()) {
+                std::cerr << "[depth-map] failed to write depth_map_z.json\n";
+                ok = false;
+            }
+        }
+    } catch (const std::exception& ex) {
+        std::cerr << "[depth-map] exception writing depth_map_z.json: "
+                  << ex.what() << "\n";
+        ok = false;
+    }
+
+    if (ok) {
+        std::cout << "[depth-map] Wrote " << g_depth_map.plan.size()
+                  << " depth(s) x " << g_depth_map.plan.stats.size()
+                  << " statistic(s) to " << output_dir << "/statistics/"
+                  << " (solver path: " << g_depth_map.solver_path
+                  << ", window " << g_depth_map.win_start << ".."
+                  << g_depth_map.win_end << ", " << acc.count[0]
+                  << " samples/face)\n";
+    }
+    return ok;
+}
+
 bool exportIlluminationStatisticsStreamed(
     const std::string& output_dir,
     const std::shared_ptr<Mesh>& mesh,
@@ -16520,6 +17260,80 @@ int main(int argc, char** argv) {
             integration_steps_cli, integration_offset_steps_cli,
             integration_offset_days);
         setEffectiveAlbedoWindow(aeff_iw.start, aeff_iw.steps);
+
+        // ---- Subsurface temperature map product (output.map_depths_m) ----
+        // Resolved HERE, at the same window and before the illumination phase,
+        // so a bad depth list costs seconds instead of hours -- and so the depth
+        // maps reduce over exactly the window every other statistics/*.bin uses.
+        if (!sim_config.output.map_depths_m.empty()) {
+            // The paths this engine can carry the accumulator through, checked
+            // before anything expensive runs. Each refusal names the fix.
+            // ⛔ READ `config`, NOT `thermal_config`. Both flags are set on the
+            // CLI/parse config early (use_gpu_thermal at the YAML fan-out and
+            // at --use-gpu-thermal; use_simd_batch at --no-simd-batch) and are
+            // only COPIED onto thermal_config ~1000 lines below this point.
+            // Reading thermal_config here returned the DEFAULTS on every run --
+            // which refused every GPU run with radiation on, i.e. the exact
+            // production case, while passing every gate that did not have both.
+            // Caught by the N=1/2/4 depth-on probe, not by inspection.
+            const bool gpu_thermal_cfg =
+                config.getPropertyBool("use_gpu_thermal", false);
+            const bool simd_batch_cfg =
+                config.getPropertyBool("use_simd_batch", true);
+            if (!run_thermal_mesh) {
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_m asks for "
+                             "subsurface temperature maps, but this run does not "
+                             "solve the thermal model (thermal.run_thermal_mesh is "
+                             "false). There is no column to sample.\n";
+                return 1;
+            }
+            if (!compute_statistics) {
+                // The depth maps ARE statistics and are written from the
+                // statistics block. Without it the run would integrate the
+                // accumulator, write nothing, and exit 0.
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set but "
+                             "statistics are disabled (--no-statistics / "
+                             "thermal.compute_statistics: false). The depth maps are "
+                             "statistics and would never be written.\n";
+                return 1;
+            }
+            if (!simd_batch_cfg) {
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set and this "
+                             "run selects the CPU SCALAR solver "
+                             "(--no-simd-batch / use_simd_batch: false).\n"
+                             "  That path gives every face its OWN depth grid "
+                             "(thermal_model.cpp, generateAdaptiveGrid per face), so "
+                             "one set of per-depth node indices and weights cannot "
+                             "describe them all. Reusing the reference grid's weights "
+                             "there is BUGS.md PTM-76's failure exactly.\n"
+                             "  Run the shipped default CPU SIMD-batch solver or the "
+                             "GPU solver, or drop output.map_depths_m.\n";
+                return 1;
+            }
+            if (enable_radiation_exchange && !gpu_thermal_cfg) {
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set with "
+                             "radiation coupling enabled on the CPU solver.\n"
+                             "  The coupling loop re-integrates selected faces through "
+                             "the CPU selected-faces re-thermal, which this engine does "
+                             "not carry the depth accumulator through; those faces' "
+                             "depth maps would keep iteration 0's uncoupled values "
+                             "while their surface maps carried the coupled ones.\n"
+                             "  Set thermal.use_gpu: true (the GPU re-thermal DOES "
+                             "carry it), turn radiation off, or drop "
+                             "output.map_depths_m.\n";
+                return 1;
+            }
+            std::string derr;
+            if (!depthMapValidateRequest(sim_config.output.map_depths_m,
+                                         sim_config.output.map_depth_snap_to_node,
+                                         sim_config.output.map_depth_stats,
+                                         mesh->faces.size(),
+                                         sim_config.output.write_raw_stats,
+                                         aeff_iw.start, aeff_iw.steps, derr)) {
+                std::cerr << "\n[depth-map] FATAL: " << derr << "\n";
+                return 1;
+            }
+        }
     }
 
     // Build the ET grid: equilibration block followed by output block, both
@@ -17753,6 +18567,21 @@ int main(int argc, char** argv) {
         // it is a claim about this file's control flow, and moving a write
         // below it silently makes the claim false.
         thermal_config_populated = true;
+
+        // ---- Subsurface depth maps, STAGE B: resolve against the REAL grid ----
+        // Here, and not at the early validation site, because `thermal_config`
+        // is only complete now: grid_m/n/b, chi, the conductivity law and every
+        // thermophysical override land above. Resolving the plan earlier built
+        // it on a default Moon column, which refused legitimate depths on any
+        // run with a non-default grid and would have put a Europa or generic
+        // body on the wrong grid entirely.
+        if (g_depth_map.requested) {
+            std::string derr;
+            if (!depthMapPrepare(thermal_config, derr)) {
+                std::cerr << "\n[depth-map] FATAL: " << derr << "\n";
+                return 1;
+            }
+        }
 
         // Debug output to verify properties were set correctly
         if (verbose) {
@@ -20495,6 +21324,35 @@ int main(int argc, char** argv) {
                     // or failed, to avoid wasting RAM (~5.2 GB for 1.8M faces ×
                     // 960 steps × 8 bytes × 0.27 selection fraction).
                     std::vector<std::vector<double>> combined_flux;
+                    if (!use_gpu_thermal_rerun && depthMapOn()) {
+                        // The CPU selected-faces re-thermal re-integrates each
+                        // selected face through its OWN per-face thermal::Model,
+                        // whose depth grid is per-face (thermal_model.cpp:3184)
+                        // -- not the shared reference grid the depth plan's
+                        // (j, w) were resolved against. Reusing those weights
+                        // there is exactly PTM-76's failure, and computing
+                        // per-face weights is a separate piece of work.
+                        //
+                        // Reachable two ways: a CPU-solver run with radiation
+                        // coupling on, and a GPU run whose re-thermal failed and
+                        // fell back. The first is refused at startup; this is
+                        // the second, and it can only be caught here.
+                        std::cerr << "\n[depth-map] FATAL: coupling iteration "
+                                  << (iter + 1) << " is running the CPU"
+                                     " selected-faces re-thermal on "
+                                  << faces_to_rerun.size() << " face(s), which this"
+                                     " engine does not carry the depth accumulator"
+                                     " through.\n"
+                                     "  Those faces' depth maps would still hold"
+                                     " iteration 0's uncoupled values while their"
+                                     " statistics/temperature_*.bin holds the coupled"
+                                     " ones -- a disagreement nothing downstream could"
+                                     " see.\n"
+                                     "  Refusing to write. Re-run with"
+                                     " thermal.use_gpu: true (the GPU re-thermal DOES"
+                                     " carry it), or drop output.map_depths_m.\n";
+                        return 1;
+                    }
                     if (!use_gpu_thermal_rerun) {
                         // Hayne (2017) parameters — match iter-0.
                         const double a_coef = (planet.albedoCoef.size() >= 2)
@@ -22000,6 +22858,15 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::cerr << "WARNING: Exception during statistics export: " << e.what() << std::endl;
+        }
+
+        // Subsurface temperature maps, beside the surface ones and reduced over
+        // the same window. A failure here is FATAL, not a warning: the run was
+        // asked for a product, and exiting 0 having produced none (or a partial
+        // one) is the silent-substitution class this project refuses.
+        if (depthMapOn() && !depthMapWrite(output_dir,
+                                           sim_config.output.write_raw_stats)) {
+            return 1;
         }
 
         // PTM-107(a): the operative per-face effective albedo, so an external energy-

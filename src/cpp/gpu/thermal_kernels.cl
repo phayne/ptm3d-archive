@@ -309,7 +309,30 @@ __kernel void persistentThermalKernel(
     // round-off floor's COST is invisible from outside the kernel -- the
     // residual alone cannot distinguish "exited in 2 steps at the precision
     // limit" from "spun to the 10-step cap and ended at the same place".
-    __global int* surf_iters)
+    __global int* surf_iters,
+    // Subsurface temperature-map accumulator (optional). DEVICE MIRROR of
+    // thermal::depthmap::Accumulator::addColumn (src/cpp/thermal/
+    // depth_map_plan.h) -- keep the two in step; the CPU-vs-GPU agreement gate
+    // is what holds them together, not inspection.
+    //
+    // Each buffer is n_depths x n_faces, depth-major, and every work item owns
+    // its own face column, so no atomics are required -- the same property the
+    // Schorghofer accumulator above relies on.
+    //
+    // The sample is taken at exactly the instant output_temps[tg] is stored,
+    // with node 0 replaced by the value stored there. Nothing else reproduces
+    // statistics/temperature_*.bin at z = 0: T_local[0] at any other point in
+    // the interval carries a different epoch's flux, and the T_geo floor is
+    // applied to the frame but not to the raw iterate.
+    __global float* depth_sum,        // running sum of T(z_d) over the window
+    __global float* depth_max,
+    __global float* depth_min,
+    __global const int*   depth_j,    // lower bracketing node, per depth
+    __global const float* depth_w,    // weight on node j+1, per depth
+    int n_depths,
+    int do_depth_accum,
+    int depth_accum_start,            // first GLOBAL output step to fold in
+    int depth_accum_end)              // one past the last
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -417,6 +440,23 @@ __kernel void persistentThermalKernel(
     // branch for a case that fires once.
     if (t_offset == 0 && n_timesteps > 0) {
         output_temps[face] = T_local[0];
+        // The depth product folds in the SAME frame, from the same column, at
+        // the same index. Row 0 is the only frame whose surface node is the
+        // stored one verbatim, so there is no override to apply here.
+        if (do_depth_accum != 0 && 0 >= depth_accum_start && 0 < depth_accum_end) {
+            for (int d = 0; d < n_depths; ++d) {
+                int   jd = depth_j[d];
+                float wd = depth_w[d];
+                float a  = T_local[jd];
+                float b  = T_local[jd + 1];
+                float v  = (wd == 0.0f) ? a
+                         : ((wd == 1.0f) ? b : (1.0f - wd) * a + wd * b);
+                int idx = d * n_faces + face;
+                depth_sum[idx] += v;
+                depth_max[idx] = fmax(depth_max[idx], v);
+                depth_min[idx] = fmin(depth_min[idx], v);
+            }
+        }
     }
 
     // Process ALL output timesteps
@@ -596,8 +636,28 @@ __kernel void persistentThermalKernel(
                 // of every substep, so the reported number cannot sit under a
                 // floor the integrator enforces.
                 if (substep == 0 && tg > 0) {
-                    output_temps[tg * n_faces + face] =
-                        (T_geo > 0.0f) ? fmax(T_surf, T_geo) : T_surf;
+                    float T0_out = (T_geo > 0.0f) ? fmax(T_surf, T_geo) : T_surf;
+                    output_temps[tg * n_faces + face] = T0_out;
+                    // Depth product, same instant, same column. Node 0 is
+                    // T0_out and not T_local[0]: the two differ by the T_geo
+                    // floor, and a z = 0 map that used the unfloored iterate
+                    // would fail to reproduce temperature_min.bin on exactly
+                    // the cold faces the floor exists for.
+                    if (do_depth_accum != 0 && tg >= depth_accum_start &&
+                        tg < depth_accum_end) {
+                        for (int d = 0; d < n_depths; ++d) {
+                            int   jd = depth_j[d];
+                            float wd = depth_w[d];
+                            float a  = (jd == 0) ? T0_out : T_local[jd];
+                            float b  = T_local[jd + 1];
+                            float v  = (wd == 0.0f) ? a
+                                     : ((wd == 1.0f) ? b : (1.0f - wd) * a + wd * b);
+                            int idx = d * n_faces + face;
+                            depth_sum[idx] += v;
+                            depth_max[idx] = fmax(depth_max[idx], v);
+                            depth_min[idx] = fmin(depth_min[idx], v);
+                        }
+                    }
                 }
 
                 // CRITICAL: Recompute surface material properties using NEW surface temperature

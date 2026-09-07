@@ -55,6 +55,153 @@ namespace opencl {
 // identical in solvePersistentAllTimesteps and solvePersistentMultipleCycles).
 static constexpr int kArgNTimesteps = 20;  // int n_timesteps
 static constexpr int kArgTOffset    = 25;  // int t_offset (Phase R, R2 — last arg)
+// int do_depth_accum, the depth-map gate. Appended after surf_iters, so every
+// index above is unmoved -- which is the whole reason new args go on the END of
+// this kernel and nowhere else.
+static constexpr int kArgDoDepthAccum = 36;
+static constexpr int kArgDepthFirst   = 30;  // first depth arg (depth_sum)
+
+// ---------------------------------------------------------------------------
+// Device-side state for the optional depth-map accumulator.
+//
+// ONE implementation, used by both persistent entry points on purpose. The nine
+// depth args are the tail of an arg list the two functions share, and
+// clSetKernelArg values PERSIST on the kernel object: if one entry point set
+// them and the other did not, the second call would run against the first
+// call's cl_mem handles, which by then are released. So both must set all nine,
+// every time, enabled or not -- and the cheapest way to guarantee that is for
+// neither of them to write the sequence out by hand.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct DepthKernelArgs {
+    cl_mem buf_sum = nullptr, buf_max = nullptr, buf_min = nullptr;
+    cl_mem buf_j   = nullptr, buf_w   = nullptr;
+    int n_depths = 0;
+    int do_accum = 0;
+    int start = 0, end = 0;
+    const ThermalOpenCLSolver::DepthAccumIO* io = nullptr;
+
+    // Returns CL_SUCCESS, or the first failing error code.
+    cl_int create(cl_context ctx,
+                  const ThermalOpenCLSolver::DepthAccumIO* depth,
+                  std::size_t n_faces_active, int n_timesteps) {
+        cl_int err = CL_SUCCESS;
+        const bool on = (depth != nullptr && depth->valid() && n_faces_active > 0);
+        io = on ? depth : nullptr;
+        n_depths = on ? static_cast<int>(depth->n_depths()) : 0;
+        do_accum = on ? 1 : 0;
+        start = 0;
+        end   = 0;
+
+        // A 4-byte dummy when off, exactly as the Schorghofer accumulator does:
+        // an always-valid handle in every slot beats a conditional arg list.
+        float  fdummy = 0.0f;
+        int    idummy = 0;
+        if (!on) {
+            buf_sum = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(float), &fdummy, &err);
+            if (err != CL_SUCCESS) return err;
+            buf_max = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(float), &fdummy, &err);
+            if (err != CL_SUCCESS) return err;
+            buf_min = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                     sizeof(float), &fdummy, &err);
+            if (err != CL_SUCCESS) return err;
+            buf_j = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(int), &idummy, &err);
+            if (err != CL_SUCCESS) return err;
+            buf_w = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                   sizeof(float), &fdummy, &err);
+            return err;
+        }
+
+        const std::size_t need =
+            static_cast<std::size_t>(n_depths) * n_faces_active;
+        // The caller owns sizing AND the identity of the sentinels; re-seed
+        // rather than trust, because a wrongly-sized buffer here is a silent
+        // out-of-bounds write on the device.
+        if (depth->sum->size()  != need) depth->sum->assign(need, 0.0f);
+        // FINITE, not +/-infinity: this program is built
+        // `-cl-fast-relaxed-math`, which implies `-cl-finite-math-only`, so a
+        // device compiler is entitled to assume no operand of the kernel's
+        // fmax/fmin is infinite. There is no OpenCL `-fno-finite-math-only`.
+        // Matches thermal::depthmap::Accumulator::allocate on the host side.
+        if (depth->vmax->size() != need)
+            depth->vmax->assign(need, -std::numeric_limits<float>::max());
+        if (depth->vmin->size() != need)
+            depth->vmin->assign(need,  std::numeric_limits<float>::max());
+
+        buf_sum = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                 need * sizeof(float), depth->sum->data(), &err);
+        if (err != CL_SUCCESS) return err;
+        buf_max = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                 need * sizeof(float), depth->vmax->data(), &err);
+        if (err != CL_SUCCESS) return err;
+        buf_min = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                 need * sizeof(float), depth->vmin->data(), &err);
+        if (err != CL_SUCCESS) return err;
+        buf_j = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                               depth->node_j->size() * sizeof(int),
+                               const_cast<int*>(depth->node_j->data()), &err);
+        if (err != CL_SUCCESS) return err;
+        buf_w = clCreateBuffer(ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                               depth->weight->size() * sizeof(float),
+                               const_cast<float*>(depth->weight->data()), &err);
+        if (err != CL_SUCCESS) return err;
+
+        start = (depth->accum_start < 0) ? 0 : depth->accum_start;
+        end   = (depth->accum_end   < 0) ? n_timesteps : depth->accum_end;
+        return CL_SUCCESS;
+    }
+
+    // Sets all nine args starting at `arg`; returns the next free index.
+    cl_int setArgs(cl_kernel k, int arg, int* next_arg) {
+        cl_int e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(cl_mem), &buf_sum))  != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(cl_mem), &buf_max))  != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(cl_mem), &buf_min))  != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(cl_mem), &buf_j))    != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(cl_mem), &buf_w))    != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(int),    &n_depths)) != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(int),    &do_accum)) != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(int),    &start))    != CL_SUCCESS) return e;
+        if ((e = clSetKernelArg(k, arg++, sizeof(int),    &end))      != CL_SUCCESS) return e;
+        if (next_arg) *next_arg = arg;
+        return CL_SUCCESS;
+    }
+
+    // Read the three accumulators back. Loud on failure: a depth product that
+    // silently kept its host-side seed would ship -inf maxima.
+    bool readback(cl_command_queue q) {
+        if (!io) return true;
+        const std::size_t bytes = io->sum->size() * sizeof(float);
+        struct { cl_mem b; void* h; const char* name; } xs[3] = {
+            { buf_sum, io->sum->data(),  "depth_sum"  },
+            { buf_max, io->vmax->data(), "depth_max"  },
+            { buf_min, io->vmin->data(), "depth_min"  },
+        };
+        for (const auto& x : xs) {
+            cl_int e = clEnqueueReadBuffer(q, x.b, CL_TRUE, 0, bytes, x.h,
+                                           0, nullptr, nullptr);
+            if (e != CL_SUCCESS) {
+                std::cerr << "[GPU Thermal] FAILED to read " << x.name << ": "
+                          << clErrorString(e) << "\n";
+                if (io->readback_failed) *io->readback_failed = true;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void release() {
+        for (cl_mem* b : { &buf_sum, &buf_max, &buf_min, &buf_j, &buf_w }) {
+            if (*b) { clReleaseMemObject(*b); *b = nullptr; }
+        }
+    }
+};
+
+}  // namespace
 
 // In-process override of the self-chunk ceiling, set by the auto-calibrate path
 // (ptm_thermal_sim.cpp ensureGpuCalibrated) via setDispatchCeilingOverride().
@@ -537,7 +684,30 @@ __kernel void persistentThermalKernel(
     // round-off floor's COST is invisible from outside the kernel -- the
     // residual alone cannot distinguish "exited in 2 steps at the precision
     // limit" from "spun to the 10-step cap and ended at the same place".
-    __global int* surf_iters)
+    __global int* surf_iters,
+    // Subsurface temperature-map accumulator (optional). DEVICE MIRROR of
+    // thermal::depthmap::Accumulator::addColumn (src/cpp/thermal/
+    // depth_map_plan.h) -- keep the two in step; the CPU-vs-GPU agreement gate
+    // is what holds them together, not inspection.
+    //
+    // Each buffer is n_depths x n_faces, depth-major, and every work item owns
+    // its own face column, so no atomics are required -- the same property the
+    // Schorghofer accumulator above relies on.
+    //
+    // The sample is taken at exactly the instant output_temps[tg] is stored,
+    // with node 0 replaced by the value stored there. Nothing else reproduces
+    // statistics/temperature_*.bin at z = 0: T_local[0] at any other point in
+    // the interval carries a different epoch's flux, and the T_geo floor is
+    // applied to the frame but not to the raw iterate.
+    __global float* depth_sum,        // running sum of T(z_d) over the window
+    __global float* depth_max,
+    __global float* depth_min,
+    __global const int*   depth_j,    // lower bracketing node, per depth
+    __global const float* depth_w,    // weight on node j+1, per depth
+    int n_depths,
+    int do_depth_accum,
+    int depth_accum_start,            // first GLOBAL output step to fold in
+    int depth_accum_end)              // one past the last
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -645,6 +815,23 @@ __kernel void persistentThermalKernel(
     // branch for a case that fires once.
     if (t_offset == 0 && n_timesteps > 0) {
         output_temps[face] = T_local[0];
+        // The depth product folds in the SAME frame, from the same column, at
+        // the same index. Row 0 is the only frame whose surface node is the
+        // stored one verbatim, so there is no override to apply here.
+        if (do_depth_accum != 0 && 0 >= depth_accum_start && 0 < depth_accum_end) {
+            for (int d = 0; d < n_depths; ++d) {
+                int   jd = depth_j[d];
+                float wd = depth_w[d];
+                float a  = T_local[jd];
+                float b  = T_local[jd + 1];
+                float v  = (wd == 0.0f) ? a
+                         : ((wd == 1.0f) ? b : (1.0f - wd) * a + wd * b);
+                int idx = d * n_faces + face;
+                depth_sum[idx] += v;
+                depth_max[idx] = fmax(depth_max[idx], v);
+                depth_min[idx] = fmin(depth_min[idx], v);
+            }
+        }
     }
 
     // Process ALL output timesteps
@@ -824,8 +1011,28 @@ __kernel void persistentThermalKernel(
                 // of every substep, so the reported number cannot sit under a
                 // floor the integrator enforces.
                 if (substep == 0 && tg > 0) {
-                    output_temps[tg * n_faces + face] =
-                        (T_geo > 0.0f) ? fmax(T_surf, T_geo) : T_surf;
+                    float T0_out = (T_geo > 0.0f) ? fmax(T_surf, T_geo) : T_surf;
+                    output_temps[tg * n_faces + face] = T0_out;
+                    // Depth product, same instant, same column. Node 0 is
+                    // T0_out and not T_local[0]: the two differ by the T_geo
+                    // floor, and a z = 0 map that used the unfloored iterate
+                    // would fail to reproduce temperature_min.bin on exactly
+                    // the cold faces the floor exists for.
+                    if (do_depth_accum != 0 && tg >= depth_accum_start &&
+                        tg < depth_accum_end) {
+                        for (int d = 0; d < n_depths; ++d) {
+                            int   jd = depth_j[d];
+                            float wd = depth_w[d];
+                            float a  = (jd == 0) ? T0_out : T_local[jd];
+                            float b  = T_local[jd + 1];
+                            float v  = (wd == 0.0f) ? a
+                                     : ((wd == 1.0f) ? b : (1.0f - wd) * a + wd * b);
+                            int idx = d * n_faces + face;
+                            depth_sum[idx] += v;
+                            depth_max[idx] = fmax(depth_max[idx], v);
+                            depth_min[idx] = fmin(depth_min[idx], v);
+                        }
+                    }
                 }
 
                 // CRITICAL: Recompute surface material properties using NEW surface temperature
@@ -1721,7 +1928,8 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     float dt,
     std::vector<float>* avg_E_inout,
     int accum_start,
-    int accum_end)
+    int accum_end,
+    const DepthAccumIO* depth)
 {
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
@@ -1831,6 +2039,34 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_resid_));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_iters_));
 
+    // Subsurface depth-map accumulator (args 30..38). Set unconditionally --
+    // see DepthKernelArgs.
+    DepthKernelArgs depth_args;
+    {
+        cl_int derr = depth_args.create(ctx, depth, n_faces_active_, n_timesteps);
+        if (derr != CL_SUCCESS) {
+            std::cerr << "[GPU Thermal] FATAL: could not allocate the depth-map "
+                         "accumulator buffers: " << clErrorString(derr) << "\n";
+            depth_args.release();
+            clReleaseMemObject(buf_flux_all);
+            clReleaseMemObject(buf_output_temps);
+            clReleaseMemObject(buf_avg_E);
+            return;
+        }
+        if (arg != kArgDepthFirst) {
+            std::cerr << "[GPU Thermal] FATAL: the persistent kernel's depth args "
+                         "start at index " << arg << ", not the "
+                      << kArgDepthFirst << " the per-cycle gate assumes. The arg "
+                         "list moved; fix kArgDepthFirst/kArgDoDepthAccum.\n";
+            depth_args.release();
+            clReleaseMemObject(buf_flux_all);
+            clReleaseMemObject(buf_output_temps);
+            clReleaseMemObject(buf_avg_E);
+            return;
+        }
+        CL_CHECK(depth_args.setArgs(persistent_kernel_, arg, &arg));
+    }
+
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
                           config_.work_group_size) * config_.work_group_size;
@@ -1937,10 +2173,14 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         }
     }
 
+    // Read back the depth-map accumulator if requested.
+    depth_args.readback(queue);
+
     // Clean up temporary buffers
     clReleaseMemObject(buf_flux_all);
     clReleaseMemObject(buf_output_temps);
     clReleaseMemObject(buf_avg_E);
+    depth_args.release();
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
@@ -2162,7 +2402,8 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     int accum_start,
     int accum_end,
     const ptm::eqextrap::Options* extrap,
-    ptm::eqextrap::Stats* extrap_stats)
+    ptm::eqextrap::Stats* extrap_stats,
+    const DepthAccumIO* depth)
 {
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
@@ -2267,6 +2508,37 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     // companion (arg 29), appended last.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_resid_));
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_surf_iters_));
+    // Subsurface depth-map accumulator (args 30..38). Its do_depth_accum slot
+    // is seeded to 0 here and, like do_accumulate, raised only for the FINAL
+    // (output) cycle -- an equilibration pass must never enter the product.
+    DepthKernelArgs depth_args;
+    {
+        cl_int derr = depth_args.create(ctx, depth, n_faces_active_, n_timesteps);
+        if (derr != CL_SUCCESS) {
+            std::cerr << "[GPU Thermal] FATAL: could not allocate the depth-map "
+                         "accumulator buffers: " << clErrorString(derr) << "\n";
+            depth_args.release();
+            clReleaseMemObject(buf_flux_all);
+            clReleaseMemObject(buf_output_temps);
+            clReleaseMemObject(buf_avg_E);
+            return;
+        }
+        if (arg != kArgDepthFirst) {
+            std::cerr << "[GPU Thermal] FATAL: the persistent kernel's depth args "
+                         "start at index " << arg << ", not the "
+                      << kArgDepthFirst << " the per-cycle gate assumes. The arg "
+                         "list moved; fix kArgDepthFirst/kArgDoDepthAccum.\n";
+            depth_args.release();
+            clReleaseMemObject(buf_flux_all);
+            clReleaseMemObject(buf_output_temps);
+            clReleaseMemObject(buf_avg_E);
+            return;
+        }
+        const int want_do = depth_args.do_accum;
+        depth_args.do_accum = 0;
+        CL_CHECK(depth_args.setArgs(persistent_kernel_, arg, &arg));
+        depth_args.do_accum = want_do;
+    }
     const int kArgIdxDoAccumulate = 22; // index of do_accumulate in the arg list
 
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
@@ -2378,6 +2650,11 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
         int do_accum_this_cycle = (enable_accum && cycle == total_cycles - 1) ? 1 : 0;
         CL_CHECK(clSetKernelArg(persistent_kernel_, kArgIdxDoAccumulate,
                                  sizeof(int), &do_accum_this_cycle));
+        // Same rule, same reason, for the depth-map accumulator.
+        int do_depth_this_cycle =
+            (depth_args.do_accum && cycle == total_cycles - 1) ? 1 : 0;
+        CL_CHECK(clSetKernelArg(persistent_kernel_, kArgDoDepthAccum,
+                                 sizeof(int), &do_depth_this_cycle));
         err = enqueuePersistentSelfChunked(persistent_kernel_, queue, n_timesteps,
                                            max_ts, global_size, local_size);
         if (err != CL_SUCCESS) {
@@ -2432,9 +2709,13 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
         }
     }
 
+    // Read back the depth-map accumulator if requested.
+    depth_args.readback(queue);
+
     clReleaseMemObject(buf_flux_all);
     clReleaseMemObject(buf_output_temps);
     clReleaseMemObject(buf_avg_E);
+    depth_args.release();
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);

@@ -594,3 +594,21 @@ set_target_properties(test_thermal_wave_depth
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Depth-map PLAN gate. thermal/depth_map_plan.h is pure (no mesh, no solver, no
+# I/O), so its refusal surface and its interpolation arithmetic can be gated
+# without a run -- which is the point: every refusal gets its own arm, because a
+# refusal nothing ever fires is a refusal that does not exist. Header-only, so
+# this links `thermal` only for uniformity with the other tool gates; it does
+# not depend on the library's behavior. No mesh, no SPICE, no GPU.
+add_executable(test_depth_map_plan test_depth_map_plan.cpp)
+target_link_libraries(test_depth_map_plan
+    PRIVATE
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_depth_map_plan
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

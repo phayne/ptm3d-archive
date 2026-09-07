@@ -479,6 +479,40 @@ struct SimulationConfig {
         // statistics/_raw/ alongside the usual {datatype}_{max,avg,min}.bin.
         // Used by the chunked-run orchestrator + ptm_merge_chunks tool.
         bool write_raw_stats = false;
+
+        // ---- Subsurface temperature map product -----------------------------
+        // Mesh-wide temperature statistics AT DEPTH, mirroring the surface
+        // products (statistics/temperature_{avg,max,min}.bin) one file set per
+        // requested depth, named `temperature_z<meters>m_<stat>.bin`.
+        //
+        // EMPTY IS OFF and is byte-neutral to every other product; that is the
+        // acceptance test for this feature, not an incidental property.
+        //
+        // The resolved weights, the snapped depths, the residuals and the
+        // PREDICTED interpolation bias per depth are written to
+        // statistics/depth_map_z.json. The refusal surface (a depth below the
+        // deepest solved node, duplicates, an unknown statistic, a file-name
+        // collision after snapping, an oversized product) lives in
+        // src/cpp/thermal/depth_map_plan.h, which is where it is unit-tested.
+        std::vector<double> map_depths_m;
+
+        // Snap each requested depth to the nearest grid node. DEFAULT ON,
+        // because the INSTANTANEOUS linear-interpolation error at an off-node
+        // depth is 1.217e-3 x A -- 0.195 K at a lunar-equatorial amplitude
+        // A = 160 K, over the project's 0.15 K floor by itself and independent
+        // of how the statistic is accumulated (measured by
+        // test_thermal_wave_depth, 2026-09-04). Only a depth landing ON a node
+        // avoids it. Turning this off is legitimate, but the run then prints
+        // the per-depth bias it is spending.
+        bool map_depth_snap_to_node = true;
+
+        // Which statistics to write per depth: any subset of avg, max, min.
+        // `avg` commutes with interpolation exactly; `max`/`min` do not, which
+        // is why they are accumulated IN the solver at the requested depth
+        // rather than interpolated from per-layer extrema afterwards (that
+        // route costs 1.229e-3 x A and is worst at layer 0).
+        std::vector<std::string> map_depth_stats = {"avg", "max", "min"};
+
         // Skip writing mesh.ply to the output directory. Useful for the
         // chunked-run workflow: chunk 0 emits mesh.ply once for the
         // orchestrator to propagate, chunks 1+ set this true and skip
