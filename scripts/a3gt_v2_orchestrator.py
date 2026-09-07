@@ -241,10 +241,11 @@ def mesh_reuse_reason(ply: Path) -> str | None:
 
     This replaces a bare ``st_size > 1_000_000`` floor. File size is not
     validity, and the floor was wrong in the direction that costs a campaign:
-    A03SP010's real, correct, VF-paired LOLA core mesh is a legitimate
+    a real, correct, VF-paired LOLA-fallback core mesh is a legitimate
     379,264-byte / 8,746-face PLY, so the floor classified it as incomplete,
     forced an unplanned rebuild, and the 56-window ring-fix campaign stopped
-    at 48/56 when the rebuild refused (2026-09-03).
+    at 48/56 when the rebuild refused (2026-09-03). Five of the campaign's
+    sites carry a core mesh of exactly that size.
 
     What the floor was standing in for is checked directly instead:
 
@@ -361,12 +362,15 @@ def site_mesh_path(site: dict, roi_radius_km: float = 5.0,
     """Per-site mesh PLY path.
 
     Legacy (single-DEM / non-extended): keeps the historical name
-    ``polar_site_L_85.218S_31.850E_R{N}km_linear.ply`` so existing production
-    meshes are still found/skipped.
+    ``<ellipse_id>_<lat>S_<lon>E_R{N}km_linear.ply`` so existing production
+    meshes are still found/skipped. Latitude and longitude are formatted to
+    three decimals by the code below; the placeholders are deliberate, because
+    a worked example here would spell out a site coordinate this project does
+    not publish (see ``scripts/check_site_id_patterns.py``).
 
     Extended (physics-horizon): encodes both radii + the density exponent so
     extended and legacy meshes never collide:
-    ``polar_site_L_85.218S_31.850E_Rcore3_Rext11.57_p1.5.ply``.
+    ``<ellipse_id>_<lat>S_<lon>E_Rcore3_Rext11.57_p1.5.ply``.
     """
     base = (f"{site['ellipse_id']}_{abs(site['lat_deg']):.3f}S_"
             f"{site['lon_deg']:.3f}E_")

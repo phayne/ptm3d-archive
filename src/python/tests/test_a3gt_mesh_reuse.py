@@ -7,13 +7,12 @@ core mesh with::
     if ply.exists() and ply.stat().st_size > 1_000_000 and read_n_faces(ply) > 0:
 
 The 1 MB floor is a proxy for "this file is complete", and it is wrong in the
-direction that costs a campaign. A03SP010's real, correct, corrected-VF-paired
-core mesh is a legitimately coarse LOLA-fallback mesh: **379,264 bytes, 8,746
-faces**, matching its ``A03SP010_corrected_vf_v3.csr`` header exactly. The
-floor called it incomplete, so the orchestrator rebuilt it rather than reusing
-it -- and the rebuild refused (the site VRT's source raster is not beside it),
-exiting 2 and hard-stopping the 56-window ring-fix campaign at 48/56 on
-2026-09-03.
+direction that costs a campaign. A legitimately coarse LOLA-fallback core mesh
+is **379,264 bytes / 8,746 faces** -- well under the floor, and exactly the
+geometry its own corrected-VF CSR header declares. The floor called such a mesh
+incomplete, so the orchestrator rebuilt it rather than reusing it -- and the
+rebuild refused (that site's VRT source raster is not beside it), exiting 2 and
+hard-stopping the 56-window ring-fix campaign at 48/56 on 2026-09-03.
 
 ``mesh_reuse_reason`` replaces the floor with the checks the floor stood in for:
 
@@ -25,9 +24,21 @@ exiting 2 and hard-stopping the 56-window ring-fix campaign at 48/56 on
    in ``radiation_exchange.cpp``, applied before a window starts rather than
    after the matrix upload).
 
-The load-bearing check here is #1 in the list below: it FAILS against the old
-rule and PASSES against the new one. Everything else guards the ways a
+The load-bearing check is the first one below: it FAILS against the old rule
+and PASSES against the new one. Everything else guards the ways a
 too-permissive replacement could let a bad mesh through.
+
+**Why the leading case is synthetic.** It used to name the real mesh by its
+site identifier and its coordinates, which this project does not publish
+(``src/python/tests/test_tracked_tree_hygiene.py``). It is now built here, from
+``_write_ply``, at 4,420 vertices and 8,746 faces -- which produces a PLY of
+**exactly 379,264 bytes**, the real file's size to the byte, because both carry
+the same ``dtm_to_ply_delaunay`` property layout. So the discriminating arm no
+longer needs local data at all, and it went from SKIPPING on a fresh clone to
+running everywhere. The real artifacts are still checked, by the arms directly
+below it, through the local fixture registry (``local_fixtures``) that already
+exists for exactly this: paths that name sites, kept in
+``~/.ptm3d/test_fixtures.json`` rather than in a tracked file.
 
 Run directly::
 
@@ -43,27 +54,39 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from a3gt_v2_orchestrator import (            # noqa: E402
+import local_fixtures                          # noqa: E402
+from a3gt_v2_orchestrator import (             # noqa: E402
     MeshVFMismatch, build_mesh, mesh_reuse_reason, parse_ply_header,
     read_csr_n_faces, read_n_faces,
 )
 
-#: The real artifacts from the site that triggered this. Local campaign data,
-#: not shipped with the repository, so every check that wants them SKIPs when
-#: they are absent rather than reporting red on a fresh clone.
-SP010_MESH = Path(
-    "/Users/paha3326/projects/a3gt/meshes/"
-    "A03SP010_87.130S_127.826E_R3km_linear.ply")
-SP010_CSR = Path(
-    "/Users/paha3326/projects/a3gt/vf_build/A03SP010/"
-    "A03SP010_corrected_vf_v3.csr")
-SP010_FACES = 8746
-SP010_BYTES = 379_264
+#: The size class that provoked this change. These are MEASUREMENTS of a mesh
+#: kind, not identifiers of a place: five of the campaign's sites carry a
+#: LOLA-fallback core mesh with exactly these numbers. ``COARSE_VERTICES`` is
+#: what ``_write_ply`` needs to reproduce ``COARSE_BYTES`` exactly, and the
+#: first check below asserts that it does rather than trusting the arithmetic.
+COARSE_FACES = 8_746
+COARSE_VERTICES = 4_420
+COARSE_BYTES = 379_264
 
 #: The rule this change removes, quoted verbatim so the test states exactly
 #: what it is discriminating against.
 OLD_FLOOR_BYTES = 1_000_000
+
+#: An invented tag for fixture filenames. It is deliberately shaped UNLIKE a
+#: real site identifier -- it matches neither the deny list in
+#: ``~/.ptm3d/sensitive_identifiers.json`` nor the structural patterns in
+#: ``scripts/check_site_id_patterns.py``, which is the point: a fixture named
+#: after the run it came from is how the identifiers got back into this file.
+FIXTURE_TAG = "TESTSITE01"
+
+#: A face count for the "pinned VF is for a different mesh" case. Any number
+#: other than ``COARSE_FACES`` works; this is the size of a full-resolution
+#: 3 km core, so the fixture mismatch is the realistic one (coarse cached mesh
+#: against a matrix built for the fine geometry).
+OTHER_VF_FACES = 2_397_890
 
 
 class Skip(Exception):
@@ -105,42 +128,81 @@ def _write_ply(path: Path, n_vertices: int, n_faces: int,
     return path
 
 
-# --------------------------------------------------------------------------
-# 1. THE DISCRIMINATING CHECK
-# --------------------------------------------------------------------------
+def _assert_coarse_mesh_discriminates(ply: Path) -> None:
+    """The whole discrimination, asserted in both directions, on one file.
 
-def check_sp010_real_mesh_is_accepted_and_old_floor_rejected_it():
-    """SP010's real mesh: refused by the floor, accepted by the new check.
-
-    This is the check that would have caught the bug, and the one that fails
-    if the fix is reverted. It asserts BOTH directions, so it cannot pass
-    vacuously against a rule that accepts everything.
+    Shared by the synthetic arm and the real-artifact arm so the two cannot
+    drift: whatever the synthetic fixture is asked to prove, the real mesh is
+    asked to prove as well.
     """
-    if not SP010_MESH.is_file():
-        raise Skip(f"{SP010_MESH} not present")
-    size = SP010_MESH.stat().st_size
-    n = read_n_faces(SP010_MESH)
-    assert size == SP010_BYTES, f"expected {SP010_BYTES:,} bytes, got {size:,}"
-    assert n == SP010_FACES, f"expected {SP010_FACES:,} faces, got {n:,}"
+    size = ply.stat().st_size
+    n = read_n_faces(ply)
+    assert n == COARSE_FACES, f"expected {COARSE_FACES:,} faces, got {n:,}"
+    assert size == COARSE_BYTES, f"expected {COARSE_BYTES:,} bytes, got {size:,}"
 
     # The old rule, quoted: it rejects this legitimate mesh.
     old_ok = size > OLD_FLOOR_BYTES and n > 0
     assert not old_ok, (
         "the old floor would have ACCEPTED this mesh, so this test no longer "
-        "discriminates -- check SP010_BYTES/OLD_FLOOR_BYTES")
+        "discriminates -- check COARSE_BYTES/OLD_FLOOR_BYTES")
 
     # The new rule accepts it.
-    assert mesh_reuse_reason(SP010_MESH) is None, mesh_reuse_reason(SP010_MESH)
+    assert mesh_reuse_reason(ply) is None, mesh_reuse_reason(ply)
 
 
-def check_sp010_csr_header_agrees_with_the_mesh():
+# --------------------------------------------------------------------------
+# 1. THE DISCRIMINATING CHECK
+# --------------------------------------------------------------------------
+
+def check_coarse_valid_mesh_is_accepted_and_old_floor_rejected_it():
+    """A coarse but valid mesh: refused by the floor, accepted by the new check.
+
+    This is the check that would have caught the bug, and the one that fails
+    if the fix is reverted. It asserts BOTH directions, so it cannot pass
+    vacuously against a rule that accepts everything -- and it is synthetic,
+    so it runs on a fresh clone with no campaign data anywhere on the machine.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ply = _write_ply(Path(td) / f"{FIXTURE_TAG}_R3km_linear.ply",
+                         COARSE_VERTICES, COARSE_FACES)
+        _assert_coarse_mesh_discriminates(ply)
+
+
+def check_registered_coarse_mesh_is_the_shape_the_synthetic_one_claims():
+    """The real artifact, when this machine has it, is that same mesh.
+
+    The synthetic fixture above is only worth anything if it is a faithful
+    stand-in, and "faithful" here is checkable to the byte. Registered as
+    ``coarse_lola_core_mesh`` in the local fixture file so this tracked test
+    does not have to name the site the mesh belongs to.
+
+    A mesh of a DIFFERENT size class registered under that name is a
+    misregistration, not a regression, so it is a named skip: the arm compares
+    against one specific pair of numbers, and reddening the suite because a
+    colleague registered their own coarse mesh would say nothing about the fix.
+    """
+    mesh = local_fixtures.fixture_file("coarse_lola_core_mesh", Skip)
+    size, n = mesh.stat().st_size, read_n_faces(mesh)
+    if (size, n) != (COARSE_BYTES, COARSE_FACES):
+        raise Skip(
+            f"the mesh registered as 'coarse_lola_core_mesh' is {size:,} bytes "
+            f"/ {n:,} faces, and this arm compares against the "
+            f"{COARSE_BYTES:,}-byte / {COARSE_FACES:,}-face class the synthetic "
+            f"fixture reproduces; register one of those, or update both "
+            f"constants together")
+    _assert_coarse_mesh_discriminates(mesh)
+
+
+def check_registered_corrected_vf_header_agrees_with_the_mesh():
     """The pinned corrected VF's int32 header is the mesh's face count."""
-    if not SP010_CSR.is_file():
-        raise Skip(f"{SP010_CSR} not present")
-    n_csr = read_csr_n_faces(SP010_CSR)
-    assert n_csr == SP010_FACES, f"CSR header says {n_csr}, expected {SP010_FACES}"
-    if SP010_MESH.is_file():
-        assert read_n_faces(SP010_MESH) == n_csr, "mesh and CSR disagree"
+    csr = local_fixtures.fixture_file("coarse_lola_corrected_vf", Skip)
+    n_csr = read_csr_n_faces(csr)
+    assert n_csr == COARSE_FACES, f"CSR header says {n_csr}, expected {COARSE_FACES}"
+    try:
+        mesh = local_fixtures.fixture_file("coarse_lola_core_mesh", Skip)
+    except Skip:
+        return
+    assert read_n_faces(mesh) == n_csr, "mesh and CSR disagree"
 
 
 # --------------------------------------------------------------------------
@@ -155,14 +217,14 @@ def check_truncated_ply_is_refused():
     it. This is the specific weak replacement this check rules out.
     """
     with tempfile.TemporaryDirectory() as td:
-        good = _write_ply(Path(td) / "good.ply", 4420, SP010_FACES)
+        good = _write_ply(Path(td) / "good.ply", COARSE_VERTICES, COARSE_FACES)
         assert mesh_reuse_reason(good) is None, mesh_reuse_reason(good)
         full = good.stat().st_size
 
-        cut = _write_ply(Path(td) / "cut.ply", 4420, SP010_FACES,
+        cut = _write_ply(Path(td) / "cut.ply", COARSE_VERTICES, COARSE_FACES,
                          truncate_to=200_000)
         assert cut.stat().st_size == 200_000
-        assert 200_000 > SP010_FACES * 13, (
+        assert 200_000 > COARSE_FACES * 13, (
             "the truncation point must exceed the naive lower bound, or this "
             "check does not discriminate")
         reason = mesh_reuse_reason(cut)
@@ -172,7 +234,7 @@ def check_truncated_ply_is_refused():
 
 
 def check_zero_face_ply_is_refused():
-    """The 0-face PLY the failed SP010 rebuild would have written is refused."""
+    """The 0-face PLY a failed rebuild would have written is refused."""
     with tempfile.TemporaryDirectory() as td:
         empty = _write_ply(Path(td) / "empty.ply", 0, 0)
         reason = mesh_reuse_reason(empty)
@@ -211,18 +273,18 @@ def check_vf_mismatch_refuses_and_does_NOT_rebuild_over_the_mesh():
     byte-identical afterwards.
     """
     with tempfile.TemporaryDirectory() as td:
-        ply = Path(td) / "A03XX999_00.000S_0.000E_R3km_linear.ply"
-        _write_ply(ply, 4420, SP010_FACES)
+        ply = Path(td) / f"{FIXTURE_TAG}_00.000S_000.000E_R3km_linear.ply"
+        _write_ply(ply, COARSE_VERTICES, COARSE_FACES)
         assert mesh_reuse_reason(ply) is None, "fixture should be valid"
         before = ply.read_bytes()
-        site = {"ellipse_id": "A03XX999", "lat_deg": -87.0, "lon_deg": 127.0}
+        site = {"ellipse_id": FIXTURE_TAG, "lat_deg": -87.0, "lon_deg": 127.0}
         try:
             build_mesh(site, dry_run=False, roi_km=3.0, mesh_path=ply,
                        dem_override=Path("/nonexistent/dem.vrt"),
-                       expected_faces=2_397_890)
+                       expected_faces=OTHER_VF_FACES)
         except MeshVFMismatch as exc:
             msg = str(exc)
-            assert "8,746" in msg and "2,397,890" in msg, msg
+            assert f"{COARSE_FACES:,}" in msg and f"{OTHER_VF_FACES:,}" in msg, msg
             assert "Not rebuilding" in msg, msg
         else:
             raise AssertionError(
@@ -256,10 +318,10 @@ def check_an_hmat_vf_is_not_mistaken_for_a_csr():
     the exact mass-rebuild this change exists to prevent.
     """
     with tempfile.TemporaryDirectory() as td:
-        stub = Path(td) / "A03XX999.vf"
+        stub = Path(td) / f"{FIXTURE_TAG}.vf"
         # The real 80-byte base-VF stub layout: magic, version, rows, cols, ...
         stub.write_bytes(b"TAMH" + struct.pack("<i", 2)
-                         + struct.pack("<2q", SP010_FACES, SP010_FACES)
+                         + struct.pack("<2q", COARSE_FACES, COARSE_FACES)
                          + b"\x00" * 56)
         assert len(stub.read_bytes()) == 80
         got = read_csr_n_faces(stub)
@@ -270,18 +332,16 @@ def check_an_hmat_vf_is_not_mistaken_for_a_csr():
     # small to be that CSR is refused too.
     with tempfile.TemporaryDirectory() as td:
         fake = Path(td) / "fake.csr"
-        fake.write_bytes(struct.pack("<i", 2_397_890) + b"\x00" * 64)
+        fake.write_bytes(struct.pack("<i", OTHER_VF_FACES) + b"\x00" * 64)
         assert read_csr_n_faces(fake) is None, (
             "a too-small file was accepted as a 2.4M-face CSR")
 
 
-def check_real_hmat_stub_on_disk_is_rejected():
-    """The same, against the real committed stub rather than a fixture."""
-    stub = Path("/Users/paha3326/projects/a3gt/base_vf/A03SP010_base_empty.vf")
-    if not stub.is_file():
-        raise Skip(f"{stub} not present")
+def check_registered_base_vf_stub_on_disk_is_rejected():
+    """The same, against a real committed stub rather than a fixture."""
+    stub = local_fixtures.fixture_file("coarse_lola_base_vf_stub", Skip)
     assert read_csr_n_faces(stub) is None, (
-        "the real A03SP010 base-VF stub was read as a face count")
+        "a real base-VF stub on disk was read as a face count")
 
 
 def check_scalar_face_property_disables_the_size_check():
@@ -313,25 +373,33 @@ def check_scalar_face_property_disables_the_size_check():
 # --------------------------------------------------------------------------
 
 def check_other_campaign_meshes_still_reused():
-    """The 6 sites the floor accepted are still accepted, unchanged.
+    """Every core mesh in the registered directory is still accepted.
 
-    Scope note: this covers the ring-fix campaign's own core meshes only. It
-    says nothing about any other campaign's meshes or about ring PLYs, which
-    go through a separate 100 kB check this change does not touch.
+    Scope note, stated as what it actually is rather than as what it used to
+    be: this covers every ``*_R3km_linear.ply`` in whatever directory is
+    registered as ``campaign_core_mesh_dir``, so on this machine it is the
+    campaign's core meshes, and on another it is whatever that person put
+    there. It says nothing about ring PLYs, which go through a separate 100 kB
+    check this change does not touch.
+
+    A failure here names the mesh by its INDEX in the sorted listing plus its
+    size and face count, not by filename: the filenames carry site identifiers
+    (``scripts/check_site_id_patterns.py``), and an assertion message ends up
+    in logs and scrollback. The index is enough to find it locally.
     """
-    mesh_dir = Path("/Users/paha3326/projects/a3gt/meshes")
-    if not mesh_dir.is_dir():
-        raise Skip(f"{mesh_dir} not present")
-    others = sorted(p for p in mesh_dir.glob("A03*_R3km_linear.ply")
+    mesh_dir = local_fixtures.fixture_path("campaign_core_mesh_dir", Skip)
+    others = sorted(p for p in mesh_dir.glob("*_R3km_linear.ply")
                     if "BACKUP" not in p.name)
     if not others:
-        raise Skip("no campaign core meshes on disk")
+        raise Skip(f"no core meshes matching *_R3km_linear.ply in {mesh_dir}")
     checked = 0
-    for ply in others:
+    for index, ply in enumerate(others):
         n = read_n_faces(ply)
         size = ply.stat().st_size
         reason = mesh_reuse_reason(ply)
-        assert reason is None, f"{ply.name} ({size:,} B, {n:,} faces): {reason}"
+        assert reason is None, (
+            f"mesh #{index} of {len(others)} in the registered directory "
+            f"({size:,} B, {n:,} faces): {reason}")
         if size > OLD_FLOOR_BYTES:
             checked += 1
     assert checked >= 1, "expected at least one above-floor mesh to confirm"
@@ -353,8 +421,9 @@ def check_header_parse_reports_the_real_layout():
 
 
 CHECKS = [
-    check_sp010_real_mesh_is_accepted_and_old_floor_rejected_it,
-    check_sp010_csr_header_agrees_with_the_mesh,
+    check_coarse_valid_mesh_is_accepted_and_old_floor_rejected_it,
+    check_registered_coarse_mesh_is_the_shape_the_synthetic_one_claims,
+    check_registered_corrected_vf_header_agrees_with_the_mesh,
     check_truncated_ply_is_refused,
     check_zero_face_ply_is_refused,
     check_unparsable_file_is_refused,
@@ -363,7 +432,7 @@ CHECKS = [
     check_no_vf_means_no_face_count_constraint,
     check_unreadable_csr_yields_none_not_a_crash,
     check_an_hmat_vf_is_not_mistaken_for_a_csr,
-    check_real_hmat_stub_on_disk_is_rejected,
+    check_registered_base_vf_stub_on_disk_is_rejected,
     check_scalar_face_property_disables_the_size_check,
     check_other_campaign_meshes_still_reused,
     check_header_parse_reports_the_real_layout,
