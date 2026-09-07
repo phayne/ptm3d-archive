@@ -79,6 +79,24 @@ enum class ThermalSolverPath {
     GpuPersistent     // runThermalModelsForAllFaces_GPU_Persistent
 };
 
+// The short label for a path, PUBLIC so that anything recording provenance
+// against the solver names it from the same table the banner does. Phase 2H's
+// per-location column recorder stamps this into every locations/*_depths.csv;
+// a second hand-written table would be free to drift from the banner, and a
+// provenance line that disagrees with the run's own disclosure is worse than
+// none.
+inline const char* thermalSolverPathName(ThermalSolverPath p) {
+    switch (p) {
+        case ThermalSolverPath::CpuScalar:        return "CPU scalar";
+        case ThermalSolverPath::CpuSimdBatch:     return "CPU SIMD batch";
+        case ThermalSolverPath::CpuStreamed:      return "CPU streamed (scalar core)";
+        case ThermalSolverPath::CpuStreamedBatch: return "CPU streamed SIMD batch";
+        case ThermalSolverPath::GpuPersistent:    return "GPU persistent";
+        case ThermalSolverPath::Unset:            break;
+    }
+    return "none";
+}
+
 // Why that path was taken. `MemoryThreshold` is the invisible one this file
 // exists for.
 enum class ThermalSolverReason {

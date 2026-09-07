@@ -209,6 +209,41 @@ inline void waveBias(double zeta1, double zeta2, double zeta_q, double w,
 }
 
 // ---------------------------------------------------------------------------
+// The "below the deepest solved node" refusal, in ONE place.
+//
+// Two products now share it -- the depth MAP (D9) and the per-location depth
+// series (locations/*_depths.csv). They used to disagree: the map refused while
+// the CSV silently extrapolated with Fourier's law and a warning. Paul's ruling
+// of 2026-09-07 -- "refuse depths greater than the bottom model grid layer" --
+// extends D9 to every depth product, so there is exactly one rule and exactly
+// one wording of it.
+//
+// ⛔ THE KEY NAMED HERE IS `thermal.thermal_b`, THE YAML KEY. The C++ field is
+// `Config::thermal.grid_b`, and the two are NOT the same string:
+// config_parser.cpp reads `getWithDefault(thermal, "thermal_b",
+// config.thermal.grid_b)`. A refusal that names the field tells the reader to
+// edit a key that does not exist -- the defect class that already shipped twice
+// (PTM-DEPTHMAP-REFUSAL-NAMES-A-NONEXISTENT-KEY, and the state-io refusal fixed
+// in `fix/sequence-scalar-guards`).
+//
+// `product` names the thing being refused, so the message reads correctly for
+// both callers; `where` is an optional site / file label appended when the
+// caller has one.
+inline std::string tooDeepRefusal(double requested_m, double z_bottom_m,
+                                  const char* product,
+                                  const std::string& where = std::string()) {
+    std::ostringstream os;
+    os << "requested depth " << requested_m << " m is below the deepest solved node ("
+       << z_bottom_m << " m)";
+    if (!where.empty()) os << " " << where;
+    os << ". The deepest depth this run can report is " << z_bottom_m
+       << " m. Increase thermal.thermal_b (the number of diurnal skin depths to "
+          "the bottom node) so the column reaches that depth, or drop the "
+          "request; the engine will not extrapolate " << product << ".";
+    return os.str();
+}
+
+// ---------------------------------------------------------------------------
 // Size of the statistics product this plan will write, in bytes: for each
 // depth and each statistic one uint32 face count plus one float32 per face,
 // plus (when raw side files are requested) a float64 sum and a uint32 count per
@@ -343,17 +378,17 @@ inline bool buildPlan(const Request& req,
             return false;
         }
         // D9: below the deepest solved node is a REFUSAL, not a Fourier
-        // extrapolation. The location export (locations/*_depths.csv) does
-        // extrapolate with a warning; a MAP must not, because a map that is
-        // physics over part of its area and extrapolation over the rest is
-        // indistinguishable to every downstream consumer.
+        // extrapolation, because a map that is physics over part of its area
+        // and extrapolation over the rest is indistinguishable to every
+        // downstream consumer.
+        //
+        // The per-location depth series (locations/*_depths.csv) used to
+        // extrapolate here with a warning. It no longer does: Paul's ruling of
+        // 2026-09-07 extends D9 to ALL depth products, and both callers now
+        // share tooDeepRefusal() so the rule and its wording cannot drift
+        // apart again.
         if (d > z_bot) {
-            std::ostringstream os;
-            os << "requested depth " << d << " m is below the deepest solved node ("
-               << z_bot << " m). Increase thermal.thermal_b (skin depths to the "
-                           "bottom node) so the column reaches that depth, or drop "
-                           "the request; the engine will not extrapolate a map.";
-            refusal = os.str();
+            refusal = tooDeepRefusal(d, z_bot, "a map");
             return false;
         }
 
@@ -568,6 +603,202 @@ struct Accumulator {
             if (v < vmin[idx]) vmin[idx] = v;
         }
         ++count[face];
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Series -- a per-face-SUBSET, per-FRAME recorder of the whole solved column.
+//
+// The Accumulator above reduces every face over a window. This does the
+// opposite: it keeps the full T(z, t) for a HANDFUL of faces, which is what
+// locations/*_depths.csv needs and what the mesh solvers otherwise throw away.
+// Phase 2H exists because that CSV used to be a SEPARATE 1-D integration of the
+// same site -- its own seed repair window, its own anchor census, its own
+// absorbed-flux composition -- so the CSV and the mesh-wide field at the same
+// face were two different numbers with nothing saying so.
+//
+// WHY THE NATIVE COLUMN AND NOT THE PLANNED DEPTHS. A max/min MAP has to be
+// accumulated at the requested depth (architecture A) because max does not
+// commute with interpolation. A TIME SERIES has no such asymmetry: interpolating
+// each recorded frame in post is arithmetically the same number as interpolating
+// before storing it. Recording the native column therefore costs nothing in
+// accuracy, keeps the CSV's own interpolation as the single implementation, and
+// leaves the recorder independent of the depth-map plan.
+//
+// SIZE. n_slots * n_frames * n_layers * 8 B. Five sites x 1440 frames x 30
+// layers is 1.6 MiB; the guard exists for the ice-layer grids that reach ~450
+// layers, not for the ordinary case.
+//
+// ⛔ EVERY (slot, frame) IS TRACKED. A recorder that is merely allocated proves
+// nothing: a solver path that never calls record() leaves it full of zeros, and
+// zeros are a plausible-looking temperature series to anything that does not
+// check. `complete()` is what the caller must consult before using a column;
+// there is no other way to tell "recorded" from "allocated".
+struct Series {
+    std::vector<int>          slot_of_face;   // n_faces; -1 = not recorded
+    std::vector<double>       T;              // n_slots x n_frames x n_layers
+    std::vector<std::uint8_t> covered;        // n_slots x n_frames
+    // Set when a face's column did not have the layer count this recorder was
+    // allocated for -- a per-face H map with ADAPTIVE_GRID gives each face its
+    // own grid. The slot is then unusable and says so, rather than recording a
+    // column whose z[] is not the one the export will interpolate on.
+    std::vector<std::uint8_t> slot_bad;       // n_slots
+    std::vector<int>          face_of_slot;   // n_slots
+    std::size_t n_slots  = 0;
+    std::size_t n_frames = 0;
+    std::size_t n_layers = 0;
+
+    bool ready() const {
+        return n_slots > 0 && n_frames > 0 && n_layers > 0 &&
+               T.size() == n_slots * n_frames * n_layers &&
+               covered.size() == n_slots * n_frames;
+    }
+
+    // `faces` are GLOBAL face indices, one per site, in the caller's order.
+    //
+    // ⛔ DEDUPED, and that is load-bearing rather than tidy. Two named sites
+    // routinely resolve to ONE mesh face (any local-patch mesh: three latitudes
+    // requested on an 80 N crater all land on the same facet). A slot per SITE
+    // would leave the loser's slot never written, and complete() would then
+    // correctly report the whole recorder as unusable and fall the CSV back to
+    // the standalone integration -- for a run in which nothing was wrong.
+    // One slot per FACE; the caller maps site -> slot through slot(face).
+    bool allocate(std::size_t n_faces, const std::vector<int>& faces_in,
+                  std::size_t n_frames_in, std::size_t n_layers_in,
+                  std::uint64_t max_bytes, std::string& refusal) {
+        *this = Series{};
+        if (faces_in.empty() || n_frames_in == 0 || n_layers_in < 2) {
+            refusal = "the per-location column recorder needs at least one site, "
+                      "one frame and two depth layers.";
+            return false;
+        }
+        std::vector<int> faces;
+        faces.reserve(faces_in.size());
+        for (int f : faces_in) {
+            if (f < 0 || static_cast<std::size_t>(f) >= n_faces) continue;
+            if (std::find(faces.begin(), faces.end(), f) == faces.end())
+                faces.push_back(f);
+        }
+        if (faces.empty()) {
+            refusal = "none of the requested sites resolved to a mesh face.";
+            return false;
+        }
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(faces.size()) * n_frames_in * n_layers_in * 8ull;
+        if (max_bytes > 0 && bytes > max_bytes) {
+            std::ostringstream os;
+            os << "recording the mesh column at " << faces.size() << " site(s) x "
+               << n_frames_in << " frame(s) x " << n_layers_in << " layer(s) would "
+               << "need " << (bytes / (1024.0 * 1024.0)) << " MiB, over the "
+               << (max_bytes / (1024.0 * 1024.0)) << " MiB ceiling.";
+            refusal = os.str();
+            return false;
+        }
+        n_slots  = faces.size();
+        n_frames = n_frames_in;
+        n_layers = n_layers_in;
+        face_of_slot = faces;
+        slot_of_face.assign(n_faces, -1);
+        for (std::size_t s = 0; s < faces.size(); ++s) {
+            slot_of_face[static_cast<std::size_t>(faces[s])] = static_cast<int>(s);
+        }
+        T.assign(n_slots * n_frames * n_layers, 0.0);
+        covered.assign(n_slots * n_frames, 0u);
+        slot_bad.assign(n_slots, 0u);
+        return true;
+    }
+
+    int slot(std::size_t face) const {
+        return (face < slot_of_face.size()) ? slot_of_face[face] : -1;
+    }
+
+    // Retire one slot: this face was solved on a grid that is not the one the
+    // recorder was sized for. Used by the CPU scalar path, where a per-face H
+    // map gives each face its own grid and a matching LAYER COUNT does not mean
+    // a matching z[] -- the "24 nodes vs 24 nodes, differing only in dz[0]"
+    // hole the depth-map plan gate found on 2026-09-07.
+    //
+    // The REASON is recorded, not just the fact: kBadLayerCount and kBadNodeZ
+    // are caught by different checks, and a stand-down message that cannot tell
+    // them apart makes the elementwise check invisible to any test -- the
+    // "guard whose own inputs are never varied" class. Measured: with the
+    // elementwise comparison deleted, an H map whose layer counts also differ
+    // still stood the recorder down, so that arm proved nothing about it.
+    static constexpr std::uint8_t kBadLayerCount = 1u;
+    static constexpr std::uint8_t kBadNodeZ      = 2u;
+    void markBad(int slot_i, std::uint8_t reason = kBadNodeZ) {
+        if (slot_i >= 0 && static_cast<std::size_t>(slot_i) < n_slots)
+            slot_bad[static_cast<std::size_t>(slot_i)] = reason;
+    }
+
+    double* columnAt(std::size_t slot_i, std::size_t frame) {
+        return &T[(slot_i * n_frames + frame) * n_layers];
+    }
+    const double* columnAt(std::size_t slot_i, std::size_t frame) const {
+        return &T[(slot_i * n_frames + frame) * n_layers];
+    }
+
+    // Store one face's column at one frame. WRITES, it does not accumulate, so
+    // a radiation-coupling re-thermal that re-integrates a selected face simply
+    // overwrites iteration 0's column -- the same REPLACE semantics
+    // Accumulator::resetFace gives the map, without the two-step.
+    //
+    // `surface_override`, when non-null, replaces node 0, for the same reason
+    // Accumulator::addColumn takes one: the SIMD and GPU paths publish a
+    // RE-EVALUATED surface node (thermal::outputSurfaceTempBatch), not the
+    // solved column's node 0, and a CSV whose z = 0 row is not that number
+    // disagrees with statistics/temperature_*.bin at the same face. It is a
+    // POINTER and not a NaN sentinel for the reason spelled out on addColumn:
+    // under -ffast-math an isnan() sentinel folds to constant false.
+    template <typename T2>
+    void record(int slot_i, std::size_t frame,
+                const T2* column, std::ptrdiff_t stride,
+                std::size_t column_layers,
+                const double* surface_override = nullptr) {
+        if (slot_i < 0 || static_cast<std::size_t>(slot_i) >= n_slots) return;
+        if (frame >= n_frames) return;
+        if (column_layers != n_layers) {
+            slot_bad[static_cast<std::size_t>(slot_i)] = kBadLayerCount;
+            return;
+        }
+        double* dst = columnAt(static_cast<std::size_t>(slot_i), frame);
+        for (std::size_t i = 0; i < n_layers; ++i) {
+            dst[i] = static_cast<double>(
+                column[static_cast<std::ptrdiff_t>(i) * stride]);
+        }
+        if (surface_override) dst[0] = *surface_override;
+        covered[static_cast<std::size_t>(slot_i) * n_frames + frame] = 1u;
+    }
+
+    // Every site, every frame, or a reason why not. The caller MUST use this;
+    // an allocated-but-unwritten recorder is indistinguishable from a recorded
+    // one by inspecting the numbers.
+    bool complete(std::string& why) const {
+        if (!ready()) { why = "the recorder was never allocated"; return false; }
+        for (std::size_t s = 0; s < n_slots; ++s) {
+            if (slot_bad[s]) {
+                std::ostringstream os;
+                os << "site slot " << s << " (face " << face_of_slot[s] << ") was solved on "
+                   << (slot_bad[s] == kBadLayerCount
+                           ? "a column with a different NUMBER OF LAYERS from"
+                           : "a grid whose NODE DEPTHS differ from")
+                   << " the reference grid this recorder was sized for";
+                why = os.str();
+                return false;
+            }
+            std::size_t missing = 0;
+            for (std::size_t f = 0; f < n_frames; ++f)
+                if (!covered[s * n_frames + f]) ++missing;
+            if (missing) {
+                std::ostringstream os;
+                os << "site slot " << s << " (face " << face_of_slot[s] << ") is "
+                   << "missing " << missing << " of " << n_frames
+                   << " frames -- the solver path that ran does not record columns";
+                why = os.str();
+                return false;
+            }
+        }
+        return true;
     }
 };
 

@@ -100,7 +100,10 @@ def per_layer_residual(times_s: np.ndarray, T: np.ndarray,
     if t_cy.size < 4:
         raise SystemExit("not enough samples in last lunation")
 
-    # Truncate at solver bottom to avoid the location-export extrapolation
+    # Truncate at solver bottom to avoid the location-export extrapolation.
+    # A no-op on a CSV from 2026-09-07 or later: the engine now refuses a
+    # depth below the deepest solved node instead of extrapolating it, so
+    # there is no flat-line tail to cut. Kept for the archived runs.
     amp = T_cy.max(axis=0) - T_cy.min(axis=0)
     bot = detect_solver_bottom(depths, amp)
     depths = depths[: bot + 1]

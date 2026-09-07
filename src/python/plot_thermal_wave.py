@@ -54,7 +54,14 @@ def load_depth_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 def detect_solver_bottom(depths: np.ndarray, amp: np.ndarray,
                          tol_K: float = 0.05) -> int:
-    """Return the deepest non-extrapolated depth index (where amp != flat-line)."""
+    """Return the deepest non-extrapolated depth index (where amp != flat-line).
+
+    ⚠️ Only needed for a CSV written BEFORE 2026-09-07. From that release the
+    engine refuses a requested depth below the deepest solved node instead of
+    extrapolating it with Fourier's law, so a new file has no flat-line tail to
+    detect and this returns the last index. Kept because the archived runs this
+    script was written against do have one.
+    """
     n = len(amp)
     cut = n - 1
     for i in range(n - 2, 0, -1):

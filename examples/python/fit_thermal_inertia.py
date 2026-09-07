@@ -197,8 +197,18 @@ def main():
 
     outdir = Path(args.outdir).expanduser().resolve()
     locations, depths_file = build_inputs(outdir)
+    # thermal_b, and it is REQUIRED, not tuning. Since 2026-09-07 a requested
+    # depth below the deepest solved node is refused rather than extrapolated
+    # (docs/configuration.md, "Per-location depth series"), and this script asks
+    # for 2.0 m. In constant-thermal-inertia mode the grid bottom is
+    # b * delta_0 with delta_0 proportional to TI, so the SHALLOWEST grid in the
+    # sweep is the smallest TI: measured on this exact base config, TI = 30 at
+    # the default b = 15 reaches 1.4998 m, which would refuse. b = 21 puts it at
+    # ~2.10 m with margin, and every larger TI deeper still. Lower the smallest
+    # grid point in `grid=` below and this number has to come up with it.
     fixed = {"output.locations_file": str(locations),
-             "output.depths_file": str(depths_file)}
+             "output.depths_file": str(depths_file),
+             "thermal.thermal_b": 21}
     base = REPO / "examples" / "quickstart_europa_diurnal.yaml"
 
     # 1. the sweep -- the lookup table.
