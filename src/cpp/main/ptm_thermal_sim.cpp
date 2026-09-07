@@ -46,6 +46,7 @@
 #include "../thermal/eq_certificate.h"
 #include "../thermal/thermal_state_io.h"
 #include "../thermal/state_identity.h"
+#include "../thermal/batch_checkpoint.h"
 #include "../thermal/depth_map_plan.h"
 #include <memory>
 #include "../thermal/planetary_properties.h"
@@ -867,6 +868,85 @@ static bool buildStateTrailer(const double* z, std::size_t n_layers,
     out.flags            = 0;
     if (id.coupling_select_dt_positive)
         out.flags |= thermal::state_io::flag::kCouplingSelectDtPositive;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// BATCH-COMPLETION CHECKPOINTING (plan phase 1D') -- the run's settings.
+// ---------------------------------------------------------------------------
+// One object, configured once from the parsed config, read by the solver
+// dispatch (which REFUSES the unsupported paths) and by the CPU SIMD-batch
+// driver (which is the one path that supports it in this version).
+//
+// ⛔ `entries` is load-bearing, not bookkeeping. The whole-mesh thermal driver
+// can be ENTERED MORE THAN ONCE in one process -- the depth-map accumulator's
+// resetFace() exists for exactly that reason ("this driver can be entered more
+// than once in a radiation-coupled run, and surface_temps is overwritten each
+// time"). A partial set that survived across two entries would let the SECOND
+// pass restore the FIRST pass's results and call the window finished. So a
+// second entry with batch checkpointing on is a FATAL refusal, not a silent
+// reuse.
+struct BatchCheckpointRun {
+    bool        requested = false;      // the config asked for it
+    std::string dir;                    // resolved partial directory
+    double      max_gib   = 64.0;
+    double      flush_mib = 0.0;        // 0 = derive (see Session::open)
+    int         entries   = 0;          // whole-mesh driver entries so far
+    thermal::batchckpt::Session session;
+};
+static BatchCheckpointRun g_batch_ckpt;
+
+// Build the identity every partial in this run shares. REFUSES when the run
+// identity was never filled: an unidentified partial set is precisely the thing
+// that must not exist, because nothing could later prove which computation it
+// belongs to.
+static bool buildBatchCheckpointIdentity(const double* z, std::size_t n_layers,
+                                         std::size_t n_faces,
+                                         std::size_t n_time_steps,
+                                         std::size_t n_depths,
+                                         std::size_t batch_size,
+                                         std::uint32_t sections,
+                                         std::uint64_t depth_plan_hash,
+                                         std::int32_t depth_win_start,
+                                         std::int32_t depth_win_end,
+                                         thermal::batchckpt::Identity& out,
+                                         std::string& err) {
+    const RunStateIdentity& id = g_run_state_identity;
+    if (!id.filled) {
+        err = "thermal.batch_checkpoint is set, but this run never filled its "
+              "state identity (the ET grid / resolved Planet were not built). "
+              "A partial nothing can identify must not be written.";
+        return false;
+    }
+    if (z == nullptr || n_layers == 0) {
+        err = "thermal.batch_checkpoint is set, but the solver offered no depth "
+              "grid to record with the partials.";
+        return false;
+    }
+    out = thermal::batchckpt::Identity();
+    out.z.assign(z, z + n_layers);
+    // The WINDOW'S FIRST epoch, not the last: with the cadence and the step
+    // count it pins the exact span the batch integrated, which is what a
+    // partial has to belong to.
+    out.et_seconds       = id.et_first;
+    out.output_cadence_s = id.output_cadence_s;
+    out.refgrid_H        = id.refgrid_H;
+    out.grid_m           = id.grid_m;
+    out.grid_n           = id.grid_n;
+    out.grid_b           = id.grid_b;
+    out.mesh_geomhash    = id.mesh_geomhash;
+    out.config_identity_hash = id.config_identity_hash;
+    out.body_name        = id.body_name;
+    out.engine_git_sha   = PTM_BUILD_GIT_SHA;
+    out.n_faces_total = static_cast<std::uint32_t>(n_faces);
+    out.n_layers      = static_cast<std::uint32_t>(n_layers);
+    out.n_time_steps  = static_cast<std::uint32_t>(n_time_steps);
+    out.n_depths      = static_cast<std::uint32_t>(n_depths);
+    out.batch_size    = static_cast<std::uint32_t>(batch_size);
+    out.sections      = sections;
+    out.depth_plan_hash = depth_plan_hash;
+    out.depth_win_start = depth_win_start;
+    out.depth_win_end   = depth_win_end;
     return true;
 }
 
@@ -5497,6 +5577,21 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // Progress tracking
     std::atomic<size_t> completed_batches{0};
+    // Set by any thread that finds a banked batch whose recorded input digest
+    // disagrees with the digest of its own live inputs. That is a partial from
+    // a computation whose forcing moved -- a different albedo map, different
+    // view factors, radiation on instead of off -- none of which
+    // config_identity_hash covers. It is fatal, and it is latched rather than
+    // thrown because the enclosing region is an OpenMP parallel block.
+    std::atomic<bool> bc_digest_conflict{false};
+    // Separate from the digest conflict on purpose: an ENOSPC while banking is
+    // an I/O failure, and telling the operator the run "mixed two
+    // computations" would send them hunting a stale partial set that does not
+    // exist. Same abort, different sentence.
+    std::atomic<bool> bc_bank_failed{false};
+    std::atomic<size_t> bc_restored_batches{0};
+    std::string bc_conflict_msg;
+    std::string bc_bank_msg;
     // Faces whose time-mean absorbed flux came back negative or non-finite. The
     // seed below substitutes 0 for those so it cannot emit a NaN column; that
     // substitution is reported after the loop rather than applied silently.
@@ -5767,6 +5862,118 @@ bool runThermalModelsForAllFacesBatchSoA(
             /*precision_floor_K=*/0.0,
             /*seconds_per_cycle=*/0.0));   // nothing measures it; banner says so
     }
+
+    // ---- batch-completion checkpointing (plan 1D'), stage B ---------------
+    // Opened against the grid this driver will actually integrate on, so the
+    // partials record the solver's own z[] rather than a re-derivation.
+    //
+    // ⛔ The SECOND-ENTRY refusal. This driver can be entered more than once in
+    // one process; a partial set that survived across entries would let the
+    // second pass restore the first pass's results. The dispatch already
+    // refuses the coupled run that causes it, and this is the backstop for any
+    // other route to a second entry.
+    const bool bc_on = g_batch_ckpt.requested;
+    if (bc_on && ++g_batch_ckpt.entries > 1) {
+        std::cerr << "\n[SIMD Batch] FATAL: the whole-mesh thermal driver was "
+                     "entered a second time with thermal.batch_checkpoint on.\n"
+                     "  The partials from the first pass would be restored into "
+                     "the second, which would report the first pass's\n"
+                     "  results as the finished window. Refusing.\n" << std::endl;
+        return false;
+    }
+    // ⛔ THE PER-BATCH DIAGNOSTICS THAT LIVE **BELOW** THE SKIP POINT.
+    // Three accumulators are fed from inside the time integration, which a
+    // restored batch does not run: the spin-up census, the equilibration
+    // certificate census, and the PTM-51 equilibration-flux dump. A resumed run
+    // would print a whole-mesh-looking census scored on the fraction of the
+    // mesh this process happened to integrate, and a PTM-51 CSV with zeros for
+    // the rest -- neither of which the crash gate can see, because one goes to
+    // stdout and the other to an env-supplied path outside the output tree.
+    //
+    // All three are opt-in diagnostics, so the honest answer is to REFUSE the
+    // combination rather than to ship a census that quietly means something
+    // else. (An earlier revision of the comment at the skip point asserted that
+    // everything with a global side effect sat above it. That was wrong, and
+    // code-review caught it; the comment is corrected there too.)
+    // Split by CONSEQUENCE, not by mechanism. The spin-up census is
+    // report-only and goes to stdout alone (ptm_thermal_sim.cpp, the
+    // `g_spinup_census->report` call below) -- and it is on by DEFAULT, so
+    // refusing on it would make this feature unusable rather than safe. It is
+    // therefore DISCLOSED beside its own report instead. The other two change
+    // something real: the certificate census can END THE SPIN-UP EARLY, and the
+    // PTM-51 dump writes a CSV product with a column per face. Those refuse.
+    if (bc_on && (g_eq_cert_census || dump_eq_seed)) {
+        std::cerr << "\n[SIMD Batch] FATAL: thermal.batch_checkpoint is on "
+                     "together with a per-batch quantity that is accumulated "
+                     "INSIDE\n  the time integration, which a restored batch "
+                     "does not run:\n"
+                  << (g_eq_cert_census
+                          ? "    - thermal.equilibration_stop_on_certificate "
+                            "(it can shorten the spin-up, so a resumed run "
+                            "would\n      integrate a different length than "
+                            "the one it resumed from)\n" : "")
+                  << (dump_eq_seed
+                          ? "    - the PTM-51 equilibration-seed dump "
+                            "(PTM_DUMP_EQ_SEED), whose CSV would carry zeros "
+                            "for every\n      restored face\n" : "")
+                  << "  Refusing rather than shipping a product that means "
+                     "something different for part of the mesh.\n" << std::endl;
+        return false;
+    }
+    if (bc_on) {
+        std::uint32_t sections = thermal::batchckpt::part::kSurfaceSeries;
+        if (ckpt.want_out) sections |= thermal::batchckpt::part::kFinalColumn;
+        if (depthMapOn())  sections |= thermal::batchckpt::part::kDepthAccum;
+        thermal::batchckpt::Identity bid;
+        std::string berr;
+        // ⭐ The depth PRODUCT's identity, which nothing else covers: not
+        // config_identity_hash (Planet + conduction grid only) and not the
+        // input digest (the batch's FORCING, which a changed depth list does
+        // not move). Without it a run killed halfway, re-pointed at a
+        // different depth list of the same length, and resumed would write one
+        // product for the restored batches and another for the rest, with
+        // complete coverage and nothing downstream able to tell.
+        std::uint64_t depth_plan_hash = 0;
+        std::int32_t  depth_win_start = -1, depth_win_end = -1;
+        if (depthMapOn()) {
+            std::ostringstream dh;
+            dh.precision(17);
+            for (const auto& e : g_depth_map.plan.entries)
+                dh << e.requested_m << ':' << e.resolved_m << ':' << e.j << ':'
+                   << e.w << ':' << e.field << ';';
+            for (auto st : g_depth_map.plan.stats) dh << int(st) << ',';
+            dh << "|raw=" << (g_depth_map.with_raw ? 1 : 0);
+            const std::string canon = dh.str();
+            std::uint64_t h = 1469598103934665603ull;
+            for (unsigned char ch : canon) { h ^= ch; h *= 1099511628211ull; }
+            depth_plan_hash = h;
+            depth_win_start = static_cast<std::int32_t>(g_depth_map.win_start);
+            depth_win_end   = static_cast<std::int32_t>(g_depth_map.win_end);
+        }
+        if (!buildBatchCheckpointIdentity(
+                ref_profile.z().data(), static_cast<size_t>(n_layers), n_faces,
+                static_cast<size_t>(total_time_steps),
+                depthMapOn() ? g_depth_map.plan.size() : 0u,
+                static_cast<size_t>(BS), sections, depth_plan_hash,
+                depth_win_start, depth_win_end, bid, berr) ||
+            !g_batch_ckpt.session.open(g_batch_ckpt.dir, bid,
+                                       g_batch_ckpt.max_gib,
+                                       g_batch_ckpt.flush_mib, std::cout,
+                                       berr)) {
+            std::cerr << "\n[SIMD Batch] FATAL: " << berr << "\n" << std::endl;
+            return false;
+        }
+        // Not a supported combination and not silently degraded: without
+        // surface_temps there is nothing to bank, so the resume would produce
+        // an empty product and call it finished.
+        if (!surface_temps_out) {
+            std::cerr << "\n[SIMD Batch] FATAL: thermal.batch_checkpoint is on "
+                         "but this run keeps no surface temperature series, so "
+                         "a partial would carry nothing.\n" << std::endl;
+            return false;
+        }
+    }
+
 
     #pragma omp parallel num_threads(thermal_threads)
     {
@@ -6137,6 +6344,119 @@ bool runThermalModelsForAllFacesBatchSoA(
                     batch.T[layer * BS + f] = 200.0;
                 }
             }
+
+            // ================= BATCH-COMPLETION CHECKPOINT ==================
+            // The skip point, and it is HERE rather than at the top of the loop
+            // on purpose. Everything above this line -- the forcing marshaling
+            // (which also feeds the streamed effective-albedo composer) and the
+            // seed (which feeds EqSeedRecorder, the anchor census and the
+            // bad-flux / floor counters) -- has global side effects that the
+            // finished run reports. A batch skipped BEFORE them would silently
+            // drop its contribution to every one of those. So a restored batch
+            // still pays for its seed and its forcing; it only skips the time
+            // integration, which is >99% of the cost.
+            //
+            // ⛔ WHAT IS **BELOW** THIS LINE AND IS THEREFORE NOT PAID. Three
+            // accumulators are fed from inside the time integration: the
+            // spin-up census, the equilibration-certificate census and the
+            // PTM-51 equilibration-flux dump. A restored batch contributes to
+            // none of them, which would silently turn a whole-mesh census into
+            // a this-process-only one. All three are opt-in, so the driver
+            // REFUSES the combination up front rather than relabeling a partial
+            // census as a full one -- see the refusal beside the session open.
+            // (An earlier revision of this comment claimed nothing with a
+            // global side effect lived below here. That was wrong.)
+            //
+            // It is also what makes the digest possible: the batch's inputs
+            // exist, in their final form, exactly at this point.
+            std::uint32_t bc_digest = 0;
+            if (bc_on) {
+                // The forcing, the seeded/restored column and the per-face
+                // interior heat flux -- the complete input set of this batch's
+                // integration, read from the live float64 arrays.
+                bc_digest = thermal::batchckpt::inputDigest(
+                    flux_base, flux_stride,
+                    static_cast<size_t>(total_time_steps),
+                    static_cast<size_t>(faces_in_batch),
+                    batch.T, static_cast<size_t>(BS),
+                    static_cast<size_t>(n_layers),
+                    batch.Qb);
+                std::uint32_t banked_digest = 0;
+                if (g_batch_ckpt.session.banked(
+                        static_cast<std::uint32_t>(batch_idx),
+                        &banked_digest)) {
+                    if (banked_digest != bc_digest) {
+                        // A partial for this batch exists but was integrated
+                        // from DIFFERENT inputs. Latch and stop; continuing
+                        // would mix two computations in one product.
+                        bool expected = false;
+                        if (bc_digest_conflict.compare_exchange_strong(expected,
+                                                                      true)) {
+                            std::ostringstream os;
+                            os << "batch " << batch_idx << " is banked in '"
+                               << g_batch_ckpt.session.fileFor(
+                                      static_cast<std::uint32_t>(batch_idx))
+                               << "' with input digest 0x" << std::hex
+                               << banked_digest << ", but this run's own inputs "
+                                  "for that batch digest to 0x"
+                               << bc_digest << std::dec
+                               << ". The forcing or the initial condition moved "
+                                  "(a different albedo map, different view "
+                                  "factors, radiation on instead of off) -- "
+                                  "none of which the configuration hash covers.";
+                            #pragma omp critical
+                            bc_conflict_msg = os.str();
+                        }
+                        continue;
+                    }
+                    thermal::batchckpt::Record rec;
+                    if (g_batch_ckpt.session.takeRecord(
+                            static_cast<std::uint32_t>(batch_idx), rec)) {
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            const size_t gf = start_face + f;
+                            const double* row =
+                                rec.surface.data() +
+                                static_cast<size_t>(f) * total_time_steps;
+                            std::copy(row, row + total_time_steps,
+                                      (*surface_temps_out)[gf].begin());
+                        }
+                        if (ckpt.want_out) {
+                            for (int f = 0; f < faces_in_batch; ++f) {
+                                const size_t gf = start_face + f;
+                                const float* col =
+                                    rec.column.data() +
+                                    static_cast<size_t>(f) * n_layers;
+                                for (int layer = 0; layer < n_layers; ++layer)
+                                    ckpt.assembled[static_cast<size_t>(layer) *
+                                                       n_faces + gf] =
+                                        col[layer];
+                            }
+                        }
+                        if (depthMapOn()) {
+                            const size_t D = g_depth_map.plan.size();
+                            auto& acc = g_depth_map.acc;
+                            for (int f = 0; f < faces_in_batch; ++f) {
+                                const size_t gf = start_face + f;
+                                for (size_t d = 0; d < D; ++d) {
+                                    const size_t src = d * faces_in_batch + f;
+                                    const size_t dst = d * n_faces + gf;
+                                    acc.sum [dst] = rec.depth_sum[src];
+                                    acc.vmax[dst] = rec.depth_max[src];
+                                    acc.vmin[dst] = rec.depth_min[src];
+                                }
+                                acc.count[gf]         = rec.depth_count[f];
+                                g_depth_map.covered[gf] = 1u;
+                            }
+                        }
+                        ++bc_restored_batches;
+                        size_t done_r = ++completed_batches;
+                        #pragma omp critical
+                        progressBar.update(static_cast<int>(done_r * BS));
+                        continue;   // skip the time integration only
+                    }
+                }
+            }
+            if (bc_digest_conflict.load() || bc_bank_failed.load()) continue;
 
             // Spin-up estimate (FIX 0, report-only). Scored after the FIRST
             // substep of the run -- late enough that advanceTimestep has filled
@@ -6550,12 +6870,103 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
+            // Bank this batch. It is FINISHED for the whole window now -- that
+            // is the property the whole feature rests on -- so the partial
+            // carries exactly what a resume would otherwise have to recompute:
+            // the surface series (every statistic and per-step product is a
+            // reduction of it), the end-of-window column, and this batch's
+            // slice of the depth accumulator.
+            if (bc_on && !bc_digest_conflict.load() && !bc_bank_failed.load()) {
+                thermal::batchckpt::Record rec;
+                rec.batch_idx    = static_cast<std::uint32_t>(batch_idx);
+                rec.batch_n      = static_cast<std::uint32_t>(faces_in_batch);
+                rec.input_digest = bc_digest;
+                rec.surface.resize(static_cast<size_t>(faces_in_batch) *
+                                   total_time_steps);
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const auto& row = (*surface_temps_out)[start_face + f];
+                    std::copy(row.begin(), row.begin() + total_time_steps,
+                              rec.surface.begin() +
+                                  static_cast<size_t>(f) * total_time_steps);
+                }
+                if (ckpt.want_out) {
+                    rec.column.resize(static_cast<size_t>(faces_in_batch) *
+                                      n_layers);
+                    for (int f = 0; f < faces_in_batch; ++f)
+                        for (int layer = 0; layer < n_layers; ++layer)
+                            rec.column[static_cast<size_t>(f) * n_layers +
+                                       layer] =
+                                ckpt.assembled[static_cast<size_t>(layer) *
+                                                   n_faces + start_face + f];
+                }
+                if (depthMapOn()) {
+                    const size_t D = g_depth_map.plan.size();
+                    const auto& acc = g_depth_map.acc;
+                    rec.depth_sum.resize(D * faces_in_batch);
+                    rec.depth_max.resize(D * faces_in_batch);
+                    rec.depth_min.resize(D * faces_in_batch);
+                    rec.depth_count.resize(faces_in_batch);
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const size_t gf = start_face + f;
+                        for (size_t d = 0; d < D; ++d) {
+                            const size_t dst = d * faces_in_batch + f;
+                            const size_t src = d * n_faces + gf;
+                            rec.depth_sum[dst] = acc.sum [src];
+                            rec.depth_max[dst] = acc.vmax[src];
+                            rec.depth_min[dst] = acc.vmin[src];
+                        }
+                        rec.depth_count[f] = acc.count[gf];
+                    }
+                }
+                std::string serr;
+                if (!g_batch_ckpt.session.stage(std::move(rec), serr)) {
+                    bool expected = false;
+                    if (bc_bank_failed.compare_exchange_strong(expected, true)) {
+                        #pragma omp critical
+                        bc_bank_msg = serr;
+                    }
+                }
+            }
+
             // Update progress
             size_t done = ++completed_batches;
             #pragma omp critical
             {
                 progressBar.update(static_cast<int>(done * BS));
             }
+        }
+    }
+
+    // A banking or digest failure inside the parallel region is reported HERE,
+    // where it can abort the run: the region cannot throw, and a run that got
+    // this far with a mixed partial set must not write results.
+    if (bc_digest_conflict.load()) {
+        std::cerr << "\n[SIMD Batch] FATAL: " << bc_conflict_msg << "\n"
+                  << "  Refusing to produce a product assembled from two "
+                     "different computations.\n" << std::endl;
+        return false;
+    }
+    if (bc_bank_failed.load()) {
+        std::cerr << "\n[SIMD Batch] FATAL: could not bank a completed face "
+                     "batch: " << bc_bank_msg << "\n"
+                  << "  The thermal solve itself is unaffected, but a partial "
+                     "set with a hole in it cannot reconstruct this window, so "
+                     "the run\n  refuses rather than leaving one behind that "
+                     "looks resumable. Free space (or unset "
+                     "thermal.batch_checkpoint) and re-run.\n" << std::endl;
+        return false;
+    }
+    if (bc_on) {
+        std::string ferr;
+        if (!g_batch_ckpt.session.finish(std::cout, ferr)) {
+            std::cerr << "\n[SIMD Batch] FATAL: " << ferr << "\n" << std::endl;
+            return false;
+        }
+        if (bc_restored_batches.load() > 0) {
+            std::cout << "[batch-ckpt] this process integrated "
+                      << (n_batches - bc_restored_batches.load()) << " batch(es) "
+                         "and RESTORED " << bc_restored_batches.load()
+                      << " from partials.\n";
         }
     }
 
@@ -6588,6 +6999,20 @@ bool runThermalModelsForAllFacesBatchSoA(
             real_eq_cycles = (times[equilibration_steps] - times[0]) / planet.day;
         }
         g_spinup_census->report(std::cout, seed_cycles + real_eq_cycles);
+        // ⛔ The census is scored one substep into the integration, which a
+        // RESTORED batch never runs. Say so, with the count, rather than
+        // printing a whole-mesh-looking banner over a fraction of the mesh.
+        // It is report-only (stdout, no file), which is why this is a
+        // disclosure and not a refusal.
+        if (bc_restored_batches.load() > 0) {
+            std::cout << "  ⚠ SCOPE: " << bc_restored_batches.load() << " of "
+                      << n_batches << " face batches were RESTORED from "
+                         "batch-completion partials and are NOT in the census "
+                         "above.\n"
+                         "    It covers only the batches this process "
+                         "integrated. The census is report-only and reaches no "
+                         "output file.\n";
+        }
     }
 
     // Certificate-driven spin-up: what the criterion actually bought. Printed
@@ -17336,6 +17761,36 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- batch-completion checkpointing (plan 1D'), stage A ----------------
+    // Resolve the switch and the directory here, beside the depth-map request,
+    // because this is the scope that knows the output directory. The capability
+    // gate (which solver paths support it) lives at the dispatch, and the
+    // session itself is opened by the driver against the real depth grid.
+    g_batch_ckpt.requested = sim_config.thermal.batch_checkpoint;
+    g_batch_ckpt.max_gib   = sim_config.thermal.batch_checkpoint_max_gib;
+    g_batch_ckpt.flush_mib = sim_config.thermal.batch_checkpoint_flush_mib;
+    if (g_batch_ckpt.requested) {
+        g_batch_ckpt.dir = sim_config.thermal.batch_checkpoint_dir.empty()
+                               ? (sim_config.output.directory +
+                                  "/_thermal_state/partial")
+                               : sim_config.thermal.batch_checkpoint_dir;
+        // A partial directory that is also the final-state path would let a
+        // partial and a state share a name. They cannot -- different magic --
+        // but the confusion is not worth the one line it costs to refuse.
+        if (!sim_config.thermal.final_state_file.empty() &&
+            sim_config.thermal.final_state_file.rfind(g_batch_ckpt.dir, 0) == 0) {
+            std::cerr << "\nFATAL: thermal.batch_checkpoint_dir ('"
+                      << g_batch_ckpt.dir << "') contains "
+                         "thermal.final_state_file ('"
+                      << sim_config.thermal.final_state_file
+                      << "').\n  Partials and the finished state must not share "
+                         "a directory: the partial sweep would see the state as "
+                         "a stray file\n  and a cleanup would see the state as a "
+                         "partial. Point them at different places.\n" << std::endl;
+            return 1;
+        }
+    }
+
     // Build the ET grid: equilibration block followed by output block, both
     // half-open. This is passed to the illumination model via
     // setExternalTimeGrid() so that ray-tracing + SPICE position queries happen
@@ -18723,6 +19178,56 @@ int main(int argc, char** argv) {
                     break;
             }
 
+            // ---- batch-checkpoint capability gate (plan 1D') ---------------
+            // The feature is implemented on the CPU SIMD-batch whole-mesh
+            // driver and NOWHERE ELSE in this version. Every other path
+            // REFUSES rather than running with the checkpoint quietly inert --
+            // a resilience feature that is off when you think it is on is
+            // worse than one that is off.
+            //
+            // The GPU path is deferred deliberately, and for a gating reason
+            // rather than an effort one: the acceptance test for this feature
+            // is "SIGKILL the engine mid-run, resume, prove the outputs
+            // byte-identical", and SIGKILL with OpenCL command queues in flight
+            // is the documented compute-wedge class on this workstation. A path
+            // whose resume equivalence cannot be crash-tested must not ship
+            // with the switch enabled.
+            if (g_batch_ckpt.requested) {
+                const char* why = nullptr;
+                if (solver_path == ptm::ThermalSolverPath::GpuPersistent)
+                    why = "the GPU persistent solver";
+                else if (solver_path == ptm::ThermalSolverPath::CpuScalar)
+                    why = "the CPU scalar solver (--no-simd-batch), whose depth "
+                          "grid is PER FACE";
+                if (why) {
+                    std::cerr << "\nFATAL: thermal.batch_checkpoint is enabled, "
+                                 "but this run selected " << why << ".\n"
+                              << "  Batch-completion checkpointing is "
+                                 "implemented on the CPU SIMD-batch whole-mesh "
+                                 "solver only in this engine version.\n"
+                              << "  Refusing rather than running with the "
+                                 "checkpoint silently inert. Either unset "
+                                 "thermal.batch_checkpoint, or select the\n"
+                                 "  SIMD-batch solver (thermal.use_gpu: false "
+                                 "and use_simd_batch: true).\n" << std::endl;
+                    return false;
+                }
+                if (enable_radiation_exchange) {
+                    std::cerr << "\nFATAL: thermal.batch_checkpoint is enabled "
+                                 "together with radiation exchange.\n"
+                              << "  The whole-mesh thermal driver is entered "
+                                 "more than once in a radiation-coupled run, "
+                                 "and a partial set that\n"
+                                 "  survived across entries would let the "
+                                 "second pass restore the FIRST pass's results "
+                                 "and call the window\n"
+                                 "  finished -- silently. Refusing. Run "
+                                 "radiation-coupled windows under the runner's "
+                                 "chunk split instead.\n" << std::endl;
+                    return false;
+                }
+            }
+
             if (solver_path == ptm::ThermalSolverPath::GpuPersistent) {
                 const std::vector<double>* face_H_ptr_l =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
@@ -18959,6 +19464,28 @@ int main(int argc, char** argv) {
             const std::vector<double>* face_H_ptr =
                 planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
             bool thermal_success_streamed;
+            // Same capability gate as the non-streamed dispatch. Streamed
+            // SIMD-batch IS the supported driver (streaming changes where the
+            // forcing comes from, not who integrates it); streamed SCALAR is
+            // not, and must refuse rather than run with the switch inert.
+            if (g_batch_ckpt.requested &&
+                stream_path != ptm::ThermalSolverPath::CpuStreamedBatch) {
+                std::cerr << "\nFATAL: thermal.batch_checkpoint is enabled, but "
+                             "this run fell back to the CPU scalar streamed "
+                             "solver.\n"
+                          << "  Batch-completion checkpointing is implemented "
+                             "on the SIMD-batch driver only in this engine "
+                             "version. Refusing rather\n"
+                             "  than running with the checkpoint silently "
+                             "inert.\n" << std::endl;
+                // ⛔ `return 1`, NOT `return false`. This site is in main()'s
+                // own body, not in the solveWholeMeshThermal lambda -- `false`
+                // would convert to exit status 0 and an orchestrator would
+                // record the window as COMPLETE over an empty output
+                // directory. The two sibling refusals above sit inside the
+                // lambda and correctly return false. Found by code-review.
+                return 1;
+            }
             if (stream_path == ptm::ThermalSolverPath::CpuStreamedBatch) {
                 // The configured (shipped-default) integrator, fed from the
                 // chunk store. The three illumination arrays are deliberately

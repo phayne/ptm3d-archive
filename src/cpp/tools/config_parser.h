@@ -298,6 +298,47 @@ struct SimulationConfig {
         // per-step checkpointing is the CPU-first solver (Phase 1).
         int checkpoint_every_output_steps = 0;
 
+        // ------------------------------------------------------------------
+        // BATCH-COMPLETION CHECKPOINTING (plan phase 1D'). This is the answer
+        // to the paragraph directly above, and it is the INVERSE of it.
+        //
+        // The solver is batch-outer, so there is no moment when all faces
+        // share an output step -- but at a batch boundary a well-defined set
+        // of faces is FINISHED FOR THE WHOLE WINDOW. Each completed batch's
+        // products are banked to a self-describing partial
+        // (thermal/batch_checkpoint.h, "PTMB"); a restart validates them,
+        // skips those batches and integrates only the rest.
+        //
+        // OFF BY DEFAULT, and byte-identity when off is the acceptance test.
+        //
+        // ⛔ WHAT THIS DOES NOT BOUND. A run that dies inside a batch loses
+        // that batch's whole time integration -- that is the granularity, by
+        // construction. Finer bounding is still the runner's process-level
+        // chunk split (scripts/run_chunked_simulation.py), which is already
+        // built and already mathematically equivalent to a single shot.
+        //
+        // ⛔ COST. A partial carries the batch's SURFACE TIME SERIES, not just
+        // its column, because every statistic and every per-step product is a
+        // reduction of that series. At the lunar polar production shape
+        // (F = 2,397,890, T = 1440) the partial set is ~26 GiB per window, not
+        // the ~210 MiB a column-only dump would cost. The engine prints the
+        // exact figure at startup and REFUSES above batch_checkpoint_max_gib
+        // rather than filling a disk quietly.
+        bool batch_checkpoint = false;
+        // Where the partials live. Empty (default) =
+        // <output.directory>/_thermal_state/partial.
+        std::string batch_checkpoint_dir = "";
+        // Ceiling on the projected partial-set size, in GiB. Exceeding it is a
+        // REFUSAL naming the projected size, not a warning: a 26 GiB surprise
+        // mid-window is a disk event, not a checkpoint.
+        double batch_checkpoint_max_gib = 64.0;
+        // How much completed work to accumulate before writing a partial, in
+        // MiB. 0 (default) DERIVES it as one sixteenth of the projected set,
+        // clamped to [1, 64] MiB -- a fixed threshold makes the feature
+        // silently useless on any run smaller than it. The engine prints the
+        // resolved value and the implied worst-case loss at startup.
+        double batch_checkpoint_flush_mib = 0.0;
+
         // Deep radiation-coupling, two-pass scheme (fixes the cold-PSR-floor
         // bias from equilibrating the deep column WITHOUT the radiosity
         // indirect flux). Orchestrated as two binary runs:
