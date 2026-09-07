@@ -531,13 +531,24 @@ def test_the_gpu_enums_are_case_insensitive_like_the_engine():
         assert valid, f"thin_margin_policy {value!r} refused: {messages}"
 
 
-def test_a_disabled_device_list_does_not_block_the_launch():
-    """And a field holding unparseable text stays editable.
+def test_an_unparseable_device_list_blocks_the_launch_and_stays_fixable():
+    """An unparseable device list is refused whether or not the GPU box is on.
 
-    IlluminationTab disables the device-ID field while illumination.use_gpu is
-    off, and validate() refused unconditionally -- so ticking the box, typing
-    `abc` and unticking it blocked Run with an error naming a field the user
-    could no longer edit, for a key the run would never read. Reproduced.
+    ⛔ THIS ARM CHANGED DIRECTION on 2026-09-06, and the reason is in the
+    engine, not here. It used to assert that unticking the box UNBLOCKED the
+    launch, on the stated grounds that this was "a key the run would never
+    read". That premise is now false: `config_parser.cpp` refuses a non-list
+    `gpu_device_ids` at CONFIG LOAD, before it looks at `use_gpu` at all
+    (PTM-CONFIG-SEQUENCE-SCALAR-SILENT). Letting the launch through would start
+    a run that dies in its first second -- and this application really can write
+    such a file: a scalar passes straight through `save_to_yaml` to disk,
+    measured.
+
+    What the original arm was actually protecting survives, and is what keeps
+    the block from being a trap: the field holding the unparseable text stays
+    EDITABLE even with the box unticked, so the user can always clear it.
+    Blocking a launch over a field the user cannot reach is the bug; blocking it
+    over one they can is the point.
     """
     with tempfile.TemporaryDirectory() as scratch:
         manager, panel = _panel(scratch)
@@ -549,14 +560,21 @@ def test_a_disabled_device_list_does_not_block_the_launch():
 
         tab.widgets["illumination.use_gpu"].setChecked(False)
         valid, messages = manager.validate()
-        assert valid, (
-            f"the launch is blocked over a key this run will not read: "
-            f"{messages}")
+        assert not valid, (
+            "the launch was allowed with an unparseable gpu_device_ids and the "
+            "GPU box unticked. The engine refuses that config at load, before "
+            "it reads use_gpu, so this would start a run that cannot start")
+        assert any("STOPS the run" in m for m in messages), (
+            f"the refusal does not say the engine stops the run, so a reader "
+            f"cannot tell it apart from a panel-only opinion: {messages}")
         assert tab.widgets["illumination.gpu_device_ids"].isEnabled(), (
             "the field holding the unparseable text is disabled, so the user "
-            "cannot clear it")
+            "cannot clear it -- that makes the block above unfixable, which is "
+            "the trap this arm has always existed to catch")
 
         tab.widgets["illumination.gpu_device_ids"].setText("")
+        valid, _messages = manager.validate()
+        assert valid, "clearing the field must unblock the launch"
         assert not tab.widgets["illumination.gpu_device_ids"].isEnabled(), (
             "once cleared it follows the GPU switch again")
 
@@ -822,7 +840,7 @@ TESTS = [
     test_an_unrecognized_output_format_BLOCKS_the_launch,
     test_an_empty_gpu_policy_is_shown_as_itself_and_repairable,
     test_the_gpu_enums_are_case_insensitive_like_the_engine,
-    test_a_disabled_device_list_does_not_block_the_launch,
+    test_an_unparseable_device_list_blocks_the_launch_and_stays_fixable,
     test_an_unreadable_machine_profile_does_not_abort_the_panel,
     test_the_gpu_policy_enums_are_the_engines_own,
     test_the_hard_floor_rule_is_the_engines_rule,

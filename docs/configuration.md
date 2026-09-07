@@ -130,7 +130,7 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `compute_statistics` | bool | true | Compute and write per-face statistics |
 | `use_gpu` | bool | false | OpenCL thermal solver (a CPU-only build refuses at startup) |
 | `gpu_devices` | int | 1 | Devices in the thermal pool (0 = all enumerated) |
-| `gpu_device_ids` | list[int] | [] | Explicit device indices; overrides `gpu_devices` |
+| `gpu_device_ids` | list[int] | [] | Explicit device indices; overrides `gpu_devices` **while non-empty**. Must be a list — a scalar is refused, because it would drop the pin rather than move it ([why](#keys-the-engine-reads-as-lists)) |
 | `gpu_batch_size` | int | 0 | Faces per GPU batch (0 = automatic cap) |
 | `gpu_inter_batch_pause_ms` | int | 0 | Pause between consecutive batches on a device |
 | `auto_calibrate_gpu` | bool | true | Probe the host once for a dispatch ceiling when no machine profile exists |
@@ -499,7 +499,7 @@ robustness; the layers it holds simply converge at the ordinary rate.
 | `positions_file` | string | `""` | Precomputed body/Sun positions instead of SPICE lookups |
 | `use_gpu` | bool | false | GPU BVH shadow-ray tracer |
 | `gpu_devices` | int | 1 | Devices for the ray tracer (0 = all enumerated) |
-| `gpu_device_ids` | list[int] | [] | Explicit device indices |
+| `gpu_device_ids` | list[int] | [] | Explicit device indices; must be a list — a scalar is refused ([why](#keys-the-engine-reads-as-lists)) |
 | `gpu_inter_batch_pause_ms` | int | 0 | Pause between consecutive batches on a device |
 | `bvh_cache_file` | string | `""` | BVH cache path (empty = auto under the output directory; `off` disables) |
 
@@ -723,7 +723,8 @@ of `map_depth_stats` reached a refusal that reported the list as *empty* when th
 user had in fact named a statistic. Both now stop the run at config load with a
 message naming the fix. `map_depths_m:` with nothing after it stays legal and
 means the same as `[]` — off. Nothing is coerced: a quoted `"a, b"` is one value,
-not two.
+not two. The same rule now covers every list key — see
+[Keys the engine reads as lists](#keys-the-engine-reads-as-lists).
 
 **A depth below the deepest solved node is refused naming `thermal.thermal_b`,**
 which is the YAML key. The engine's own field for it is `grid_b`; the two are
@@ -795,6 +796,37 @@ See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
 | `albedo_hapke_w` | float | -1.0 | Single-scattering albedo (below 0 = derive from the Bond albedo) |
 | `conductivity_model` | string | `"hayne2017"` | `hayne2017` or `martinez2021` — see [martinez-conductivity-model.md](martinez-conductivity-model.md). An unrecognized value stops the run |
 
+## Keys the engine reads as lists
+
+Six keys are read as YAML **sequences**. yaml-cpp iterates a scalar as an *empty*
+sequence, so before 2026-09-06 writing one without brackets was a silent no-op —
+the value was dropped, the default stood, and nothing said so. All six now stop
+the run at config load, naming the value given and the list form that fixes it.
+
+| Key | A scalar used to mean | Now |
+|---|---|---|
+| `output.map_depths_m` | product OFF; complete run, exit 0, no maps, no message | refused |
+| `output.map_depth_stats` | empty; run stopped later reporting the list as *empty* | refused, as a shape error |
+| `thermal.gpu_device_ids` | **no explicit pin** | refused |
+| `illumination.gpu_device_ids` | **no explicit pin** | refused |
+| `radiation.gpu_device_ids` | **no explicit pin** | refused |
+| `generic_body.shape.semi_axes_km` | body keeps its **default** shape | refused |
+
+⚠️ **The `gpu_device_ids` case is a safety one, not a tidiness one.**
+`gpu_device_ids` overrides `gpu_devices` *only while it is non-empty*. A scalar
+therefore does not pin a different card — it drops the pin, and the run follows
+`gpu_devices`: `1` (the default) selects the first enumerated GPU, and `0`/auto
+selects **every** enumerated GPU. So `gpu_devices: 0` beside `gpu_device_ids: 2`
+silently meant "use all of them".
+
+`semi_axes_km` is refused on **length** as well: it must list exactly three axes.
+A two- or four-element list was also skipped in silence, leaving the body at its
+default shape while the file appeared to set it.
+
+A key written with nothing after it (`gpu_device_ids:`, `map_depths_m:`) is a
+null, not a scalar, and keeps meaning "not set" — that spelling is unchanged.
+Nothing is ever coerced: a quoted `"0, 1"` is one value, not two.
+
 ## generic_body
 
 Bodies without built-in properties are described here, with an ephemeris from
@@ -802,6 +834,10 @@ either Keplerian elements or a SPICE metakernel, plus a `surface:` block that
 carries the full thermophysical property set. See the asteroid examples in
 [`../examples/`](../examples/) and
 [docs/tutorials/](tutorials/).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `shape.semi_axes_km` | list[float] × 3 | body default | Triaxial semi-axes a, b, c in km. Must be exactly three entries; any other shape or length is refused (see [Keys the engine reads as lists](#keys-the-engine-reads-as-lists)) |
 
 ### How `generic_body.spice_metakernel` is resolved
 

@@ -294,6 +294,14 @@ void warnUnreadFluxCubeKeys(const YAML::Node& fc) {
 // NEVER coerce a scalar into a one-element list. Splitting "0.05, 0.25" would
 // accept on the user's behalf something the run will not do, and wrapping a
 // bare scalar would silently make a two-depth request a one-depth one.
+//
+// ⛔ EVERY key the parser reads with `for (const auto& item : node)` or gates on
+// `.IsSequence()` needs this. Six do, and all six are guarded as of
+// 2026-09-06 (PTM-CONFIG-SEQUENCE-SCALAR-SILENT): output.map_depths_m,
+// output.map_depth_stats, thermal/illumination/radiation.gpu_device_ids and
+// generic_body.shape.semi_axes_km. If you add a seventh, guard it in the same
+// breath -- the failure is invisible by construction, so it will not be found
+// by running the thing.
 // `consequence` is what the empty list would have MEANT for this key, and it is
 // a parameter rather than one shared sentence because the two call sites do not
 // share an outcome: an empty depth list is a silent surface-only run, an empty
@@ -336,6 +344,25 @@ void requireYamlSequence(const YAML::Node& node,
           "coerced: a quoted \"a, b\" is one value, not two.";
     throw std::runtime_error(os.str());
 }
+
+// The consequence sentence shared by the three `gpu_device_ids` keys, which is
+// the same on all three and is the reason this key class is a SAFETY matter and
+// not a tidiness one.
+//
+// Semantics, from config_parser.h:173-179: `gpu_device_ids` overrides
+// `gpu_devices` ONLY while it is non-empty; empty means "no explicit pin", and
+// the run then follows `gpu_devices` -- 1 (the default) = the first enumerated
+// GPU, 0 / "auto" = EVERY enumerated GPU. So a scalar written to pin one device
+// does not pin a different device; it drops the pin entirely, and next to
+// `gpu_devices: 0` that silently turns "use this one card" into "use all of
+// them". On this machine that is the load pattern that hard-wedges the W6800X.
+const char* const kDeviceIdsConsequence =
+    "the device list would be EMPTY, and an empty list is not 'no devices' -- "
+    "it means NO EXPLICIT PIN, so the run falls back to `gpu_devices` (1 = the "
+    "first enumerated GPU, 0/auto = EVERY enumerated GPU). A scalar meant to "
+    "pin one card therefore drops the pin instead of honoring it, silently, "
+    "and beside `gpu_devices: 0` it selects every card on the machine";
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -496,7 +523,12 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.compute_statistics = getWithDefault(thermal, "compute_statistics", config.thermal.compute_statistics);
             config.thermal.use_gpu = getWithDefault(thermal, "use_gpu", config.thermal.use_gpu);
             config.thermal.gpu_devices = getWithDefault(thermal, "gpu_devices", config.thermal.gpu_devices);
-            if (thermal["gpu_device_ids"] && thermal["gpu_device_ids"].IsSequence()) {
+            if (thermal["gpu_device_ids"]) {
+                requireYamlSequence(thermal["gpu_device_ids"],
+                                    "thermal.gpu_device_ids",
+                                    "GPU device indices",
+                                    kDeviceIdsConsequence,
+                                    "thermal:\n      gpu_device_ids: [0]");
                 config.thermal.gpu_device_ids.clear();
                 for (const auto& v : thermal["gpu_device_ids"]) {
                     config.thermal.gpu_device_ids.push_back(v.as<int>());
@@ -604,7 +636,12 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 config.illumination.use_gpu);
             config.illumination.gpu_devices = getWithDefault(n, "gpu_devices",
                 config.illumination.gpu_devices);
-            if (n["gpu_device_ids"] && n["gpu_device_ids"].IsSequence()) {
+            if (n["gpu_device_ids"]) {
+                requireYamlSequence(n["gpu_device_ids"],
+                                    "illumination.gpu_device_ids",
+                                    "GPU device indices",
+                                    kDeviceIdsConsequence,
+                                    "illumination:\n      gpu_device_ids: [0]");
                 config.illumination.gpu_device_ids.clear();
                 for (const auto& v : n["gpu_device_ids"]) {
                     config.illumination.gpu_device_ids.push_back(v.as<int>());
@@ -791,7 +828,12 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
 
             // Multi-GPU radiosity dispatch (mirrors thermal pool YAML keys).
             config.radiation.gpu_devices = getWithDefault(rad, "gpu_devices", config.radiation.gpu_devices);
-            if (rad["gpu_device_ids"] && rad["gpu_device_ids"].IsSequence()) {
+            if (rad["gpu_device_ids"]) {
+                requireYamlSequence(rad["gpu_device_ids"],
+                                    "radiation.gpu_device_ids",
+                                    "GPU device indices",
+                                    kDeviceIdsConsequence,
+                                    "radiation:\n      gpu_device_ids: [0]");
                 config.radiation.gpu_device_ids.clear();
                 for (const auto& v : rad["gpu_device_ids"]) {
                     config.radiation.gpu_device_ids.push_back(v.as<int>());
@@ -833,7 +875,31 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 config.generic_body.radius_km = getWithDefault(shape, "radius_km", config.generic_body.radius_km);
                 config.generic_body.mesh_file = getWithDefault(shape, "mesh_file", config.generic_body.mesh_file);
                 config.generic_body.mesh_scale = getWithDefault(shape, "mesh_scale", config.generic_body.mesh_scale);
-                if (shape["semi_axes_km"] && shape["semi_axes_km"].IsSequence() && shape["semi_axes_km"].size() == 3) {
+                if (shape["semi_axes_km"]) {
+                    // TWO silent skips lived in the old `&&` chain, and the
+                    // second is the nastier one: a list of the RIGHT type and
+                    // the WRONG length (two axes, or four) also fell through,
+                    // leaving the body at its default triaxial shape with the
+                    // config plainly asking for another. Both are refused now.
+                    requireYamlSequence(shape["semi_axes_km"],
+                                        "generic_body.shape.semi_axes_km",
+                                        "three semi-axes a, b, c in kilometers",
+                                        "the body would silently keep its DEFAULT "
+                                        "shape -- the axes in this file would not be "
+                                        "applied to anything",
+                                        "shape:\n        semi_axes_km: [1.2, 1.0, 0.9]");
+                    if (shape["semi_axes_km"].size() != 3) {
+                        std::ostringstream os;
+                        os << "generic_body.shape.semi_axes_km must list exactly THREE "
+                              "semi-axes (a, b, c in kilometers); this config lists "
+                           << shape["semi_axes_km"].size()
+                           << ". A list of any other length is ignored, and the body "
+                              "keeps its default shape while the file appears to set "
+                              "it. Write, for example:\n"
+                              "    shape:\n"
+                              "      semi_axes_km: [1.2, 1.0, 0.9]";
+                        throw std::runtime_error(os.str());
+                    }
                     config.generic_body.semi_axis_a_km = shape["semi_axes_km"][0].as<double>();
                     config.generic_body.semi_axis_b_km = shape["semi_axes_km"][1].as<double>();
                     config.generic_body.semi_axis_c_km = shape["semi_axes_km"][2].as<double>();

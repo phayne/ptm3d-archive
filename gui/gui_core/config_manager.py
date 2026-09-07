@@ -2143,33 +2143,36 @@ class ConfigManager:
                 "on latitude, so this longitude will be ignored. Set a "
                 "latitude, or clear the longitude to -999.")
 
-        # GPU device lists. The engine reads gpu_device_ids ONLY when it is a
-        # YAML sequence (config_parser.cpp gates on IsSequence()), so a
-        # malformed value is not rejected -- it is ignored, and the run uses a
-        # different device set than the panel shows. Refuse it here, where the
-        # user can still see the field.
+        # GPU device lists. As of 2026-09-06 the engine REFUSES this key when it
+        # is not a YAML sequence (config_parser.cpp, requireYamlSequence): it
+        # used to ignore it, which meant the run silently used a different
+        # device set than the panel showed. Both outcomes are worth refusing
+        # here, and the message says which one the engine will do.
         for section in ("thermal", "radiation", "illumination"):
             node = self.config.get(section)
             node = node if isinstance(node, dict) else {}
             if "gpu_device_ids" not in node:
                 continue
-            # Only when that section's GPU path is actually on. The
-            # illumination field is DISABLED while illumination.use_gpu is off,
-            # so an unconditional error blocked the launch over a field the
-            # user could no longer edit, for a key the run would never read.
-            # Reproduced: tick the box, type `abc`, untick it.
-            if not node.get("use_gpu", False):
-                continue
             parsed = self.parse_device_ids(node.get("gpu_device_ids"))
             if parsed is None:
+                # ⛔ UNCONDITIONAL, unlike the negative-index clause below. The
+                # engine refuses this at CONFIG LOAD, before it looks at
+                # `use_gpu` at all, so a section whose GPU path is switched off
+                # is not exempt -- this application can and does write such a
+                # file (measured: a scalar passes straight through to disk).
+                # The earlier `use_gpu` gate was added because the field was
+                # DISABLED while the box was unticked, which made the block
+                # unfixable; the panel now keeps an unparseable field editable
+                # for exactly that reason (config_panel.py, `stuck`), so the
+                # user can always clear it.
                 errors.append(
                     f"{section}.gpu_device_ids is "
                     f"{node.get('gpu_device_ids')!r}, which is not a list of "
-                    f"device indices. The engine reads this key only as a YAML "
-                    f"sequence, so it would be IGNORED and the run would use a "
-                    f"different device set than shown. Use e.g. 0,1 -- or "
-                    f"leave it blank to select by count.")
-            elif any(v < 0 for v in parsed):
+                    f"device indices. The engine STOPS the run on this, at "
+                    f"config load, whether or not this section's GPU path is "
+                    f"switched on. Use e.g. 0,1 -- or clear the field to "
+                    f"select by count.")
+            elif any(v < 0 for v in parsed) and node.get("use_gpu", False):
                 errors.append(
                     f"{section}.gpu_device_ids contains a negative index "
                     f"({parsed}); device indices start at 0.")

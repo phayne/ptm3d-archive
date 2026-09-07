@@ -991,18 +991,31 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
     }
 
     // Named individually even though z[] already implies them: a report that
-    // says "grid_b was 15, this run is 32" is actionable and "node 7 differs"
-    // is not.
+    // says "thermal_b was 15, this run is 32" is actionable and "node 7
+    // differs" is not.
+    //
+    // ⛔ TWO DIFFERENT NAMES, and they must not be swapped. The CLAUSE name --
+    // the first argument to `fail`, and what a user writes in
+    // `thermal.state_restore_allow_mismatch` -- is `grid_m` / `grid_n` /
+    // `grid_b`, and `docs/configuration.md` documents exactly those. The YAML
+    // KEY that sets the value is `thermal.thermal_m` / `_n` / `_b`
+    // (config_parser.cpp: getWithDefault(thermal, "thermal_b",
+    // config.thermal.grid_b)); `thermal.grid_b` is the C++ FIELD and is not a
+    // config key at all. These messages named the field, so a user acting on
+    // one went looking for a key that does not exist -- and had they added it,
+    // the engine would have ignored it in silence
+    // (PTM-STATEIO-REFUSAL-NAMES-A-NONEXISTENT-KEY, the same defect fixed in
+    // depth_map_plan.h). The clause name stays; the message names the key.
     if (t->grid_m >= 0 && run.grid_m >= 0 && t->grid_m != run.grid_m)
-        fail("grid_m", "thermal.grid_m: " + std::to_string(t->grid_m) +
+        fail("grid_m", "thermal.thermal_m: " + std::to_string(t->grid_m) +
                        " in the checkpoint, " + std::to_string(run.grid_m) +
                        " in this run");
     if (t->grid_n >= 0 && run.grid_n >= 0 && t->grid_n != run.grid_n)
-        fail("grid_n", "thermal.grid_n: " + std::to_string(t->grid_n) +
+        fail("grid_n", "thermal.thermal_n: " + std::to_string(t->grid_n) +
                        " in the checkpoint, " + std::to_string(run.grid_n) +
                        " in this run");
     if (t->grid_b >= 0 && run.grid_b >= 0 && t->grid_b != run.grid_b)
-        fail("grid_b", "thermal.grid_b: " + std::to_string(t->grid_b) +
+        fail("grid_b", "thermal.thermal_b: " + std::to_string(t->grid_b) +
                        " in the checkpoint, " + std::to_string(run.grid_b) +
                        " in this run");
     if (std::isfinite(t->refgrid_H) && std::isfinite(run.refgrid_H) &&
