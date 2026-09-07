@@ -190,16 +190,41 @@ SKIP_EXTENSIONS = {
 SKIP_PREFIXES = ("third_party/", "data/spice/", "data/kernels/")
 
 
+class GitUnavailable(RuntimeError):
+    """git could not list the tracked files, so the default scan cannot run.
+
+    NOT the same thing as a clean tree, and the difference used to be invisible:
+    `tracked_files()` returned `[]` on every git failure, `main` printed
+    "no files to check" and returned 0, and a gate that had scanned NOTHING was
+    indistinguishable at the exit code from one that had scanned 1,100 files and
+    found nothing wrong. On this machine that is a live path, not a hypothetical:
+    `/usr/bin/git` is the xcrun shim and exits 1, and the checkout sits on
+    OneDrive, where the working tree can be evicted out from under a command.
+    """
+
+
 def tracked_files():
-    """Every tracked file, via the git binary that works on this machine."""
+    """Every tracked file, via the git binary that works on this machine.
+
+    Raises :class:`GitUnavailable` -- with what each candidate said -- rather
+    than returning an empty list. A caller that wants the old behavior has to
+    ask for it in as many words.
+    """
+    attempts = []
     for git in ("/Library/Developer/CommandLineTools/usr/bin/git", "git"):
         try:
             out = subprocess.check_output([git, "ls-files"],
-                                          stderr=subprocess.DEVNULL)
-            return [p for p in out.decode().split("\n") if p]
-        except (OSError, subprocess.CalledProcessError):
+                                          stderr=subprocess.PIPE)
+        except OSError as exc:
+            attempts.append(f"{git}: {exc}")
             continue
-    return []
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or b"").decode(errors="replace").strip()
+            attempts.append(f"{git}: exit {exc.returncode}"
+                            + (f" ({detail.splitlines()[0]})" if detail else ""))
+            continue
+        return [p for p in out.decode().split("\n") if p]
+    raise GitUnavailable("; ".join(attempts) or "no git binary was tried")
 
 
 def walk(paths):
@@ -368,7 +393,9 @@ def _parser():
         prog="check_american_english.py",
         description="Report British spellings in prose, comments and UI text.",
         epilog="Exit status: 0 clean, 1 British spelling(s) found, 2 usage "
-               "error. A path that begins with '-' must be given after '--'.")
+               "error, 3 the tracked-file list could not be obtained (git "
+               "failed, or reported no tracked files) so NOTHING was scanned. "
+               "A path that begins with '-' must be given after '--'.")
     p.add_argument("paths", nargs="*", metavar="PATH",
                    help="files or directories to check "
                         "(default: every git-tracked file)")
@@ -394,13 +421,43 @@ def main(argv):
     # strictness fix into a broken CI gate.
     args = _parser().parse_intermixed_args(argv[1:])
     excludes = args.exclude
-    paths = args.paths or tracked_files()
+    # The DEFAULT scan is the whole tracked tree, and "I could not get that
+    # list" has to be told apart from "I got it and it was clean". Both used to
+    # be exit 0 with a line on stderr; a wrapper reading only $? could not see
+    # the difference, and neither could CI. Exit 3, its own code, so a caller
+    # can act on it without parsing text.
+    if args.paths:
+        paths = args.paths
+        scanning_tracked_tree = False
+    else:
+        scanning_tracked_tree = True
+        try:
+            paths = tracked_files()
+        except GitUnavailable as exc:
+            print(f"check_american_english: FAILED TO RUN -- the tracked-file "
+                  f"list could not be obtained, so NOTHING was checked. "
+                  f"git said: {exc}", file=sys.stderr)
+            return 3
+        if not paths:
+            print("check_american_english: FAILED TO RUN -- git listed no "
+                  "tracked files, so NOTHING was checked. Run this from inside "
+                  "the checkout, or name the paths to scan.", file=sys.stderr)
+            return 3
     if excludes:
         paths = [p for p in paths
                  if not any(p.replace(os.sep, "/").startswith(x)
                             for x in excludes if x)]
     if not paths:
-        print("check_american_english: no files to check", file=sys.stderr)
+        # Reachable two ways, and only one of them is the caller's own doing:
+        # --exclude that filters everything out. That stays exit 0 -- the user
+        # asked for it and the message says what happened -- but a DEFAULT scan
+        # emptied by --exclude scanned nothing it was asked to, and says so.
+        if scanning_tracked_tree:
+            print("check_american_english: FAILED TO RUN -- --exclude removed "
+                  "every tracked file, so NOTHING was checked.", file=sys.stderr)
+            return 3
+        print("check_american_english: no files to check "
+              "(--exclude removed every path named)", file=sys.stderr)
         return 0
     total = 0
     for path in sorted(set(walk(paths))):
