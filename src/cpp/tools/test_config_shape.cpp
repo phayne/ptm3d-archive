@@ -246,28 +246,85 @@ int main() {
     // ------------------------------------------------------------------
     // 3. do no harm: the guard fires on these two keys and nothing else
     // ------------------------------------------------------------------
-    std::cout << "\n[3] the guard is scoped -- and here is what it does NOT cover\n";
+    // ------------------------------------------------------------------
+    // 3. the GPU device lists -- the same defect, and a SAFETY one
+    // ------------------------------------------------------------------
+    // `gpu_device_ids` overrides `gpu_devices` only while it is NON-EMPTY
+    // (config_parser.h:173-179). A scalar therefore does not pin a different
+    // card, it drops the pin: the run falls back to `gpu_devices`, which is 1
+    // (first GPU) by default and EVERY enumerated GPU at 0/auto. Written next
+    // to `gpu_devices: 0`, `gpu_device_ids: 2` silently means "all of them" --
+    // the load pattern that hard-wedges this machine's W6800X.
+    std::cout << "\n[3] the GPU device lists (thermal / illumination / radiation)\n";
+    for (const char* section : {"thermal", "illumination", "radiation"}) {
+        const std::string sec(section);
+        refuses(sec + ":\n  gpu_device_ids: 0\n",
+                {"must be a YAML LIST",          // the shape
+                 "NO EXPLICIT PIN",              // why it is not a tidiness fix
+                 "EVERY enumerated GPU",         // the safety consequence
+                 "(0)"},                         // the value given
+                "a scalar " + sec + ".gpu_device_ids is refused, naming the pin "
+                "it would have dropped");
+        {
+            const Load r = load(sec + ":\n  gpu_device_ids: [0, 2]\n");
+            check(!r.threw, "a real " + sec + ".gpu_device_ids list still parses");
+        }
+        {
+            // Bare `gpu_device_ids:` keeps meaning "no explicit pin", exactly
+            // as omitting the key does. Refusing it would break a legal file.
+            const Load r = load(sec + ":\n  gpu_device_ids:\n");
+            check(!r.threw, "a NULL " + sec + ".gpu_device_ids is still 'no pin'");
+        }
+    }
     {
-        // ⛔ THIS ARM RECORDS A KNOWN HOLE, it does not bless one. Four other
-        // keys are read the same way and are NOT guarded:
-        //   thermal.gpu_device_ids, illumination.gpu_device_ids,
-        //   radiation.gpu_device_ids, generic_body.shape.semi_axes_km
-        // (flux_cubes.locations is a sequence of maps and is already gated on
-        // IsSequence()). A scalar in any of them keeps the default in silence:
-        // `gpu_device_ids: 0`, meant as "pin device 0", leaves the list empty,
-        // which means "use every device" -- the opposite of the request, with
-        // no message. That is PTM-CONFIG-SEQUENCE-SCALAR-SILENT, filed rather
-        // than fixed here because widening the guard changes the behavior of
-        // configs that run today and is outside this change's approved scope.
-        //
-        // Kept as an arm because it is also the control that proves the arms
-        // above measure THE GUARD and not some blanket new strictness. When the
-        // hole is closed, this arm flips to `refuses(...)` and this comment goes.
-        const Load r = load("illumination:\n  gpu_device_ids: 0\n");
+        const Load r = load("thermal:\n  gpu_device_ids: [1, 3]\n");
+        check(!r.threw && r.config.thermal.gpu_device_ids.size() == 2 &&
+                  r.config.thermal.gpu_device_ids[0] == 1 &&
+                  r.config.thermal.gpu_device_ids[1] == 3,
+              "...and the indices it parses are the ones written");
+    }
+
+    // ------------------------------------------------------------------
+    // 4. generic_body.shape.semi_axes_km -- TWO silent skips, not one
+    // ------------------------------------------------------------------
+    std::cout << "\n[4] generic_body.shape.semi_axes_km\n";
+    refuses("generic_body:\n  shape:\n    semi_axes_km: 1.2\n",
+            {"must be a YAML LIST", "keep its DEFAULT", "(1.2)"},
+            "a scalar semi-axis is refused");
+    refuses("generic_body:\n  shape:\n    semi_axes_km: [1.2, 1.0]\n",
+            {"exactly THREE", "lists 2"},
+            "a list of the RIGHT type and the WRONG length is refused too -- "
+            "the second silent skip in the old `&&` chain");
+    refuses("generic_body:\n  shape:\n    semi_axes_km: [1.2, 1.0, 0.9, 0.8]\n",
+            {"exactly THREE", "lists 4"},
+            "...in both directions");
+    {
+        const Load r = load("generic_body:\n  shape:\n"
+                            "    semi_axes_km: [1.2, 1.0, 0.9]\n");
+        check(!r.threw && r.config.generic_body.semi_axis_a_km == 1.2 &&
+                  r.config.generic_body.semi_axis_b_km == 1.0 &&
+                  r.config.generic_body.semi_axis_c_km == 0.9,
+              "three axes still parse, in order");
+    }
+    {
+        const Load r = load("generic_body:\n  shape:\n    type: sphere\n");
         check(!r.threw,
-              "an unguarded sequence key elsewhere is unchanged -- the guard is "
-              "the two depth-map keys and nothing else (see the comment: this "
-              "records a hole, it does not approve of it)");
+              "a shape block WITHOUT the key is untouched by the guard");
+    }
+
+    // ------------------------------------------------------------------
+    // 5. do no harm: the guard is these six keys and no others
+    // ------------------------------------------------------------------
+    std::cout << "\n[5] the guard is scoped\n";
+    {
+        // The control. `gpu_batch_size` sits beside `gpu_device_ids`, is read
+        // with the same direct-node style, and is a SCALAR key -- so if the
+        // change had become blanket strictness rather than a per-key guard,
+        // this is what would break.
+        const Load r = load("thermal:\n  gpu_batch_size: 4096\n");
+        check(!r.threw && r.config.thermal.gpu_batch_size == 4096,
+              "a neighboring SCALAR key is unaffected -- the guard is per key, "
+              "not blanket strictness");
     }
     {
         const Load r = load("output:\n  map_depths_m: [0.05]\n"

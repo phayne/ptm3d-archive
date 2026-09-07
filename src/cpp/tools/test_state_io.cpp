@@ -793,16 +793,42 @@ int main() {
         }
 
         // --- wrong grid_b (the D14 clause's own knob) ----------------------
+        // ⛔ The message must name the YAML KEY `thermal.thermal_b`, NOT the
+        // C++ field `thermal.grid_b`. The clause NAME stays `grid_b` -- that is
+        // what `state_restore_allow_mismatch` accepts and what
+        // docs/configuration.md lists -- but a refusal telling a user to change
+        // `thermal.grid_b` sends them after a key the parser never reads
+        // (PTM-STATEIO-REFUSAL-NAMES-A-NONEXISTENT-KEY). Both directions are
+        // asserted: the old spelling is not a substring of the new one, so the
+        // negative half is what fails if it ever comes back.
         {
             sio::Identity r = matchingRun();
             r.grid_b = 32;
             sio::checkRestore(&file, sio::TrailerStatus::Ok, r, no_allow, v);
-            bool named_b = false;
-            for (const auto& s : v.refusals)
-                if (s.find("thermal.grid_b") != std::string::npos) named_b = true;
+            bool named_b = false, named_field = false;
+            for (const auto& s : v.refusals) {
+                if (s.find("thermal.thermal_b") != std::string::npos) named_b = true;
+                if (s.find("thermal.grid_b") != std::string::npos) named_field = true;
+            }
             check(!v.ok() && named_b,
-                  "G8: a different thermal.grid_b refuses BY NAME, not just as a "
-                  "depth-grid difference");
+                  "G8: a different bottom-depth setting refuses BY NAME, naming "
+                  "the YAML key thermal.thermal_b, not just a depth-grid "
+                  "difference");
+            check(!named_field,
+                  "G8: ...and does NOT name thermal.grid_b, which is the C++ "
+                  "field and not a config key");
+            // ...and the CLAUSE name is unchanged, so an existing
+            // `state_restore_allow_mismatch: [grid_b]` still downgrades it.
+            // Without this arm, renaming the clause along with the message
+            // would silently break every config carrying that opt-out.
+            sio::checkRestore(&file, sio::TrailerStatus::Ok, r, {"grid_b"}, v);
+            bool warned_b = false;
+            for (const auto& s : v.warnings)
+                if (s.find("thermal.thermal_b") != std::string::npos) warned_b = true;
+            check(v.ok() && warned_b,
+                  "G8: state_restore_allow_mismatch [grid_b] still downgrades "
+                  "this clause -- the CLAUSE name did not change with the "
+                  "message");
         }
 
         // --- wrong epoch, ONE CADENCE: warn, do not refuse -----------------

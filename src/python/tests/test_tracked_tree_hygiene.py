@@ -64,6 +64,14 @@ below and each with its own arm in both directions:
    body or site name is written into. They were on the never-open list; the
    binary siblings ``.bsp``/``.bpc`` still are.
 
+**Near-misses that have already been ruled on live in :data:`KNOWN_BENIGN`**,
+each with its ruling and each with a live arm asserting it stays unreported. A
+near-miss that is only remembered gets re-investigated, and the cheapest-looking
+answer to a re-flag is to edit the file -- which is how something already
+declared fine gets scrubbed anyway. Add to that table rather than to the local
+list's ``allow_paths`` unless the whole file really should be exempt from every
+term.
+
 Run directly::
 
     python3 src/python/tests/test_tracked_tree_hygiene.py
@@ -116,6 +124,32 @@ BINARY_SUFFIXES = {
 #: ``docs/figures/architecture.svg`` already carries a text-anchor coordinate
 #: whose first three decimals match a listed latitude.
 SHORT_FORM_MIN_DECIMALS = 3
+
+#: Tracked files whose numbers have been LOOKED AT and RULED BENIGN, with the
+#: ruling. This is the project's record of "already investigated, leave it
+#: alone" -- distinct from the local list's ``allow_paths``, which exempts a
+#: whole file from every term and is the heavier instrument.
+#:
+#: Each entry gets an arm below asserting the file is still not reported, so a
+#: future widening of the matching rules fails HERE, with the ruling in the
+#: message, instead of sending somebody to scrub a file Paul has already said
+#: is fine. Nothing here quotes a number: this file is itself scanned.
+KNOWN_BENIGN = {
+    "docs/figures/architecture.svg": (
+        "Two text-anchor coordinates share their first three decimals with a "
+        "listed latitude and then diverge -- arithmetic coincidence in a "
+        "generated drawing. Measured 2026-09-05; it is why the derived short "
+        "forms are guarded by a digit boundary instead of being matched loosely."
+    ),
+    "scripts/property_maps/lookup_face_at_site.py": (
+        "The usage example in the module docstring carries a latitude and "
+        "longitude that sit close to a listed site but are NOT it. "
+        "⛔ RULED BENIGN BY PAUL, 2026-09-06, verbatim: \"not the same site\". "
+        "Do NOT scrub it, and do not add a numeric-PROXIMITY rule that would "
+        "flag it -- the derived short forms deliberately match spellings of the "
+        "same number, not neighborhoods of it."
+    ),
+}
 
 
 class Skip(unittest.SkipTest):
@@ -501,27 +535,39 @@ def test_a_coordinate_written_SHORT_is_found_and_a_longer_number_is_not():
         "make the check unusable")
 
 
-def test_the_two_benign_svg_coincidences_still_pass():
-    """The named regression: architecture.svg must stay clean.
+def test_the_known_benign_files_stay_unreported():
+    """The named regressions: every file already ruled benign stays clean.
 
-    Its two hits are the real, measured false positives this guard was designed
-    around -- the reason the short forms were NOT bulk-added to the list by hand
-    on 2026-09-05. If they ever start failing, the digit-boundary guard has been
-    weakened, and the answer is to fix the guard, not to allow-list the file:
-    an allow entry would exempt that file from every OTHER term as well.
+    These are real, measured near-misses that somebody has already spent time
+    on. Without this arm, a future widening of the matching rules re-flags them,
+    and the cheapest-looking response is to edit the file -- which would mean
+    scrubbing something the project has decided is fine, or adding an
+    ``allow_paths`` entry that exempts that file from every OTHER term too.
+
+    So: if one of these fails, the guard changed, and the guard is what to fix.
+    The ruling travels with the failure message.
     """
     literals, regexes, allow = load_deny_list()
-    target = "docs/figures/architecture.svg"
-    if not (REPO_ROOT / target).is_file():
-        raise Skip(f"{target} is not in this checkout")
+    present = {name: why for name, why in KNOWN_BENIGN.items()
+               if (REPO_ROOT / name).is_file()}
+    if not present:
+        raise Skip("none of the known-benign files is in this checkout")
     hits = [h for h in scan(REPO_ROOT, literals, regexes, allow)
-            if h[0] == target]
-    assert not hits, (
-        f"{target} now reports {len(hits)} hit(s): "
-        + ", ".join(f"line {n} ({t!r})" for _p, n, t in hits[:5])
-        + ". Its numbers are longer coordinates that happen to share three "
-          "decimals with a listed one; fix the boundary guard in "
-          "short_form_patterns rather than allow-listing the file")
+            if h[0] in present]
+    if hits:
+        by_file = {}
+        for name, number, term in hits:
+            by_file.setdefault(name, []).append((number, term))
+        report = "\n".join(
+            f"  {name}: {len(v)} hit(s) -- "
+            + ", ".join(("the FILE NAME" if n == 0 else f"line {n}") + f" ({t!r})"
+                        for n, t in v[:5])
+            + f"\n    RULING: {present[name]}"
+            for name, v in by_file.items())
+        raise AssertionError(
+            "a file that was already investigated and ruled benign is being "
+            "reported again. The matching rules changed; fix them rather than "
+            "the file.\n" + report)
 
 
 def test_a_spice_text_kernel_is_read():
@@ -583,7 +629,7 @@ CHECKS = [
     test_the_check_can_actually_fail,
     test_a_file_NAME_carrying_a_term_is_found,
     test_a_coordinate_written_SHORT_is_found_and_a_longer_number_is_not,
-    test_the_two_benign_svg_coincidences_still_pass,
+    test_the_known_benign_files_stay_unreported,
     test_a_spice_text_kernel_is_read,
     test_the_untracked_working_tree_is_not_scanned,
 ]

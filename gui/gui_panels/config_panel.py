@@ -639,11 +639,12 @@ class BaseConfigTab(QWidget):
         self.config_manager.set_value(key, coerced)
 
     # ── GPU device lists ─────────────────────────────────────────────
-    # The engine reads `gpu_device_ids` ONLY when it is a YAML sequence
-    # (config_parser.cpp gates on IsSequence()), so a malformed value is not
-    # rejected -- it is ignored, and the run silently uses a different device
-    # set than the panel shows. The field therefore parses on every keystroke
-    # and says out loud when it cannot.
+    # The engine REFUSES `gpu_device_ids` when it is not a YAML sequence
+    # (config_parser.cpp, requireYamlSequence, 2026-09-06). Before that it
+    # ignored a malformed value, and the run silently used a different device
+    # set than the panel showed -- with `gpu_devices: 0` beside it, every card
+    # on the machine. Either way the field parses on every keystroke and says
+    # out loud when it cannot.
 
     def add_device_ids_field(self, layout, row, label_text, key, tooltip=""):
         """A '0,1' text field bound to a YAML sequence of device indices."""
@@ -4704,9 +4705,10 @@ class IlluminationTab(BaseConfigTab):
                 continue
             # A field holding a value that cannot be parsed stays EDITABLE even
             # when its section's GPU path is off, so the user can always clear
-            # it. validate() no longer blocks on it either, but a config that
-            # carries unparseable text should not become unfixable from the
-            # panel that put it there.
+            # it. This is now load-bearing rather than a courtesy: validate()
+            # blocks on an unparseable value UNCONDITIONALLY (the engine refuses
+            # it at config load, before it looks at `use_gpu`), so without this
+            # the config would be unfixable from the panel that wrote it.
             stuck = (key.endswith("gpu_device_ids")
                      and ConfigManager.parse_device_ids(
                          self.config_manager.get_value(key, [])) is None)
