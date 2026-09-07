@@ -43,16 +43,26 @@ except ImportError:
 from ptm_regridder import (
     STATISTICS_FIELDS, STAT_TYPES, BODY_RADII,
     MeshRegridder, GridResolutionEstimator,
+    depth_entries, discover_depth_fields,
     detect_body_from_mesh, detect_available_statistics,
     read_binary_data, read_ply_mesh_minimal,
 )
-from ptm_cog import export_field
+from ptm_cog import depth_band_tags, export_field
 
 
-def _expected_field_files():
-    """All (field_name, basename) pairs the converter knows about."""
+def _expected_field_files(stats_dir=None):
+    """All (field_name, basename) pairs the converter knows about.
+
+    ``stats_dir`` adds this run's subsurface temperature maps. They are not in
+    ``STATISTICS_FIELDS`` and cannot be -- their names carry the depth, so the
+    set belongs to the run -- and without them a run that asked for depth maps
+    would silently export only its surface products.
+    """
+    catalog = dict(STATISTICS_FIELDS)
+    if stats_dir is not None:
+        catalog.update(discover_depth_fields(stats_dir))
     out = []
-    for base, info in STATISTICS_FIELDS.items():
+    for base, info in catalog.items():
         if info.get('scalar'):
             out.append((base, f"{base}.bin"))
         else:
@@ -245,13 +255,23 @@ def main():
 
     # Export
     print(f"[3/4] Writing COGs to {output_dir} ...", flush=True)
-    fields_to_basename = {}
-    for base, info in STATISTICS_FIELDS.items():
-        if info.get('scalar'):
-            fields_to_basename[base] = f"{base}.bin"
-        else:
-            for stat in STAT_TYPES:
-                fields_to_basename[f"{base}_{stat}"] = f"{base}_{stat}.bin"
+    fields_to_basename = dict(_expected_field_files(stats_dir))
+    # What the run recorded about each depth: the depth asked for and the
+    # residual left after moving to the nearest depth it solves on. Read ONCE,
+    # and empty when the run wrote no manifest -- in which case each raster
+    # still carries the depth from its own file name, and no other depth is
+    # invented.
+    depth_manifest = depth_entries(stats_dir)
+    # Counted over what will ACTUALLY be written, not over what exists: with
+    # `--fields temperature_avg` on a run with two depths, counting the
+    # available set announced six depth bands and wrote none of them.
+    n_depth_fields = sum(1 for f in targets if depth_band_tags(f))
+    if n_depth_fields:
+        print(f"      subsurface temperature maps: {n_depth_fields} band(s)"
+              + ("" if depth_manifest else
+                 "; no depth_map_z.json in this directory, so each band "
+                 "reports the depth in its file name and not the depth that "
+                 "was requested"), flush=True)
 
     written = 0
     skipped = 0
@@ -281,6 +301,7 @@ def main():
                 overview_resampling=args.overview_resampling,
                 interpolation=args.interpolation,
                 nodata_value=nodata_value,
+                extra_tags=depth_band_tags(field_name, depth_manifest),
             )
         except Exception as exc:
             print(f"      FAIL  {field_name:30s} ({type(exc).__name__}: {exc})",

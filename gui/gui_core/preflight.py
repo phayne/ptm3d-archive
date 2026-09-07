@@ -240,6 +240,13 @@ class PreflightReport:
     beaming_warning: str = ""                        # facet-scale rule text, if triggered
     vf_cost_line: str = ""                           # advisory VF cost headline
     flux_cube_line: str = ""                         # cube count and product size
+    #: Subsurface temperature maps: the size of the statistics product, and --
+    #: separately -- what a per-output-step product at the same depths would
+    #: cost. TWO lines, not one: the two products differ in size AND in the
+    #: interpolation error they carry, so a single figure would be wrong for
+    #: whichever one the reader had in mind.
+    depth_map_line: str = ""
+    depth_map_series_line: str = ""
     #: `gui_core.flux_cubes.LayoutPlan` when the run needs its cube layout
     #: prepared before launch, else None. The launcher CARRIES IT OUT -- it
     #: builds the layout if the plan says build, and either way writes the
@@ -269,6 +276,10 @@ class PreflightReport:
             out.append(f"VF-COST: {self.vf_cost_line}")
         if self.flux_cube_line:
             out.append(f"FLUX-CUBES: {self.flux_cube_line}")
+        if self.depth_map_line:
+            out.append(f"DEPTH-MAPS: {self.depth_map_line}")
+        if self.depth_map_series_line:
+            out.append(f"DEPTH-MAPS: {self.depth_map_series_line}")
         for w in self.warnings:
             out.append(f"WARNING: {w}")
         for i in self.info:
@@ -710,6 +721,17 @@ def read_vf_nnz(vf_path):
         return None
     (nnz,) = struct.unpack("<Q", header[24:32])
     return int(nnz)
+
+
+def positive_int(value):
+    """`value` as a positive int, or None. A count that will not parse is not
+    a count of zero, and a size estimate built on one would be a made-up
+    number wearing the same font as a measured one."""
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _fmt_duration(seconds):
@@ -1600,6 +1622,27 @@ def run_preflight(config, find_executable, project_root=None,
     report.cloud_paths.extend(flux_findings.cloud_paths)
     report.flux_cube_line = flux_findings.line
     report.flux_cube_plan = flux_findings.build_plan
+
+    # -- Subsurface temperature maps ------------------------------------------
+    # The whole rule set lives in gui_core.depth_maps, beside the arithmetic
+    # the Output tab shows, so the launch check and the tab cannot drift into
+    # two opinions about what the engine will accept or how big the product is.
+    #
+    # The facet count is THIS function's own (`expected_face_count`, already
+    # used by the view-factor guard above), so there is one answer to "how many
+    # facets will this mesh have" and not a second copy of the rule. When it is
+    # not derivable the size line says so rather than guessing.
+    from gui_core import depth_maps as _dm
+    depth_findings = _dm.preflight_findings(
+        config,
+        n_faces=expected_face_count(config),
+        n_frames=positive_int((config.get("simulation") or {}).get(
+            "timesteps")))
+    report.errors.extend(depth_findings.errors)
+    report.warnings.extend(depth_findings.warnings)
+    report.info.extend(depth_findings.info)
+    report.depth_map_line = depth_findings.line
+    report.depth_map_series_line = depth_findings.series_line
 
     # -- Engine env completeness (R3a) ---------------------------------------
     env, applied = build_engine_env(config)

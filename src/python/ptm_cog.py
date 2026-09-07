@@ -40,7 +40,8 @@ try:
 except ImportError:
     GDAL_AVAILABLE = False
 
-from ptm.results import FIELD_INFO, STATISTICS_FIELDS, STAT_LABELS
+from ptm.results import (FIELD_INFO, STATISTICS_FIELDS, STAT_LABELS,
+                         depth_of_field, field_info)
 
 
 def _find_gdal_tool(name):
@@ -155,26 +156,91 @@ def field_metadata(field_name):
         band = f"{label} ({units})" if units else label
         return units, label, band
 
+    # `field_info`, not `STATISTICS_FIELDS`: that catalog is fixed, and a
+    # subsurface temperature map is named for the depth it holds, so the set of
+    # them belongs to the run. One resolver keeps this raster and the GUI's own
+    # export describing the same file the same way.
     parts = field_name.rsplit('_', 1)
     if len(parts) == 2 and parts[1] in STAT_LABELS:
-        base = STATISTICS_FIELDS.get(parts[0], {})
+        base = field_info(parts[0])
         if base:
             stat = STAT_LABELS[parts[1]]
             units = base.get('units', '')
             label = f"{base.get('label', parts[0])} ({stat})"
+            if 'depth_m' in base:
+                label = (f"Temperature at {base['depth_m']:g} m depth "
+                         f"({stat})")
             return units, label, label
 
-    base = STATISTICS_FIELDS.get(field_name, {})
+    base = field_info(field_name)
     if base:
         units = base.get('units', '')
         label = base.get('label', field_name)
+        if 'depth_m' in base:
+            label = f"Temperature at {base['depth_m']:g} m depth"
         band = f"{label} ({units})" if units else label
         return units, label, band
 
     return '', field_name, field_name
 
 
+def depth_band_tags(field_name, manifest_entries=None):
+    """Band metadata naming the depth a subsurface map holds, or ``{}``.
+
+    Three separate facts, and they are not the same number:
+
+    ``depth_m``
+        the depth these pixels hold, AS PRECISELY AS THE RUN RECORDED IT: the
+        manifest's resolved depth when there is a manifest, and otherwise the
+        three decimals the file name carries. The two differ, and by more than
+        rounding noise -- a real lunar run resolved a 0.05 m request to
+        0.052724 m and named the file ``z0p053m``, so the name is 276 um
+        coarser than the number. The name is a naming convention; this is the
+        measurement. Always present for a depth map.
+    ``depth_requested_m``
+        the depth that was asked for. Present only when the run wrote
+        ``statistics/depth_map_z.json``.
+    ``depth_residual_m``
+        resolved minus requested. Nonzero exactly when the run moved the
+        request to the nearest depth it solves on, which is the default -- so
+        a reader of the raster can tell a moved depth from one that was asked
+        for, WITHOUT the run directory in front of them. A GeoTIFF outlives
+        the directory it came from, and a depth that silently moved is the
+        kind of thing that gets quoted as the depth requested.
+
+    `manifest_entries` is :func:`ptm.results.depth_entries` output. Without it
+    only ``depth_m`` is reported, at the file name's precision: an absent
+    manifest yields fewer tags and a coarser one, never invented ones.
+    """
+    base = field_name.rsplit('_', 1)[0] if field_name.rsplit('_', 1)[-1] \
+        in STAT_LABELS else field_name
+    depth_m = depth_of_field(base)
+    if depth_m is None:
+        return {}
+    tags = {'depth_m': f"{depth_m:.3f}"}
+    entry = (manifest_entries or {}).get(base)
+    if isinstance(entry, dict):
+        if 'resolved_m' in entry:
+            tags['depth_m'] = f"{float(entry['resolved_m']):.9g}"
+        if 'requested_m' in entry:
+            tags['depth_requested_m'] = f"{float(entry['requested_m']):.9g}"
+        if 'residual_m' in entry:
+            tags['depth_residual_m'] = f"{float(entry['residual_m']):.9g}"
+        if 'on_node' in entry:
+            tags['depth_on_solved_node'] = \
+                'true' if entry['on_node'] else 'false'
+    return tags
+
+
 # --- Statistics ------------------------------------------------------------
+
+#: Every tag name `_compute_stats_tags` can produce. Named once so
+#: `export_field` can refuse to let a caller's extra band metadata collide with
+#: one, rather than one of them quietly winning.
+_STATS_TAG_NAMES = ('STATISTICS_VALID_PERCENT', 'STATISTICS_MINIMUM',
+                    'STATISTICS_MAXIMUM', 'STATISTICS_MEAN',
+                    'STATISTICS_STDDEV')
+
 
 def _compute_stats_tags(data):
     """Compute STATISTICS_* tag dict from a 2D float32 array with NaN nodata."""
@@ -230,7 +296,8 @@ def export_field(output_path, face_values, regridder, field_name,
                  overview_resampling='AVERAGE',
                  software='PTM3D',
                  interpolation='linear',
-                 nodata_value=DEFAULT_NODATA):
+                 nodata_value=DEFAULT_NODATA,
+                 extra_tags=None):
     """Regrid ``face_values`` and write a COG to ``output_path``.
 
     Args:
@@ -243,9 +310,22 @@ def export_field(output_path, face_values, regridder, field_name,
         compress: TIFF compression (default LZW).
         overview_resampling: Resampling for overview levels (default AVERAGE).
         software: ``software`` tag written to the file.
+        extra_tags: extra band metadata, ``{name: str}``. Used for the depth a
+            subsurface temperature map holds -- see :func:`depth_band_tags`.
+            Written on the BAND, beside the ``STATISTICS_*`` tags, because it
+            describes what the pixels ARE. It cannot overwrite one of those:
+            they are applied last, and a collision raises rather than
+            silently winning, since a statistic quietly replaced by a depth
+            would be a wrong number in the same field name.
 
     Returns ``(grid, stats_tags)``.
     """
+    extra_tags = dict(extra_tags or {})
+    clash = sorted(set(extra_tags) & set(_STATS_TAG_NAMES))
+    if clash:
+        raise ValueError(
+            f"extra_tags would overwrite the computed statistics tag(s) "
+            f"{clash} on band 1 of {output_path}")
     if not GDAL_AVAILABLE:
         raise RuntimeError("osgeo.gdal is required for COG export")
 
@@ -300,6 +380,8 @@ def export_field(output_path, face_values, regridder, field_name,
             band.WriteArray(grid_flipped)
             band.SetNoDataValue(float(nodata_value))
             band.SetDescription(band_desc)
+            for k, v in extra_tags.items():
+                band.SetMetadataItem(str(k), str(v))
             for k, v in stats_tags.items():
                 band.SetMetadataItem(k, v)
 
