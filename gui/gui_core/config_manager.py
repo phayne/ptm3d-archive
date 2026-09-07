@@ -11,6 +11,7 @@ from pathlib import Path
 from ptm.engine_defaults import ENGINE_DEFAULTS
 
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+from gui_core import depth_maps
 from gui_core import yaml_roundtrip
 
 logger = logging.getLogger(__name__)
@@ -519,7 +520,27 @@ class ConfigManager:
             "include_primary_ir": False,
             "locations_file": "",
             "depths_file": "",
-            "series_output": ""
+            "series_output": "",
+            # --- Subsurface temperature maps ---------------------------
+            # WRITTEN SELECTIVELY, like `gpu:` and `flux_cubes:`, and for the
+            # same reason: the engine's switch IS the depth list, so a run
+            # without depth maps is exactly a run whose `output:` block never
+            # mentions them. Stamping three keys into every configuration the
+            # GUI touches would put a feature nobody asked for in front of
+            # every reader of every file. See _output_section_for_yaml.
+            #
+            # There is no separate on/off key, deliberately: an empty list is
+            # off in the engine, and a second switch beside it would be a
+            # second source of truth for one fact.
+            "map_depths_m": [],
+            "map_depth_snap_to_node": True,
+            "map_depth_stats": list(depth_maps.STAT_NAMES),
+            # GUI-SYNTHETIC and STRIPPED at save (like `flux_cubes.mode` and
+            # `mesh.topo_source`). It records which of the two products the
+            # user asked for so the launch check can answer for that one. The
+            # engine has no such key, and writing one would look like a
+            # setting being honored.
+            "map_depth_product": depth_maps.PRODUCT_STATISTICS,
         },
         # --- Flux cubes (docs/flux-cubes.md) ------------------------------
         # Passive six-face irradiance probes standing on the terrain. The
@@ -1365,6 +1386,82 @@ class ConfigManager:
             out[key] = value
         return out
 
+    #: The three depth-map keys the engine reads, and the one this application
+    #: keeps for itself. Sourced from `gui_core.depth_maps` rather than retyped:
+    #: a GUI copy of an engine key name is how a control ends up writing
+    #: something nothing reads.
+    DEPTH_MAP_ENGINE_KEYS = (depth_maps.DEPTHS_LEAF, depth_maps.SNAP_LEAF,
+                             depth_maps.STATS_LEAF)
+
+    def _output_section_for_yaml(self, output):
+        """The `output:` block to write.
+
+        Every key is written, as before, EXCEPT the depth-map ones, which are
+        selective for the reason `gpu:` and `flux_cubes:` are:
+
+        * The engine's switch for subsurface temperature maps IS the depth
+          list. An empty `output.map_depths_m` and no key at all are the same
+          run, so a configuration that does not use the feature must not gain
+          three lines describing it. Every project file the GUI has ever saved
+          would otherwise change on the next save, for no behavioral reason.
+        * With depths requested, the list is written; the other two are written
+          only when they differ from what the engine would do on its own. That
+          is what keeps opening somebody's file and saving it from ADDING a
+          `map_depth_stats:` line they never wrote -- the engine's own default
+          is already all three statistics, so writing it would state a
+          preference the author never expressed.
+        * `map_depth_product` is never written. It is this application's
+          record of which product the user asked the launch check about, and
+          the engine has no such key; a key nothing reads, sitting in a saved
+          file, is indistinguishable from a setting being honored.
+        """
+        out = {}
+        for key, value in (output or {}).items():
+            if key == depth_maps.PRODUCT_LEAF:
+                continue
+            if key in self.DEPTH_MAP_ENGINE_KEYS:
+                continue
+            out[key] = value
+
+        # ⛔ A value that is not a list is KEPT AS THE FILE WROTE IT and passed
+        # through, not coerced and not dropped. `list()` on a bare `0.05`
+        # raises, out of a Qt slot, which is a process abort; `list()` on
+        # `"0.05, 0.25"` invents ten single-character depths. The
+        # configuration check and the launch check both refuse it by name --
+        # `depth_maps.sequence_problems` -- so nothing runs on it, and the
+        # user's own text stays in their own file for them to fix.
+        raw_depths = (output or {}).get(depth_maps.DEPTHS_LEAF)
+        if not isinstance(raw_depths, (list, tuple)):
+            if raw_depths is not None:
+                out[depth_maps.DEPTHS_LEAF] = raw_depths
+            return out
+        depths = list(raw_depths)
+        if not depths:
+            return out
+        out[depth_maps.DEPTHS_LEAF] = depths
+
+        for leaf in (depth_maps.SNAP_LEAF, depth_maps.STATS_LEAF):
+            if leaf not in (output or {}):
+                continue
+            value = output[leaf]
+            engine_value = ENGINE_DEFAULTS.get("output." + leaf)
+            if leaf == depth_maps.STATS_LEAF:
+                if not isinstance(value, (list, tuple)):
+                    # Same rule as above: keep what the file says, refuse it
+                    # elsewhere. `[str(v) for v in "avg"]` is ['a','v','g'].
+                    if value is not None:
+                        out[leaf] = value
+                    continue
+                # The engine's default for this one is a LIST, which the
+                # generated defaults table records as None (it carries scalars).
+                # The engine's own default is all three statistics, in this
+                # order -- config_parser.h -- so that is what "unchanged" means.
+                engine_value = list(depth_maps.STAT_NAMES)
+                value = [str(v) for v in (value or [])]
+            if not yaml_roundtrip.values_equal(engine_value, value):
+                out[leaf] = value
+        return out
+
     def gpu_policy_report(self):
         """(rows, writes_section) for the read-mostly display.
 
@@ -1590,6 +1687,14 @@ class ConfigManager:
                     v if isinstance(v, dict) else {})
                 if flux_out:
                     out[k] = flux_out
+                continue
+            if k == "output":
+                # Partly selective: the subsurface-depth keys are written only
+                # when the run asks for that product, and the panel's own
+                # product selector is never written at all. Everything else in
+                # this section is written as before.
+                out[k] = self._output_section_for_yaml(
+                    v if isinstance(v, dict) else {})
                 continue
             if k == "mesh":
                 # Translate the GUI-synthetic topo_source mode into concrete
@@ -2216,6 +2321,27 @@ class ConfigManager:
                 f"output.vtk_mode is {out_cfg.get('vtk_mode')!r}; it must be "
                 f"one of {', '.join(valid_vtk_modes)}. The engine writes no "
                 f"VTK for anything else and does not say so.")
+
+        # Subsurface temperature maps. Every clause below is one the engine
+        # itself stops on, transcribed once in `gui_core.depth_maps` so the
+        # panel, this check and the launch check cannot hold three opinions.
+        # The clauses that need the run's solved depth grid are NOT here and
+        # cannot be; that module's docstring says which and why.
+        #
+        # The SIZE clause is deliberately NOT here. It needs the mesh's facet
+        # count, which means reading a mesh header -- and this function runs
+        # from a Qt slot on every edit, where that would be a file read per
+        # keystroke and, on cloud-backed storage, a stall. The launch check
+        # owns it (`gui_core.depth_maps.size_refusal`), where the mesh is
+        # already being probed.
+        depth_list, depth_stats, depth_snap, depth_shape = \
+            depth_maps.request_from_config(self.config)
+        problems = list(depth_shape)
+        if depth_list:
+            problems.extend(depth_maps.validate_request(
+                depth_list, depth_stats, depth_snap))
+            problems.extend(depth_maps.engine_support(self.config).blockers)
+        errors.extend(f"Depth maps: {p}" for p in problems)
 
         # A custom body's surface value too small to survive the trip into the
         # solver. The engine forwards it through std::to_string -- six decimal

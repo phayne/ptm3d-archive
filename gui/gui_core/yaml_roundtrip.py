@@ -35,13 +35,14 @@ logger = logging.getLogger(__name__)
 
 try:
     from ruamel.yaml import YAML
-    from ruamel.yaml.comments import CommentedMap
+    from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from ruamel.yaml.scalarstring import SingleQuotedScalarString
     RUAMEL_AVAILABLE = True
     RUAMEL_IMPORT_ERROR = ""
 except ImportError as exc:  # pragma: no cover - exercised by the absence test
     YAML = None
     CommentedMap = dict
+    CommentedSeq = list
     SingleQuotedScalarString = str
     RUAMEL_AVAILABLE = False
     RUAMEL_IMPORT_ERROR = str(exc)
@@ -74,6 +75,36 @@ def quote_if_ambiguous(value):
     except Exception:                                  # noqa: BLE001
         pass
     return SingleQuotedScalarString(value)
+
+
+def match_sequence_style(previous, value):
+    """Keep a rewritten list in the layout the file already used for it.
+
+    ruamel emits a plain Python list as a BLOCK sequence, so overwriting a
+    value the file wrote inline --
+
+        map_depths_m: [0.0, 0.05]
+
+    -- turned one line into four. Those four lines DO carry the key the user
+    edited, but `layout_only_changes` recognizes an edited line by matching a
+    YAML key at the start of it and a sequence item has none, so the save also
+    announced them as "layout the writer could not reproduce exactly": a
+    correct edit, reported to the user as an unexplained reflow. Measured on a
+    depth list and on `gpu.gpu_device_ids`, both of which shipped files spell
+    inline.
+
+    Only the FLOW case is handled, because block is already ruamel's own
+    default: a key the file never carried has no style to copy and keeps
+    whatever the emitter would have produced before this function existed.
+    """
+    if not RUAMEL_AVAILABLE or not isinstance(value, (list, tuple)):
+        return value
+    fa = getattr(previous, "fa", None)
+    if fa is None or not fa.flow_style():
+        return value
+    seq = CommentedSeq(value)
+    seq.fa.set_flow_style()
+    return seq
 
 
 UNAVAILABLE_MESSAGE = (
@@ -223,7 +254,10 @@ class RoundTripDoc:
                     child = CommentedMap()
                     node[part] = child
                 node = child
-            node[parts[-1]] = quote_if_ambiguous(value)
+            leaf = parts[-1]
+            node[leaf] = match_sequence_style(
+                node.get(leaf) if isinstance(node, dict) else None,
+                quote_if_ambiguous(value))
 
         for dotted in removals:
             parts = dotted.split(".")

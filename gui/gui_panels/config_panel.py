@@ -4,6 +4,7 @@ Tabbed interface for simulation parameter configuration
 """
 
 import logging
+import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QScrollArea,
     QGroupBox, QGridLayout, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
@@ -4793,8 +4794,217 @@ class OutputTab(BaseConfigTab):
         loc_group.setLayout(loc_layout)
         layout.addWidget(loc_group)
 
+        layout.addWidget(self._build_depth_group())
+
         layout.addStretch()
         self.create_scroll_area(content)
+
+    # -- Subsurface temperature maps -------------------------------------
+    #
+    # Beside the location exports, because the two answer the same question at
+    # different scales: the location export writes a full time series at a
+    # handful of points, and this writes one number per facet over the whole
+    # mesh at a few depths. A reader looking for "temperature below the
+    # surface" finds both in one place.
+    #
+    # THERE IS NO ON/OFF SWITCH, deliberately. The engine's switch IS the depth
+    # list -- an empty list is off, and a run with an empty list writes exactly
+    # what a run with no key writes -- so a checkbox beside it would be a second
+    # source of truth for one fact, and the two could disagree.
+
+    def _build_depth_group(self):
+        from gui_core import depth_maps as dm
+        self._dm = dm
+
+        group = QGroupBox("Subsurface Temperature Maps")
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+
+        label = QLabel("Depths below surface (m):")
+        label.setToolTip(get_tooltip(dm.DEPTHS_KEY))
+        self._apply_tooltip(label, dm.DEPTHS_KEY)
+        self.depth_edit = QLineEdit()
+        self.depth_edit.setToolTip(get_tooltip(dm.DEPTHS_KEY))
+        self.depth_edit.setPlaceholderText(
+            "empty -- surface products only. Example: 0, 0.05, 0.25")
+        # NOT `add_string_field`: that helper writes the widget's TEXT into the
+        # key, and this key holds a list of numbers. Writing the text would put
+        # a string where the engine reads a sequence.
+        self.depth_edit.textChanged.connect(self._on_depths_typed)
+        grid.addWidget(label, 0, 0)
+        grid.addWidget(self.depth_edit, 0, 1)
+        self.widgets[dm.DEPTHS_KEY] = self.depth_edit
+
+        self.add_bool_field(grid, 1, "Use the nearest depth the model solves on",
+                            dm.SNAP_KEY)
+        self.widgets[dm.SNAP_KEY].toggled.connect(
+            lambda _on: self._refresh_depth_readouts())
+
+        stats_label = QLabel("Statistics at each depth:")
+        stats_label.setToolTip(get_tooltip(dm.STATS_KEY))
+        self._apply_tooltip(stats_label, dm.STATS_KEY)
+        stats_box = QWidget()
+        stats_row = QHBoxLayout(stats_box)
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        self.depth_stat_boxes = {}
+        for name in dm.STAT_NAMES:
+            box = QCheckBox(dm.STAT_LABELS[name])
+            box.setToolTip(get_tooltip(dm.STATS_KEY))
+            box.toggled.connect(self._on_depth_stats_toggled)
+            stats_row.addWidget(box)
+            self.depth_stat_boxes[name] = box
+            # Registered under its own key so the help-text checks can name it,
+            # and so a test can reach it the way it reaches every other control.
+            self.widgets["output.map_depth_stat_" + name] = box
+        stats_row.addStretch()
+        grid.addWidget(stats_label, 2, 0)
+        grid.addWidget(stats_box, 2, 1)
+
+        self.add_combo_field(grid, 3, "Form:", dm.PRODUCT_KEY,
+                             [dm.PRODUCT_STATISTICS, dm.PRODUCT_TIME_SERIES])
+        self.widgets[dm.PRODUCT_KEY].currentTextChanged.connect(
+            lambda _text: self._refresh_depth_readouts())
+
+        # The read-outs. TWO of them, and they are not merged: the summary
+        # product and a per-output-step product differ both in size and in the
+        # interpolation error they carry -- by about a factor of two, in
+        # opposite directions -- so one combined figure would be wrong for
+        # whichever one the reader had in mind.
+        self.depth_summary = QLabel("")
+        self.depth_summary.setWordWrap(True)
+        self.depth_summary.setStyleSheet(
+            "color: #90caf9; font-size: 11px; padding: 4px;")
+        grid.addWidget(self.depth_summary, 4, 0, 1, 2)
+
+        self.depth_series_note = QLabel("")
+        self.depth_series_note.setWordWrap(True)
+        self.depth_series_note.setStyleSheet(
+            "color: #90caf9; font-size: 11px; padding: 4px;")
+        grid.addWidget(self.depth_series_note, 5, 0, 1, 2)
+
+        group.setLayout(grid)
+        self.depth_group = group
+        return group
+
+    def _on_depths_typed(self, text):
+        """Parse the field and store the list, never the text.
+
+        An entry that is not a number is stored AS TYPED rather than dropped:
+        an empty list is how this feature is switched off, so discarding a bad
+        entry would turn the whole product off because of one typo, and the
+        text that caused it would be gone from every check downstream. Kept,
+        it is refused by name -- here, by the configuration check, and by the
+        launch check.
+        """
+        depths, _error = self._dm.parse_depth_list(text)
+        self.on_widget_changed(self._dm.DEPTHS_KEY, depths)
+        self._refresh_depth_readouts()
+
+    def _on_depth_stats_toggled(self, _checked=None):
+        """The three boxes are one list key, in the engine's own order."""
+        chosen = [name for name in self._dm.STAT_NAMES
+                  if self.depth_stat_boxes[name].isChecked()]
+        self.on_widget_changed(self._dm.STATS_KEY, chosen)
+        self._refresh_depth_readouts()
+
+    def _depth_scale(self):
+        """(facets, output steps) for the size read-out, or (None, None).
+
+        Both come from `gui_core.preflight` -- the same functions the launch
+        check uses -- so the number on this tab and the number in the launch
+        message are one answer, not two.
+
+        MEMOIZED on what the answer depends on. `expected_face_count` opens the
+        mesh and reads 64 KiB of its header, and this runs on every keystroke in
+        the depth field; on a cloud-backed mesh path that made the field
+        stutter. The key is the mesh identity, so importing a different mesh
+        still recomputes -- it is a cache, not a freeze.
+        """
+        from gui_core.preflight import expected_face_count, positive_int
+        config = self.config_manager.get_config()
+        mesh = config.get("mesh") or {}
+        import_file = str(mesh.get("import_file", "") or "")
+        key = (import_file, mesh.get("resolution"),
+               bool(mesh.get("use_topographic", False)))
+        try:
+            key = key + (os.path.getmtime(import_file) if import_file else 0,)
+        except OSError:
+            key = key + (None,)
+        cached = getattr(self, "_depth_face_cache", None)
+        if cached is None or cached[0] != key:
+            self._depth_face_cache = (key, expected_face_count(config))
+        faces = self._depth_face_cache[1]
+        steps = positive_int((config.get("simulation") or {}).get("timesteps"))
+        return faces, steps
+
+    def showEvent(self, event):
+        """Refresh the size read-out whenever this tab comes to the front.
+
+        The read-out depends on the MESH, which is set on another tab, and each
+        tab's `value_changed` is its own -- nothing on the Mesh tab reaches
+        here. Without this, setting depths on a small procedural sphere and
+        then importing a 2.4-million-facet mesh left the panel showing the old
+        size, and showing "under the ceiling" for a request that had gone over
+        it, until the user happened to retype a depth. The launch check was
+        right the whole time; only the number in front of the user was stale.
+        """
+        super().showEvent(event)
+        if hasattr(self, "depth_summary"):
+            self._refresh_depth_readouts()
+
+    def _refresh_depth_readouts(self):
+        """Rebuild both read-outs from the configuration as it stands."""
+        dm = self._dm
+        config = self.config_manager.get_config()
+        depths, stats, snap, shape_problems = dm.request_from_config(config)
+        _parsed, parse_error = dm.parse_depth_list(self.depth_edit.text())
+
+        if not depths:
+            self.depth_summary.setText(
+                "\n".join(shape_problems) if shape_problems else
+                "No depths listed, so this run writes the surface products "
+                "only and nothing below the surface. Add one or more depths "
+                "above to write a temperature map at each of them.")
+            self.depth_series_note.setText("")
+            return
+
+        faces, steps = self._depth_scale()
+        lines = list(shape_problems)
+        if parse_error:
+            lines.append(parse_error)
+        lines.extend(dm.validate_request(depths, stats, snap))
+        lines.extend(dm.engine_support(config).blockers)
+        lines.append(dm.snap_note(snap))
+        lines.extend(dm.error_lines(snap))
+
+        names = dm.file_names(depths, [s for s in stats if s in dm.STAT_NAMES])
+        if names:
+            shown = ", ".join(names[:3])
+            if len(names) > 3:
+                shown += ", ... (%d files)" % len(names)
+            lines.append(
+                ("Files, under statistics/: %s. With the nearest solved depth "
+                 "in use, each name carries the depth actually sampled, which "
+                 "the run works out from its own depth grid and records in "
+                 "statistics/depth_map_z.json -- so a name here can move."
+                 if snap else
+                 "Files, under statistics/: %s. Each name carries the depth "
+                 "you asked for.") % shown)
+
+        summary, series = dm.size_lines(config, faces, steps)
+        lines.extend(summary)
+        self.depth_summary.setText("\n".join(lines))
+
+        if dm.normalize_product(
+                (config.get("output") or {}).get(dm.PRODUCT_LEAF)) \
+                == dm.PRODUCT_TIME_SERIES:
+            series = list(series) + [
+                "This model writes the summary, not the per-step series, so "
+                "this run would stop before it started. Choose the summary "
+                "above, or list a few points in the locations file and their "
+                "depths in the depths file to get a full series at each "
+                "point."]
+        self.depth_series_note.setText("\n".join(series))
 
     def load_from_config(self):
         config = self.config_manager.get_config()
@@ -4816,6 +5026,54 @@ class OutputTab(BaseConfigTab):
         self.set_text("output.locations_file", out.get("locations_file", ""))
         self.set_text("output.depths_file", out.get("depths_file", ""))
         self.set_text("output.series_output", out.get("series_output", ""))
+        self._load_depth_group(out)
+
+    def _load_depth_group(self, out):
+        """Show the file's depth settings without writing any of them back.
+
+        SIGNALS ARE BLOCKED ON EVERY CONTROL HERE. Each one's handler writes to
+        the configuration, so merely displaying a file would edit it -- and the
+        depth field's handler would round-trip the author's own list through a
+        parse, so a file spelling a depth `5e-2` would come back `0.05` on a
+        save nobody asked for.
+
+        There is no default depth list to seed and none is invented: an empty
+        list is the engine's own "off", so a configuration that says nothing
+        about depth maps keeps saying nothing. The two accompanying settings
+        come from the merged defaults, which are the ENGINE's defaults, and the
+        writer leaves them out of the file while they still match -- so opening
+        somebody's configuration and saving it adds no line they did not write.
+        """
+        dm = self._dm
+        # `request_from_config`, not a raw read: a hand-edited `map_depths_m:
+        # 0.05` is a single value where a list belongs, and `format_depth_list`
+        # of a bare float would show `0.05` as if it were a fine list while
+        # every check refused it. The reader returns no depths for that case
+        # and the read-out below says why, so the field shows empty and the
+        # message explains it rather than the field lying quietly.
+        depths, _stats, _snap, _problems = dm.request_from_config(
+            {"output": out})
+        self.depth_edit.blockSignals(True)
+        self.depth_edit.setText(dm.format_depth_list(depths))
+        self.depth_edit.blockSignals(False)
+
+        snap_box = self.widgets[dm.SNAP_KEY]
+        snap_box.blockSignals(True)
+        self.set_bool(dm.SNAP_KEY, out.get(dm.SNAP_LEAF, True))
+        snap_box.blockSignals(False)
+
+        chosen = dm.normalize_stats(out.get(dm.STATS_LEAF))
+        for name, box in self.depth_stat_boxes.items():
+            box.blockSignals(True)
+            box.setChecked(name in chosen)
+            box.blockSignals(False)
+
+        # `set_enum` blocks its own signals and leaves an unrecognized value in
+        # the configuration rather than displaying a different one.
+        self.set_enum(dm.PRODUCT_KEY,
+                      out.get(dm.PRODUCT_LEAF, dm.PRODUCT_STATISTICS),
+                      dm.PRODUCT_ALIASES)
+        self._refresh_depth_readouts()
 
 
 class EngineFlagsTab(BaseConfigTab):

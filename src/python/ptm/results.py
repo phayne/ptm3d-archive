@@ -26,6 +26,8 @@ directory that composes these functions with the readers in ``ptm.readers``.
 """
 
 import hashlib
+import json
+import re
 import struct
 import warnings
 from pathlib import Path
@@ -74,6 +76,144 @@ STATISTICS_FIELDS = {
     # scalar=True: single per-face value (no avg/max/min split).
     'ice_depth':         {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
 }
+
+# --- Subsurface temperature maps -------------------------------------------
+#
+# A run that asks for `output.map_depths_m` writes one per-facet file per depth
+# per statistic, named `temperature_z<meters, '.' -> 'p'>m_<stat>.bin` with the
+# depth to three decimals, plus a sidecar `statistics/depth_map_z.json` saying
+# which depth each file holds.
+#
+# These CANNOT live in STATISTICS_FIELDS: the name carries the depth, so the
+# set of fields is a property of the run and not of this module. They are
+# discovered from the directory instead, by :func:`discover_depth_fields`, and
+# `detect_available_statistics` reports them alongside the fixed catalog so
+# every consumer -- the GUI's field menu, the COG exporter's enumeration --
+# picks them up without being told about depths at all.
+
+#: The engine's naming rule, read backwards. Anchored, and the fractional part
+#: is exactly three digits, so it cannot match a future field that merely
+#: begins the same way.
+DEPTH_FIELD_RE = re.compile(r"^temperature_z(\d+)p(\d{3})m$")
+
+#: The sidecar the engine writes beside the maps.
+DEPTH_MANIFEST_NAME = "depth_map_z.json"
+
+
+def depth_of_field(base_field):
+    """Depth in meters carried by a depth-map field name, or None.
+
+    ``temperature_z0p050m`` -> ``0.05``. Exact: the name holds three decimals,
+    so the value is reconstructed from the digits rather than through a float
+    parse of the whole string.
+    """
+    match = DEPTH_FIELD_RE.match(str(base_field))
+    if not match:
+        return None
+    return int(match.group(1)) + int(match.group(2)) / 1000.0
+
+
+def field_info(base_field):
+    """``{'label': ..., 'units': ...}`` for a statistics field, or ``{}``.
+
+    ``STATISTICS_FIELDS`` first, then the subsurface-map naming rule. This is
+    the ONE place a depth field's label and unit are decided, so a consumer
+    that resolves labels through it -- the raster exporter, the GUI's export
+    dialog -- describes ``temperature_z0p298m_max`` the same way. Before it
+    existed the exporter said "Temperature at 0.298 m depth (Maximum)" and the
+    export dialog said "temperature_z0p298m (Maximum)" with no unit at all,
+    for the same file.
+
+    Works from the NAME alone: no directory, no manifest, no I/O. The extra
+    facts a manifest carries (the depth that was requested, the residual) come
+    from :func:`discover_depth_fields`, which has a run directory to read.
+    """
+    info = STATISTICS_FIELDS.get(base_field)
+    if info:
+        return dict(info)
+    depth_m = depth_of_field(base_field)
+    if depth_m is None:
+        return {}
+    return {'label': f"Temperature at {depth_m:g} m", 'units': 'K',
+            'depth_m': depth_m}
+
+
+def read_depth_manifest(stats_dir):
+    """``statistics/depth_map_z.json`` as a dict, or ``{}``.
+
+    Returns ``{}`` rather than raising for a run that has no manifest, an
+    unreadable one, or one written by a future schema: the manifest ENRICHES a
+    depth field (it carries the depth that was asked for, and the residual left
+    after moving to the nearest solved depth) and no consumer needs it to read
+    the data. What it must never do is guess -- a missing manifest yields no
+    entries, not invented ones.
+    """
+    path = Path(stats_dir) / DEPTH_MANIFEST_NAME
+    if not path.is_file():
+        return {}
+    try:
+        with open(path, "r") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError) as exc:
+        warnings.warn(
+            f"{path} could not be read ({exc}); the depth maps are still "
+            f"readable, but the depth each file was asked for is not "
+            f"available and only the depth in the file name is reported.")
+        return {}
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def depth_entries(stats_dir):
+    """``{field: entry}`` from the manifest, keyed by the field name on disk.
+
+    Each entry is the engine's own record for one depth: ``requested_m``,
+    ``resolved_m``, ``residual_m``, the interpolation weights it used, and the
+    predicted error. Empty when the run wrote no manifest.
+    """
+    manifest = read_depth_manifest(stats_dir)
+    out = {}
+    for entry in manifest.get("depths") or []:
+        if isinstance(entry, dict) and entry.get("field"):
+            out[str(entry["field"])] = entry
+    return out
+
+
+def discover_depth_fields(stats_dir):
+    """``{base_field: info}`` for every subsurface temperature map on disk.
+
+    ``info`` has the same shape as a ``STATISTICS_FIELDS`` entry -- ``label``
+    and ``units`` -- plus the depth in meters and, when the run wrote its
+    manifest, the depth that was REQUESTED and the residual between the two.
+    Those last two are what make a snapped depth readable as a snapped depth
+    rather than as the depth somebody typed.
+
+    Discovery is by NAME ONLY, and deliberately: it must work on a run
+    directory alone, with no configuration and no engine.
+    """
+    stats_dir = Path(stats_dir)
+    if not stats_dir.is_dir():
+        return {}
+    entries = depth_entries(stats_dir)
+    found = {}
+    for path in sorted(stats_dir.glob("temperature_z*m_*.bin")):
+        base, _, stat = path.stem.rpartition("_")
+        if stat not in STAT_TYPES:
+            continue
+        if base in found:
+            continue
+        info = field_info(base)
+        if "depth_m" not in info:
+            continue
+        entry = entries.get(base)
+        if isinstance(entry, dict):
+            for source, target in (("requested_m", "depth_requested_m"),
+                                   ("residual_m", "depth_residual_m"),
+                                   ("on_node", "depth_on_node")):
+                if source in entry:
+                    info[target] = entry[source]
+        found[base] = info
+    return found
+
 
 NICE_RESOLUTIONS = [0.001, 0.002, 0.005, 0.01, 0.02, 0.025, 0.05,
                     0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0]
@@ -591,6 +731,13 @@ def detect_available_statistics(stats_dir):
     """Return a list of (base_field, stat_type) tuples for files that exist
     and contain non-NaN data. ``stat_type`` is None for scalar fields like
     ``ice_depth`` (file is ``<base>.bin`` with no _avg/_max/_min suffix).
+
+    Subsurface temperature maps are included when the run wrote any. They are
+    NOT in ``STATISTICS_FIELDS`` and cannot be -- the name carries the depth,
+    so the set is a property of the run -- so they are discovered from the
+    directory by :func:`discover_depth_fields` and reported here alongside the
+    fixed catalog. A run without them is unaffected: the discovery finds
+    nothing and the returned list is what it always was.
     """
     stats_dir = Path(stats_dir)
     if not stats_dir.is_dir():
@@ -611,7 +758,9 @@ def detect_available_statistics(stats_dir):
             return False
 
     available = []
-    for base_field, info in STATISTICS_FIELDS.items():
+    catalog = dict(STATISTICS_FIELDS)
+    catalog.update(discover_depth_fields(stats_dir))
+    for base_field, info in catalog.items():
         if info.get('scalar'):
             if _file_has_data(stats_dir / f"{base_field}.bin"):
                 available.append((base_field, None))
@@ -1232,12 +1381,26 @@ class Results:
     def field_catalog(self):
         """The field catalog in this run's :attr:`units_style`.
 
-        ``STATISTICS_FIELDS`` plus :data:`EXTRA_FIELD_INFO`, so a field that
-        exists on disk always has a label and a unit.
+        ``STATISTICS_FIELDS`` plus :data:`EXTRA_FIELD_INFO` plus whatever
+        subsurface temperature maps this run wrote, so a field that exists on
+        disk always has a label and a unit. The depth maps are discovered from
+        this run's own ``statistics/`` directory, because their names carry the
+        depth and no fixed catalog can hold them.
         """
+        # The depth discovery scans a directory and parses a JSON sidecar, and
+        # `axis_label` calls this per label, so the result is cached on the
+        # instance: a run directory's set of depth maps does not change while
+        # it is open, and re-globbing per axis label cost two directory scans a
+        # time for an answer that cannot have moved.
+        cached = getattr(self, "_field_catalog_cache", None)
+        if cached is not None:
+            return dict(cached)
         merged = dict(STATISTICS_FIELDS)
         merged.update(self.EXTRA_FIELD_INFO)
-        return field_catalog(merged, units_style=self.units_style)
+        merged.update(discover_depth_fields(self.path / "statistics"))
+        self._field_catalog_cache = field_catalog(
+            merged, units_style=self.units_style)
+        return dict(self._field_catalog_cache)
 
     def units_of(self, field):
         """The unit string for ``field``, spelled in this run's units style."""
