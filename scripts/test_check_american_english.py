@@ -256,6 +256,54 @@ check(out.returncode == 1 and b"colour" in out.stdout,
       f"a PATH after --exclude's value is still a path, not a usage error "
       f"(got {out.returncode})")
 
+# --- 10. "I could not look" is not "nothing to find" ------------------------
+# `tracked_files()` returned [] on every git failure. `main` then printed
+# "no files to check" and returned 0 -- so a run that scanned NOTHING and a
+# clean tracked tree were indistinguishable at the exit code. On this machine
+# that is a live path: `/usr/bin/git` is the xcrun shim and exits 1, and the
+# checkout lives on OneDrive, where the working tree can be evicted.
+#
+# Both directions, because either one alone proves nothing: the failure path
+# must be loud AND the success path must still find the tree.
+norepo = tempfile.mkdtemp()
+out = subprocess.run([sys.executable, TARGET], cwd=norepo, capture_output=True)
+check(out.returncode == 3,
+      f"a whole-tree scan where git cannot answer exits 3, not 0 "
+      f"(got {out.returncode})")
+check(b"clean" not in out.stdout,
+      "a run that could not list the tracked files never reports a clean tree")
+check(b"NOTHING was checked" in out.stderr,
+      "...and says so, in the message, not only in the exit code")
+
+# The positive control for the same code path, from a real checkout. Without
+# this, a `tracked_files` that raised unconditionally would pass the arm above.
+# `tracked_files` reads the PROCESS cwd, so the directory is what selects the
+# repository -- hence the chdir, restored in `finally` because everything after
+# this point would otherwise resolve against the wrong tree.
+repo = os.path.dirname(HERE)
+_was = os.getcwd()
+try:
+    os.chdir(repo)
+    listed = chk.tracked_files()
+except chk.GitUnavailable as exc:               # pragma: no cover
+    listed = []
+    print(f"note: {repo} is not a usable checkout here ({exc})")
+finally:
+    os.chdir(_was)
+check(len(listed) > 100
+      and "scripts/check_american_english.py" in listed,
+      f"from a real checkout the same call lists the tracked tree, including "
+      f"the checker itself (got {len(listed)} file(s))")
+
+# `--exclude` that empties an EXPLICIT path list is the caller's own doing and
+# stays exit 0 (arms 9 above depend on it). `--exclude` that empties the
+# DEFAULT whole-tree scan is a run that checked nothing it was asked to.
+out = subprocess.run([sys.executable, TARGET, "--exclude", ""], cwd=norepo,
+                     capture_output=True)
+check(out.returncode == 3,
+      f"--exclude does not turn a failed tree listing into a pass "
+      f"(got {out.returncode})")
+
 if _fail == 0:
     print("\nALL AMERICAN-ENGLISH CHECKER TESTS PASSED")
 else:

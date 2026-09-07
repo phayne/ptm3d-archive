@@ -612,3 +612,23 @@ set_target_properties(test_depth_map_plan
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# The YAML shape guards in ConfigParser::loadFromYAML. Links the ptm_tools
+# LIBRARY (defined above, around line 486) rather than compiling
+# config_parser.cpp a second time: the point of the test is the SHIPPED parser,
+# with the shipped flags, not a private copy that could disagree with it.
+add_executable(test_config_shape test_config_shape.cpp)
+target_link_libraries(test_config_shape
+    PRIVATE
+    ptm_tools
+    # ConfigParser::validate calls thermal::parseEqSeedMode/-Anchor, so
+    # ptm_tools does not link on its own.
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_config_shape
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

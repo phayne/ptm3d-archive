@@ -256,21 +256,29 @@ def sequence_problems(output):
     """Refusals for a key the engine reads as a LIST that does not hold one.
 
     ⛔ MEASURED on the engine, not reasoned about (2026-09-06, a Moon run on
-    the shipped depth-map binary):
+    the shipped depth-map binary), and then FIXED in the engine the same day.
+    Both columns are kept because the first one is why this function exists and
+    because a run started from an older binary still behaves that way:
 
-    ================================  ==========================================
-    ``map_depths_m: 0.05``            run COMPLETES, exit 0, writes NO depth
-                                      maps and says nothing at all
-    ``map_depths_m: "0.05, 0.25"``    the same silence
-    ``map_depth_stats: avg``          run STOPS, exit 1, "map_depth_stats is
-                                      empty"
-    ``map_depth_stats:`` (nothing)    run STOPS, exit 1, same message
-    ================================  ==========================================
+    ==============================  ==================  =====================
+    written in the file             before the fix      on today's engine
+    ==============================  ==================  =====================
+    ``map_depths_m: 0.05``          COMPLETES, exit 0,  STOPS at config load,
+                                    no depth maps, no   exit 1, naming the
+                                    message at all      list form
+    ``map_depths_m: "0.05, 0.25"``  the same silence    the same refusal
+    ``map_depth_stats: avg``        STOPS, exit 1,      STOPS, exit 1, "must
+                                    "map_depth_stats    be a YAML LIST ...
+                                    is empty"           a single value (avg)"
+    ``map_depth_stats:`` (nothing)  STOPS, exit 1,      unchanged -- a null is
+                                    "is empty"          an empty list
+    ==============================  ==================  =====================
 
-    The first two are the dangerous pair: a forgotten pair of brackets is a
-    complete, successful, subsurface-free run that nobody is told about. So
-    this refuses it here, where somebody is looking, even though the engine
-    would go ahead.
+    The first two were the dangerous pair: a forgotten pair of brackets was a
+    complete, successful, subsurface-free run that nobody was told about. The
+    engine refuses them now, and this still refuses them HERE, before a launch,
+    because a refusal beside the control that caused it costs nothing and a
+    refusal after a queued run costs the queue.
 
     Refusing also has to be the ONLY outcome -- never a coercion. Splitting the
     string ``"0.05, 0.25"`` into depths would accept, on the user's behalf,
@@ -283,17 +291,15 @@ def sequence_problems(output):
             and not isinstance(depths, (list, tuple)):
         problems.append(
             "output.map_depths_m holds a single value, not a list. The model "
-            "reads this key as a list, and when it is not one the run "
-            "completes normally and writes no subsurface maps at all, without "
-            "saying so. Write it as a list -- for example [0.05] -- or remove "
-            "it.")
+            "reads this key as a list and stops the run when it is not one. "
+            "Write it as a list -- for example [0.05] -- or remove it.")
     stats = output.get(STATS_LEAF, _ABSENT)
     if stats is not _ABSENT and stats is not None \
             and not isinstance(stats, (list, tuple)):
         problems.append(
             "output.map_depth_stats holds a single value, not a list. The "
-            "model reads this key as a list and stops the run when it finds "
-            "none. Write it as a list -- for example [avg, max, min].")
+            "model reads this key as a list and stops the run when it is not "
+            "one. Write it as a list -- for example [avg, max, min].")
     return problems
 
 
@@ -444,7 +450,10 @@ def validate_request(depths, stats, snap_to_node=True):
 
     Not here, and not decidable here: a depth below the deepest solved node,
     and two depths that land on one node once moved to the nearest. Both need
-    the solved grid; see the module docstring.
+    the solved grid; see the module docstring. The first of those is refused by
+    the engine naming ``thermal.thermal_b`` -- the YAML key, which is spelled
+    differently from the model's own field ``grid_b``; if that sentence is ever
+    mirrored here, mirror the KEY.
     """
     problems = []
     if not depths:

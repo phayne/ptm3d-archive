@@ -41,7 +41,11 @@
 // because each of them would otherwise ship a map that is physics over part of
 // its area and something else over the rest, distinguishable only by a log
 // line:
-//   * a depth below the deepest solved node (naming thermal.grid_b);
+//   * a depth below the deepest solved node (naming thermal.thermal_b -- the
+//     YAML key. The C++ FIELD is `thermal.grid_b` and the two are NOT the same
+//     string: config_parser.cpp reads `getWithDefault(thermal, "thermal_b",
+//     config.thermal.grid_b)`. A refusal that names the field tells the reader
+//     to edit a key that does not exist);
 //   * a negative or non-finite depth;
 //   * duplicate requested depths (refuse, do NOT dedupe -- a dedupe hides a
 //     config error and changes the file set the caller expected);
@@ -346,9 +350,9 @@ inline bool buildPlan(const Request& req,
         if (d > z_bot) {
             std::ostringstream os;
             os << "requested depth " << d << " m is below the deepest solved node ("
-               << z_bot << " m). Increase thermal.grid_b (skin depths to the bottom "
-                           "node) so the column reaches that depth, or drop the "
-                           "request; the engine will not extrapolate a map.";
+               << z_bot << " m). Increase thermal.thermal_b (skin depths to the "
+                           "bottom node) so the column reaches that depth, or drop "
+                           "the request; the engine will not extrapolate a map.";
             refusal = os.str();
             return false;
         }

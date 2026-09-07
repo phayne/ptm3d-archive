@@ -28,6 +28,13 @@ Limits worth stating: the parse is textual, so it tracks the shape of
 ``if (root["section"])`` blocks). If that shape changes, the parse loses keys
 -- which is why the test asserts a floor on the key count and on the set of
 sections, instead of trusting whatever it happens to find.
+
+One textual ambiguity is resolved rather than assumed away.
+``const auto& X = Y["Z"];`` is written for both a section and a single key, and
+reading every one of them as a section dropped the keys bound that way while
+still reporting the table current (PTM-ENGINECONFIG-ALIAS-DROPS-KEY). See
+:func:`_section_aliases`: an alias is a section only if the parser goes on to
+read keys OUT of it.
 """
 
 from __future__ import annotations
@@ -238,6 +245,92 @@ _TOKEN_RE = re.compile(
     r'|(\w+)\["([^"]+)"\]'
 )
 
+#: Just the binding, for the pre-scan that decides what each one MEANS.
+_BIND_RE = re.compile(r'const\s+auto&\s+(\w+)\s*=\s*(\w+)\["([^"]+)"\]')
+
+#: "not in the middle of an identifier". `\b` is wrong here: it would still let
+#: `d` match the tail of `rad`, because `d` is a word character on both sides.
+_WORD_L = r'(?<![A-Za-z0-9_])'
+
+
+def _balanced_body(text, start):
+    """``text`` from ``start`` to the close of the first brace-balanced block.
+
+    Falls back to the rest of the file if the braces do not balance, so a parse
+    that cannot find the end still sees at least what it saw before -- the
+    caller's other guards (the key-count floor, the section set) are what catch
+    a genuinely broken parse, and losing everything here would just move the
+    failure somewhere less legible.
+    """
+    open_at = text.find("{", start)
+    if open_at < 0:
+        return text[start:]
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
+def _section_aliases(body):
+    """Names bound by ``const auto& X = Y["Z"];`` that are really SECTIONS.
+
+    ``const auto&`` says nothing about what was bound. The parser uses it for
+    two different things:
+
+        const auto& output = root["output"];        a SECTION -- Z is a section
+                                                    name and its keys follow
+        const auto& d = output["map_depths_m"];     a KEY -- Z is the key, and
+                                                    the alias is the value
+
+    Reading both as the first was PTM-ENGINECONFIG-ALIAS-DROPS-KEY: the second
+    form put ``output.map_depths_m`` in the SECTIONS set, and sections are
+    excluded from the defaults table, so the key was dropped -- while
+    ``python3 -m ptm.engine_config`` still printed "engine_defaults.py is
+    current". A table that silently loses a key while reporting itself current
+    is worse than one that fails, because everything downstream (the GUI's
+    key check, the dead-key audit) then agrees the key does not exist.
+
+    The distinguishing fact is USE, not spelling: a section is a node you go on
+    to read keys OUT of, either as ``getWithDefault(X, "k", ...)`` or as
+    ``X["k"]``. A bound KEY is used as a value -- iterated, ``.as<T>()``,
+    ``.IsSequence()`` -- and never subscripted with a key name.
+
+    A name bound twice is a hard error rather than a guess: this returns one
+    verdict per NAME, so two bindings with different roles cannot both be
+    honored, and picking one silently is the class of failure this function
+    exists to close.
+    """
+    bound = {}
+    for match in _BIND_RE.finditer(body):
+        name = match.group(1)
+        if name in bound:
+            raise ValueError(
+                f"{_SOURCE}: the node alias {name!r} is bound more than once "
+                f"inside loadFromYAML ({bound[name]!r} and "
+                f"{match.group(3)!r}). This extractor classifies an alias by "
+                f"name, so it cannot tell the two apart; rename one.")
+        bound[name] = match.group(3)
+    # ⛔ `_WORD_L` is not decoration. Without it, `d["` matches inside `rad["`,
+    # and `config_parser.cpp` really does contain `rad["`, `gb["`, `spin["`,
+    # `mesh["`, `thermal["`, `shape["` and `output["` -- so an alias named `d`,
+    # `b`, `n`, `e`, `h` or `l` would be classified as a SECTION by a subscript
+    # written somewhere else entirely, and its key would be dropped exactly as
+    # before. Found in review, reproduced against the shipped source shape, and
+    # pinned by the second half of
+    # test_config_parity.test_an_aliased_key_is_not_read_as_a_section.
+    used_as_section = set()
+    for name in bound:
+        escaped = _WORD_L + re.escape(name)
+        if re.search(r'getWithDefault(?:<[^>]*>)?\(\s*' + escaped + r'\s*,', body) \
+                or re.search(escaped + r'\["', body):
+            used_as_section.add(name)
+    return used_as_section
+
 
 def parse_engine_config(repo_root):
     """Derive the engine's config surface from the C++ parser sources.
@@ -256,19 +349,34 @@ def parse_engine_config(repo_root):
 
     struct_defaults = _parse_struct_defaults(header)
 
+    # ⛔ The BRACE-BALANCED function, not "everything after it". The tail also
+    # holds saveToYAML, validate, overrideFromCommandLine and the no-yaml
+    # fallback; reading those was harmless while the extractor only collected
+    # matches, but `_section_aliases` now REFUSES on a duplicate alias name, and
+    # a future `const auto& thermal = ...` in saveToYAML would hard-fail the
+    # whole parity suite over legal C++ in a function this tool does not model.
+    # Measured: scoping changes no key (189 before and after) -- so this is a
+    # correction of what the docstring already claimed, not a behavior change.
     start = source.index("SimulationConfig ConfigParser::loadFromYAML")
-    body = _strip_comments(source[start:])
+    body = _strip_comments(_balanced_body(source, start))
 
     alias = {}
     sections = set()
     found = {}
+    section_aliases = _section_aliases(body)
     for match in _TOKEN_RE.finditer(body):
         if match.group(1):
             base = match.group(2)
             prefix = "" if base == "root" else alias.get(base, "?" + base)
             full = (prefix + "." if prefix else "") + match.group(3)
-            alias[match.group(1)] = full
-            sections.add(full)
+            if match.group(1) in section_aliases:
+                alias[match.group(1)] = full
+                sections.add(full)
+            else:
+                # A KEY bound to a name, not a section. Recorded as the direct
+                # read it is; the alias is deliberately NOT registered, so a
+                # later `d["something"]` on it cannot invent a nested key.
+                found.setdefault(full, ("none", None))
         elif match.group(4):
             node = alias.get(match.group(4), "?" + match.group(4))
             found.setdefault(f"{node}.{match.group(5)}", ("struct", match.group(6)))

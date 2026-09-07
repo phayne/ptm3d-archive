@@ -272,6 +272,70 @@ void warnUnreadFluxCubeKeys(const YAML::Node& fc) {
     line << " -- editing them changes no result. See docs/flux-cubes.md.";
     std::cerr << line.str() << std::endl;
 }
+
+// ---------------- Shape guard for the keys read as YAML SEQUENCES -------------
+// yaml-cpp iterates a SCALAR node as an EMPTY range: `for (const auto& item :
+// node)` over `map_depths_m: 0.05` clears the destination vector and then never
+// fills it. Measured on the shipped depth-map binary (2026-09-06) the run
+// COMPLETED, exited 0, wrote no subsurface maps and said nothing at all; the
+// quoted form `map_depths_m: "0.05, 0.25"` is the same scalar and the same
+// silence. That is a forgotten pair of brackets producing a surface-only run
+// nobody is told about, so it is refused here instead -- a fatal config error
+// (ptm_thermal_sim.cpp, PTM-66), not a warning, because a warning on a run that
+// otherwise succeeds is what the operator will not see.
+//
+// A NULL node -- `map_depths_m:` with nothing after it, or an explicit `~` --
+// is deliberately NOT refused. yaml-cpp's operator bool() is IsDefined(), so it
+// arrives here truthy while being neither sequence nor scalar; it is the
+// natural spelling of "none", it leaves the vector empty, and an empty list is
+// exactly how this product is switched off. Same reasoning, and the same
+// treatment, as thermal.state_restore_allow_mismatch.
+//
+// NEVER coerce a scalar into a one-element list. Splitting "0.05, 0.25" would
+// accept on the user's behalf something the run will not do, and wrapping a
+// bare scalar would silently make a two-depth request a one-depth one.
+// `consequence` is what the empty list would have MEANT for this key, and it is
+// a parameter rather than one shared sentence because the two call sites do not
+// share an outcome: an empty depth list is a silent surface-only run, an empty
+// statistic list stops the run a few seconds later with a different message.
+// Writing one of those for both would be the same class of defect this guard
+// exists to remove -- a message that is confidently wrong about what happened.
+void requireYamlSequence(const YAML::Node& node,
+                         const char* dotted_key,
+                         const char* what,
+                         const char* consequence,
+                         const char* example) {
+    if (node.IsSequence() || node.IsNull()) return;
+
+    std::ostringstream os;
+    os << dotted_key << " must be a YAML LIST of " << what << ", and this "
+          "config gives ";
+    if (node.IsScalar()) {
+        // Quote the value back, because "it is not a list" without saying WHICH
+        // value sends the reader hunting. Bounded and de-fanged first: this is
+        // file content going to a terminal, and a scalar carrying ESC or a
+        // newline would otherwise write control sequences into the operator's
+        // console (or a log a later reader trusts). Bytes >= 0x80 are left
+        // alone -- a non-ASCII value is a legitimate thing to be told about.
+        std::string got = node.Scalar();
+        if (got.size() > 60) got = got.substr(0, 57) + "...";
+        for (char& c : got) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            if (u < 0x20 || u == 0x7f) c = '?';
+        }
+        os << "a single value (" << got << ")";
+    } else if (node.IsMap()) {
+        os << "a mapping";
+    } else {
+        os << "a value this parser cannot read as a list";
+    }
+    os << ". Read as a list, that is ZERO entries -- " << consequence
+       << ". Write it as a list, for example:\n"
+          "    " << example << "\n"
+          "  (a value per line under a `- ` marker works too). Nothing is "
+          "coerced: a quoted \"a, b\" is one value, not two.";
+    throw std::runtime_error(os.str());
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -570,14 +634,30 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // Subsurface depth-map product. Two sequences, so they are read
             // with direct node access rather than getWithDefault.
             //
-            // NOTE for whoever adds the next one: write the subscript out at
-            // every use. Binding it as `const auto& d = output["key"];` makes
-            // src/python/ptm/engine_config.py classify the key as a SECTION
+            // NOTE, kept because the history explains the shape: binding a key
+            // as `const auto& d = output["key"];` used to make
+            // src/python/ptm/engine_config.py classify it as a SECTION
             // declaration and drop it from the parity table -- while still
             // reporting "engine_defaults.py is current". That false green cost
-            // a review cycle on 2026-09-05 (owed ledger row
-            // PTM-ENGINECONFIG-ALIAS-DROPS-KEY).
+            // a review cycle on 2026-09-05. The extractor now classifies an
+            // alias by USE (a section is a node it goes on to read keys out
+            // of), so that form is read correctly and its regression arm is
+            // test_config_parity.test_an_aliased_key_is_not_read_as_a_section.
+            // Writing the subscript out at every use is still the clearer
+            // style, and it is what the two reads below do.
+            //
+            // Both are shape-guarded by requireYamlSequence: a scalar here is
+            // a silent no-op on `map_depths_m` (complete run, exit 0, no maps)
+            // and a MISDIAGNOSIS on `map_depth_stats` (the plan reported
+            // "output.map_depth_stats is empty" for a file that named a
+            // statistic). See the helper for the measurements.
             if (output["map_depths_m"]) {
+                requireYamlSequence(output["map_depths_m"], "output.map_depths_m",
+                                    "depths in meters below the surface",
+                                    "the depth-map product would be switched OFF and "
+                                    "the run would finish normally, writing no "
+                                    "subsurface maps and reporting nothing",
+                                    "output:\n      map_depths_m: [0.05, 0.25]");
                 config.output.map_depths_m.clear();
                 for (const auto& item : output["map_depths_m"]) {
                     config.output.map_depths_m.push_back(item.as<double>());
@@ -586,6 +666,12 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.output.map_depth_snap_to_node = getWithDefault(
                 output, "map_depth_snap_to_node", config.output.map_depth_snap_to_node);
             if (output["map_depth_stats"]) {
+                requireYamlSequence(output["map_depth_stats"], "output.map_depth_stats",
+                                    "statistic names (avg, max, min)",
+                                    "the run would stop later on anyway, reporting the "
+                                    "list as EMPTY -- which is not what this file says "
+                                    "and not the edit that fixes it",
+                                    "output:\n      map_depth_stats: [avg, max, min]");
                 config.output.map_depth_stats.clear();
                 for (const auto& item : output["map_depth_stats"]) {
                     config.output.map_depth_stats.push_back(item.as<std::string>());

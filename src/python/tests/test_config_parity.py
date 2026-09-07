@@ -250,6 +250,126 @@ def test_committed_table_matches_cxx_sources():
     assert tuple(sorted({k.split('.')[0] for k in defaults})) == tuple(ENGINE_SECTIONS)
 
 
+def test_an_aliased_key_is_not_read_as_a_section():
+    """``const auto& d = output["k"];`` is a KEY, not a section declaration.
+
+    PTM-ENGINECONFIG-ALIAS-DROPS-KEY. The extractor classified every
+    ``const auto& X = Y["Z"];`` as a section declaration, put ``Y.Z`` in the
+    SECTIONS set, and then excluded sections from the defaults table -- so a
+    key written that way vanished from the parity table while
+    ``python3 -m ptm.engine_config`` went on printing "engine_defaults.py is
+    current". A table that loses a key and reports itself healthy is worse than
+    one that fails: the GUI key check and the dead-key audit both then agree
+    the key does not exist.
+
+    Run against a SYNTHETIC pair of sources, not the shipped ones, and that is
+    deliberate. ``config_parser.cpp`` writes the subscript out at every use
+    today, so the shipped tree cannot exercise this either way -- an arm that
+    only read the real sources would pass just as well with the defect back in.
+    """
+    import tempfile
+
+    header = """
+    struct SimulationConfig {
+        struct OutputParams {
+            std::string directory = "output";
+            std::vector<double> probe_depths_m;
+        } output;
+        struct RadiationParams {
+            bool enabled = false;
+        } radiation;
+    };
+    """
+    # ⛔ `rad["enabled"]` is load-bearing, not scenery. The alias under test is
+    # named `d`, and the shipped parser really does contain `rad["`, `gb["`,
+    # `mesh["` and `spin["`. A "used as a section" search without an identifier
+    # boundary finds `d` inside `rad` and classifies the alias as a section from
+    # a subscript in a different section entirely -- which is the original bug,
+    # reached by a second road. The first draft of the fix had exactly that
+    # hole and this fixture, without these three lines, passed over it.
+    source = """
+    SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
+        if (root["output"]) {
+            const auto& output = root["output"];
+            config.output.directory = getWithDefault(output, "directory",
+                                                     config.output.directory);
+            const auto& d = output["probe_depths_m"];
+            config.output.probe_depths_m.clear();
+            for (const auto& item : d) {
+                config.output.probe_depths_m.push_back(item.as<double>());
+            }
+        }
+        if (root["radiation"]) {
+            const auto& rad = root["radiation"];
+            if (rad["enabled"]) {
+                config.radiation.enabled = getWithDefault(rad, "enabled",
+                                                          config.radiation.enabled);
+            }
+        }
+    }
+
+    bool ConfigParser::saveToYAML(const std::string& filename) {
+        // Outside loadFromYAML. A binding here must not collide with one above:
+        // the extractor claims to read ONE function and has to actually do it.
+        const auto& output = root["some_other_thing"];
+        return true;
+    }
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src" / "cpp" / "tools").mkdir(parents=True)
+        (root / "src" / "cpp" / "tools" / "config_parser.h").write_text(header)
+        (root / "src" / "cpp" / "tools" / "config_parser.cpp").write_text(source)
+        defaults, no_default, unparsed = engine_config.parse_engine_config(root)
+
+    assert not unparsed, unparsed
+    assert "output.probe_depths_m" in defaults, (
+        "a key bound as `const auto& d = output[\"probe_depths_m\"]` was "
+        f"dropped from the table; it holds {sorted(defaults)}. That is the "
+        "silent-loss failure, and nothing else in this suite can see it "
+        "because the shipped parser does not use that form")
+    assert "output.probe_depths_m" in no_default, (
+        "the aliased key was found but claims a literal default; it is read "
+        "outside getWithDefault and has none")
+    assert defaults["output.probe_depths_m"] is None
+    # The control: the ordinary section bindings beside it still work, so this
+    # is not passing because the classifier now calls everything a key.
+    assert defaults.get("output.directory") == "output", (
+        f"the section binding stopped resolving: {sorted(defaults)}")
+    # The second section resolves too. Its VALUE is None rather than False, and
+    # that is pre-existing first-match-wins behavior, not something this change
+    # introduced: `if (rad["enabled"])` is a direct read and it is seen before
+    # the `getWithDefault` on the next line, so the no-default record is the one
+    # that sticks. What matters here is that `rad` was classified as a SECTION.
+    assert "radiation.enabled" in defaults, (
+        f"the second section binding stopped resolving: {sorted(defaults)}")
+
+    # And nothing was picked up from saveToYAML, which this extractor does not
+    # model. A parse that read the whole file tail would either invent a key
+    # here or -- worse, once duplicate aliases are refused -- hard-fail on it.
+    assert not any(k.startswith("some_other_thing") for k in defaults), (
+        f"a key was read from outside loadFromYAML: {sorted(defaults)}")
+
+    # And a name bound twice REFUSES rather than picking one silently.
+    twice = source.replace('const auto& d = output["probe_depths_m"];',
+                           'const auto& d = output["probe_depths_m"];\n'
+                           '            const auto& d = output["directory"];')
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src" / "cpp" / "tools").mkdir(parents=True)
+        (root / "src" / "cpp" / "tools" / "config_parser.h").write_text(header)
+        (root / "src" / "cpp" / "tools" / "config_parser.cpp").write_text(twice)
+        try:
+            engine_config.parse_engine_config(root)
+        except ValueError as exc:
+            assert "bound more than once" in str(exc), str(exc)
+        else:
+            raise AssertionError(
+                "an alias bound twice was accepted; this extractor decides an "
+                "alias's meaning by NAME, so two bindings cannot both be "
+                "honored and choosing one quietly is the same class of defect")
+
+
 def test_generated_module_is_byte_current():
     """The committed file equals what --regenerate would write right now."""
     defaults, no_default = _derive()
@@ -342,6 +462,7 @@ def test_shipped_examples_have_no_new_dead_keys():
 TESTS = [
     test_extractor_is_not_vacuous,
     test_committed_table_matches_cxx_sources,
+    test_an_aliased_key_is_not_read_as_a_section,
     test_generated_module_is_byte_current,
     test_gui_written_yaml_uses_only_engine_keys,
     test_shipped_examples_have_no_new_dead_keys,
