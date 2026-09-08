@@ -1959,6 +1959,7 @@ class ThermalTab(BaseConfigTab):
         adv_run = self.advanced_section("Initial Condition and Run State")
         adv_run.add_widget(seed_group)
         adv_run.add_widget(state_group)
+        adv_run.add_widget(self._build_crash_group())
         layout.addWidget(adv_run)
 
         # Integration Window (advanced)
@@ -2102,6 +2103,109 @@ class ThermalTab(BaseConfigTab):
                 "run completes normally, prints '[Ice stability] WARNING: "
                 "requested but accumulator not ready', and writes no "
                 "ice_depth.bin. Tick the GPU box above, or expect no product.")
+
+    # ── Crash resilience: banking finished facet groups ───────────────
+    #
+    # Beside the run-state fields, because all three are about carrying a
+    # solution from one process into another; this is the automatic one.
+    #
+    # THERE IS NO "SAVE EVERY N MINUTES" CONTROL, deliberately. The solver
+    # carries each group of facets through the whole time span before it starts
+    # the next, so there is no moment at which the whole mesh has reached the
+    # same step, and a control offering one would be a promise this model
+    # cannot keep. The plan for this feature says so in as many words.
+    #
+    # AND NO RESUME BUTTON. The model reads banked work back whenever it finds
+    # it, after re-verifying every file against this run's mesh, depth grid,
+    # epoch, window and forcing. A button here would be a second and weaker
+    # opinion about a decision already made strictly. What the launch check
+    # does instead is SAY what is in the directory -- including, and this is
+    # the one that matters, when there is nothing in it.
+
+    def _build_crash_group(self):
+        from gui_core import batch_checkpoint as bck
+        self._bck = bck
+
+        group = QGroupBox("Crash Resilience")
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+
+        self.add_bool_field(grid, 0, "Bank finished facet groups",
+                            bck.ENABLE_KEY)
+        self.widgets[bck.ENABLE_KEY].toggled.connect(
+            lambda _on: self._refresh_crash_readout())
+
+        self.add_directory_field(grid, 1, "Bank into:", bck.DIR_KEY)
+        self.add_double_field(grid, 2, "Size limit (GiB):", bck.MAX_GIB_KEY,
+                              0.0, 100000.0, 1)
+        self.widgets[bck.MAX_GIB_KEY].valueChanged.connect(
+            lambda _v: self._refresh_crash_readout())
+
+        self.crash_summary = QLabel("")
+        self.crash_summary.setWordWrap(True)
+        self.crash_summary.setStyleSheet(
+            "color: #90caf9; font-size: 11px; padding: 4px;")
+        grid.addWidget(self.crash_summary, 3, 0, 1, 2)
+
+        group.setLayout(grid)
+        self.crash_group = group
+        return group
+
+    def _crash_scale(self):
+        """(facets, reported steps) for the size read-out, or (None, None).
+
+        Both come from `gui_core.preflight`, the same functions the launch
+        check uses, so the figure on this tab and the figure in the launch
+        message are one answer and not two.
+
+        MEMOIZED on the mesh identity for the same reason the depth read-out
+        is: `expected_face_count` opens the mesh and reads its header, and this
+        runs whenever the switch or the limit moves.
+        """
+        from gui_core.preflight import expected_face_count, positive_int
+        config = self.config_manager.get_config()
+        mesh = config.get("mesh") or {}
+        import_file = str(mesh.get("import_file", "") or "")
+        key = (import_file, mesh.get("resolution"),
+               bool(mesh.get("use_topographic", False)))
+        try:
+            key = key + (os.path.getmtime(import_file) if import_file else 0,)
+        except OSError:
+            key = key + (None,)
+        cached = getattr(self, "_crash_face_cache", None)
+        if cached is None or cached[0] != key:
+            self._crash_face_cache = (key, expected_face_count(config))
+        faces = self._crash_face_cache[1]
+        steps = positive_int((config.get("simulation") or {}).get("timesteps"))
+        return faces, steps
+
+    def _refresh_crash_readout(self):
+        """Rebuild the read-out from the configuration as it stands."""
+        bck = getattr(self, "_bck", None)
+        if bck is None or not hasattr(self, "crash_summary"):
+            return
+        config = self.config_manager.get_config()
+        if not bck.enabled(config):
+            self.crash_summary.setText(
+                "Off. An interrupted run starts again from the beginning. Turn "
+                "this on for a long run, and read the size below before you "
+                "do -- what gets banked is the surface temperature at every "
+                "step for every facet, which is larger than it sounds.")
+            return
+
+        lines = list(bck.engine_support(config).blockers)
+        inert = bck.inert_warning(config)
+        if inert:
+            lines.append(inert)
+        conflict = bck.final_state_conflict(config)
+        if conflict:
+            lines.append(conflict)
+
+        faces, steps = self._crash_scale()
+        lines.extend(bck.size_lines(config, faces, steps))
+        lines.append(
+            "Where: %s" % bck.partial_dir(config))
+        self.crash_summary.setText("\n".join(line for line in lines if line))
 
     # ── Basal heat flow ──────────────────────────────────────────────
 
@@ -2451,6 +2555,13 @@ class ThermalTab(BaseConfigTab):
             self.set_text("thermal.final_state_file",
                           thermal.get("final_state_file", ""))
 
+            self.set_bool("thermal.batch_checkpoint",
+                          thermal.get("batch_checkpoint", False))
+            self.set_text("thermal.batch_checkpoint_dir",
+                          thermal.get("batch_checkpoint_dir", ""))
+            self.set_numeric("thermal.batch_checkpoint_max_gib",
+                             thermal.get("batch_checkpoint_max_gib", 64.0))
+
             self.set_numeric("thermal.integration_days", thermal["integration_days"])
             self.set_numeric("thermal.integration_steps", thermal["integration_steps"])
 
@@ -2540,6 +2651,7 @@ class ThermalTab(BaseConfigTab):
         self._update_seed_gating()
         self._update_qb_gating()
         self._update_ice_gating()
+        self._refresh_crash_readout()
 
 
 class RadiationTab(BaseConfigTab):

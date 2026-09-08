@@ -593,6 +593,16 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             }
             config.thermal.checkpoint_lookahead_steps = getWithDefault(thermal, "checkpoint_lookahead_steps", config.thermal.checkpoint_lookahead_steps);
             config.thermal.checkpoint_every_output_steps = getWithDefault(thermal, "checkpoint_every_output_steps", config.thermal.checkpoint_every_output_steps);
+            // Batch-completion checkpointing (plan 1D'). Read with the repeated
+            // subscript, NOT as `const auto& x = thermal["batch_checkpoint"]`:
+            // an aliased read matches ptm.engine_config's section-declaration
+            // pattern, is classified as a section, is dropped from the parity
+            // table, and the tool still reports "engine_defaults.py is current"
+            // (owed row PTM-ENGINECONFIG-ALIAS-DROPS-KEY).
+            config.thermal.batch_checkpoint         = getWithDefault(thermal, "batch_checkpoint",         config.thermal.batch_checkpoint);
+            config.thermal.batch_checkpoint_dir     = getWithDefault(thermal, "batch_checkpoint_dir",     config.thermal.batch_checkpoint_dir);
+            config.thermal.batch_checkpoint_max_gib = getWithDefault(thermal, "batch_checkpoint_max_gib", config.thermal.batch_checkpoint_max_gib);
+            config.thermal.batch_checkpoint_flush_mib = getWithDefault(thermal, "batch_checkpoint_flush_mib", config.thermal.batch_checkpoint_flush_mib);
             config.thermal.indirect_mean_out_file = getWithDefault(thermal, "indirect_mean_out_file", config.thermal.indirect_mean_out_file);
             config.thermal.eq_indirect_flux_file  = getWithDefault(thermal, "eq_indirect_flux_file",  config.thermal.eq_indirect_flux_file);
             config.thermal.eq_indirect_source     = getWithDefault(thermal, "eq_indirect_source",     config.thermal.eq_indirect_source);
@@ -1228,6 +1238,16 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "final_state_file" << YAML::Value << config.thermal.final_state_file;
         if (config.thermal.checkpoint_lookahead_steps != 0)
             out << YAML::Key << "checkpoint_lookahead_steps" << YAML::Value << config.thermal.checkpoint_lookahead_steps;
+        // Emitted only when the feature is on, so a round-tripped config does
+        // not acquire a resilience knob it never asked for.
+        if (config.thermal.batch_checkpoint) {
+            out << YAML::Key << "batch_checkpoint" << YAML::Value << config.thermal.batch_checkpoint;
+            if (!config.thermal.batch_checkpoint_dir.empty())
+                out << YAML::Key << "batch_checkpoint_dir" << YAML::Value << config.thermal.batch_checkpoint_dir;
+            out << YAML::Key << "batch_checkpoint_max_gib" << YAML::Value << config.thermal.batch_checkpoint_max_gib;
+            if (config.thermal.batch_checkpoint_flush_mib > 0.0)
+                out << YAML::Key << "batch_checkpoint_flush_mib" << YAML::Value << config.thermal.batch_checkpoint_flush_mib;
+        }
         if (!config.thermal.state_restore_allow_mismatch.empty()) {
             out << YAML::Key << "state_restore_allow_mismatch"
                 << YAML::Value << YAML::Flow << YAML::BeginSeq;
