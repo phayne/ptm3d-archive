@@ -121,15 +121,8 @@ const char* thermalSolverCaveats(ThermalSolverPath p, bool simd_batch_requested)
 // asked for the SIMD batch solver, because that -- and only that -- is a
 // substitution of one integrator for another that the caller did not request.
 static const char* pathLabel(ThermalSolverPath p) {
-    switch (p) {
-        case ThermalSolverPath::CpuScalar:        return "CPU scalar";
-        case ThermalSolverPath::CpuSimdBatch:     return "CPU SIMD batch";
-        case ThermalSolverPath::CpuStreamed:      return "CPU streamed (scalar core)";
-        case ThermalSolverPath::CpuStreamedBatch: return "CPU streamed SIMD batch";
-        case ThermalSolverPath::GpuPersistent:    return "GPU persistent";
-        case ThermalSolverPath::Unset:            break;
-    }
-    return "none";
+    // One table, in the header, shared with every provenance consumer.
+    return thermalSolverPathName(p);
 }
 
 void discloseThermalSolverPath(ThermalSolverPath path,

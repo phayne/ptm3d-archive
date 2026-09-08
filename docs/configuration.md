@@ -876,6 +876,120 @@ directory.
 a per-depth **time series** (5 depths x 1440 frames at 2.4M faces is 64 GiB, a
 disk event rather than a product) and an arch-B **native-grid** export.
 
+### Per-location depth series (`locations_file` + `depths_file`)
+
+Setting both keys writes one CSV per named site,
+`locations/<name>_depths.csv`: a `# Location:` comment, a `# Integration:`
+comment, a header `time,T(z=0.000 m),T(z=0.050 m),...`, then one row per step
+**of the whole integration, equilibration prefix included** (unlike
+`statistics/`, which covers the output window only).
+
+> ### Announced behavior change, 2026-09-07 — read this before comparing runs
+>
+> Two things changed for every run that writes a `*_depths.csv`. Both are
+> deliberate, both move numbers, and neither is a bug fix.
+>
+> **1. The CSV is now the mesh solver's own column, not a second integration.**
+> Before this release the depth CSV at a site was solved by a *separate* 1-D
+> thermal run of that site — its own equilibration seed window, its own surface
+> anchor, its own absorbed-flux composition. `statistics/temperature_*.bin` at
+> the same mesh face came from the whole-mesh solver. The two need not agree, and
+> did not. The CSV is now recorded *during* the whole-mesh solve, so the file and
+> the map are one integration.
+>
+> *How much this moves your numbers* (global lunar icosphere, 4 sites, 6 depths,
+> one equilibration lunation, CPU SIMD-batch — the shipped default solver):
+>
+> | | max \|ΔT\| | where |
+> |---|---|---|
+> | all rows, including the equilibration prefix | **8.71 K** | z = 0.010 m |
+> | output window only | **1.40 K** | z = 0 m |
+> | output window, mean over rows | 0.005 – 0.25 K | deepest → shallowest |
+>
+> On a radiation-coupled lunar crater run the same comparison is 0.81 K / 0.70 K.
+> **On the CPU scalar path (`--no-simd-batch`) the CSVs are unchanged to the last
+> printed digit** — that path already used the same column routine and the same
+> flux, so there was nothing to reconcile.
+>
+> The new values are the ones the rest of the run reports: after the change the
+> CSV, reduced over the statistics window, matches
+> `statistics/temperature_*.bin` at the same face to within the two files'
+> combined representation floor (float32 in the `.bin`, six decimals in the CSV)
+> — measured at **0.945x that floor**, against **7,400x** before.
+>
+> **2. A requested depth below the deepest solved node is now refused.** The CSV
+> used to extrapolate below the grid with Fourier's law,
+> `T = T_bottom + Qb*(z - z_bottom)/k_bottom`, and a warning. It no longer does:
+> the run stops, before the solve, naming the deepest depth it can report and
+> `thermal.thermal_b` (the YAML key; the C++ field is `grid_b` and is not
+> settable). This is the depth map's D9 rule, extended to every depth product.
+>
+> ⛔ **This will stop configs that used to complete.** The shipped
+> `data/locations/depths.txt` asks for depths down to 1.00 m, and the default
+> lunar grid (`thermal_b: 15`) solves to 0.4706 m — that pairing now refuses.
+> The fix is in the message: raise `thermal.thermal_b` until the bottom node
+> reaches the depth you want (on the Moon, `45` reaches 1.4119 m), or remove the
+> out-of-range depths. The refusal costs seconds, not a whole run.
+
+**Which integration produced a given file is written in the file.** Line 2 of
+every CSV is either
+
+```
+# Integration: mesh column, recorded during the whole-mesh solve on the CPU SIMD batch path (grid fingerprint ...); the same integration as statistics/temperature_*.bin at this face
+```
+
+or
+
+```
+# Integration: standalone 1-D column, re-solved for this site (runThermalModelDepthSeries) -- NOT the mesh-wide integration; see the run log
+```
+
+A log line does not travel with a CSV, and after this change the same file name
+can hold either product. Every reader in this repository skips `#` lines, so the
+extra comment is additive.
+
+**Which solver paths record the column.** The CPU SIMD-batch solver (the shipped
+default, including its streamed variant), the CPU scalar solver, and the CPU
+radiation-coupling selected-faces re-thermal — so a coupled CPU run's CSV
+carries the *re-thermalled* column at the faces coupling touched, not iteration
+zero's. The **GPU persistent solver keeps no per-frame column** and is not
+covered: a GPU run falls back to the standalone integration, says so in the log,
+and stamps the fallback into each CSV. It is not silent and it is not a refusal —
+the file is still written, and still usable, as long as you read it as what it
+says it is.
+
+**The other case that falls back** is the CPU scalar path with a per-face
+thermal-inertia / `h_parameter_map`, which gives every face its own depth grid.
+The recorder compares each face's node depths against the reference grid
+*elementwise*, not by layer count — two faces can agree on the number of layers
+and differ in the top cell — and stands down naming which of the two checks
+refused.
+
+**How this composes with `map_depths_m`.** The two products share the solved
+column, and where both are active they are the same numbers: measured over
+4 sites x 4 depths x {avg, max, min}, the CSV reduced over the statistics window
+matches the depth map at that site's face to **0.925x** the two files'
+representation floor on the CPU scalar path and **0.945x** on the CPU SIMD-batch
+path (**0.962x** with a per-face `H` map on the SIMD path). They reach that
+number through two independent samplings — the map through
+`depthmap::Accumulator::addColumn`, the CSV through `depthmap::sampleColumnAtDepths`
+— so the agreement is a cross-check, not a tautology.
+
+Where they *refuse*, the stricter one wins and it is the map. On the CPU scalar
+path with a per-face `H` map, `map_depths_m` refuses the whole run at
+configuration time; the depth CSV's own stand-down is never reached, because
+there is no run left to stand down in. Drop `map_depths_m` and the same config
+completes, with the CSV falling back to the standalone integration and saying
+so. Both behaviors are correct and they are consistent: neither product is ever
+written from a grid it was not resolved against.
+
+**A per-face H map changes what the CSV means, deliberately.** The recorded
+column is the mesh solve's, and the CPU SIMD-batch solver puts every face on one
+grid at the map's reference *H*. The old standalone column was solved at *that
+face's* H on its own grid: better resolved for the site, and not the number the
+mesh-wide field reports there. Agreement with the mesh is what the CSV is for;
+the run prints both H values at each site so the trade is visible.
+
 ## thermophysical
 
 On a built-in body (Moon, Mercury, Europa) the parser consumes only the keys

@@ -84,9 +84,15 @@ def read_time_steps(path):
 #: ``depths_m`` the depth of each column in meters; ``temperature`` the
 #: ``(n_times, n_depths)`` block in kelvin; ``n_equilibration`` how many leading
 #: rows were dropped as equilibration (0 from the raw reader --
-#: :meth:`ptm.results.Results.depth_series` is what fills it in).
+#: :meth:`ptm.results.Results.depth_series` is what fills it in);
+#: ``integration`` the engine's ``# Integration:`` provenance line, or ``None``
+#: for a file written before 2026-09-07 that carries no such line. ``None``
+#: means UNKNOWN, not "mesh column" -- a pre-2026-09-07 file is a standalone
+#: 1-D re-integration of the site and may disagree with
+#: ``statistics/temperature_*.bin`` at the same face.
 DepthSeries = namedtuple(
-    "DepthSeries", "location utc depths_m temperature n_equilibration")
+    "DepthSeries",
+    "location utc depths_m temperature n_equilibration integration")
 
 
 def read_depth_series(path):
@@ -100,8 +106,15 @@ def read_depth_series(path):
     this product in the tree -- reads it through here rather than parsing the
     file for itself.
 
-    Two properties of this file are not shared by any other output product,
-    and both are silent:
+    Since 2026-09-07 the file also carries a ``# Integration:`` line naming
+    which integration produced it -- the mesh solver's own recorded column, or
+    a standalone 1-D re-solve of the site -- returned as ``integration``. It is
+    ``None`` for an older file, and ``None`` means *unknown*: every
+    pre-2026-09-07 depth CSV is a standalone re-integration and need not agree
+    with ``statistics/temperature_*.bin`` at the same mesh face.
+
+    Two further properties of this file are not shared by any other output
+    product, and both are silent:
 
     * **It covers the equilibration period as well as the output window**,
       where ``statistics/`` and the per-step binaries cover the output window
@@ -118,6 +131,7 @@ def read_depth_series(path):
     path = Path(path)
     location = path.stem
     header = None
+    integration = None
     rows, utc = [], []
     for line in path.read_text().splitlines():
         line = line.strip()
@@ -127,6 +141,9 @@ def read_depth_series(path):
             _, _, tail = line.partition("Location:")
             if tail.strip():
                 location = tail.strip()
+            _, _, itail = line.partition("Integration:")
+            if itail.strip():
+                integration = itail.strip()
             continue
         if header is None:
             header = [c.strip() for c in line.split(",")]
@@ -164,7 +181,8 @@ def read_depth_series(path):
             f"Space the entries in output.depths_file further apart.",
             stacklevel=2)
     return DepthSeries(location=location, utc=utc, depths_m=depths,
-                       temperature=temperature, n_equilibration=0)
+                       temperature=temperature, n_equilibration=0,
+                       integration=integration)
 
 
 # --- body_positions.csv -----------------------------------------------------

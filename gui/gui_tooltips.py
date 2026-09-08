@@ -1308,6 +1308,12 @@ TOOLTIPS = {
     "output.depths_file": (
         "The depths, in meters, at which those location time series are "
         "reported. Values between the model's own layers are interpolated.\n"
+        "A depth BELOW the deepest solved node is refused and the run stops "
+        "before the solve -- it is not extrapolated. Raise thermal.thermal_b "
+        "until the bottom node reaches the depth you want, or drop the depth.\n"
+        "The CSV is the mesh solver's own column on the CPU solvers, and a "
+        "separate 1-D re-solve of the site on the GPU solver; each file's "
+        "'# Integration:' line says which.\n"
         "Set it alongside the locations file; without it you get the model's "
         "native layer depths.\n"
         "YAML key: output.depths_file"

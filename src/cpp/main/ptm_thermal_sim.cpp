@@ -722,7 +722,12 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     int face_idx = -1,
     double* H_used = nullptr,
     thermal::EqSeedResult* seed_out = nullptr,
-    bool* seed_applied_out = nullptr);
+    bool* seed_applied_out = nullptr,
+    // Depths this SITE's own grid cannot reach. Never zero-filled silently:
+    // the caller refuses the run (Paul's ruling, 2026-09-07). Separate from the
+    // stage-B check because a per-face H map gives each site its own grid.
+    int* n_too_deep_out = nullptr,
+    double* first_too_deep_m = nullptr);
 static bool generateDepthProfilePlots(const std::string& csv_dir, const std::string& executable_path);
 
 bool exportLocationTemperatureOnly(const std::string& output_file,
@@ -1200,6 +1205,284 @@ static bool depthMapPrepare(const thermal::Config& config, std::string& err) {
               << (thermal::depthmap::estimateBytes(g_depth_map.plan, n_faces,
                                                    with_raw) / (1024.0 * 1024.0))
               << " MiB\n";
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The per-location depth series (locations/*_depths.csv) checked against the
+// run's own depth grid -- EARLY, at the same stage-B point the depth map uses,
+// so a request the engine cannot honor costs seconds instead of a whole solve.
+//
+// PAUL'S RULING, 2026-09-07: "Yes, refuse depths greater than the bottom model
+// grid layer." Before this, the CSV silently extrapolated below the deepest
+// solved node with Fourier's law (T = T_bottom + Qb*(z - z_bottom)/k_bottom)
+// and a warning, while the depth MAP refused (D9). Two depth products with two
+// policies, distinguishable only by a log line, is the silent-substitution
+// class; the ruling collapses them onto the map's rule. The refusal text itself
+// is thermal::depthmap::tooDeepRefusal(), shared with buildPlan, so the two can
+// no longer drift -- and so the key it names stays `thermal.thermal_b`.
+//
+// ⭐ WHY THE REFERENCE GRID IS ENOUGH, measured rather than assumed. The check
+// resolves the grid at refGridHOverride, and a per-face H map gives each face
+// its own grid -- so the obvious worry is a site whose bottom node is
+// SHALLOWER than the reference's, which this could not see. It cannot happen:
+// BOTH grid generators put the bottom at
+//     z_max = config.b * delta_0,   delta_0 = sqrt(2*kappa_0/omega),
+// and kappa_0 is ks/(rhos*cp) -- the z = 0 limit of the exponential
+// densification, where exp(-z/H) = 1 and H cancels identically
+// (thermal_model.cpp generateAdaptiveGrid, and generateStableGrid via
+// kappa_ref). H moves the NODE SPACING, never the bottom. Verified on the
+// engine: four sites at H = 0.037-0.115 m from a synthetic per-face map all
+// report "deepest SOLVED node at 0.4706 m", the reference value.
+//
+// ⚠️ So the per-site check at the export is a BACKSTOP THAT CANNOT FIRE TODAY,
+// and it is kept as one rather than cited as coverage. It would start earning
+// its place the moment a per-face ks / rhos / cp map exists, and it fails the
+// run instead of fabricating a column, which is the right failure either way.
+// The run's REFERENCE depth grid -- the one every face shares unless a per-face
+// H map is loaded -- derived exactly as depthMapPrepare and every solver derive
+// it. One copy, because stage B now has three consumers (the depth map, the
+// depth-CSV range check and the per-location column recorder) and three
+// hand-rolled copies of a five-line Planet/Profile construction is three places
+// for refGridHOverride to be forgotten.
+static std::vector<double> referenceDepthGrid(const thermal::Config& config) {
+    thermal::Planet ref_planet(config.getProperty("planet", "Moon"));
+    applyConfiguredThermo(ref_planet, config);
+    thermal::Profile ref_profile(ref_planet, 0.0, config, false,
+                                 refGridHOverride(config));
+    const auto& z = ref_profile.z();
+    return std::vector<double>(z.begin(), z.end());
+}
+
+static bool depthCsvValidateDepths(const thermal::Config& config,
+                                   const std::vector<double>& z,
+                                   const std::vector<double>& depths_m,
+                                   const std::string& depths_file,
+                                   std::string& err) {
+    if (depths_m.empty()) return true;
+
+    if (z.size() < 2) {
+        err = "the per-location depth series needs a solved depth grid with at "
+              "least two nodes; this run has " + std::to_string(z.size()) + ".";
+        return false;
+    }
+    const double z_bot = z.back();
+
+    std::ostringstream where;
+    where << "on this run's reference depth grid (thermal_m/n/b = "
+          << config.m << "/" << config.n << "/" << config.b << ")";
+
+    for (double d : depths_m) {
+        if (!std::isfinite(d)) {
+            err = "output.depths_file (" + depths_file +
+                  ") contains a non-finite depth.";
+            return false;
+        }
+        if (d < 0.0) {
+            std::ostringstream os;
+            os << "output.depths_file (" << depths_file
+               << ") contains a negative depth (" << d
+               << " m). Depth is measured downward from the surface; 0.0 is the "
+                  "surface node.";
+            err = os.str();
+            return false;
+        }
+        if (d > z_bot) {
+            err = thermal::depthmap::tooDeepRefusal(d, z_bot,
+                                                    "a depth series",
+                                                    where.str()) +
+                  "  (from output.depths_file " + depths_file + ")";
+            return false;
+        }
+    }
+
+    // Save and restore BOTH the field flags and the PRECISION. This runs at
+    // stage B, before the solver and every downstream diagnostic, so leaking
+    // setprecision(4) here would silently re-format every default-format number
+    // in the rest of the run's log. (The identical pattern at the export is
+    // harmless only because it runs last.)
+    {
+        const std::ios::fmtflags cf = std::cout.flags();
+        const std::streamsize    cp = std::cout.precision();
+        std::cout << "[location depth export] " << depths_m.size()
+                  << " requested depth(s) all lie at or above the deepest solved "
+                     "node (" << std::fixed << std::setprecision(4) << z_bot
+                  << " m, thermal_m/n/b = " << config.m << "/" << config.n << "/"
+                  << config.b << ").\n";
+        std::cout.flags(cf);
+        std::cout.precision(cp);
+    }
+    return true;
+}
+
+// ===========================================================================
+// PHASE 2H -- locations/*_depths.csv backed by the MESH SOLVER's own column.
+//
+// Before this, the CSV at a site and statistics/temperature_*.bin at the same
+// face came from two different integrations (PTM-DEPTHCSV-SEPARATE-INTEGRATION):
+// runThermalModelDepthSeries re-solved a standalone 1-D column with its own
+// seed repair window (seed_config.seed_forcing_steps), its own anchor census
+// and its own absorbed-flux composition -- its own comment says it is "NOT
+// IDENTICAL TO THE MESH-WIDE PATH". Nothing downstream could tell.
+//
+// The fix is to RECORD the located faces' columns during the whole-mesh solve
+// and write the CSV from those. Which solver ran therefore decides whether the
+// CSV is mesh-backed, and the run says which it got -- in the log AND in the
+// CSV's own header, so a file on disk carries its provenance.
+//
+// ⛔ THE SURFACE CONVENTION DIFFERS BY PATH and the recorder must honor the
+// path it is recording, not a favorite. The CPU SIMD-batch path publishes a
+// RE-EVALUATED surface node (thermal::outputSurfaceTempBatch) at every frame
+// but its own node 0 at frame 0; the CPU scalar path publishes model.T(i, 0)
+// itself. A CSV row at z = 0 that carries anything other than what THAT path's
+// surface product carries reintroduces, at z = 0, exactly the CSV-vs-map
+// disagreement this phase exists to remove.
+struct LocationColumnsRun {
+    thermal::depthmap::Series series;
+    // The reference grid the recorder is sized for. The site -> face and
+    // site -> slot maps live in `series` (slot_of_face / face_of_slot); keeping
+    // a second copy here would be a second thing to keep in step, and the
+    // export resolves through series.slot(face) anyway.
+    std::vector<double> z;
+    std::string grid_fingerprint;
+    std::string solver_path = "(none)";
+    bool active = false;
+};
+static LocationColumnsRun g_loc_columns;
+
+static inline bool locationColumnsOn() { return g_loc_columns.active; }
+
+// -1 when this face is not a recorded site, which is the overwhelmingly common
+// case -- one integer load and a compare on the solver's hot path.
+static inline int locationColumnSlot(std::size_t face) {
+    return g_loc_columns.active ? g_loc_columns.series.slot(face) : -1;
+}
+
+// Name the path that is about to record. SEPARATE from the grid check below
+// because the CPU SCALAR path has no single reference grid to check -- it
+// builds one per face, and the recorder therefore verifies each face's z[]
+// elementwise as it records. Without this the provenance line in every CSV
+// from that path read "on the (none) path", which is a provenance line that
+// tells the reader nothing. Measured, not supposed: it is what the first
+// --no-simd-batch arm printed.
+static inline void locationColumnsSetPath(const char* path_name) {
+    if (locationColumnsOn()) g_loc_columns.solver_path = path_name;
+}
+
+// Called by each whole-mesh solver before it integrates, exactly as
+// depthMapVerifyGrid is. A recorder sized for a grid the solver did not build
+// would store columns whose z[] is not the one the export interpolates on.
+static bool locationColumnsVerifyGrid(const double* z, std::size_t n_layers,
+                                      const char* path_name) {
+    if (!locationColumnsOn()) return true;
+    bool same = (n_layers == g_loc_columns.z.size());
+    if (same) {
+        for (std::size_t i = 0; i < n_layers; ++i) {
+            if (z[i] != g_loc_columns.z[i]) { same = false; break; }
+        }
+    }
+    if (!same) {
+        std::cerr << "[location-columns] the depth grid used by " << path_name
+                  << " is not the reference grid the per-location recorder was "
+                     "sized for (" << n_layers << " layers vs "
+                  << g_loc_columns.z.size() << "). Standing the recorder down; "
+                     "the depth CSVs will fall back to the standalone 1-D "
+                     "integration and will say so.\n";
+        g_loc_columns.active = false;
+        return false;
+    }
+    // BACKSTOP ONLY. The authoritative label comes from
+    // locationColumnsSetPath(), which reads the same ptm::ThermalSolverPath the
+    // run's own "[thermal-solver] PATH:" banner is derived from -- so a CSV's
+    // provenance line and the banner cannot name different solvers. This
+    // internal name is used only when no disclosure has been made, and it
+    // matches the depth map's own solver_path field in depth_map_z.json.
+    if (g_loc_columns.solver_path == "(none)")
+        g_loc_columns.solver_path = path_name;
+    return true;
+}
+
+// Stage B: resolve the sites to mesh faces and size the recorder. Runs beside
+// depthMapPrepare, on the same populated thermal_config, before the solve.
+static bool locationColumnsPrepare(const thermal::Config& config,
+                                   const std::vector<double>& z,
+                                   const std::shared_ptr<Mesh>& mesh,
+                                   const std::string& locations_file,
+                                   int total_time_steps,
+                                   std::string& err) {
+    g_loc_columns = LocationColumnsRun{};
+    if (!mesh || mesh->faces.empty() || total_time_steps <= 0) return true;
+
+    // Do not allocate for a solver that cannot record. The GPU persistent
+    // solver keeps no per-frame column, so on a GPU run this buffer would be
+    // filled with nothing, held for the whole integration -- up to the 2 GiB
+    // ceiling -- and thrown away, and its size check could refuse a run for a
+    // product it was never going to produce. Announced, because "the recorder
+    // is off" is a fact about the CSVs the user is about to get.
+    if (config.getPropertyBool("use_gpu_thermal", false)) {
+        std::cout << "[location-columns] thermal.use_gpu is set, and the GPU "
+                     "persistent solver keeps no per-frame T(z) column, so the "
+                     "mesh-column recorder is OFF for this run. The depth CSVs "
+                     "will be a standalone 1-D re-integration of each site and "
+                     "will say so on each file's '# Integration:' line. Use the "
+                     "CPU solver (thermal.use_gpu: false) for CSVs that match "
+                     "statistics/temperature_*.bin at the same face. This "
+                     "decision is made before the dispatch, so it also stands "
+                     "if the GPU solver later falls back to a CPU path.\n";
+        return true;
+    }
+
+    auto locs = readLocationsCSV(locations_file);
+    if (locs.empty()) return true;   // the export itself reports this
+    if (z.size() < 2) return true;
+
+    std::vector<int> faces;
+    std::vector<std::string> names;
+    faces.reserve(locs.size());
+    names.reserve(locs.size());
+    for (std::size_t i = 0; i < locs.size(); ++i) {
+        const std::string name = std::get<0>(locs[i]);
+        const int f = findNearestFaceIndexByLatLon(mesh, std::get<1>(locs[i]),
+                                                   std::get<2>(locs[i]));
+        if (f < 0) continue;   // the export reports the skip, per site
+        faces.push_back(f);
+        names.push_back(name.empty() ? ("loc_" + std::to_string(i)) : name);
+    }
+    if (faces.empty()) return true;
+
+    // 2 GiB. Generous for a handful of sites and still refuses the request that
+    // is a disk event rather than a product: the ice-layer configs reach ~450
+    // layers, and 450 x 1440 frames x 8 B is 5 MiB per site, so this ceiling is
+    // ~370 site-runs of that shape.
+    std::string refusal;
+    if (!g_loc_columns.series.allocate(mesh->faces.size(), faces,
+                                       static_cast<std::size_t>(total_time_steps),
+                                       z.size(), 2ull << 30, refusal)) {
+        err = refusal;
+        return false;
+    }
+    g_loc_columns.z = z;
+    g_loc_columns.grid_fingerprint =
+        thermal::state_io::gridFingerprint(z.data(), z.size());
+    g_loc_columns.active = true;
+
+    const std::size_t n_slots = g_loc_columns.series.n_slots;
+    std::cout << "[location-columns] recording the mesh solver's own column at "
+              << n_slots << " face(s) for " << faces.size() << " site(s), "
+              << total_time_steps
+              << " frame(s) x " << z.size() << " layer(s) ("
+              << (static_cast<double>(n_slots) * total_time_steps * z.size()
+                  * 8.0 / (1024.0 * 1024.0))
+              << " MiB). If the solver path that runs records columns, "
+                 "locations/*_depths.csv is written from them instead of a "
+                 "standalone 1-D re-run; the export says which it got, and so "
+                 "does each CSV's '# Integration:' line. Not every path records "
+                 "yet -- the GPU persistent solver keeps no per-frame column, so "
+                 "a GPU run falls back and says so.\n";
+    for (std::size_t s = 0; s < faces.size(); ++s) {
+        std::cout << "[location-columns] site '" << names[s] << "' -> face "
+                  << faces[s] << "\n";
+    }
     return true;
 }
 
@@ -3734,7 +4017,28 @@ std::vector<double> runThermalModelWithMatchedTimes(
     // anyway; this is the second lock, because a default-on parameter would
     // have made the refusal the only thing standing between a re-entry and a
     // double-counted average.
-    bool fold_depth_map = false) {
+    bool fold_depth_map = false,
+    // Plan phase 2H: global face index for the per-location column recorder,
+    // or -1.
+    //
+    // DELIBERATELY SEPARATE from seed_record_face. That one also drives the
+    // PTM_DUMP_SEED row and the anchor census, and the radiation-coupling CPU
+    // re-thermal -- which must record its column, because its faces are the
+    // ones whose mesh-wide temperature it just replaced -- passes -1 there on
+    // purpose. Reusing one argument for both would have made recording the
+    // re-thermal's column also label those faces as freshly seeded.
+    //
+    // ALSO SEPARATE from 2D's `fold_depth_map`, and the asymmetry is the whole
+    // point of having two flags rather than one: the depth MAP is an average
+    // over faces and MUST NOT be folded twice, so the re-thermal is locked out
+    // of it; the depth CSV is a per-frame series that must be REPLACED by the
+    // re-thermal, because those are exactly the faces whose mesh-wide
+    // temperature the coupling loop just overwrote. One flag for both would
+    // have had to be wrong for one of them.
+    //
+    // ORDER: `fold_depth_map` stays where phase 2D put it so 2D's existing
+    // call sites keep their positional meaning; 2H's is appended after it.
+    long long loc_column_face = -1) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -3888,6 +4192,54 @@ std::vector<double> runThermalModelWithMatchedTimes(
         if (model.T.rows() == N && model.T.cols() > 0) {
             for (int i = 0; i < N; ++i) {
                 temps_out[i] = model.T(i, 0);  // Column 0 is surface
+            }
+            // Phase 2H: hand this face's whole T(z, t) to the per-location
+            // recorder. NO surface override here, and that is the point of the
+            // parameter on Series::record: this path's published surface
+            // product IS model.T(i, 0) -- the line directly above -- so the
+            // recorded node 0 already is what statistics/temperature_*.bin is
+            // reduced from at this face. Overriding it with a re-evaluated
+            // surface, as the SIMD path must, would make the CSV disagree with
+            // the mesh at z = 0 on exactly the path where they already agree.
+            if (loc_column_face >= 0 && locationColumnsOn()) {
+                const int slot =
+                    locationColumnSlot(static_cast<std::size_t>(loc_column_face));
+                if (slot >= 0) {
+                    // The grid, ELEMENTWISE, not just its length. With a
+                    // per-face H map ADAPTIVE_GRID gives each face its own z[],
+                    // and two faces can agree on the layer COUNT while their
+                    // node depths differ in the top cell. Recording such a
+                    // column would have the export interpolate this face's
+                    // temperatures on another face's depths -- a wrong-depth
+                    // CSV with nothing in the output to betray it.
+                    const auto& gz = model.profile.getGrid().z;
+                    const bool same_len = (gz.size() == g_loc_columns.z.size());
+                    bool grid_ok = same_len;
+                    if (grid_ok) {
+                        for (std::size_t i = 0; i < gz.size(); ++i) {
+                            if (gz[i] != g_loc_columns.z[i]) { grid_ok = false; break; }
+                        }
+                    }
+                    if (!grid_ok) {
+                        // The REASON, not just the fact: a stand-down that
+                        // reports "node depths differ" when the layer count is
+                        // what differed points the operator at the wrong knob.
+                        g_loc_columns.series.markBad(
+                            slot,
+                            same_len
+                                ? thermal::depthmap::Series::kBadNodeZ
+                                : thermal::depthmap::Series::kBadLayerCount);
+                    } else {
+                        const std::size_t n_z =
+                            static_cast<std::size_t>(model.T.cols());
+                        const std::ptrdiff_t stride = model.T.outerStride();
+                        for (int i = 0; i < N; ++i) {
+                            g_loc_columns.series.record(
+                                slot, static_cast<std::size_t>(i),
+                                &model.T(i, 0), stride, n_z);
+                        }
+                    }
+                }
             }
         } else {
             std::cerr << "ERROR: Unexpected thermal model output size: " 
@@ -4881,7 +5233,8 @@ bool runThermalModelsForAllFacesStreamed(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
                 face_qb, face_H, static_cast<long long>(f),
                 &seed_floor_faces, &anchor_census, st_ptr,
-                /*fold_depth_map=*/true);
+                /*fold_depth_map=*/true,
+                /*loc_column_face=*/static_cast<long long>(f));
 
             if (ckpt.want_out && st.out_column) ckpt.scatterOut(f, st_out.data());
 
@@ -5189,7 +5542,8 @@ bool runThermalModelsForAllFaces(
                     &seed_floor_faces,
                     &anchor_census,
                     st_ptr,
-                    /*fold_depth_map=*/true
+                    /*fold_depth_map=*/true,
+                    /*loc_column_face=*/static_cast<long long>(f)
                 );
 
                 if (ckpt.want_out && st.out_column)
@@ -5746,6 +6100,13 @@ bool runThermalModelsForAllFacesBatchSoA(
                             "cpu_simd_batch")) {
         return false;
     }
+    // Phase 2H: the per-location column recorder, held to the same grid by the
+    // same kind of check. Unlike the map's, a mismatch here stands the recorder
+    // DOWN rather than failing the run -- the CSV then falls back to the
+    // standalone integration and says so, which is a degraded product, not a
+    // wrong one.
+    locationColumnsVerifyGrid(ref_profile.z().data(),
+                              static_cast<size_t>(n_layers), "cpu_simd_batch");
 
     // BUGS.md PTM-SIGSEGV-450LAYER: the CPU SIMD batch path's ThermalBatchSoA
     // stack-allocates every per-layer array at a fixed size
@@ -7010,6 +7371,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                                               &batch.T[f], BS);
                 }
             }
+            // Phase 2H, frame 0. No surface override for the same reason the
+            // depth map takes none here: row 0's surface node IS batch.T[f]
+            // (getSurfaceTemp returns exactly that), it is the initial
+            // condition verbatim, and re-solving it would put a different
+            // number in the CSV from the one surface_temps_out just stored.
+            //
+            // Recorded UNCONDITIONALLY of the statistics window, unlike the
+            // map: the CSV covers the whole integration including the
+            // equilibration prefix, which is the row set it has always had.
+            if (locationColumnsOn()) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const int slot = locationColumnSlot(start_face + f);
+                    if (slot >= 0)
+                        g_loc_columns.series.record(slot, 0, &batch.T[f], BS,
+                                                    static_cast<size_t>(n_layers));
+                }
+            }
             if (depthMapOn()) {
                 for (int f = 0; f < faces_in_batch; ++f)
                     g_depth_map.covered[start_face + f] = 1u;
@@ -7083,6 +7461,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                                 : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                         g_depth_map.acc.addColumn(
                             g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf);
+                    }
+                }
+                // Phase 2H, frame t+1, SAME column, SAME instant, SAME surface
+                // override -- the CSV's z = 0 row is then literally the number
+                // surface_temps_out carries, which is what
+                // statistics/temperature_*.bin is reduced from.
+                if (locationColumnsOn()) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const int slot = locationColumnSlot(start_face + f);
+                        if (slot < 0) continue;
+                        const double surf =
+                            surface_temps_out
+                                ? (*surface_temps_out)[start_face + f][t + 1]
+                                : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                        g_loc_columns.series.record(
+                            slot, static_cast<size_t>(t + 1), &batch.T[f], BS,
+                            static_cast<size_t>(n_layers), &surf);
                     }
                 }
             }
@@ -11452,6 +11847,69 @@ static int findNearestFaceIndexByLatLon(const std::shared_ptr<Mesh>& mesh, doubl
     return best_idx;
 }
 
+// Sample a solved column at the requested depths. ONE implementation, two
+// column sources: the standalone 1-D re-solve (runThermalModelDepthSeries) and
+// phase 2H's recorded mesh column. `node(t, j)` is the only thing that differs
+// between them.
+//
+// Sharing it is not tidiness. If the two products interpolated through two
+// copies of this arithmetic, the announced 2H delta would be "a different
+// integration" summed with "a different interpolation", and neither could be
+// attributed; and Paul's too-deep ruling would have two places to be true in.
+//
+// `n_too_deep_out` counts depths below the deepest node -- refused, never
+// extrapolated, never zero-filled silently; the caller ends the run.
+template <typename NodeFn>
+static std::vector<std::vector<double>> sampleColumnAtDepths(
+    const std::vector<double>& z_layers,
+    const std::vector<double>& depths_m,
+    int n_frames,
+    NodeFn node,
+    int* n_too_deep_out,
+    double* first_too_deep_m)
+{
+    if (n_too_deep_out)   *n_too_deep_out   = 0;
+    if (first_too_deep_m) *first_too_deep_m = 0.0;
+    const int Nz = static_cast<int>(z_layers.size());
+    std::vector<std::vector<double>> T_depths(
+        depths_m.size(), std::vector<double>(static_cast<size_t>(n_frames), 0.0));
+    if (Nz < 2) return T_depths;
+
+    for (size_t k = 0; k < depths_m.size(); ++k) {
+        const double zq = depths_m[k];
+        if (zq <= z_layers.front()) {
+            for (int t = 0; t < n_frames; ++t) T_depths[k][t] = node(t, 0);
+            continue;
+        }
+        if (zq >= z_layers.back()) {
+            // PAUL'S RULING (2026-09-07): below the deepest solved node is a
+            // refusal, not a Fourier extrapolation. Exactly AT the bottom node
+            // is exact, and stays so.
+            if (zq > z_layers.back()) {
+                if (n_too_deep_out) {
+                    if (*n_too_deep_out == 0 && first_too_deep_m)
+                        *first_too_deep_m = zq;
+                    ++(*n_too_deep_out);
+                }
+                continue;
+            }
+            for (int t = 0; t < n_frames; ++t) T_depths[k][t] = node(t, Nz - 1);
+            continue;
+        }
+        int j = 0;
+        while (j + 1 < Nz && z_layers[j + 1] < zq) ++j;
+        const int jp = std::min(j + 1, Nz - 1);
+        const double tfrac = (z_layers[jp] > z_layers[j])
+                                 ? ((zq - z_layers[j]) / (z_layers[jp] - z_layers[j]))
+                                 : 0.0;
+        for (int t = 0; t < n_frames; ++t) {
+            const double a = node(t, j), b = node(t, jp);
+            T_depths[k][t] = a + (b - a) * tfrac;
+        }
+    }
+    return T_depths;
+}
+
 static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -11464,8 +11922,12 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     int face_idx,
     double* H_used,
     thermal::EqSeedResult* seed_out,
-    bool* seed_applied_out)
+    bool* seed_applied_out,
+    int* n_too_deep_out,
+    double* first_too_deep_m)
 {
+    if (n_too_deep_out)   *n_too_deep_out   = 0;
+    if (first_too_deep_m) *first_too_deep_m = 0.0;
     // Build flux array [2 x N]: times, flux
     Eigen::MatrixXd flux_arr(2, static_cast<int>(times.size()));
     for (int i = 0; i < static_cast<int>(times.size()); ++i) {
@@ -11557,68 +12019,51 @@ static std::vector<std::vector<double>> runThermalModelDepthSeries(
     const bool rows_are_layers = (Tmat.rows() == Nz && Tmat.cols() == Nt);
     const bool cols_are_layers = (Tmat.cols() == Nz && Tmat.rows() == Nt);
 
-    std::vector<std::vector<double>> T_depths;
-    T_depths.resize(depths_m.size(), std::vector<double>(Nt, 0.0));
-
     if (!rows_are_layers && !cols_are_layers) {
-        // Unexpected shape; fallback to surface only
-        for (size_t k = 0; k < depths_m.size(); ++k) {
-            for (int t = 0; t < Nt; ++t) {
-                double Ts = rows_are_layers ? Tmat(0, t) : (cols_are_layers ? Tmat(t, 0) : 0.0);
-                T_depths[k][t] = Ts;
-            }
-        }
-        return T_depths;
+        // Unexpected shape; fall back to surface only.
+        std::vector<std::vector<double>> T_flat(
+            depths_m.size(), std::vector<double>(Nt, 0.0));
+        return T_flat;
     }
 
-    // For each depth, interpolate between adjacent layers
-    for (size_t k = 0; k < depths_m.size(); ++k) {
-        const double zq = depths_m[k];
-        if (zq <= z_layers.front()) {
-            for (int t = 0; t < Nt; ++t) T_depths[k][t] = rows_are_layers ? Tmat(0, t) : Tmat(t, 0);
-            continue;
-        }
-        if (zq >= z_layers.back()) {
-            // Extrapolate using Fourier's law: dT/dz = Qb / k
-            // T(z) = T_bottom + Qb * (z - z_bottom) / k_bottom
-            int j = Nz - 1;
-            const double z_bottom = z_layers.back();
-            const double Qb = planet.Qb;  // Interior heat flux (W/m²)
-            const auto& k_vec = mdl.profile.getGrid().k;
-            const double k_bottom = (k_vec.size() > 0) ? k_vec.back() : planet.kd;
-            const double dz_extra = zq - z_bottom;
-            const double dT_extrapolate = (k_bottom > 0.0) ? (Qb * dz_extra / k_bottom) : 0.0;
-
-            for (int t = 0; t < Nt; ++t) {
-                double T_bottom = rows_are_layers ? Tmat(j, t) : Tmat(t, j);
-                T_depths[k][t] = T_bottom + dT_extrapolate;
-            }
-            continue;
-        }
-        int j = 0;
-        while (j + 1 < Nz && z_layers[j + 1] < zq) ++j;
-        int jp = std::min(j + 1, Nz - 1);
-        const double tfrac = (z_layers[jp] > z_layers[j]) ? ((zq - z_layers[j]) / (z_layers[jp] - z_layers[j])) : 0.0;
-        for (int t = 0; t < Nt; ++t) {
-            const double Tj  = rows_are_layers ? Tmat(j,  t) : Tmat(t, j);
-            const double Tjp = rows_are_layers ? Tmat(jp, t) : Tmat(t, jp);
-            T_depths[k][t] = Tj + (Tjp - Tj) * tfrac;
-        }
-    }
-    return T_depths;
+    // PAUL'S RULING, 2026-09-07, and the shared sampler that carries it. What
+    // used to live in this loop was, for a depth past the last node,
+    //     T(z) = T_bottom + Qb*(z - z_bottom)/k_bottom
+    // -- Fourier's law through a grid the run never integrated, written into
+    // the same column as solved temperatures and separable from them only by a
+    // warning line. That is the asymmetry D9 already removed from the depth
+    // MAP; the ruling extends D9 to every depth product, and the rule now
+    // lives in ONE place for both products.
+    const std::vector<double> z_vec(z_layers.begin(), z_layers.end());
+    return sampleColumnAtDepths(
+        z_vec, depths_m, Nt,
+        [&](int t, int j) {
+            return rows_are_layers ? Tmat(j, t) : Tmat(t, j);
+        },
+        n_too_deep_out, first_too_deep_m);
 }
 
 static bool writeLocationDepthCSV(const std::string& out_path,
                            const std::string& location_name,
                            const std::vector<std::string>& time_strings,
                            const std::vector<double>& depths_m,
-                           const std::vector<std::vector<double>>& T_depths)
+                           const std::vector<std::vector<double>>& T_depths,
+                           const std::string& provenance)
 {
     if (depths_m.size() != T_depths.size()) return false;
     std::ofstream out(out_path);
     if (!out.is_open()) return false;
 
     out << "# Location: " << (location_name.empty() ? "unnamed" : location_name) << "\n";
+    // WHICH INTEGRATION produced these numbers, in the file itself. A log line
+    // does not travel with a CSV, and after phase 2H the same file name can
+    // hold either the mesh solver's own column or a standalone 1-D re-run of
+    // the site -- which is exactly the distinction the phase exists to make
+    // visible. Every shipped reader skips '#' lines (verified in
+    // src/python/ptm/readers.py, plot_depth_profiles.py, plot_thermal_wave.py,
+    // equilibration_figure.py and energy_conservation_figure.py), so this is
+    // additive.
+    if (!provenance.empty()) out << "# Integration: " << provenance << "\n";
     out << "time";
     out << std::fixed;
     for (double z : depths_m) out << ",T(z=" << std::setprecision(3) << z << " m)";
@@ -12004,7 +12449,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     std::atomic<size_t>* seed_floor_faces,
     SeedAnchorCensus*    anchor_census,
     FaceStateIO* state,
-    bool fold_depth_map);
+    bool fold_depth_map,
+    long long loc_column_face);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -19297,6 +19743,45 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---- Per-location depth series, the SAME stage-B check --------------
+        // Paul's ruling (2026-09-07) makes a depth below the deepest solved
+        // node a refusal for the CSV exactly as D9 already made it one for the
+        // map. Checked HERE and not at the export so it costs seconds, not a
+        // whole solve; the export carries its own per-site backstop for the
+        // per-face-H-map case this reference-grid check cannot see.
+        if (export_locations && !locations_file.empty() && !depths_file.empty()) {
+            std::string cerr_msg;
+            const std::vector<double> csv_depths = readDepthsFile(depths_file);
+            // Built once and shared by both consumers below: a Profile is not
+            // free, and two copies could silently diverge.
+            const std::vector<double> ref_z = referenceDepthGrid(thermal_config);
+            if (!depthCsvValidateDepths(thermal_config, ref_z, csv_depths,
+                                        depths_file, cerr_msg)) {
+                std::cerr << "\n[location depth export] FATAL: " << cerr_msg << "\n";
+                return 1;
+            }
+            // ...and size the recorder that makes the CSV the mesh's own column
+            // (phase 2H).
+            //
+            // A refusal here is a SIZE refusal, not a physics one, so it stands
+            // the recorder down and lets the export fall back to the standalone
+            // integration -- loudly -- rather than failing the run. Killing the
+            // run would take a year-long lunar chunk with 17 sites on a
+            // 450-layer ice grid, which used to complete and write perfectly
+            // usable CSVs, and give it nothing. The too-deep refusal above IS a
+            // physics refusal and does end the run; the two are different and
+            // are treated differently on purpose.
+            std::string lcerr;
+            if (!locationColumnsPrepare(thermal_config, ref_z, mesh,
+                                        locations_file, total_time_steps, lcerr)) {
+                std::cerr << "[location-columns] NOT RECORDING the mesh column: "
+                          << lcerr
+                          << "\n  The depth CSVs will be a standalone 1-D "
+                             "re-integration of each site and will say so, in the "
+                             "log and on each file's '# Integration:' line.\n";
+            }
+        }
+
         // Debug output to verify properties were set correctly
         if (verbose) {
             std::cout << "Thermal config properties:" << std::endl;
@@ -19436,6 +19921,11 @@ int main(int argc, char** argv) {
                         use_simd_batch_l);
                     break;
             }
+            // Phase 2H: the per-location column recorder is labeled from the
+            // SAME `solver_path` the banner above is derived from, so a CSV's
+            // "# Integration:" line and the run's disclosed solver path cannot
+            // disagree.
+            locationColumnsSetPath(ptm::thermalSolverPathName(solver_path));
 
             // ---- batch-checkpoint capability gate (plan 1D') ---------------
             // The feature is implemented on the CPU SIMD-batch whole-mesh
@@ -19704,6 +20194,7 @@ int main(int argc, char** argv) {
                     ptm::ThermalSolverReason::MemoryThreshold,
                     why.str(),
                     use_simd_batch_s);
+                locationColumnsSetPath(ptm::thermalSolverPathName(stream_path));
             }
 
             // On-demand getters from illumination model (no large buffers)
@@ -22253,7 +22744,36 @@ int main(int argc, char** argv) {
                                 thermal_config,
                                 equilibration_steps,
                                 /*Qb_override=*/-1.0,
-                                face_H
+                                face_H,
+                                // Phase 2H. The seed-recorder / census
+                                // arguments stay at their defaults: this call
+                                // is a RE-integration, not a fresh seed, and
+                                // labeling it as one would put a second anchor
+                                // line in the census for the same face. Only
+                                // the column recorder is wired, and it must be:
+                                // these are the faces whose mesh-wide
+                                // temperature this loop just replaced, so
+                                // leaving iteration 0's column recorded would
+                                // make the CSV disagree with the mesh at
+                                // exactly the faces radiation coupling touches.
+                                /*seed_record_face=*/-1,
+                                /*seed_floor_faces=*/nullptr,
+                                /*anchor_census=*/nullptr,
+                                /*state=*/nullptr,
+                                // 2D's map fold stays OFF and 2H's column
+                                // recorder stays ON, and the disagreement is
+                                // deliberate. The depth MAP is an average over
+                                // the window, so re-entering it here would fold
+                                // a second contribution on top of iteration
+                                // zero's. The depth CSV is a per-frame series
+                                // that is REPLACED, not accumulated, and these
+                                // are precisely the faces whose mesh-wide
+                                // temperature this loop just overwrote --
+                                // leaving iteration zero's column recorded
+                                // would make the CSV disagree with the mesh at
+                                // exactly the faces radiation coupling touched.
+                                /*fold_depth_map=*/false,
+                                /*loc_column_face=*/static_cast<long long>(f)
                             );
 
                             // Store results
@@ -24295,17 +24815,85 @@ int main(int argc, char** argv) {
                 // the fix. AbsorbedFluxComposer::bindResolvedAlbedos(), which
                 // existed only because thermal_config used to be out of scope
                 // here, goes with it -- it had no other caller.
-                std::shared_ptr<ptm::SpatialMap> loc_albedo_map =
-                    loadExplicitAlbedoMap(thermal_config, "[location depth export]");
+                // ---- PHASE 2H: is the mesh solver's own column available? --
+                // Decided BEFORE anything else in this block, because when it
+                // is, none of the standalone integration's apparatus is needed
+                // or wanted: no second absorbed-flux composition, no second
+                // seed, no second anchor census. When it is NOT, every one of
+                // those still runs and the run says -- in the log and in each
+                // CSV's own header -- that the file is a separate integration.
+                //
+                // ⛔ "Allocated" is not "recorded". Series::complete() is the
+                // only thing that can tell them apart: a solver path that never
+                // calls record() leaves the recorder full of zeros, and zeros
+                // are a plausible-looking temperature series to every consumer.
+                std::string loc_columns_why;
+                bool loc_mesh_backed =
+                    locationColumnsOn() &&
+                    g_loc_columns.series.complete(loc_columns_why);
+                // The recorder was sized for total_time_steps frames at stage B
+                // and the loop below reads frames [0, total_time_steps). The
+                // two are the same variable and nothing between them writes it
+                // -- checked rather than trusted, because if that ever stopped
+                // being true the read would run off the end of the buffer
+                // rather than produce a wrong number.
+                if (loc_mesh_backed &&
+                    g_loc_columns.series.n_frames !=
+                        static_cast<std::size_t>(total_time_steps)) {
+                    std::ostringstream why;
+                    why << "the recorder holds " << g_loc_columns.series.n_frames
+                        << " frames but the export wants " << total_time_steps;
+                    loc_columns_why = why.str();
+                    loc_mesh_backed = false;
+                }
+                std::string loc_provenance;
+                if (loc_mesh_backed) {
+                    loc_provenance =
+                        "mesh column, recorded during the whole-mesh solve on the "
+                        + g_loc_columns.solver_path +
+                        " path (grid fingerprint " + g_loc_columns.grid_fingerprint +
+                        "); the same integration as statistics/temperature_*.bin at "
+                        "this face";
+                    std::cout << "[location-columns] the depth CSVs are the MESH "
+                                 "SOLVER'S OWN column (" << g_loc_columns.solver_path
+                              << "). The CSV at a site and "
+                                 "statistics/temperature_*.bin at that site's face are "
+                                 "now one integration.\n";
+                } else {
+                    loc_provenance =
+                        "standalone 1-D column, re-solved for this site "
+                        "(runThermalModelDepthSeries) -- NOT the mesh-wide "
+                        "integration; see the run log";
+                    std::cerr << "[location-columns] NOTE: the depth CSVs are a "
+                                 "STANDALONE 1-D re-integration of each site, not the "
+                                 "mesh solver's own column";
+                    if (!loc_columns_why.empty())
+                        std::cerr << " (" << loc_columns_why << ")";
+                    else if (!locationColumnsOn())
+                        std::cerr << " (the per-location column recorder was not "
+                                     "active for this run)";
+                    std::cerr << ". They may differ from statistics/temperature_*.bin "
+                                 "at the same face; each CSV records which it is on its "
+                                 "'# Integration:' line.\n";
+                }
+
+                // The absorbed-flux composer is the standalone path's apparatus
+                // and is built only when that path will run.
+                std::shared_ptr<ptm::SpatialMap> loc_albedo_map;
                 AbsorbedFluxComposer loc_composer;
-                const bool loc_composer_ready = loc_composer.build(
-                    loc_albedo_map, mesh, mesh->faces.size(),
-                    default_visible_albedo, thermal_config, &planet, planet.S,
-                    "cpu_location_depth_series");
-                if (!loc_composer_ready) {
-                    std::cerr << "Warning: could not compose absorbed flux for the "
-                                 "per-location depth profiles; skipping them rather than "
-                                 "writing columns from an unresolved albedo." << std::endl;
+                bool loc_composer_ready = true;
+                if (!loc_mesh_backed) {
+                    loc_albedo_map =
+                        loadExplicitAlbedoMap(thermal_config, "[location depth export]");
+                    loc_composer_ready = loc_composer.build(
+                        loc_albedo_map, mesh, mesh->faces.size(),
+                        default_visible_albedo, thermal_config, &planet, planet.S,
+                        "cpu_location_depth_series");
+                    if (!loc_composer_ready) {
+                        std::cerr << "Warning: could not compose absorbed flux for the "
+                                     "per-location depth profiles; skipping them rather than "
+                                     "writing columns from an unresolved albedo." << std::endl;
+                    }
                 }
 
                 // Indirect (terrain-scattered + terrain-IR) flux, added exactly
@@ -24316,7 +24904,11 @@ int main(int argc, char** argv) {
                 // Omitting it made these columns cold by the dominant daytime
                 // term at shadowed and high-latitude faces, which is precisely
                 // where a validation figure is read.
-                const bool loc_have_indirect = !indirect_flux_series.empty();
+                // Only the standalone path composes its own flux; a recorded
+                // mesh column already carries whatever the solver integrated,
+                // indirect term included, by construction.
+                const bool loc_have_indirect =
+                    !loc_mesh_backed && !indirect_flux_series.empty();
                 if (loc_have_indirect) {
                     std::cout << "[location export] including the indirect "
                                  "(terrain-scattered + terrain-IR) flux, the same "
@@ -24341,7 +24933,7 @@ int main(int argc, char** argv) {
                                      "at every site, so at a skipped face the CSV will read WARMER "
                                      "than the mesh-wide temperature." << std::endl;
                     }
-                } else if (sim_config.radiation.enabled) {
+                } else if (!loc_mesh_backed && sim_config.radiation.enabled) {
                     // Radiation was asked for but no series exists: the columns
                     // are then direct + primary only, and that has to be said.
                     std::cerr << "[location export] WARNING: radiation.enabled is true but "
@@ -24371,7 +24963,7 @@ int main(int argc, char** argv) {
                 // census that was forgotten.
                 SeedAnchorCensus loc_anchor_census;
                 size_t loc_sites_seeded = 0, loc_sites_unseeded = 0;
-                if (loc_composer_ready && !locs.empty()) {
+                if (!loc_mesh_backed && loc_composer_ready && !locs.empty()) {
                     const int loc_seed_steps =
                         (equilibration_steps > 0 &&
                          equilibration_steps < static_cast<int>(times.size()))
@@ -24414,19 +25006,22 @@ int main(int argc, char** argv) {
                     // which is what the composer's per-step instantaneous solar
                     // constant and the effective-albedo window both expect.
                     const size_t fi = static_cast<size_t>(face_idx);
-                    const std::vector<double>* ind_row =
-                        (loc_have_indirect && fi < indirect_flux_series.size())
-                            ? &indirect_flux_series[fi] : nullptr;
-                    std::vector<double> flux_sum(static_cast<size_t>(total_time_steps), 0.0);
-                    for (int t = 0; t < total_time_steps; ++t) {
-                        const double direct = loc_flux.direct(fi, t);
-                        const double refl   = loc_flux.reflected(fi, t);
-                        const double pir    = loc_flux.primary_ir(fi, t);
-                        double absorbed = loc_composer.absorbed(fi, t, direct, refl, pir);
-                        if (ind_row && static_cast<size_t>(t) < ind_row->size()) {
-                            absorbed += (*ind_row)[static_cast<size_t>(t)];
+                    std::vector<double> flux_sum;
+                    if (!loc_mesh_backed) {
+                        const std::vector<double>* ind_row =
+                            (loc_have_indirect && fi < indirect_flux_series.size())
+                                ? &indirect_flux_series[fi] : nullptr;
+                        flux_sum.assign(static_cast<size_t>(total_time_steps), 0.0);
+                        for (int t = 0; t < total_time_steps; ++t) {
+                            const double direct = loc_flux.direct(fi, t);
+                            const double refl   = loc_flux.reflected(fi, t);
+                            const double pir    = loc_flux.primary_ir(fi, t);
+                            double absorbed = loc_composer.absorbed(fi, t, direct, refl, pir);
+                            if (ind_row && static_cast<size_t>(t) < ind_row->size()) {
+                                absorbed += (*ind_row)[static_cast<size_t>(t)];
+                            }
+                            flux_sum[static_cast<size_t>(t)] = absorbed;
                         }
-                        flux_sum[static_cast<size_t>(t)] = absorbed;
                     }
 
                     // thermal_config, NOT the default-constructed `config`. See
@@ -24441,16 +25036,71 @@ int main(int argc, char** argv) {
                     double loc_H_used = 0.0;
                     thermal::EqSeedResult loc_seed;
                     bool loc_seed_applied = false;
-                    auto T_depths = runThermalModelDepthSeries(
-                        flux_sum, times, lat_deg, thermal_config, depths_m,
-                        equilibration_steps, planet, &grid_bottom_m,
-                        face_idx, &loc_H_used, &loc_seed, &loc_seed_applied);
+                    int    loc_n_too_deep = 0;
+                    double loc_first_too_deep = 0.0;
+                    std::vector<std::vector<double>> T_depths;
+                    const int loc_slot = loc_mesh_backed
+                                             ? g_loc_columns.series.slot(fi) : -1;
+                    if (loc_mesh_backed && loc_slot < 0) {
+                        // Unreachable today -- prepare and this loop resolve the
+                        // same locations file against the same immutable mesh
+                        // with the same function. It is also the one thing that
+                        // would fire if output.locations_file were REWRITTEN
+                        // between the stage-B read and this one and gained a
+                        // site: the new site has no slot. Guarded anyway, because
+                        // the alternative is depthsFromRecordedColumn returning
+                        // a zero-filled block that gets written out stamped
+                        // "mesh column ... the same integration as
+                        // statistics/temperature_*.bin". Zeros are a plausible
+                        // temperature series to every consumer; that is the
+                        // exact failure Series::complete() exists to make
+                        // impossible, and it must not come back in through the
+                        // one path complete() does not cover.
+                        std::cerr << "\n[location-columns] FATAL: site '"
+                                  << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                  << "' resolved to face " << face_idx
+                                  << ", which the column recorder holds no slot for, "
+                                     "even though the recorder reported itself complete. "
+                                     "Refusing to write a column of zeros labeled as the "
+                                     "mesh solve's.\n";
+                        return 1;
+                    }
+                    if (loc_mesh_backed) {
+                        // PHASE 2H. The column this site's face was integrated
+                        // on during the whole-mesh solve -- not a second
+                        // integration of it. No seed is applied here, no anchor
+                        // is run and no flux is composed, because all three
+                        // already happened, once, in the solver whose field
+                        // statistics/temperature_*.bin is written from.
+                        // The H the RECORDED grid was built at, which on the
+                        // SIMD path is the run's shared reference H, NOT this
+                        // face's map value. Reporting the face's own H here
+                        // would be a false statement about the column that was
+                        // actually integrated.
+                        const double ref_H = refGridHOverride(thermal_config);
+                        loc_H_used     = (ref_H > 0.0) ? ref_H : planet.H;
+                        grid_bottom_m  = g_loc_columns.z.back();
+                        const auto& rec = g_loc_columns.series;
+                        T_depths = sampleColumnAtDepths(
+                            g_loc_columns.z, depths_m, total_time_steps,
+                            [&rec, loc_slot](int t, int j) {
+                                return rec.columnAt(static_cast<size_t>(loc_slot),
+                                                    static_cast<size_t>(t))[j];
+                            },
+                            &loc_n_too_deep, &loc_first_too_deep);
+                    } else {
+                        T_depths = runThermalModelDepthSeries(
+                            flux_sum, times, lat_deg, thermal_config, depths_m,
+                            equilibration_steps, planet, &grid_bottom_m,
+                            face_idx, &loc_H_used, &loc_seed, &loc_seed_applied,
+                            &loc_n_too_deep, &loc_first_too_deep);
+                    }
 
                     // Per-site anchor status + Kirchhoff yes/no. Printed per
                     // SITE, not just aggregated: the sites are individually
                     // named validation points, and "3 of 5 anchored" does not
                     // tell you which two columns you may not quote.
-                    {
+                    if (!loc_mesh_backed) {
                         const std::string site_label =
                             name.empty() ? ("loc_" + std::to_string(i)) : name;
                         if (!loc_seed_applied) {
@@ -24537,7 +25187,29 @@ int main(int argc, char** argv) {
                     // proven no-op here. Report the H each site actually got --
                     // "the map is loaded" is not evidence that this path read
                     // it.
-                    if (!planet.face_H_overrides.empty()) {
+                    if (!planet.face_H_overrides.empty() && loc_mesh_backed) {
+                        // PHASE 2H changed what this line means on a per-face
+                        // H map, and the change is the point rather than a side
+                        // effect. The CSV is now the column the MESH solver
+                        // integrated, and the CPU SIMD-batch path puts every
+                        // face on ONE grid at the map's reference H. The old
+                        // standalone column was solved at THIS face's H on its
+                        // own grid -- better resolved for the site, and not the
+                        // number the mesh-wide field reports at that face.
+                        // Agreement with the mesh is what the CSV is for; the
+                        // trade is stated, not hidden.
+                        std::cout << "[location export] site '"
+                                  << (name.empty() ? ("loc_" + std::to_string(i)) : name)
+                                  << "' face " << face_idx
+                                  << ": a per-face H map is loaded, and this column is "
+                                     "the mesh solve's, on the shared reference grid at "
+                                     "H = " << fmtSig(loc_H_used)
+                                  << " m -- not this face's map H ("
+                                  << fmtSig(planet.H_for_face(face_idx))
+                                  << " m). That is what makes it agree with "
+                                     "statistics/temperature_*.bin at this face."
+                                  << std::endl;
+                    } else if (!planet.face_H_overrides.empty()) {
                         std::cout << "[location export] site '"
                                   << (name.empty() ? ("loc_" + std::to_string(i)) : name)
                                   << "' face " << face_idx << ": H = "
@@ -24579,37 +25251,63 @@ int main(int argc, char** argv) {
                     // prints only when the reach CHANGES, so a uniform map (or
                     // no map at all) reads exactly as it did before.
                     {
-                        const size_t n_extrap = static_cast<size_t>(std::count_if(
-                            depths_m.begin(), depths_m.end(),
-                            [&](double z) { return z > grid_bottom_m; }));
+                        const std::string site_label =
+                            name.empty() ? ("loc_" + std::to_string(i)) : name;
                         if (loc_depth_reach_reported == 0
                             || std::abs(grid_bottom_m - loc_depth_reach_last_m) > 1e-9) {
+                            const std::ios::fmtflags cf = std::cout.flags();
+                            const std::streamsize    cp = std::cout.precision();
                             std::cout << "[location export] depth grid (thermal_m/n/b = "
                                       << thermal_config.m << "/" << thermal_config.n << "/"
                                       << thermal_config.b << "): deepest SOLVED node at "
                                       << std::fixed << std::setprecision(4) << grid_bottom_m
-                                      << " m, at site '"
-                                      << (name.empty() ? ("loc_" + std::to_string(i)) : name)
-                                      << "'." << std::endl;
+                                      << " m, at site '" << site_label << "'." << std::endl;
+                            std::cout.flags(cf);
+                            std::cout.precision(cp);
                             loc_depth_reach_last_m = grid_bottom_m;
                         }
-                        if (n_extrap > 0) {
-                            std::cerr << "[location export] WARNING: site '"
-                                      << (name.empty() ? ("loc_" + std::to_string(i)) : name)
-                                      << "': " << n_extrap << " of "
-                                      << depths_m.size() << " requested depths lie BELOW "
-                                      << std::fixed << std::setprecision(4) << grid_bottom_m
-                                      << " m and are a Fourier's-law extrapolation "
-                                         "T = T_bottom + Qb*(z - z_bottom)/k_bottom, not a "
-                                         "solved temperature. Raise thermal.thermal_b to solve "
-                                         "them." << std::endl;
+                        // PAUL'S RULING (2026-09-07): refuse, do not extrapolate.
+                        //
+                        // ⚠️ WHAT THIS BACKSTOP IS AND IS NOT, measured. It is
+                        // NOT reachable through a per-face H map: both grid
+                        // generators put the bottom at z_max = b*delta_0 with
+                        // delta_0 from ks/(rhos*cp) at z = 0, where the
+                        // exp(-z/H) densification is 1 and H cancels
+                        // identically, so H moves node SPACING and never the
+                        // bottom (four sites at H = 0.037-0.115 m from a
+                        // synthetic map all report 0.4706 m). It IS reachable,
+                        // and does fire, if the stage-B check is bypassed or
+                        // removed -- verified by injection (F6): with stage B
+                        // disabled this refusal is what stops the run. So it is
+                        // a second line against the check above going away, not
+                        // coverage of a case that check cannot see.
+                        if (loc_n_too_deep > 0) {
+                            std::ostringstream where;
+                            where << "on the grid this SITE was solved on (site '"
+                                  << site_label << "', face " << face_idx
+                                  << ", H = " << fmtSig(loc_H_used) << " m)";
+                            std::cerr << "\n[location depth export] FATAL: "
+                                      << thermal::depthmap::tooDeepRefusal(
+                                             loc_first_too_deep, grid_bottom_m,
+                                             "a depth series", where.str())
+                                      << "\n  " << loc_n_too_deep << " of "
+                                      << depths_m.size()
+                                      << " requested depths are below this site's bottom "
+                                         "node. A per-face thermal-inertia / H map gives "
+                                         "each site its own grid, so a depth that the "
+                                         "reference grid reaches can still be out of reach "
+                                         "here.\n  The mesh-wide statistics in this output "
+                                         "directory are complete and unaffected; no "
+                                         "*_depths.csv was written for this site.\n";
+                            return 1;
                         }
                         ++loc_depth_reach_reported;
                     }
 
                     std::string base = sanitize(name.empty() ? ("loc_" + std::to_string(i)) : name);
                     const std::string out_path = loc_out_dir + "/" + base + "_depths.csv";
-                    if (!writeLocationDepthCSV(out_path, name, time_strings, depths_m, T_depths)) {
+                    if (!writeLocationDepthCSV(out_path, name, time_strings, depths_m,
+                                               T_depths, loc_provenance)) {
                         std::cerr << "Warning: Failed to write depth series for location '" << name << "'" << std::endl;
                     } else {
                         std::cout << "Wrote depth temperature series: " << out_path << std::endl;
@@ -24621,7 +25319,7 @@ int main(int argc, char** argv) {
                 // against each other in one log.
                 if (loc_sites_seeded > 0) {
                     loc_anchor_census.report("cpu-location-depth-series");
-                } else if (loc_composer_ready && !locs.empty()) {
+                } else if (!loc_mesh_backed && loc_composer_ready && !locs.empty()) {
                     // Distinguish the two ways this can be empty. "No site was
                     // seeded" and "no site was solved at all" have completely
                     // different remedies, and one line that covers both tells
