@@ -11,6 +11,7 @@ from pathlib import Path
 from ptm.engine_defaults import ENGINE_DEFAULTS
 
 from gui_core.preflight import RECOMMENDED_ENGINE_ENV
+from gui_core import batch_checkpoint
 from gui_core import depth_maps
 from gui_core import yaml_roundtrip
 
@@ -369,6 +370,12 @@ class ConfigManager:
             # resume, which is the whole long-run workflow.
             "initial_state_file": "",
             "final_state_file": "",
+            # Banking finished facet groups so an interrupted run resumes.
+            # Off by default, which is also the engine's default: byte identity
+            # when it is off is this feature's own acceptance test.
+            "batch_checkpoint": False,
+            "batch_checkpoint_dir": "",
+            "batch_checkpoint_max_gib": 64.0,
             # --- Equilibration convergence (item 2.7) ---------------------
             # The GUI exposed the equilibration CYCLE COUNT and a cadence tier
             # and nothing about the criterion those cycles are scored against.
@@ -2345,6 +2352,27 @@ class ConfigManager:
                 depth_list, depth_stats, depth_snap))
             problems.extend(depth_maps.engine_support(self.config).blockers)
         errors.extend(f"Depth maps: {p}" for p in problems)
+
+        # Banking finished facet groups. Same shape and the same reason: each
+        # clause is one the engine stops on, transcribed once in
+        # `gui_core.batch_checkpoint`. The SIZE clause is not here, and the
+        # count of what is already banked is not here either -- both read the
+        # file system, and this function runs from a Qt slot on every edit.
+        #
+        # ⛔ GATED ON THE FEATURE BEING ON. Without this line every run on the
+        # graphics cards, and every run with facet-to-facet infrared exchange,
+        # was reported as invalid -- the conditions are only conditions
+        # BECAUSE the banking is on. Caught by the full test suite (four shipped
+        # configurations went red); it was invisible to this feature's own
+        # suite, whose fixtures all switch the banking on, which is what makes a
+        # guard's own inputs worth varying.
+        if batch_checkpoint.enabled(self.config):
+            errors.extend(
+                f"Crash resilience: {p}"
+                for p in batch_checkpoint.engine_support(self.config).blockers)
+            _bc_conflict = batch_checkpoint.final_state_conflict(self.config)
+            if _bc_conflict:
+                errors.append(f"Crash resilience: {_bc_conflict}")
 
         # A custom body's surface value too small to survive the trip into the
         # solver. The engine forwards it through std::to_string -- six decimal

@@ -59,6 +59,10 @@ LABELS = {
     # -- run state ----------------------------------------------------------
     "thermal.initial_state_file": "Warm start from state file:",
     "thermal.final_state_file": "Save final state to:",
+    # -- crash resilience ---------------------------------------------------
+    "thermal.batch_checkpoint": "Bank finished facet groups",
+    "thermal.batch_checkpoint_dir": "Bank into:",
+    "thermal.batch_checkpoint_max_gib": "Size limit (GiB):",
     # -- ice stability ------------------------------------------------------
     "thermal.ice_stability.flux_threshold_kgm2s":
         "Ice survives below this loss rate (kg m^-2 s^-1):",
@@ -520,6 +524,54 @@ TOOLTIPS = {
         "one at the last exported frame, which is what the next piece must "
         "resume from.\n"
         "YAML key: thermal.final_state_file"
+    ),
+
+    # -- Crash resilience -----------------------------------------------------
+    "thermal.batch_checkpoint": (
+        "Write each group of facets to disk as soon as it is finished, so an "
+        "interrupted run can start again and only integrate the groups it "
+        "never got to.\n"
+        "Off by default, and worth turning on for a run long enough that "
+        "losing it would hurt. It changes no temperature anywhere: it saves "
+        "results a group has already reached and reads them back instead of "
+        "computing them again.\n"
+        "Read the size figure beside it first. What is saved is the surface "
+        "temperature at every step for every facet, so on a fine mesh over a "
+        "long window it runs to tens of gigabytes.\n"
+        "There is no option to save every so many minutes, because the solver "
+        "carries each group of facets all the way through time before it "
+        "starts the next one -- so the whole mesh is never at the same step, "
+        "and a mid-run save would contain facets that have not been solved "
+        "yet. An interruption inside one group loses that group's work; to "
+        "bound it more tightly, split the run into shorter runs with the "
+        "chunked-run script.\n"
+        "Needs the thermal model on the processor, with facet-to-facet "
+        "infrared exchange off. The run stops and says so otherwise.\n"
+        "YAML key: thermal.batch_checkpoint"
+    ),
+    "thermal.batch_checkpoint_dir": (
+        "Where the part-finished facet groups are written. Leave blank for a "
+        "_thermal_state/partial folder inside the run's own output "
+        "directory.\n"
+        "Point it somewhere with room, and somewhere no other run is using: "
+        "part-finished work from a different run is checked and refused, but "
+        "only after it has been found.\n"
+        "Starting a run whose bank still holds finished work reads that work "
+        "back rather than computing it again. Empty the folder to integrate "
+        "from the beginning.\n"
+        "YAML key: thermal.batch_checkpoint_dir"
+    ),
+    "thermal.batch_checkpoint_max_gib": (
+        "The most the part-finished work may occupy, in gibibytes. The run "
+        "works out the figure before it starts and stops rather than exceed "
+        "it.\n"
+        "The default of 64 suits a moderate mesh. The same figure is also the "
+        "extra memory a resumed run holds while it reads the work back, so "
+        "raising it costs twice.\n"
+        "Zero switches the check off, which is not advised: the size grows "
+        "with facets multiplied by steps and reaches an awkward figure "
+        "sooner than expected.\n"
+        "YAML key: thermal.batch_checkpoint_max_gib"
     ),
 
     # -- Ice stability --------------------------------------------------------
