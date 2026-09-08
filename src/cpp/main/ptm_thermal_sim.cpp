@@ -1232,6 +1232,180 @@ static bool depthMapVerifyGrid(const double* z, size_t n_layers,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// CPU SCALAR PATH (plan phase 2D).
+//
+// This path builds a Profile -- and therefore a depth grid -- PER FACE
+// (thermal_model.cpp, generateAdaptiveGrid, called from Profile's constructor
+// with that face's own H). The rest of the engine puts every face on one
+// reference grid, which is what lets one set of (node, weight) pairs describe
+// the whole mesh.
+//
+// WHEN THOSE PER-FACE GRIDS ARE ALL THE SAME GRID, and they are whenever no
+// per-face property map is loaded, this path is not a special case at all: the
+// plan the reference grid produced is the plan every face would produce, and
+// the product is the SIMD-batch path's product computed one face at a time.
+// The engine used to refuse the whole path anyway. It now refuses only the
+// combination that is genuinely under-determined, and it VERIFIES the rest
+// rather than asserting it: every face's own grid is compared against the
+// plan's before its column is folded, so "the grids agree" is measured on the
+// grids and not inferred from the absence of a map.
+//
+// WHY THE PER-FACE-MAP COMBINATION IS STILL REFUSED, in full, because this is
+// the decision the phase existed to make:
+//
+//   With a per-face H map and an adaptive grid, face A and face B solve on
+//   different nodes. Snapping each face to ITS nearest node then samples a
+//   surface that undulates from facet to facet, and the file name -- which
+//   carries one depth -- could only be one facet's answer stamped on all of
+//   them. Turning snapping off does fix the NAME (every facet is interpolated
+//   to exactly the requested depth, so the resolved depth is single-valued
+//   again) but not the PRODUCT: statistics/depth_map_z.json carries one
+//   `native_z_m`, one `node_j`, one `weight_on_j_plus_1` and one interpolation
+//   error budget per depth, and on a per-face grid each of those is a
+//   distribution. Emitting one facet's numbers as the manifest for a map
+//   assembled from many is the same defect the depth product's own refusals
+//   exist to prevent -- physics over part of the area, something else over the
+//   rest, distinguishable only by a log line.
+//
+//   Shipping it properly means a per-face error budget: a manifest that
+//   reports the spread of the resolved depths and of the bias, not a single
+//   value. That is a different product from the one this schema describes, and
+//   inventing it silently under the existing schema version would be worse
+//   than refusing. So the refusal names the map, names both remedies, and says
+//   what the missing product would be.
+// ---------------------------------------------------------------------------
+
+// Does this run give every face the same depth grid? Decidable from the
+// configuration and the loaded property map, before any solving.
+//
+// The only per-face input to generateAdaptiveGrid is H (Profile's constructor
+// applies H_override to its own Planet copy, and kappa(z) carries exp(-z/H)),
+// so a run with no per-face H override puts every face on one grid. With
+// ADAPTIVE_GRID off the grid comes from generateStableGrid, whose inputs are
+// the surface skin depth and (m, n, b) -- none of which carry H -- so the
+// grids are uniform there whatever the map says.
+// ⛔ Takes the SAME vector the per-face loop reads, not a Planet. The streamed
+// driver's per-face H comes from its own `face_H_overrides` parameter; its
+// `planet` is used for the albedo model. Today's single caller derives one from
+// the other so they agree, but a guard that inspects a different object from
+// the one that varies the grid is a guard that can be right by luck.
+// (Found by code-review, 2026-09-07.)
+//
+// The ADAPTIVE_GRID clause is correct and, in THIS binary, unreachable: nothing
+// in main() or config_parser.cpp ever assigns Config::ADAPTIVE_GRID, so it is
+// always the `true` default and only the standalone tools override it. Kept
+// because the predicate is a statement about the grid builder, not about what
+// the YAML happens to expose today -- but nothing prints a message that depends
+// on it, because a message that cannot be printed cannot be checked.
+static bool scalarGridsAreUniform(const std::vector<double>* face_H_overrides,
+                                  const thermal::Config& config) {
+    if (!config.ADAPTIVE_GRID) return true;
+    return !face_H_overrides || face_H_overrides->empty();
+}
+
+// Set by a solver thread when a face's own grid turns out not to be the grid
+// the plan was resolved against. Checked by the driver after the parallel loop
+// -- a thread cannot end the run, and a message printed from inside one and
+// then ignored is not a refusal.
+static std::atomic<bool> g_depth_scalar_grid_failed{false};
+static std::mutex g_depth_scalar_grid_mu;
+static std::string g_depth_scalar_grid_msg;
+
+// Fold one CPU-scalar face's whole T(z, t) history into the accumulator.
+//
+// `T` is the model's own matrix, rows = time steps (absolute, including the
+// spin-up prefix), columns = depth nodes, column-major -- so one face's column
+// at step i starts at &T(i, 0) and strides by T.outerStride(). Eigen's default
+// storage order is what makes that true, and the assertion below is what keeps
+// it true.
+//
+// NO SURFACE OVERRIDE, and that is a difference from the SIMD-batch path
+// rather than an omission. This path publishes T(i, 0) itself as the face's
+// surface temperature (see runThermalModelWithMatchedTimes), so node 0 IS the
+// number that reaches statistics/temperature_*.bin and a z = 0 map built on it
+// reproduces that file. The SIMD path publishes a re-evaluated surface node and
+// therefore has to pass one.
+//
+// Thread-safe by ownership: every writer touches only its own face's slots in
+// the accumulator, exactly as the batch and device paths do.
+// `z` is a raw pointer, not a vector reference: the solver's own grid lives in
+// a 64-byte-aligned allocator's vector, which is a DIFFERENT type from
+// std::vector<double> and will not bind to one.
+static void depthMapFoldScalarFace(size_t face,
+                                   const double* z, size_t n_layers,
+                                   const Eigen::MatrixXd& T,
+                                   int n_steps) {
+    static_assert(!Eigen::MatrixXd::IsRowMajor,
+                  "the scalar depth fold reads one face's column as a strided "
+                  "run of T(i, .), which needs column-major storage");
+    if (!depthMapOn()) return;
+    if (g_depth_scalar_grid_failed.load(std::memory_order_relaxed)) return;
+
+    // The face's OWN grid against the plan's. Measured, not assumed: the
+    // uniformity test above is a statement about the inputs, and this is a
+    // statement about the grids themselves. A face whose grid has the same
+    // LENGTH at different depths is exactly what an input-level test cannot
+    // see, and it is the failure that would ship a wrong-depth map.
+    bool same = (n_layers == g_depth_map.plan.z.size());
+    if (same) {
+        for (size_t i = 0; i < n_layers; ++i) {
+            if (z[i] != g_depth_map.plan.z[i]) { same = false; break; }
+        }
+    }
+    if (!same) {
+        if (!g_depth_scalar_grid_failed.exchange(true,
+                                                 std::memory_order_relaxed)) {
+            std::ostringstream os;
+            os << "face " << face << " solved on a depth grid that is not the "
+                  "one output.map_depths_m was resolved against ("
+               << n_layers << " nodes vs " << g_depth_map.plan.z.size()
+               << "; fingerprints "
+               << thermal::state_io::gridFingerprint(z, n_layers)
+               << " vs " << g_depth_map.grid_fingerprint << ").\n"
+                  "  The per-depth node indices and weights would address a "
+                  "different column from the one that was integrated.";
+            std::lock_guard<std::mutex> lk(g_depth_scalar_grid_mu);
+            g_depth_scalar_grid_msg = os.str();
+        }
+        return;
+    }
+
+    // REPLACE, not add, exactly as the SIMD-batch driver does before its first
+    // fold of a batch. Neither CPU scalar driver is re-entered today -- depth
+    // maps with radiation on a CPU solver are refused before the run starts --
+    // but the batch driver IS re-entered on that path, and the asymmetry would
+    // become a double-counted average the moment that refusal were relaxed.
+    // One face, once, so it costs nothing. (Found by code-review, 2026-09-07.)
+    g_depth_map.acc.resetFace(face);
+
+    const int lo = std::max(0, g_depth_map.win_start);
+    const int hi = std::min(n_steps, g_depth_map.win_end);
+    const std::ptrdiff_t stride =
+        static_cast<std::ptrdiff_t>(T.outerStride());
+    for (int i = lo; i < hi; ++i) {
+        g_depth_map.acc.addColumn(g_depth_map.plan, face, &T(i, 0), stride);
+    }
+    g_depth_map.covered[face] = 1u;
+}
+
+// The driver-side half of the per-face grid check. A solver thread cannot end
+// the run, and a message printed from inside one and then ignored is not a
+// refusal -- it is the "message in a line nobody branches on" shape this
+// project has already shipped once. Returns false to fail the run.
+static bool depthMapScalarGridCheckPassed(const char* path_name) {
+    if (!g_depth_scalar_grid_failed.load(std::memory_order_relaxed)) return true;
+    std::string msg;
+    {
+        std::lock_guard<std::mutex> lk(g_depth_scalar_grid_mu);
+        msg = g_depth_scalar_grid_msg;
+    }
+    std::cerr << "\n[depth-map] FATAL: on the " << path_name << " path, " << msg
+              << "\n  Refusing to write a depth map rather than write a wrong "
+                 "one.\n";
+    return false;
+}
+
 // Fold one GPU batch's float32 accumulators into the run-scope (float64) one.
 // `replace` is for the radiation-coupling re-thermal, which re-integrates a
 // face and must REPLACE its contribution rather than add a second copy.
@@ -3552,7 +3726,15 @@ std::vector<double> runThermalModelWithMatchedTimes(
     SeedAnchorCensus*    anchor_census    = nullptr,
     // Warm start / final-state capture. Null = neither, and this function is
     // then bit-identical to what it was before PTM-76.
-    FaceStateIO* state = nullptr) {
+    FaceStateIO* state = nullptr,
+    // Plan phase 2D. True ONLY from the two whole-mesh CPU scalar drivers, so
+    // the radiation-coupling re-thermal -- which calls this for a SELECTED
+    // subset of faces and would fold a second contribution on top of the first
+    // -- cannot reach it by accident. That combination is refused earlier
+    // anyway; this is the second lock, because a default-on parameter would
+    // have made the refusal the only thing standing between a re-entry and a
+    // double-counted average.
+    bool fold_depth_map = false) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -3687,6 +3869,16 @@ std::vector<double> runThermalModelWithMatchedTimes(
                 temps_out.assign(N, std::numeric_limits<double>::quiet_NaN());
                 return temps_out;
             }
+        }
+
+        // Subsurface temperature maps (plan phase 2D). Folded from THIS
+        // face's own grid and THIS face's own T(z, t), before the surface
+        // series is extracted -- the same matrix, the same instants.
+        if (fold_depth_map && depthMapOn() && seed_record_face >= 0 &&
+            model.T.rows() == N && model.T.cols() > 0) {
+            const auto& face_z = model.profile.getGrid().z;
+            depthMapFoldScalarFace(static_cast<size_t>(seed_record_face),
+                                   face_z.data(), face_z.size(), model.T, N);
         }
 
         // Extract surface temperatures
@@ -4338,19 +4530,48 @@ static bool refuseEqStopOnCertificate(const thermal::Config& config,
 // the illumination phase; THIS is the guarantee.
 //
 // Both CPU scalar paths give every face its own depth grid (generateAdaptiveGrid
-// per face), so one set of per-depth node indices and weights cannot describe
-// them all -- reusing the reference grid's there is BUGS.md PTM-76 exactly.
-static bool refuseDepthMapOnPath(const char* path_name) {
+// per face). Whether that MATTERS depends on whether those grids differ, which
+// depends on whether a per-face H map is loaded -- see the block above
+// scalarGridsAreUniform for the whole ruling. Returns true to refuse.
+static bool refuseDepthMapOnPath(const char* path_name,
+                                 const std::vector<double>* face_H_overrides,
+                                 const thermal::Config& config) {
     if (!depthMapOn()) return false;
-    std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set, but this run "
-                 "entered the " << path_name << " path.\n"
-                 "  That path builds a SEPARATE depth grid for every face, so the "
-                 "single set of per-depth node indices and weights this product "
-                 "resolved against the shared reference grid does not describe "
-                 "it.\n"
-                 "  Refusing rather than sampling the wrong nodes (BUGS.md "
-                 "PTM-76). Use the CPU SIMD-batch solver (the shipped default) "
-                 "or the GPU solver, or drop output.map_depths_m.\n";
+    if (scalarGridsAreUniform(face_H_overrides, config)) {
+        // Supported, and said out loud: this path reaches the same product by
+        // a different route, and a reader comparing two runs needs to know
+        // which route produced which file. The per-face grid check in
+        // depthMapFoldScalarFace is what makes the claim measured.
+        g_depth_map.solver_path = path_name;
+        std::cout << "[depth-map] " << path_name
+                  << ": no per-face H map is loaded, so every face solves on "
+                     "the same depth grid and the plan resolved against the "
+                     "reference grid describes every face. Each face's own grid "
+                     "is checked against it before that face is folded in.\n";
+        return false;
+    }
+    std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set, this run "
+                 "entered the " << path_name << " path, and a per-face H map is "
+                 "loaded ("
+              << (face_H_overrides ? face_H_overrides->size() : 0u)
+              << " faces).\n"
+                 "  That combination gives every face its OWN depth grid, so "
+                 "there is no single resolved depth to name the file after and "
+                 "no single (node, weight) pair or interpolation-error figure "
+                 "for statistics/depth_map_z.json to report. Reporting one "
+                 "face's numbers as the manifest for a map assembled from many "
+                 "would be the wrong-depth failure this product's refusals "
+                 "exist to prevent (BUGS.md PTM-76).\n"
+                 "  Setting output.map_depth_snap_to_node: false would fix the "
+                 "file NAME -- every face would be interpolated to exactly the "
+                 "requested depth -- but not the manifest, which is "
+                 "single-valued by schema. A map on a per-face grid needs a "
+                 "per-face error budget, and this engine does not write one.\n"
+                 "  Remedies: use the CPU SIMD-batch solver (the shipped "
+                 "default) or the GPU solver -- both put every face on one "
+                 "grid; or drop the per-face H map (thermal.h_parameter_map, "
+                 "thermal.thermal_inertia_map, thermal.use_default_property_map); "
+                 "or drop output.map_depths_m.\n";
     return true;
 }
 
@@ -4474,7 +4695,8 @@ bool runThermalModelsForAllFacesStreamed(
     const std::string& final_state_file)
 {
     if (refuseEqStopOnCertificate(config, "streamed CPU")) return false;
-    if (refuseDepthMapOnPath("streamed CPU scalar")) return false;
+    if (refuseDepthMapOnPath("streamed CPU scalar", face_H_overrides, config))
+        return false;
     if (!mesh || mesh->faces.empty() || total_time_steps <= 0) {
         std::cerr << "Streamed thermal: invalid mesh or time steps\n";
         return false;
@@ -4658,7 +4880,8 @@ bool runThermalModelsForAllFacesStreamed(
             std::vector<double> temps = runThermalModelWithMatchedTimes(
                 face_flux, times, mesh->latitudes[f], config, /*equilibration_steps*/0,
                 face_qb, face_H, static_cast<long long>(f),
-                &seed_floor_faces, &anchor_census, st_ptr);
+                &seed_floor_faces, &anchor_census, st_ptr,
+                /*fold_depth_map=*/true);
 
             if (ckpt.want_out && st.out_column) ckpt.scatterOut(f, st_out.data());
 
@@ -4695,6 +4918,7 @@ bool runThermalModelsForAllFacesStreamed(
               << (ms/1000.0) << " s (" << ms << " ms)" << std::endl;
 
     if (!ckpt.finish()) return false;
+    if (!depthMapScalarGridCheckPassed("streamed CPU scalar")) return false;
 
     return true;
 }
@@ -4720,7 +4944,10 @@ bool runThermalModelsForAllFaces(
     const std::string& initial_state_file,
     const std::string& final_state_file) {
     if (refuseEqStopOnCertificate(config, "CPU scalar")) return false;
-    if (refuseDepthMapOnPath("CPU scalar (--no-simd-batch)")) return false;
+    if (refuseDepthMapOnPath("CPU scalar (--no-simd-batch)",
+                             planet ? &planet->face_H_overrides : nullptr,
+                             config))
+        return false;
 
     // Load albedo map if specified
     std::shared_ptr<ptm::SpatialMap> albedo_map;
@@ -4961,7 +5188,8 @@ bool runThermalModelsForAllFaces(
                     static_cast<long long>(f),
                     &seed_floor_faces,
                     &anchor_census,
-                    st_ptr
+                    st_ptr,
+                    /*fold_depth_map=*/true
                 );
 
                 if (ckpt.want_out && st.out_column)
@@ -5072,6 +5300,8 @@ bool runThermalModelsForAllFaces(
               << seconds << " seconds (" << duration.count() << " ms)" << std::endl;
 
     if (!ckpt.finish()) success = false;
+    if (!depthMapScalarGridCheckPassed("CPU scalar (--no-simd-batch)"))
+        success = false;
 
     if (success) {
         std::cerr << "\nThermal models completed successfully!" << std::endl;
@@ -11773,7 +12003,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     long long seed_record_face,
     std::atomic<size_t>* seed_floor_faces,
     SeedAnchorCensus*    anchor_census,
-    FaceStateIO* state);
+    FaceStateIO* state,
+    bool fold_depth_map);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -17722,17 +17953,45 @@ int main(int argc, char** argv) {
                              "statistics and would never be written.\n";
                 return 1;
             }
-            if (!simd_batch_cfg) {
-                std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set and this "
+            // Plan phase 2D. The CPU scalar solver builds a Profile per face,
+            // so its depth grids differ from face to face EXACTLY when a
+            // per-face H map is LOADED -- H is the only per-face input to
+            // generateAdaptiveGrid. Without one the grids are identical and the
+            // reference plan describes every face, which is why this is no
+            // longer a blanket refusal.
+            //
+            // ⛔ `planet.face_H_overrides`, NOT the three configuration keys.
+            // A map can be configured and not load -- `use_default_property_map`
+            // on a DEM mesh prints "not an icosphere ... custom map required"
+            // and leaves the overrides EMPTY, and a bad custom path warns and
+            // falls back to one body-default H. Keying on the keys refused
+            // those runs for a reason the same log had just contradicted, one
+            // screen earlier. Both gates now read the same fact: the loaded
+            // map. (Found by code-review, 2026-09-07.)
+            //
+            // The authoritative check is still at the path entry
+            // (refuseDepthMapOnPath), and every face's own grid is compared
+            // against the plan's before it is folded in. THIS one is the
+            // courtesy that saves the illumination phase; the map is loaded
+            // ~880 lines above, so the same predicate is available here.
+            const bool perface_map_loaded = !planet.face_H_overrides.empty();
+            if (!simd_batch_cfg && perface_map_loaded) {
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_m is set, this "
                              "run selects the CPU SCALAR solver "
-                             "(--no-simd-batch / use_simd_batch: false).\n"
-                             "  That path gives every face its OWN depth grid "
-                             "(thermal_model.cpp, generateAdaptiveGrid per face), so "
-                             "one set of per-depth node indices and weights cannot "
-                             "describe them all. Reusing the reference grid's weights "
-                             "there is BUGS.md PTM-76's failure exactly.\n"
+                             "(--no-simd-batch / use_simd_batch: false), and a "
+                             "per-face H map is loaded ("
+                          << planet.face_H_overrides.size() << " faces).\n"
+                             "  That path builds a depth grid per face, and a "
+                             "per-face H map makes those grids differ -- so there is "
+                             "no single resolved depth for the file name and no "
+                             "single (node, weight) pair or error figure for "
+                             "statistics/depth_map_z.json. Reusing the reference "
+                             "grid's weights there is BUGS.md PTM-76's failure "
+                             "exactly.\n"
                              "  Run the shipped default CPU SIMD-batch solver or the "
-                             "GPU solver, or drop output.map_depths_m.\n";
+                             "GPU solver, drop the property map, or drop "
+                             "output.map_depths_m. Without a per-face map the CPU "
+                             "scalar solver DOES write depth maps.\n";
                 return 1;
             }
             if (enable_radiation_exchange && !gpu_thermal_cfg) {

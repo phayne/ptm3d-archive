@@ -830,11 +830,42 @@ byte-identical and `avg` differs by the device's float32 running-sum error
 check on any new run.
 
 **Which solver paths carry it.** The CPU SIMD-batch solver (the shipped default),
-the GPU persistent solver on any device count, and the GPU radiation-coupling
-selected-faces re-thermal. The **CPU scalar** path (`--no-simd-batch`) gives every
-face its own depth grid, so one set of per-depth node indices and weights cannot
-describe it; that path, and a radiation-coupled run on the CPU solver, **refuse**
-rather than sample the wrong nodes. Every refusal names the fix.
+the GPU persistent solver on any device count, the GPU radiation-coupling
+selected-faces re-thermal, and — since 2026-09-07 — both **CPU scalar** paths
+(`--no-simd-batch`, and the streamed fallback it drops into on a large mesh),
+*provided no per-face thermal property map is loaded*. A radiation-coupled run on
+the CPU solver still **refuses**. Every refusal names the fix.
+
+**Why the CPU scalar path has a condition.** It builds a `Profile`, and therefore
+a depth grid, per face. The only per-face input to that grid is `H`, so without a
+per-face `H` map every face lands on the same grid, the plan resolved against the
+reference grid describes all of them, and the product is the SIMD-batch product
+computed one face at a time. That is not assumed: the run compares **each face's
+own grid** against the plan's before folding that face in, and stops if any face
+disagrees. With `thermal.h_parameter_map`, `thermal.thermal_inertia_map` or
+`thermal.use_default_property_map` set, the grids genuinely differ and the run
+refuses — before the illumination phase where the configuration alone settles it,
+and at the solver otherwise.
+
+That refusal is a decision about the *product*, not only about the file name.
+Snapping each face to its own nearest node would leave the name (one depth)
+describing a surface that undulates facet to facet. Turning snapping off repairs
+the name — every facet is then interpolated to exactly the requested depth — but
+not `depth_map_z.json`, which carries one `native_z_m`, one `node_j`, one
+`weight_on_j_plus_1` and one interpolation-error figure per depth, each of which
+would be a distribution over facets. Publishing one facet's numbers as the
+manifest for a map assembled from many is the class of defect the rest of these
+refusals exist to prevent. A map on a per-face grid needs a per-face error budget,
+and this engine does not write one.
+
+**Measured, on the shipped 12,800-facet lunar crater at depths 0, 0.05 and
+0.25 m.** The z = 0 map is byte-identical to `statistics/temperature_*.bin` on the
+CPU scalar path, as it is on the others — there the surface node it publishes *is*
+the column's node 0, so no re-evaluated surface value is substituted. Against the
+CPU SIMD-batch path at the same depths, the two solvers' maps agree to within the
+margin by which their **surface** products already differ: surface `avg`
+max |ΔT| 0.205 K, and at 0.053 m and 0.218 m 0.137 K and 0.118 K. The depth
+sampling adds nothing beyond the solvers' own disagreement.
 
 **Chunked runs.** With `write_raw_stats: true`, `ptm_merge_chunks` discovers the
 depth fields from chunk 0 and refuses if any chunk carries a different depth set
