@@ -1144,6 +1144,21 @@ void IlluminationModel::processRayBatch() {
     tls_batch_size = 0;
 }
 
+// The ONE spelling of "the GPU ray path is usable" -- see the header. This is
+// the exact three-term condition traceOccluded has always used; the only change
+// is that it now has a name, so a caller that compiles in both configurations
+// can ask the question without naming GPU-only members.
+bool IlluminationModel::gpuRayPathReady() const {
+#ifdef PTM_GPU_OPENCL
+    return use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_;
+#else
+    // On a CPU-only build there is no pool and no uploaded mesh, and nothing
+    // ever sets use_gpu_ray_tracer_ true. Returning false unconditionally is
+    // the same answer, arrived at without naming members that do not exist.
+    return false;
+#endif
+}
+
 // The tnear rule for the batched occlusion path. Extracted from the lambda that
 // used to live inside traceOccluded so that shadowRayTnear() can report the value
 // the rays ACTUALLY use rather than a second copy of the formula that would agree
@@ -1167,8 +1182,10 @@ std::vector<uint8_t> IlluminationModel::traceOccluded(
     if (n == 0) return blocked;
 
 #ifdef PTM_GPU_OPENCL
-    // Use GPU ray tracer if available
-    if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_) {
+    // Use GPU ray tracer if available. The CONDITION is gpuRayPathReady(); the
+    // CALL stays inside the guard because traceOccludedGPU does not exist on a
+    // CPU build.
+    if (gpuRayPathReady()) {
         return traceOccludedGPU(origins, directions);
     }
 #endif
@@ -6688,7 +6705,15 @@ void IlluminationModel::probeOccludedBatch(
         const std::vector<std::array<double, 3>>& origins,
         const std::vector<std::array<double, 3>>& directions,
         std::vector<uint8_t>& blocked) {
-    if (!embree_scene_ && !(use_gpu_ray_tracer_ && gpu_mesh_uploaded_)) {
+    // ⛔ gpuRayPathReady(), not a hand-written condition. The previous spelling
+    // named gpu_mesh_uploaded_ directly, which is declared only under
+    // PTM_GPU_OPENCL -- it built green with the GPU on and broke the CPU-only
+    // build. It was also WRONG on the GPU build: it omitted gpu_ray_pool_, so a
+    // tracer flagged on with no pool passed this check, fell through
+    // traceOccluded -> traceOccludedGPU -> the CPU fallback -> no Embree scene,
+    // and returned an all-zero (NOT blocked) vector. That is precisely the
+    // fabricated clear sky this guard exists to prevent.
+    if (!embree_scene_ && !gpuRayPathReady()) {
         // Do NOT return "all clear". A passive probe reading an unbuilt scene as
         // open sky would report a 0.0 m ceiling everywhere -- a perfect-looking,
         // completely wrong field. Return ALL BLOCKED and say so once; the caller

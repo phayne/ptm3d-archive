@@ -1050,6 +1050,22 @@ private:
     // GPU-only. On a CPU build nothing ever sets it true, so the guarded
     // branches elide with zero behavior change.
     bool use_gpu_ray_tracer_ = false;
+
+    // ⛔ THE ONE SPELLING OF "the GPU ray path is usable".
+    //
+    // The members it tests (gpu_ray_pool_, gpu_mesh_uploaded_) are declared ONLY
+    // under PTM_GPU_OPENCL, so any code that compiles in BOTH configurations and
+    // names them directly builds green here and fails the CPU-only build. That
+    // is not hypothetical: probeOccludedBatch did exactly that and broke CI,
+    // while the canonical rebuild.sh builds GPU-ON and every validation arm is a
+    // GPU arm -- so no local gate could have caught it.
+    //
+    // Declared unconditionally, defined in both configurations (CPU-only returns
+    // false, and nothing on a CPU build can make it true). Call it instead of
+    // re-spelling the condition; a call to a GPU-only FUNCTION still has to sit
+    // inside a guard, because the function does not exist, but the CONDITION
+    // never needs one again.
+    bool gpuRayPathReady() const;
 #ifdef PTM_GPU_OPENCL
     std::unique_ptr<gpu::opencl::BVHBuilder> gpu_bvh_;
     std::unique_ptr<gpu::opencl::BVHGPUPool> gpu_ray_pool_;
