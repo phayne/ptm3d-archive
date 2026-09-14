@@ -5,6 +5,7 @@
 #include "flux_cube_format.h"
 #include "../radiation/radiosity_reconstruction.h"
 #include "../illumination/primary_disk.h"
+#include "../illumination/solar_disk_visibility.h"
 
 #include <algorithm>
 #include <cmath>
@@ -139,54 +140,22 @@ void sampleDisk(const V3& origin_km, const V3& primary_pos_km, double radius_km,
     }
 }
 
-// Unoccluded fraction of the SOLAR DISK seen from `o`, using the ENGINE'S OWN
-// ladder primitives (ptm::disk::probeOffset / hammersley / squareToConcentricDisk,
-// the same functions illumination_model.cpp:4360-4368 escalates through). Not a
-// second sampler: the shape of the ladder and the point set are the engine's.
+// Unoccluded fraction of the SOLAR DISK seen from `o`.
 //
-//   alpha <= 0            -> point sun, binary test (legacy behavior)
-//   5-probe unanimous     -> 1 or 0, no further rays
-//   5-probe split         -> `samples` directions across the disk
-//
-// Returns the fraction in [0,1]; `split` reports whether the disk was partially
-// occluded, which is what the penumbral flag should mean.
+// The ladder used to live here. It now lives in
+// illumination/solar_disk_visibility.h, because the shadow-depth pass asks the
+// identical question from a point above the surface and two copies of it would
+// be the PTM-45(ii) drift class. This is a thin V3 adapter over that one
+// spelling; `{0,0,0}` selects the historical disk basis, so the arithmetic is
+// unchanged.
 double solarDiskVisibility(const V3& o, const V3& s_hat, double alpha,
                            int samples,
                            const std::function<bool(const std::array<double,3>&,
                                                     const std::array<double,3>&)>& occluded,
                            bool& split) {
-    split = false;
-    if (alpha <= 0.0) return occluded(arr(o), arr(s_hat)) ? 0.0 : 1.0;
-    // Disk basis perpendicular to the Sun direction.
-    const V3 a = (std::fabs(s_hat.z) < 0.9) ? V3{0, 0, 1} : V3{1, 0, 0};
-    const V3 t = unit3({a.y * s_hat.z - a.z * s_hat.y,
-                        a.z * s_hat.x - a.x * s_hat.z,
-                        a.x * s_hat.y - a.y * s_hat.x});
-    const V3 b = {s_hat.y * t.z - s_hat.z * t.y,
-                  s_hat.z * t.x - s_hat.x * t.z,
-                  s_hat.x * t.y - s_hat.y * t.x};
-    const double ta = std::tan(alpha);
-    auto dir = [&](double dx, double dy) {
-        return unit3(add(s_hat, add(mul(t, dx * ta), mul(b, dy * ta))));
-    };
-    int clear = 0;
-    for (uint32_t k = 0; k < ptm::disk::PRIMARY_DISK_PROBES; ++k) {
-        double dx, dy;
-        ptm::disk::probeOffset(k, dx, dy);
-        if (!occluded(arr(o), arr(dir(dx, dy)))) ++clear;
-    }
-    if (clear == 0) return 0.0;
-    if (clear == static_cast<int>(ptm::disk::PRIMARY_DISK_PROBES)) return 1.0;
-    split = true;
-    const uint32_t N = static_cast<uint32_t>(std::max(8, samples));
-    int hit = 0;
-    for (uint32_t i = 0; i < N; ++i) {
-        double u, v, dx, dy;
-        ptm::disk::hammersley(i, N, 0.0, 0.0, u, v);
-        ptm::disk::squareToConcentricDisk(u, v, dx, dy);
-        if (!occluded(arr(o), arr(dir(dx, dy)))) ++hit;
-    }
-    return static_cast<double>(hit) / static_cast<double>(N);
+    return ptm::disk::solarDiskVisibility(arr(o), arr(s_hat), alpha, samples,
+                                          ptm::disk::Vec3{0.0, 0.0, 0.0},
+                                          occluded, split);
 }
 
 }  // namespace
@@ -567,6 +536,8 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
 
     // ----------------------------------------------------------------- write
     const std::string dir = in.output_dir + "/flux_cubes";
+    const std::string stem = in.output_stem.empty() ? std::string("flux_cubes")
+                                                    : in.output_stem;
     try { std::filesystem::create_directories(dir); }
     catch (const std::exception& e) { err = std::string("flux cubes: cannot create output dir: ") + e.what(); return false; }
 
@@ -638,7 +609,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
         h.json_len = static_cast<uint32_t>(json.size());
         h.has_names = c.names.empty() ? 0u : 1u;
 
-        const std::string fp = dir + "/flux_cubes.fcb";
+        const std::string fp = dir + "/" + stem + ".fcb";
         std::ofstream o(fp, std::ios::binary);
         if (!o) { err = "flux cubes: cannot write " + fp; return false; }
         o.write(reinterpret_cast<const char*>(&h), sizeof(h));
@@ -683,7 +654,8 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
     }
 
     if (in.write_csv) {
-        const std::string cdir = dir + "/csv";
+        const std::string cdir = dir + ((stem == "flux_cubes") ? std::string("/csv")
+                                                              : ("/csv_" + stem));
         try { std::filesystem::create_directories(cdir); }
         catch (const std::exception& e) { err = std::string("flux cubes: cannot create csv dir: ") + e.what(); return false; }
         // A cap on the lattice fan-out must never drop a NAMED location: those

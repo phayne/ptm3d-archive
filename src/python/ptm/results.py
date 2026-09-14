@@ -73,8 +73,21 @@ STATISTICS_FIELDS = {
     'direct_solar':      {'label': 'Direct Solar',        'units': 'W/m^2'},
     'primary_reflected': {'label': 'Primary Reflected',   'units': 'W/m^2'},
     'primary_ir':        {'label': 'Primary IR',          'units': 'W/m^2'},
+    # Shadow depth: the maximum height above the local surface at which the Sun
+    # is not even partially visible (the umbral ceiling), meters, measured along
+    # the body radial. avg/max/min are over RESOLVED, NONZERO epochs only --
+    # statistics/shadow_depth.json carries the sentinel encoding, the search
+    # ladder and its resolution, and the epoch window.
+    'shadow_depth':      {'label': 'Shadow Depth', 'units': 'm'},
     # scalar=True: single per-face value (no avg/max/min split).
     'ice_depth':         {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
+    # The two populations the depth statistics deliberately exclude. A PSR face
+    # is unresolved (+inf) at most epochs BY DESIGN -- no number is invented for
+    # it -- so these fractions are how that shows up in a map.
+    'shadow_lit_frac':   {'label': 'Fraction of Epochs Lit at the Surface',
+                          'units': '', 'scalar': True},
+    'shadow_unresolved_frac': {'label': 'Fraction of Epochs Umbral Above the Search Ceiling',
+                               'units': '', 'scalar': True},
 }
 
 # --- Subsurface temperature maps -------------------------------------------

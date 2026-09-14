@@ -1,6 +1,7 @@
 #include "../mesh/mesh_utils.h"
 #include "../illumination/illumination_model.h"
 #include "../fluxcubes/flux_cube_pass.h"
+#include "../illumination/shadow_depth_pass.h"
 #include "../constants/constants.h"
 // Header-only, and deliberately NOT behind the GPU guard: the eq_extrapolation
 // knob has to be parsed and refused in CPU-only builds too.
@@ -24411,9 +24412,55 @@ int main(int argc, char** argv) {
     // export passes `time_steps` against these same arrays, which is a live
     // defect; do not copy its pattern here.
     if (sim_config.flux_cubes.enabled) {
-        std::cout << "\n[flux-cubes] enabled; running post-solve pass." << std::endl;
+        // MULTI-HEIGHT. A geometry cache carries ONE height (FcgHeader.height_m
+        // is a scalar and part of the cache key), so "cubes at three heights" is
+        // three caches over ONE thermal solve: the terrain field does not depend
+        // on how high the fixture sits, and re-solving per height would triple
+        // the cost of a window to recompute an identical temperature field.
+        //
+        // `cache_files` (a list) and `cache_file` (one) are resolved to the same
+        // vector here; setting both is already refused in the parser.
+        std::vector<std::string> fc_caches = sim_config.flux_cubes.cache_files;
+        if (fc_caches.empty() && !sim_config.flux_cubes.cache_file.empty())
+            fc_caches.push_back(sim_config.flux_cubes.cache_file);
+        if (fc_caches.empty()) {
+            std::cerr << "[FATAL] flux cubes: flux_cubes.enabled is true but neither "
+                         "`cache_file` nor `cache_files` names a geometry cache. A run "
+                         "asked for a product must not succeed having produced none.\n";
+            return 1;
+        }
+        // Output stems, resolved and collision-checked BEFORE any pass runs.
+        // Doing it inside the loop meant the first cache had already written its
+        // .fcb before the clash was found -- the run still failed, but it left a
+        // partial product behind, and a partial product is the thing somebody
+        // picks up later.
+        std::vector<std::string> fc_stems(fc_caches.size(), "flux_cubes");
+        if (fc_caches.size() > 1) {
+            for (size_t ci = 0; ci < fc_caches.size(); ++ci) {
+                std::string stem = std::filesystem::path(fc_caches[ci]).stem().string();
+                // A cache path is operator input and the stem becomes a path
+                // component; sanitize it to a file-name-safe form.
+                for (char& ch : stem)
+                    if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-'))
+                        ch = '_';
+                if (stem.empty()) stem = "cache" + std::to_string(ci);
+                fc_stems[ci] = "flux_cubes_" + stem;
+            }
+            for (size_t ci = 0; ci < fc_stems.size(); ++ci) {
+                for (size_t cj = 0; cj < ci; ++cj) {
+                    if (fc_stems[cj] != fc_stems[ci]) continue;
+                    std::cerr << "[FATAL] flux cubes: caches " << cj << " and " << ci
+                              << " (" << fc_caches[cj] << ", " << fc_caches[ci]
+                              << ") have the same file-name stem '" << fc_stems[ci]
+                              << "', so their outputs would land on one path and the "
+                                 "second would overwrite the first. Rename one.\n";
+                    return 1;
+                }
+            }
+        }
+        std::cout << "\n[flux-cubes] enabled; running post-solve pass over "
+                  << fc_caches.size() << " geometry cache(s)." << std::endl;
         ptm::fluxcubes::PassInputs fcin;
-        fcin.cache_file = sim_config.flux_cubes.cache_file;
         fcin.n_faces_core = num_faces;
         // The same mesh-identity hash the corrected-VF gate uses.
         {
@@ -24573,11 +24620,118 @@ int main(int argc, char** argv) {
                           ? "UNIFORM planet.albedo FALLBACK (no per-face array was captured)"
                           : "per-face face_albedos_rad captured at the radiation block")
                   << std::endl;
-        std::string fc_err;
-        if (!ptm::fluxcubes::runFluxCubePass(fcin, fc_err)) {
-            // A run that was asked for a product and made none must FAIL, never
-            // downgrade to "ran without cubes".
-            std::cerr << "[FATAL] " << fc_err << std::endl;   // fc_err is already prefixed
+        // One pass per cache. The output stem is the cache's own file name, so
+        // the three products are traceable to the three caches by inspection;
+        // each .fcb still carries its own height_m in the header and the JSON,
+        // so the file is self-describing whatever it is called. A SINGLE cache
+        // keeps the historical stem and therefore the historical file names.
+        for (size_t ci = 0; ci < fc_caches.size(); ++ci) {
+            fcin.cache_file = fc_caches[ci];
+            fcin.output_stem = fc_stems[ci];
+            std::cout << "[flux-cubes] cache " << (ci + 1) << "/" << fc_caches.size()
+                      << ": " << fcin.cache_file << " -> flux_cubes/"
+                      << fcin.output_stem << ".fcb" << std::endl;
+            std::string fc_err;
+            if (!ptm::fluxcubes::runFluxCubePass(fcin, fc_err)) {
+                // A run that was asked for a product and made none must FAIL,
+                // never downgrade to "ran without cubes".
+                std::cerr << "[FATAL] " << fc_err << std::endl;   // already prefixed
+                return 1;
+            }
+        }
+    }
+
+    // ========== SHADOW DEPTH (if requested) ==========
+    //
+    // A post-solve pass over (face x output epoch), for the same reason the
+    // flux-cube pass is one: the per-step illumination loop has three dispatch
+    // routes and hanging a height search inside it means three insertion points
+    // that must agree forever. Passive -- it reads arrays and writes its own
+    // files -- so `enabled: false` (the default) and `true` must both leave every
+    // other output byte-identical.
+    if (sim_config.shadow_depth.enabled) {
+        std::cout << "\n[shadow-depth] enabled; running post-solve pass." << std::endl;
+        ptm::shadowdepth::PassInputs sdin;
+        sdin.face_centers = &mesh->face_centers;
+        sdin.face_normals = &mesh->face_normals;
+        sdin.n_faces = num_faces;
+        sdin.times = &filtered_times;
+        sdin.time_strings = &filtered_time_strings;
+        sdin.equilibration_steps = equilibration_steps;
+        sdin.total_time_steps = total_time_steps;
+        sdin.sun_positions = &sun_positions;
+        sdin.solar_radius_km = constants::SUN_RADIUS;
+        sdin.solar_disk_samples = sim_config.shadow_depth.solar_disk_samples;
+        sdin.h_max_m = sim_config.shadow_depth.h_max_m;
+        sdin.march_steps = sim_config.shadow_depth.march_steps;
+        sdin.bisect_rounds = sim_config.shadow_depth.bisect_rounds;
+        sdin.write_frames = sim_config.shadow_depth.write_frames;
+        sdin.write_raw_stats = sim_config.output.write_raw_stats;
+        sdin.monotonicity_faces = sim_config.shadow_depth.monotonicity_faces;
+        sdin.monotonicity_epochs = sim_config.shadow_depth.monotonicity_epochs;
+        sdin.output_dir = output_dir;
+        // ⛔ UNITS: sun_positions is in KM; the mesh frame is METERS for
+        // lunar/Europa DEMs and KILOMETERS for asteroid shape models. Same
+        // detection the illumination model and the flux-cube block use.
+        {
+            double r0 = 0.0;
+            if (num_faces > 0) {
+                const auto& fc0 = mesh->face_centers[0];
+                r0 = std::sqrt(fc0[0]*fc0[0] + fc0[1]*fc0[1] + fc0[2]*fc0[2]);
+            }
+            const bool centers_in_meters = (r0 > 10000.0);
+            sdin.mesh_to_km = centers_in_meters ? 1.0e-3 : 1.0;
+            std::cout << "[shadow-depth] mesh frame detected as "
+                      << (centers_in_meters ? "METERS" : "KILOMETERS")
+                      << " (|face_center[0]| = " << r0 << "); mesh_to_km = "
+                      << sdin.mesh_to_km << std::endl;
+        }
+        // The consistency gate against the engine's own illumination field. The
+        // flat array is strided by total_time_steps, NOT by the output count.
+        {
+            const size_t expect = num_faces * static_cast<size_t>(total_time_steps);
+            if (direct_solar_values.size() == expect) {
+                sdin.direct_solar = &direct_solar_values;
+            } else {
+                std::cerr << "[shadow-depth] WARNING: the direct-solar array is "
+                          << direct_solar_values.size() << " long, not the expected "
+                          << expect << " (a streamed illumination path frees it). The "
+                             "consistency gate against direct_solar will NOT run, and "
+                             "statistics/shadow_depth.json records that it did not -- "
+                             "it is not a pass.\n";
+            }
+        }
+        if (illumination_model && (illumination_model->hasEmbreeScene())) {
+            IlluminationModel* im = illumination_model.get();
+            sdin.occluded_batch = [im](const std::vector<std::array<double, 3>>& o,
+                                       const std::vector<std::array<double, 3>>& d,
+                                       std::vector<uint8_t>& b) {
+                im->probeOccludedBatch(o, d, b);
+            };
+            sdin.scene_has_offset = im->sceneHasOriginOffset();
+            // The tnear the rays will ACTUALLY use, evaluated at a real face
+            // centroid in this scene -- not a formula repeated here.
+            sdin.resolved_tnear_m = (num_faces > 0)
+                ? im->shadowRayTnear(mesh->face_centers[0]) : -1.0;
+        } else {
+            std::cerr << "[shadow-depth] the illumination model has no ray-traced scene "
+                         "at post-solve time; the pass will refuse rather than report a "
+                         "clear sky at every face.\n";
+        }
+        {
+            std::ostringstream pj;
+            pj << "{\"engine_git_sha\":\"" << PTM_BUILD_GIT_SHA << "\""
+               << ",\"engine_build_type\":\"" << PTM_BUILD_TYPE << "\""
+               << ",\"config_used_path\":\"" << (output_dir + "/config_used.yaml") << "\""
+               << ",\"mesh_core\":\"" << sim_config.mesh.import_file << "\""
+               << ",\"mesh_ring\":\"" << sim_config.mesh.occluder_file << "\""
+               << ",\"n_faces\":" << num_faces << "}";
+            sdin.provenance_json = pj.str();
+        }
+        std::string sd_err;
+        if (!ptm::shadowdepth::runShadowDepthPass(sdin, sd_err)) {
+            // A run that was asked for a product and made none must FAIL.
+            std::cerr << "[FATAL] " << sd_err << std::endl;
             return 1;
         }
     }

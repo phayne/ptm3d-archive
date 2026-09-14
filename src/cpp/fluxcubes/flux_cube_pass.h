@@ -119,6 +119,17 @@ struct PassInputs {
 
     // --- output ----------------------------------------------------------
     std::string output_dir;            // run directory; files land in flux_cubes/
+    // File stem inside flux_cubes/, without extension. "flux_cubes" (the
+    // default) gives the historical flux_cubes/flux_cubes.fcb and
+    // flux_cubes/csv/, so a single-cache run is byte-for-byte and name-for-name
+    // what it always was.
+    //
+    // A MULTI-HEIGHT run consumes several caches in one pass over one thermal
+    // solve and must not write them all to one path. The caller gives each pass
+    // its own stem; the .fcb still carries its own height_m in the header AND in
+    // the JSON, so every file stays self-describing and no reader -- including
+    // the HDF5 packager, which takes an explicit .fcb path -- needs to change.
+    std::string output_stem = "flux_cubes";
     bool write_binary = true;
     bool write_csv = true;
     int  write_csv_max_cubes = 0;      // 0 = every cube

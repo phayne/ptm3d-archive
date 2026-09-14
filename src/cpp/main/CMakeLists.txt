@@ -23,6 +23,7 @@ target_link_libraries(ptm_thermal_sim
     fileio
     radiation
     flux_cubes
+    shadow_depth
     ${CSPICE_LIBRARIES}
     ${EMBREE_LIBRARIES}
     ${OpenMP_CXX_LIBRARIES}

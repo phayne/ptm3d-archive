@@ -1144,6 +1144,19 @@ void IlluminationModel::processRayBatch() {
     tls_batch_size = 0;
 }
 
+// The tnear rule for the batched occlusion path. Extracted from the lambda that
+// used to live inside traceOccluded so that shadowRayTnear() can report the value
+// the rays ACTUALLY use rather than a second copy of the formula that would agree
+// today and drift later. Arithmetic unchanged.
+float IlluminationModel::tnearForLocalOrigin(const std::array<double,3>& org_local) {
+    const double r = std::sqrt(org_local[0]*org_local[0] +
+                               org_local[1]*org_local[1] +
+                               org_local[2]*org_local[2]);
+    const double ulp = std::numeric_limits<double>::epsilon() * r;
+    const double scaled = std::max(1e-6 * r, 0.01);  // 1 ppm of radius, min 1 cm
+    return static_cast<float>(std::max(16.0 * ulp, scaled));
+}
+
 std::vector<uint8_t> IlluminationModel::traceOccluded(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions,
@@ -1162,15 +1175,6 @@ std::vector<uint8_t> IlluminationModel::traceOccluded(
 
     // Fall back to CPU Embree
     if (!embree_scene_) return blocked;
-
-    auto estimate_tnear = [&](const std::array<double,3>& org_local) -> float {
-        const double r = std::sqrt(org_local[0]*org_local[0] +
-                                   org_local[1]*org_local[1] +
-                                   org_local[2]*org_local[2]);
-        const double ulp = std::numeric_limits<double>::epsilon() * r;
-        const double scaled = std::max(1e-6 * r, 0.01);  // 1 ppm of radius, min 1 cm
-        return static_cast<float>(std::max(16.0 * ulp, scaled));
-    };
 
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n; ++i) {
@@ -1194,7 +1198,7 @@ std::vector<uint8_t> IlluminationModel::traceOccluded(
         ray.dir_x = static_cast<float>(directions[i][0] * inv_dl);
         ray.dir_y = static_cast<float>(directions[i][1] * inv_dl);
         ray.dir_z = static_cast<float>(directions[i][2] * inv_dl);
-        ray.tnear = estimate_tnear(org_local_d);
+        ray.tnear = tnearForLocalOrigin(org_local_d);
         ray.tfar  = 1.0e30f;
         ray.mask  = 0xFFFFFFFFu;
         ray.flags = 0;
@@ -6678,6 +6682,39 @@ bool IlluminationModel::probeOccluded(const std::array<double, 3>& origin,
     std::vector<std::array<double, 3>> o{origin}, d{direction};
     const std::vector<int> hit = intersectsFirst(o, d);
     return !hit.empty() && hit[0] >= 0;
+}
+
+void IlluminationModel::probeOccludedBatch(
+        const std::vector<std::array<double, 3>>& origins,
+        const std::vector<std::array<double, 3>>& directions,
+        std::vector<uint8_t>& blocked) {
+    if (!embree_scene_ && !(use_gpu_ray_tracer_ && gpu_mesh_uploaded_)) {
+        // Do NOT return "all clear". A passive probe reading an unbuilt scene as
+        // open sky would report a 0.0 m ceiling everywhere -- a perfect-looking,
+        // completely wrong field. Return ALL BLOCKED and say so once; the caller
+        // is expected to have refused before getting here (the pass requires a
+        // scene origin offset, which an unbuilt scene does not have).
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[IlluminationModel] WARNING: probeOccludedBatch called with no "
+                         "ray-traced scene; reporting ALL BLOCKED rather than all clear, "
+                         "because a clear-sky answer here fabricates an unshadowed "
+                         "terrain.\n";
+        }
+        blocked.assign(origins.size(), 1);
+        return;
+    }
+    blocked = traceOccluded(origins, directions, /*coherent=*/false);
+}
+
+double IlluminationModel::shadowRayTnear(const std::array<double, 3>& origin_world) const {
+    const std::array<double, 3> org_local = {
+        origin_world[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin_world[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin_world[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    return static_cast<double>(tnearForLocalOrigin(org_local));
 }
 
 double IlluminationModel::probePrimaryHeating(double mean_cos, double primary_distance) {

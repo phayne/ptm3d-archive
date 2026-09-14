@@ -34,3 +34,22 @@ if(ENABLE_GPU AND TARGET ptm_gpu)
     target_link_libraries(illumination_model PUBLIC ptm_gpu)
     target_compile_definitions(illumination_model PUBLIC PTM_GPU_OPENCL)
 endif()
+# ---------------------------------------------------------------------------
+# Shadow depth: the umbral-ceiling post-solve pass.
+#
+# A SEPARATE, dependency-light library on purpose. Like flux_cubes it takes its
+# ray casting as a callback and links no Embree, no CSPICE and no illumination
+# model, so the standalone falsifier can exercise it against synthetic geometry
+# with closed-form answers. Linking it into illumination_model would make the
+# test drag in a scene lifetime that only exists inside a running simulation.
+# ---------------------------------------------------------------------------
+add_library(shadow_depth STATIC
+    shadow_depth_pass.cpp
+)
+target_include_directories(shadow_depth PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/cpp
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(shadow_depth PUBLIC OpenMP::OpenMP_CXX)
+endif()

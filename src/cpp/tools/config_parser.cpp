@@ -225,6 +225,7 @@ void warnUnreadFluxCubeKeys(const YAML::Node& fc) {
 
     static const char* const kRead[] = {
         "cache_file",
+        "cache_files",
         "enabled",
         "locations",
         "shadow_probe_rays",
@@ -270,6 +271,41 @@ void warnUnreadFluxCubeKeys(const YAML::Node& fc) {
          << " key(s) under `flux_cubes:` are read by nothing and have NO effect: ";
     for (size_t i = 0; i < dead.size(); ++i) line << (i ? ", " : "") << dead[i];
     line << " -- editing them changes no result. See docs/flux-cubes.md.";
+    std::cerr << line.str() << std::endl;
+}
+
+// Same contract as warnUnreadFluxCubeKeys, for `shadow_depth:`. Every key the
+// `root["shadow_depth"]` branch consumes must appear here; the reads are
+// individual statements, so the list cannot be derived and this comment is the
+// contract. A typo in this block would otherwise be a silently ignored setting
+// on a product whose whole cost is set by these numbers.
+void warnUnreadShadowDepthKeys(const YAML::Node& sd) {
+    if (!sd || !sd.IsMap()) return;
+    static const char* const kRead[] = {
+        "bisect_rounds",
+        "enabled",
+        "h_max_m",
+        "march_steps",
+        "monotonicity_epochs",
+        "monotonicity_faces",
+        "solar_disk_samples",
+        "write_frames",
+    };
+    std::vector<std::string> dead;
+    for (const auto& kv : sd) {
+        std::string key;
+        try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+        bool is_read = false;
+        for (const char* r : kRead) { if (key == r) { is_read = true; break; } }
+        if (!is_read) dead.push_back(key);
+    }
+    if (dead.empty()) return;
+    std::sort(dead.begin(), dead.end());
+    std::ostringstream line;
+    line << "[config] WARNING: " << dead.size()
+         << " key(s) under `shadow_depth:` are read by nothing and have NO effect: ";
+    for (size_t i = 0; i < dead.size(); ++i) line << (i ? ", " : "") << dead[i];
+    line << " -- editing them changes no result.";
     std::cerr << line.str() << std::endl;
 }
 
@@ -732,6 +768,42 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             const auto& fc = root["flux_cubes"];
             config.flux_cubes.enabled = getWithDefault(fc, "enabled", config.flux_cubes.enabled);
             config.flux_cubes.cache_file = getWithDefault(fc, "cache_file", config.flux_cubes.cache_file);
+            // MULTI-HEIGHT cache list. A cache carries ONE height (FcgHeader's
+            // height_m is a scalar and part of the cache key), so three heights
+            // is three caches consumed by one run.
+            //
+            // ⛔ Guarded, because this is the SEVENTH key in this parser read as
+            // a sequence and the failure is invisible by construction: yaml-cpp
+            // iterates a scalar as an EMPTY range, so `cache_files: layout.fcg`
+            // would leave the list empty and the run would produce no cubes,
+            // print nothing, and exit 0. Same guard, same reasons, as
+            // output.map_depths_m (PTM-CONFIG-SEQUENCE-SCALAR-SILENT).
+            if (fc["cache_files"]) {
+                requireYamlSequence(fc["cache_files"], "flux_cubes.cache_files",
+                                    "geometry cache paths, one per cube height",
+                                    "no cache would be loaded and the run would "
+                                    "produce NO flux cubes at all while exiting 0",
+                                    "flux_cubes:\n      cache_files:\n"
+                                    "        - site_h0p35.fcg\n"
+                                    "        - site_h1p00.fcg");
+                config.flux_cubes.cache_files.clear();
+                for (const auto& v : fc["cache_files"]) {
+                    const std::string path = v.as<std::string>();
+                    if (!path.empty()) config.flux_cubes.cache_files.push_back(path);
+                }
+            }
+            // Both spellings set is an ambiguity, not a merge. Which one wins is
+            // not a question a config file should be allowed to leave open, and
+            // silently preferring one would make the other look honored.
+            if (!config.flux_cubes.cache_files.empty() &&
+                !config.flux_cubes.cache_file.empty()) {
+                throw std::runtime_error(
+                    "flux_cubes: BOTH `cache_file` and `cache_files` are set. They are "
+                    "the single-cache and multi-height spellings of the same input and "
+                    "only one can be honored; picking one silently would make the other "
+                    "look like it was read. Use `cache_files:` (a list) for one or more "
+                    "heights, or `cache_file:` for exactly one.");
+            }
             config.flux_cubes.write_binary = getWithDefault(fc, "write_binary", config.flux_cubes.write_binary);
             config.flux_cubes.write_csv = getWithDefault(fc, "write_csv", config.flux_cubes.write_csv);
             config.flux_cubes.write_csv_max_cubes = getWithDefault(fc, "write_csv_max_cubes", config.flux_cubes.write_csv_max_cubes);
@@ -772,6 +844,21 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 }
             }
             warnUnreadFluxCubeKeys(fc);
+        }
+
+        // Parse the shadow-depth section. Same top-level placement, same
+        // PTM-67 reasoning, as flux_cubes.
+        if (root["shadow_depth"]) {
+            const auto& sd = root["shadow_depth"];
+            config.shadow_depth.enabled = getWithDefault(sd, "enabled", config.shadow_depth.enabled);
+            config.shadow_depth.h_max_m = getWithDefault(sd, "h_max_m", config.shadow_depth.h_max_m);
+            config.shadow_depth.march_steps = getWithDefault(sd, "march_steps", config.shadow_depth.march_steps);
+            config.shadow_depth.bisect_rounds = getWithDefault(sd, "bisect_rounds", config.shadow_depth.bisect_rounds);
+            config.shadow_depth.solar_disk_samples = getWithDefault(sd, "solar_disk_samples", config.shadow_depth.solar_disk_samples);
+            config.shadow_depth.write_frames = getWithDefault(sd, "write_frames", config.shadow_depth.write_frames);
+            config.shadow_depth.monotonicity_faces = getWithDefault(sd, "monotonicity_faces", config.shadow_depth.monotonicity_faces);
+            config.shadow_depth.monotonicity_epochs = getWithDefault(sd, "monotonicity_epochs", config.shadow_depth.monotonicity_epochs);
+            warnUnreadShadowDepthKeys(sd);
         }
 
         // Parse Radiation section

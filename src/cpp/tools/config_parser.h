@@ -577,6 +577,24 @@ struct SimulationConfig {
         // "run without cubes" -- a run asked for a product must not succeed
         // quietly having produced none.
         std::string cache_file = "";
+        // MULTI-HEIGHT. A cache carries ONE height: FcgHeader.height_m is a
+        // scalar and it is part of the cache key, so "cubes at 0.35 m, 1.0 m and
+        // 2.0 m" is three caches, not one. They are consumed in ONE run -- one
+        // thermal solve, three flux-cube passes, three .fcb outputs -- because
+        // re-running the solve per height would be three times the cost for a
+        // field that does not depend on the height at all.
+        //
+        // ⛔ THIS IS A LIST AND IT IS GUARDED. yaml-cpp iterates a SCALAR as an
+        // EMPTY range, so `cache_files: layout.fcg` would clear the vector and
+        // never fill it: a run with no cubes, no message and exit 0. Guarded in
+        // config_parser.cpp with requireYamlSequence, same as the six keys
+        // PTM-CONFIG-SEQUENCE-SCALAR-SILENT covered on 2026-09-06.
+        //
+        // Empty (the default) => the single-cache `cache_file` path, whose
+        // outputs keep their historical names. Setting BOTH is refused rather
+        // than merged: which one wins is not a question a config should leave
+        // open.
+        std::vector<std::string> cache_files;
         bool write_binary = true;      // flux_cubes/flux_cubes.fcb
         bool write_csv = true;         // flux_cubes/csv/cube_XXXXX.csv
         // 0 = every cube. On a 720-step production window the full fan-out is
@@ -603,6 +621,42 @@ struct SimulationConfig {
         };
         std::vector<NamedLocation> locations;
     } flux_cubes;
+
+    // Shadow depth -- the maximum height above the local surface at which the
+    // Sun is not even partially visible, per face and per output epoch.
+    //
+    // TOP LEVEL for the same reason flux_cubes is: nested under `output:` it
+    // would be reachable by the body-defaults machinery that makes
+    // `thermophysical:` decorative on a built-in body (PTM-67).
+    //
+    // `enabled: false` (the default) must be byte-neutral to every other
+    // output, and `true` must be too -- the pass reads arrays and writes its
+    // own files and touches no mesh field.
+    struct ShadowDepthParams {
+        bool enabled = false;
+        // The search ceiling. 5 m is Paul's number, from crew mobility and
+        // thermal constraints; it is configurable because that is a mission
+        // parameter and not a physical constant.
+        double h_max_m = 5.0;
+        // March rungs, then bisections inside the bracket the march found.
+        // Pure bisection is NOT an option here: it assumes the
+        // blocked-below/clear-above transition is single-valued and an overhang
+        // breaks that. Final bracket = h_max/(march_steps * 2^bisect_rounds) =
+        // 0.0195 m at the defaults.
+        int march_steps = 16;
+        int bisect_rounds = 4;
+        // Solar-disk escalation count when the 5-ray probe splits. The disk is
+        // the engine's own finite disk; the umbra is DEFINED by it.
+        int solar_disk_samples = 128;
+        // Per-epoch frames in shadow_depth/. The window statistics and the
+        // manifest are written regardless.
+        bool write_frames = true;
+        // Sampled monotonicity audit: rungs ABOVE the first clear one, which the
+        // march never looks at. 0 disables it, and the manifest then records a
+        // zero sample rather than a zero failure count.
+        int monotonicity_faces = 10000;
+        int monotonicity_epochs = 10;
+    } shadow_depth;
 
     // Radiation Exchange
     struct RadiationParams {

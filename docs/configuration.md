@@ -675,7 +675,8 @@ list.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | false | Run the flux-cube pass. Turning it on must be byte-neutral to every mesh field |
-| `cache_file` | string | `""` | Geometry cache built by `ptm_flux_cube_geom`. **Required** when enabled |
+| `cache_file` | string | `""` | Geometry cache built by `ptm_flux_cube_geom`. **Required** when enabled, unless `cache_files` is given |
+| `cache_files` | list[string] | — | **Multi-height.** One cache per cube height, all consumed by ONE run. Setting this *and* `cache_file` is refused |
 | `locations` | list[map] | — | Named locations (`name`, `lat_deg`, `lon_deg`, optional `height_m`, `edge_m`). The parser's only sequence of maps, so its per-entry fields have no dotted keys |
 | `write_binary` | bool | true | Write `flux_cubes/flux_cubes.fcb` |
 | `write_csv` | bool | true | Write `flux_cubes/csv/cube_XXXXX.csv` |
@@ -687,8 +688,93 @@ reported inert**: they live in the cache header, and honoring a YAML copy would
 create two sources of truth for one number. `warnUnreadFluxCubeKeys()` names any
 key the parser does not consume.
 
+### Cubes at more than one height
+
+A geometry cache carries **one** height: `FcgHeader.height_m` is a scalar and it
+is part of the cache key, so "cubes at 0.35 m, 1.0 m and 2.0 m" is three caches,
+not one. Build them with three `ptm_flux_cube_geom --height-m` runs and list them:
+
+```yaml
+flux_cubes:
+  enabled: true
+  cache_files:
+    - site_h0p35.fcg
+    - site_h1p00.fcg
+    - site_h2p00.fcg
+```
+
+One thermal solve, three flux-cube passes, three `.fcb` files. The terrain field
+does not depend on how high the fixture sits, so re-running the solve per height
+would triple the cost of a window to recompute an identical temperature field.
+
+Outputs are named after each cache's own file stem —
+`flux_cubes/flux_cubes_site_h0p35.fcb` — and every `.fcb` carries its own
+`height_m` in the binary header *and* in the JSON, so each file is
+self-describing and `scripts/ptm_flux_cubes_to_hdf5.py` (which takes an explicit
+`.fcb` path) needs no change. Two caches whose file-name stems collide are
+refused **before any pass runs**, so no partial product is left behind.
+
+A **single** cache — whether written as `cache_file:` or as a one-element
+`cache_files:` — keeps the historical `flux_cubes/flux_cubes.fcb` name and
+produces a byte-identical flux payload either way.
+
 **CLI-only for now.** There is no GUI surface for this section; whether to build
 one is decision DP-7 in [design/gui-update-plan.md](design/gui-update-plan.md).
+
+## shadow_depth
+
+**The maximum height above the local surface at which the Sun is not even
+partially visible** — the *umbral* ceiling — per face and per output epoch. Top
+level, for the same PTM-67 reason `flux_cubes` is.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | false | Run the shadow-depth pass. On or off must be byte-neutral to every other output |
+| `h_max_m` | float | 5.0 | Search ceiling, meters. Crew mobility and thermal constraints |
+| `march_steps` | int | 16 | March rungs from the surface to `h_max_m` |
+| `bisect_rounds` | int | 4 | Bisections inside the bracket the march found. Final bracket = `h_max_m / (march_steps * 2^bisect_rounds)` = 0.0195 m at the defaults |
+| `solar_disk_samples` | int | 128 | Disk samples when a unanimously *blocked* probe is escalated |
+| `write_frames` | bool | true | Per-epoch `shadow_depth/shadow_depth_%04d.bin` |
+| `monotonicity_faces` | int | 10000 | Faces sampled by the overhang audit (0 disables) |
+| `monotonicity_epochs` | int | 10 | Epochs sampled by the overhang audit (0 disables) |
+
+**Height is along the body radial**, not along the face normal — that is the
+definition, and it is the same vertical `ptm_flux_cube_geom` places its cubes
+along, so the two products stack by construction.
+
+**The Sun is a finite disk**, and that is what makes this the *umbral* ceiling
+rather than the penumbral one. The disk test is the engine's own ladder
+(`src/cpp/illumination/solar_disk_visibility.h`, shared with the flux-cube pass).
+Dropping the solar angular radius would move the answer by
+`d * sec^2(eps) * theta_sun` — 0.19 m at a 20 m occluder distance and 45 deg
+elevation, ten times the search resolution.
+
+**The search is march-then-bisect, not pure bisection.** Bisection assumes the
+blocked-below / clear-above transition is single-valued, and an overhang breaks
+that. The march finds the first clear rung from the surface upward, which is the
+contiguous umbral column a person standing there is inside.
+
+Outputs:
+
+| Path | Contents |
+|---|---|
+| `shadow_depth/shadow_depth_%04d.bin` | one frame per output epoch: `uint32` face count then `float32[F]` |
+| `statistics/shadow_depth_{avg,max,min}.bin` | over **resolved, nonzero** epochs only; `NaN` where a face had none |
+| `statistics/shadow_lit_frac.bin` | fraction of evaluated epochs with the Sun visible at the surface |
+| `statistics/shadow_unresolved_frac.bin` | fraction umbral above `h_max_m` |
+| `statistics/shadow_depth.json` | the manifest: ladder, resolution, sentinel encoding, solar-disk treatment, the resolved ray `tnear`, the epoch window, and the consistency-gate counts. Written **last**, so its presence certifies the maps beside it are complete |
+
+Sentinels: `0.0` means the Sun is visible at the surface; `+inf` (float32
+`0x7F800000`) means no clear height was found at or below `h_max_m`, which is
+**the majority value inside a permanently shadowed region by design** — no number
+is invented for it, the fractions report it structurally; `NaN` means the face
+was not evaluated.
+
+⚠️ **Chunked runs**: `scripts/run_chunked_simulation.py` force-sets
+`output.skip_time_series` for every chunk, so it **refuses** a config that asks
+for `write_frames: true`. Set `write_frames: false` (the window statistics and the
+manifest still merge correctly across chunks, from `statistics/_raw` sum/count
+side files) or run the window unchunked.
 
 ## gpu
 
@@ -1014,7 +1100,7 @@ See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
 
 ## Keys the engine reads as lists
 
-Six keys are read as YAML **sequences**. yaml-cpp iterates a scalar as an *empty*
+Seven keys are read as YAML **sequences**. yaml-cpp iterates a scalar as an *empty*
 sequence, so before 2026-09-06 writing one without brackets was a silent no-op —
 the value was dropped, the default stood, and nothing said so. All six now stop
 the run at config load, naming the value given and the list form that fixes it.
@@ -1027,6 +1113,7 @@ the run at config load, naming the value given and the list form that fixes it.
 | `illumination.gpu_device_ids` | **no explicit pin** | refused |
 | `radiation.gpu_device_ids` | **no explicit pin** | refused |
 | `generic_body.shape.semi_axes_km` | body keeps its **default** shape | refused |
+| `flux_cubes.cache_files` | no cache loaded; run produces **no flux cubes at all** and exits 0 | refused |
 
 ⚠️ **The `gpu_device_ids` case is a safety one, not a tidiness one.**
 `gpu_device_ids` overrides `gpu_devices` *only while it is non-empty*. A scalar

@@ -80,9 +80,12 @@ EXPECTED_SECTIONS = (
     # table because there is no dotted key for them -- see the note at the
     # locations block in config_parser.cpp.
     # `gpu` is the cross-cutting GPU safety policy (docs/gpu-wedge-guardrails.md).
+    # `shadow_depth` is the umbral-ceiling product (the maximum height above the
+    # local surface at which the Sun is not even partially visible). Top level
+    # for the same PTM-67 reason `flux_cubes` is.
     "advanced", "flux_cubes", "generic_body", "gpu", "illumination", "mesh",
     "output",
-    "radiation", "simulation", "thermal", "thermophysical",
+    "radiation", "shadow_depth", "simulation", "thermal", "thermophysical",
 )
 
 # Keys present in shipped example configs that the engine's parser never reads.
