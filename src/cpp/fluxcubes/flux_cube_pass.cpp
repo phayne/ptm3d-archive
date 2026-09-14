@@ -262,14 +262,66 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
         err = "flux cubes: times and time_strings disagree in length";
         return false;
     }
-    if (in.equilibration_steps + n_steps != in.total_time_steps) {
+    // ⛔ THE RELATION IS `<=`, NOT `==`, AND THAT IS NOT A LOOSENING.
+    // What this check exists to protect is the ABSOLUTE-step indexing below:
+    // every series read is at t = equilibration_steps + k for k in [0, n_steps),
+    // against arrays strided by total_time_steps (direct_solar) or sized to it
+    // (surface_temps, the indirect series, the ephemerides). The condition that
+    // keeps every one of those reads in range is
+    //     equilibration_steps + n_steps <= total_time_steps,
+    // and the `==` spelling was a stricter accident of the era before the
+    // checkpoint look-ahead existed. Loosening to `<=` cannot admit a read the
+    // `==` form forbade: under `==` the largest absolute index touched is
+    // total_time_steps - 1, and under `<=` it is equilibration_steps + n_steps
+    // - 1, which is no larger.
+    //
+    // A CHUNKED run sets thermal.checkpoint_lookahead_steps: 1, and
+    // ptm_thermal_sim.cpp:18284 then builds
+    //     total_time_steps = equilibration_steps + output_steps + look-ahead,
+    // while the exported epoch slice (the `times` handed here) is the contiguous
+    // range [equilibration_steps, equilibration_steps + time_steps) -- see the
+    // three export paths at ptm_thermal_sim.cpp:13719, 23559 and 23816, each of
+    // which slices contiguously and clamps at total_time_steps. So the engine
+    // GUARANTEES `<=` and produces `==` only when the look-ahead is zero.
+    // Requiring equality refused every chunked window: measured 118 + 59 != 178
+    // on a 2-chunk crater80N run. The same defect was fixed in
+    // shadow_depth_pass.cpp:137 first; this is the sibling it named.
+    //
+    // What must still hold, and what the absolute-step indexing below assumes,
+    // is that the exported epochs are the FIRST n_steps after equilibration.
+    if (in.equilibration_steps + n_steps > in.total_time_steps) {
         std::ostringstream m;
         m << "flux cubes: time-axis relation violated -- equilibration_steps ("
           << in.equilibration_steps << ") + output steps (" << n_steps
-          << ") != total_time_steps (" << in.total_time_steps
-          << "). The cube rows would not line up with time_steps.txt.";
+          << ") EXCEEDS total_time_steps (" << in.total_time_steps
+          << "). The per-epoch rows would index past the end of the series and "
+             "silently stop lining up with time_steps.txt.";
         err = m.str();
         return false;
+    }
+    {
+        const int extra = in.total_time_steps - in.equilibration_steps - n_steps;
+        if (extra > 0) {
+            // Say it out loud. One extra step is the documented chunk
+            // look-ahead; more than one is a configuration this pass has never
+            // been shown correct for, and it must not pass in silence.
+            std::cout << "[flux-cubes] time axis: " << in.equilibration_steps
+                      << " equilibration + " << n_steps << " output = "
+                      << (in.equilibration_steps + n_steps) << " of "
+                      << in.total_time_steps << " integrated steps; the extra "
+                      << extra << " step(s) are"
+                      << (extra == 1 ? " the chunk checkpoint look-ahead"
+                                     : " NOT the single-step chunk look-ahead -- "
+                                       "confirm what they are")
+                      << " and are integrated but not exported.\n";
+            if (extra > 1) {
+                std::cerr << "  [flux-cubes] WARNING: " << extra << " integrated steps "
+                             "are neither equilibration nor output. The exported epochs "
+                             "are assumed to be the FIRST " << n_steps
+                          << " after equilibration; if that is not true for this run, "
+                             "every cube row is mislabeled in time.\n";
+            }
+        }
     }
     if (n_steps > 1) {
         const double dt0 = (*in.times)[1] - (*in.times)[0];
