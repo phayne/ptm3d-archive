@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-193 keys across 11 sections.
+202 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -22,6 +22,7 @@ ENGINE_SECTIONS = (
     'mesh',
     'output',
     'radiation',
+    'shadow_depth',
     'simulation',
     'thermal',
     'thermophysical',
@@ -31,6 +32,7 @@ ENGINE_SECTIONS = (
 #: one nested list. Their entry in ENGINE_DEFAULTS is None, which means "no
 #: default in the parser", not "defaults to null".
 KEYS_WITHOUT_DEFAULT = (
+    'flux_cubes.cache_files',
     'flux_cubes.locations',
     'generic_body.shape.semi_axes_km',
     'illumination.gpu_device_ids',
@@ -48,6 +50,7 @@ ENGINE_DEFAULTS = {
     'advanced.default_visible_albedo': -1.0,
     'advanced.verbose': False,
     'flux_cubes.cache_file': '',
+    'flux_cubes.cache_files': None,
     'flux_cubes.enabled': False,
     'flux_cubes.locations': None,
     'flux_cubes.shadow_probe_rays': 5,
@@ -163,6 +166,14 @@ ENGINE_DEFAULTS = {
     'radiation.use_monte_carlo_vf': False,
     'radiation.verbose': False,
     'radiation.view_factor_file': '',
+    'shadow_depth.bisect_rounds': 4,
+    'shadow_depth.enabled': False,
+    'shadow_depth.h_max_m': 5.0,
+    'shadow_depth.march_steps': 16,
+    'shadow_depth.monotonicity_epochs': 10,
+    'shadow_depth.monotonicity_faces': 10000,
+    'shadow_depth.solar_disk_samples': 128,
+    'shadow_depth.write_frames': True,
     'simulation.body': 'Europa',
     'simulation.duration_days': 3.55,
     'simulation.spice_coverage_strict': False,

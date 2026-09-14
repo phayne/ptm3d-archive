@@ -488,7 +488,34 @@ def make_chunk_yaml(base_cfg: dict, chunk_dir: Path,
     out["directory"]        = str(chunk_dir)
     out["write_raw_stats"]  = True
     # Per-step time-series files would be huge for long chunked runs.
-    # Force-skip them — the orchestrator workflow only needs stats.
+    # Force-skip them -- the orchestrator workflow only needs stats.
+    #
+    # ⛔ BUT NOT WHEN THE CONFIG ASKED FOR A PER-EPOCH PRODUCT. This line is
+    # unconditional in the original and it is a silent substitution: a chunked
+    # production run with `shadow_depth.write_frames: true` would cast every ray
+    # of a ~1e8-ray-per-epoch search and then write ZERO frames, exit 0, and
+    # report success. The operator gets a directory with statistics and no field
+    # vs time, having paid the whole cost for it.
+    #
+    # The rule is the standing one: when something cannot be done as asked, fail
+    # -- do not do something else quietly. Skipping the time series is the
+    # DEFAULT here, not an override, so a config that explicitly wants frames is
+    # refused rather than overruled.
+    wants_frames = bool(
+        (base_cfg.get("shadow_depth") or {}).get("write_frames", False)
+        and (base_cfg.get("shadow_depth") or {}).get("enabled", False)
+    )
+    if wants_frames:
+        raise SystemExit(
+            "run_chunked_simulation: this config sets shadow_depth.enabled with "
+            "shadow_depth.write_frames: true, and the chunked runner force-sets "
+            "output.skip_time_series = True for every chunk. The run would cast "
+            "every shadow-depth ray and write no frames at all, silently.\n"
+            "  Either set shadow_depth.write_frames: false (the window statistics "
+            "and statistics/shadow_depth.json are still written, and they merge "
+            "correctly across chunks), or run the window unchunked.\n"
+            "Refusing rather than dropping the product you asked for."
+        )
     out["skip_time_series"] = True
     # Chunk 0 writes mesh.ply once for the orchestrator to propagate to the
     # parent dir; chunks 1+ skip the redundant per-chunk mesh write (~hundreds

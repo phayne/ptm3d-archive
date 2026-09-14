@@ -458,6 +458,11 @@ private:
         bool processed = false;
     };
     // Ray tracing methods
+    // The tnear rule for the batched occlusion path, in ONE place. Declared
+    // here and called from both traceOccluded and the public shadowRayTnear, so
+    // the number a caller is told is the number the rays actually use.
+    static float tnearForLocalOrigin(const std::array<double, 3>& org_local);
+
     std::vector<uint8_t> traceOccluded(
         const std::vector<std::array<double, 3>>& origins,
         const std::vector<std::array<double, 3>>& directions,
@@ -603,6 +608,32 @@ public:
     // case a probe treats it as absent, not as a point source at the origin).
     double primaryRadiusKm() const { return has_primary_body_ ? primary_radius_ : 0.0; }
     bool hasEmbreeScene() const { return embree_scene_ != nullptr; }
+
+    // --- BATCHED passive probe (shadow depth) -----------------------------
+    // probeOccluded above is one ray per call, routed through intersectsFirst.
+    // That is fine for the flux cubes' ~1e6 probes and it is NOT fine for the
+    // ~1e8 a per-face vertical search casts: the shadow-depth pass needs the
+    // OMP-parallel batched path (and its GPU route), so it gets one.
+    //
+    // This adds no physics. It is traceOccluded, which is private only because
+    // nothing outside had a reason to call it.
+    void probeOccludedBatch(const std::vector<std::array<double, 3>>& origins,
+                            const std::vector<std::array<double, 3>>& directions,
+                            std::vector<uint8_t>& blocked);
+
+    // ⛔ THE ONE NUMBER THAT SILENTLY INVALIDATES A HEIGHT SEARCH.
+    // The batched path derives each ray's tnear from the distance to the SCENE
+    // origin: max(16*ulp, max(1e-6*r, 0.01)). With the scene origin offset
+    // applied r is meters and tnear is the 1 cm floor. WITHOUT it, r is the body
+    // radius -- 1.737e6 m on the Moon -- and tnear is 1.74 m, so every ray skips
+    // the first 1.74 m of terrain. A 0-5 m vertical search would then return a
+    // confident, wrong field with no error anywhere; this is the
+    // ptm-shadow-ray-1cm-offset-floor-psr-leak class.
+    //
+    // So the value is EXPOSED rather than assumed, and it is computed by the
+    // same function traceOccluded calls, not by a second copy of the formula.
+    double shadowRayTnear(const std::array<double, 3>& origin_world) const;
+    bool sceneHasOriginOffset() const { return scene_has_offset_; }
 
 private:
     
@@ -1019,6 +1050,22 @@ private:
     // GPU-only. On a CPU build nothing ever sets it true, so the guarded
     // branches elide with zero behavior change.
     bool use_gpu_ray_tracer_ = false;
+
+    // ⛔ THE ONE SPELLING OF "the GPU ray path is usable".
+    //
+    // The members it tests (gpu_ray_pool_, gpu_mesh_uploaded_) are declared ONLY
+    // under PTM_GPU_OPENCL, so any code that compiles in BOTH configurations and
+    // names them directly builds green here and fails the CPU-only build. That
+    // is not hypothetical: probeOccludedBatch did exactly that and broke CI,
+    // while the canonical rebuild.sh builds GPU-ON and every validation arm is a
+    // GPU arm -- so no local gate could have caught it.
+    //
+    // Declared unconditionally, defined in both configurations (CPU-only returns
+    // false, and nothing on a CPU build can make it true). Call it instead of
+    // re-spelling the condition; a call to a GPU-only FUNCTION still has to sit
+    // inside a guard, because the function does not exist, but the CONDITION
+    // never needs one again.
+    bool gpuRayPathReady() const;
 #ifdef PTM_GPU_OPENCL
     std::unique_ptr<gpu::opencl::BVHBuilder> gpu_bvh_;
     std::unique_ptr<gpu::opencl::BVHGPUPool> gpu_ray_pool_;

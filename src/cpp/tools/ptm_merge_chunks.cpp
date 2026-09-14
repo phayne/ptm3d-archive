@@ -103,11 +103,21 @@ bool write_float32_array(const fs::path& p, const std::vector<float>& data) {
 //         component is merged independently and any disagreement between chunks
 //         is an ERROR, because the alternative is a merged product that quietly
 //         drops a map the chunks all carried.
+//
+// `nan_when_empty`: what a face with NO contribution in any chunk gets. For the
+// surface fields that is 0.0 and always has been (a face with no samples had no
+// flux). For SHADOW DEPTH it must be NaN, because 0.0 is a MEANING in that field
+// -- "the Sun is visible at the surface" -- so scrubbing an empty face to 0.0
+// would turn "this face was never resolved" into "this face was always lit", at
+// every permanently shadowed face, silently. NaN also matches what the engine
+// writes for the same case in a single-chunk run, so a merged window and an
+// unchunked one say the same thing.
 bool merge_one_datatype(const std::string& name,
                         const std::vector<fs::path>& chunk_dirs,
                         const fs::path& outdir,
                         uint32_t expected_N,
-                        bool strict = false) {
+                        bool strict = false,
+                        bool nan_when_empty = false) {
     std::vector<float>   merged_max, merged_min;
     std::vector<double>  merged_sum;
     std::vector<uint64_t> merged_count;
@@ -207,10 +217,11 @@ bool merge_one_datatype(const std::string& name,
             merged_avg[i] = std::numeric_limits<float>::quiet_NaN();
         }
         // Scrub sentinels for faces with no contribution at all.
+        const float empty = nan_when_empty ? std::numeric_limits<float>::quiet_NaN() : 0.0f;
         if (merged_max[i] == std::numeric_limits<float>::lowest())
-            merged_max[i] = 0.0f;
+            merged_max[i] = empty;
         if (merged_min[i] == std::numeric_limits<float>::max())
-            merged_min[i] = 0.0f;
+            merged_min[i] = empty;
     }
 
     fs::path stats_out = outdir / "statistics";
@@ -259,6 +270,67 @@ std::vector<std::string> discover_depth_fields(const fs::path& chunk_dir) {
         }
     }
     return out;
+}
+
+// ---- Scalar per-face fraction merge ---------------------------------------
+//
+// A FRACTION is not a max and not a per-chunk average: merging shadow_lit_frac
+// by taking chunk 0's file, or by averaging the chunks' own fractions, is wrong
+// whenever the chunks carry different epoch counts -- and chunked windows
+// routinely do, because the last chunk is short. Without this the merged
+// product would silently ship ONE chunk's fraction under a whole-window name.
+//
+// So it is merged from sum + count, the same way `avg` is, and written back as
+// the scalar `statistics/<name>.bin` the Python side reads (STATISTICS_FIELDS
+// entries with 'scalar': True).
+bool merge_scalar_fraction(const std::string& name,
+                           const std::vector<fs::path>& chunk_dirs,
+                           const fs::path& outdir,
+                           uint32_t expected_N) {
+    std::vector<double>   merged_sum(expected_N, 0.0);
+    std::vector<uint64_t> merged_count(expected_N, 0u);
+
+    // Present in chunk 0 or not at all. Present in SOME chunks is a refusal,
+    // not a partial merge: a fraction assembled from a subset of the window is
+    // a number that is true of no window.
+    const fs::path raw0 = chunk_dirs.front() / "statistics" / "_raw";
+    const bool want = fs::exists(raw0 / (name + "_sum.bin")) &&
+                      fs::exists(raw0 / (name + "_count.bin"));
+    if (!want) return true;   // the product was not requested; nothing to merge
+
+    for (const auto& cd : chunk_dirs) {
+        const fs::path raw = cd / "statistics" / "_raw";
+        const fs::path p_sum   = raw / (name + "_sum.bin");
+        const fs::path p_count = raw / (name + "_count.bin");
+        if (!fs::exists(p_sum) || !fs::exists(p_count)) {
+            std::cerr << "[merge] ERROR: " << name << " is present in chunk 0 but its "
+                         "statistics/_raw sum/count is missing in " << cd
+                      << ". A fraction merged from a subset of the chunks is true of "
+                         "no window; refusing.\n";
+            return false;
+        }
+        uint32_t N = 0;
+        std::vector<double>   sum_arr;
+        std::vector<uint32_t> count_arr;
+        if (!read_double_array(p_sum, N, sum_arr)   || N != expected_N) return false;
+        if (!read_uint32_array(p_count, N, count_arr) || N != expected_N) return false;
+        for (uint32_t i = 0; i < expected_N; ++i) {
+            merged_sum[i]   += sum_arr[i];
+            merged_count[i] += count_arr[i];
+        }
+    }
+
+    std::vector<float> out(expected_N, std::numeric_limits<float>::quiet_NaN());
+    for (uint32_t i = 0; i < expected_N; ++i)
+        if (merged_count[i] > 0)
+            out[i] = static_cast<float>(merged_sum[i] / static_cast<double>(merged_count[i]));
+
+    fs::path stats_out = outdir / "statistics";
+    fs::create_directories(stats_out);
+    if (!write_float32_array(stats_out / (name + ".bin"), out)) return false;
+    std::cout << "[merge] " << name << ": merged " << chunk_dirs.size()
+              << " chunks  (" << expected_N << " faces, from _raw sum/count)\n";
+    return true;
 }
 
 // ---- Ice-stability merge --------------------------------------------------
@@ -516,6 +588,50 @@ int main(int argc, char** argv) {
             }
             std::cout << "[merge] subsurface depth maps: " << depth_fields.size()
                       << " field(s) merged\n";
+        }
+    }
+
+    // Shadow depth. STRICT, and only when chunk 0 actually carries it: strict
+    // mode is what turns "the chunks were run with write_raw_stats off" into a
+    // refusal naming the missing files, instead of a merged directory that
+    // silently has no shadow-depth maps at all while every chunk had them.
+    if (fs::exists(chunk_dirs.front() / "statistics" / "shadow_depth_max.bin") ||
+        fs::exists(chunk_dirs.front() / "statistics" / "shadow_depth_avg.bin") ||
+        fs::exists(chunk_dirs.front() / "statistics" / "shadow_depth_min.bin")) {
+        if (!merge_one_datatype("shadow_depth", chunk_dirs, outdir, expected_N,
+                                /*strict=*/true, /*nan_when_empty=*/true)) {
+            std::cerr << "[merge] ERROR merging shadow_depth\n";
+            ok = false;
+        }
+    }
+
+    // Shadow-depth fractions. These are per-face scalars over the whole window,
+    // so they merge from sum + count and not by any per-chunk rule.
+    for (const char* frac : { "shadow_lit_frac", "shadow_unresolved_frac" }) {
+        if (!merge_scalar_fraction(frac, chunk_dirs, outdir, expected_N)) {
+            std::cerr << "[merge] ERROR merging " << frac << "\n";
+            ok = false;
+        }
+    }
+    // Carry the shadow-depth manifest through. It describes the search ladder,
+    // the sentinel encoding and the vertical convention, all chunk-invariant;
+    // without it the merged directory holds maps whose sentinel values are not
+    // documented anywhere. Written by the pass LAST, so its presence in chunk 0
+    // is also evidence chunk 0's maps are complete.
+    if (fs::exists(chunk_dirs.front() / "statistics" / "shadow_depth_max.bin")) {
+        const fs::path src = chunk_dirs.front() / "statistics" / "shadow_depth.json";
+        if (fs::exists(src)) {
+            std::error_code ec;
+            fs::copy_file(src, outdir / "statistics" / "shadow_depth.json",
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                std::cerr << "[merge] WARNING: could not copy shadow_depth.json: "
+                          << ec.message() << "\n";
+            }
+        } else {
+            std::cerr << "[merge] WARNING: chunk 0 has shadow-depth maps but no "
+                         "statistics/shadow_depth.json; the merged product will not "
+                         "say what its +inf entries mean.\n";
         }
     }
 
