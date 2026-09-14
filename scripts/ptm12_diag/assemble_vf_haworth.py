@@ -103,6 +103,23 @@ _PLY_NP = {"float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
            "short": "<i2", "ushort": "<u2", "int16": "<i2", "uint16": "<u2"}
 
 
+def narrow_perm(p, name):
+    """Store an argsort permutation as int32 when its own length fits, else keep int64.
+
+    A permutation's values are indices into itself, so the bound is len(p), not the face
+    count -- and len(p) here is a NONZERO count, which is not bounded by 2**31 (the
+    worst-case A3GT site, 1e7 faces, reaches ~2.4e10 nonzeros). int32 halves the array;
+    int64 is kept, with a warning on stderr, whenever it would not be exact. Indexing
+    with the narrowed permutation is value-for-value identical to indexing with the
+    original, so this never changes a computed number -- only the footprint."""
+    if len(p) < 2 ** 31:
+        return p.astype(np.int32, copy=False)
+    print(f"[assemble] *** WARNING: permutation '{name}' has len={len(p)} >= 2**31, so its "
+          f"indices do not fit int32; keeping int64 ({p.nbytes / 2**30:.2f} GiB). This is the "
+          "documented fallback, not a failure -- the matrix is unaffected. ***", file=sys.stderr)
+    return p
+
+
 def read_ply_geometry(path):
     """Header-aware PLY vertex+face reader (PLY face order), reading vertices in
     their NATIVE precision widened to float64.
@@ -201,6 +218,13 @@ def main():
     t0 = time.time()
     area, ctr, faces = face_areas(a.mesh)
     N = len(area)
+    # Face-bounded index arrays (lo/hi/a_idx/b_idx/rows/cols) are held as int32: each
+    # element is a face index in [0, N), so int32 is exact for any N < 2**31 and halves
+    # the footprint of the six largest index arrays. Fail loud rather than truncate.
+    if N >= 2 ** 31:
+        raise SystemExit(
+            f"FATAL: mesh has N={N} faces; the int32 face-index arrays this assembler uses "
+            "hold indices only up to 2**31-1. Refusing rather than truncating silently.")
     print(f"[assemble] mesh={a.mesh}  N={N} faces  total_area={area.sum():.3f} m^2")
     GEOMHASH = float(area.sum()) + float((area * np.arange(1, N + 1)).sum()) * 1e-9
 
@@ -226,6 +250,7 @@ def main():
     seen = np.zeros(N, dtype=np.int32)   # sweep coverage: records per source face
     Is, Js, Vs = [], [], []
     Is_old, Js_old, Vs_old = [], [], []  # also track what the OLD fractional rule would have kept
+    want_old = bool(a.floor_idx)         # the OLD-rule arrays feed the --floor-idx report ONLY
     truncated = []
     for p in files:
         raw = np.frombuffer(open(p, "rb").read(), dtype=np.uint8)
@@ -243,10 +268,11 @@ def main():
                 if keep.any():
                     Is.append(np.full(int(keep.sum()), src, dtype=np.int32))
                     Js.append(arr["j"][keep].copy()); Vs.append(arr["f"][keep].copy())
-                keep_old = arr["f"] >= a.old_thr_frac
-                if keep_old.any():
-                    Is_old.append(np.full(int(keep_old.sum()), src, dtype=np.int32))
-                    Js_old.append(arr["j"][keep_old].copy()); Vs_old.append(arr["f"][keep_old].copy())
+                if want_old:
+                    keep_old = arr["f"] >= a.old_thr_frac
+                    if keep_old.any():
+                        Is_old.append(np.full(int(keep_old.sum()), src, dtype=np.int32))
+                        Js_old.append(arr["j"][keep_old].copy()); Vs_old.append(arr["f"][keep_old].copy())
             q += nnz * 8
 
     # ---- sweep-coverage gate ----
@@ -270,6 +296,7 @@ def main():
               "matrix below IS BIASED on those faces. ***", file=sys.stderr)
 
     I = np.concatenate(Is); J = np.concatenate(Js); V = np.concatenate(Vs)
+    del Is, Js, Vs                       # the per-chunk lists duplicate I/J/V; drop them now
     print(f"[assemble] NEW rule directed nnz={len(I)} ({len(I)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
     # ---- before/after floor-far-wall-aggregate report (Sagan's requested checkpoint number) ----
@@ -305,9 +332,11 @@ def main():
     # is not. See test_vf_assembler_gate.py and
     # SESSION-NOTES-2026-08-19-fc08-far-field-vf-rootcause.md.
     S = area[I] * V.astype(np.float64)
-    lo = np.minimum(I, J).astype(np.int64); hi = np.maximum(I, J).astype(np.int64)
-    key = lo * np.int64(N) + hi
-    o = np.argsort(key, kind="stable"); key = key[o]; S = S[o]; lo = lo[o]; hi = hi[o]
+    lo = np.minimum(I, J).astype(np.int32); hi = np.maximum(I, J).astype(np.int32)
+    key = np.multiply(lo, np.int64(N), dtype=np.int64)   # int64 accumulator: range ~N**2
+    key += hi
+    o = narrow_perm(np.argsort(key, kind="stable"), "o")
+    key = key[o]; S = S[o]; lo = lo[o]; hi = hi[o]
     bnd = np.concatenate(([0], np.nonzero(np.diff(key))[0] + 1, [len(key)]))
     gs = bnd[:-1]; ge = bnd[1:]; csum = np.concatenate(([0.0], np.cumsum(S)))
     if a.symmetrize_divisor == "hits":
@@ -322,11 +351,13 @@ def main():
     print(f"[assemble] symmetrization divisor = {a.symmetrize_divisor} "
           f"({'2 (directions tried; unbiased)' if a.symmetrize_divisor == 'tried' else 'directions HIT -- DEFECTIVE, gate use only'})")
     a_idx = lo[gs]; b_idx = hi[gs]
+    del S, lo, hi, key, o, csum, bnd, gs, ge   # grouping scratch; a_idx/b_idx/Ssym carry it now
     print(f"[assemble] unique undirected pairs={len(a_idx)} ({len(a_idx)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
     rows = np.concatenate([a_idx, b_idx]); cols = np.concatenate([b_idx, a_idx]); Sd = np.concatenate([Ssym, Ssym])
     Aend = np.concatenate([area[a_idx], area[b_idx]])
     F = Sd / Aend
+    del Sd, Aend                         # both were consumed by F
 
     # ---- symmetric ΣF<=1 cap (reciprocity-preserving congruence) ----
     for it in range(40):
@@ -353,7 +384,8 @@ def main():
         print(f"[radiance-prune] applied: kept nnz={len(F)}  post-prune SigmaF max={rs.max():.4f} "
               f"mean={rs.mean():.4f}  {time.time()-t0:.0f}s")
 
-    o2 = np.argsort(rows, kind="stable"); rows = rows[o2]; cols = cols[o2]; F = F[o2]
+    o2 = narrow_perm(np.argsort(rows, kind="stable"), "o2")
+    rows = rows[o2]; cols = cols[o2]; F = F[o2]
     indptr = np.zeros(N + 1, dtype=np.int64); np.add.at(indptr, rows + 1, 1); indptr = np.cumsum(indptr)
     out = a.out_csr
     with open(out, "wb") as fh:
