@@ -27,10 +27,22 @@
 //     S*V_sun and the nadir face exactly 0. Falsifies a sign flip or a face
 //     mis-assignment that arm A cannot see (arm A has no direct beam).
 //
-//  E. TIME-AXIS REFUSAL (negative control). A time axis whose length breaks
-//     equilibration_steps + n_steps == total_time_steps MUST be refused. If it
-//     is accepted, cube rows silently stop lining up with time_steps.txt, which
-//     is the PTM-250/251 defect class.
+//  E. CHUNKED WINDOW (positive control). A chunked run integrates one grid
+//     point past its export window (thermal.checkpoint_lookahead_steps: 1), so
+//     equilibration + output is one SHORT of total_time_steps. That window MUST
+//     run, and it must read the FIRST n_steps epochs after equilibration -- not
+//     the look-ahead step, and not an epoch window shifted by one. The fixture
+//     ramps T with absolute step so a shifted read gives a different number:
+//     10 K per step, against a 1e-9 K check.
+//     Before the fix this arm was refused outright, which is why flux cubes
+//     could not be produced for any chunked window.
+//
+//  J. TIME-AXIS REFUSAL (negative control). An output window that runs PAST the
+//     end of the integrated series -- equilibration_steps + n_steps >
+//     total_time_steps -- MUST still be refused. This is the case the check was
+//     written for: accepting it reads past the end of every series and cube
+//     rows silently stop lining up with time_steps.txt (the PTM-250/251 defect
+//     class). Relaxing == to <= must not cost this refusal.
 //
 //  F. CACHE-KEY REFUSAL (negative control). A cache built for a different mesh
 //     MUST be refused, never rebuilt or applied anyway.
@@ -164,9 +176,22 @@ struct Fixture {
     static constexpr size_t NF = 4;      // synthetic mesh faces
     static constexpr int EQ = 3;         // equilibration steps
     static constexpr int NS = 2;         // output steps
-    static constexpr int TT = EQ + NS;
+    static constexpr int TT = EQ + NS;   // integrated steps with NO look-ahead
+    // A chunked window integrates `lookahead` grid points past its export
+    // window so the checkpoint it hands the next chunk is the state at that
+    // chunk's FIRST epoch (thermal.checkpoint_lookahead_steps). Those points
+    // are integrated and never exported, so the series are sized to tt() while
+    // `times` stays NS long. Default 0 keeps every pre-existing arm unchanged.
+    int lookahead = 0;
+    int tt() const { return TT + lookahead; }
     int32_t partner = 2;
     double eps = 0.95, albedo = 0.20, T = 360.0;
+    // Temperature as a function of ABSOLUTE step: T + dT_per_step * t. Default
+    // 0 makes every step identical, which is what arms A-I assume. A non-zero
+    // value is what lets the chunked arm tell the right epoch window from a
+    // shifted one.
+    double dT_per_step = 0.0;
+    double tempAt(int t) const { return T + dT_per_step * static_cast<double>(t); }
     double q_dir_face = 0.0, q_ind_ir = 0.0, q_ind_vis = 0.0;
     double S = 1361.0;
     std::array<double, 3> sun{{0, 0, 0}};
@@ -180,14 +205,19 @@ struct Fixture {
     std::vector<std::array<double, 3>> sunpos, pripos;
 
     void build() {
-        direct.assign(NF * TT, 0.0);
-        temps.assign(NF, std::vector<double>(TT, T));
-        isol.assign(NF, std::vector<double>(TT, q_ind_vis));
-        iir.assign(NF, std::vector<double>(TT, q_ind_ir));
-        for (size_t f = 0; f < NF; ++f)
-            for (int t = 0; t < TT; ++t) direct[f * TT + t] = q_dir_face;
-        sunpos.assign(TT, sun);
-        pripos.assign(TT, {{0, 0, 0}});
+        const int n = tt();
+        direct.assign(NF * static_cast<size_t>(n), 0.0);
+        temps.assign(NF, std::vector<double>(n, T));
+        isol.assign(NF, std::vector<double>(n, q_ind_vis));
+        iir.assign(NF, std::vector<double>(n, q_ind_ir));
+        for (size_t f = 0; f < NF; ++f) {
+            for (int t = 0; t < n; ++t) {
+                direct[f * static_cast<size_t>(n) + t] = q_dir_face;
+                temps[f][t] = tempAt(t);
+            }
+        }
+        sunpos.assign(n, sun);
+        pripos.assign(n, {{0, 0, 0}});
     }
 
     ptm::fluxcubes::PassInputs inputs(const std::string& cache, const std::string& out,
@@ -199,7 +229,7 @@ struct Fixture {
         in.times = &times;
         in.time_strings = &tstr;
         in.equilibration_steps = EQ;
-        in.total_time_steps = TT;
+        in.total_time_steps = tt();
         in.direct_solar = &direct;
         in.surface_temps = &temps;
         in.indirect_solar_series = &isol;
@@ -342,17 +372,83 @@ int main() {
         }
     }
 
-    // ------------------------------------------------------- NEGATIVE CONTROLS
-    std::printf("\n--- NEGATIVE CONTROLS (each MUST be refused) ---\n");
+    // ---------------------------------------------------------------- ARM E
     {
-        Fixture fx; fx.build();
+        std::printf("\n--- ARM E: chunked window (checkpoint look-ahead), MUST run ---\n");
+        Fixture fx;
+        fx.lookahead = 1;         // the chunk integrates one unexported step
+        fx.dT_per_step = 10.0;    // T varies with ABSOLUTE step, so a shift shows
+        fx.build();
         const std::string dir = base + "/armE";
         const std::string cache = writeCache(dir, fx.partner, GH, Fixture::NF, 0.108, 0.108);
         auto in = fx.inputs(cache, dir, GH);
-        in.total_time_steps = Fixture::TT + 1;    // breaks eq + n_steps == total
+        std::printf("  time axis: eq %d + output %d = %d of %d integrated "
+                    "(look-ahead %d)\n",
+                    Fixture::EQ, Fixture::NS, Fixture::EQ + Fixture::NS,
+                    fx.tt(), fx.lookahead);
+        std::string err;
+        if (!runFluxCubePass(in, err)) {
+            std::printf("  FAIL: a chunked window was REFUSED: %s\n", err.c_str());
+            ++fails;
+        } else {
+            Fcb f;
+            if (!readFcb(dir + "/flux_cubes/flux_cubes.fcb", f)) {
+                std::printf("  FAIL: no .fcb\n"); ++fails;
+            } else if (static_cast<int>(f.h.n_steps) != Fixture::NS) {
+                std::printf("  FAIL: n_steps %u, want %d (the look-ahead step must "
+                            "not be exported)\n", f.h.n_steps, Fixture::NS);
+                ++fails;
+            } else {
+                // The exported epochs are the FIRST NS after equilibration:
+                // absolute steps EQ and EQ+1, never EQ+1 and EQ+2 (a shift into
+                // the look-ahead) and never EQ-1 and EQ (a shift back into
+                // equilibration).
+                for (int k = 0; k < Fixture::NS; ++k) {
+                    const int t_abs = Fixture::EQ + k;
+                    char label[80];
+                    std::snprintf(label, sizeof(label),
+                                  "T_face[k=%d] = T(absolute step %d)", k, t_abs);
+                    check(label, f.t_face[k], fx.tempAt(t_abs), 1e-9, fails);
+                    std::snprintf(label, sizeof(label),
+                                  "nadir terrain_ir[k=%d] = eps*sigma*T(%d)^4", k, t_abs);
+                    check(label, at(f, 0, kFaceNadir, kCompTerrainIR, k),
+                          fx.eps * SIGMA * std::pow(fx.tempAt(t_abs), 4), 1e-9, fails);
+                }
+                // Discrimination, stated rather than assumed: a one-step shift
+                // would move T_face[0] by dT_per_step, which is 1e10 times the
+                // 1e-9 tolerance above.
+                const double shifted = fx.tempAt(Fixture::EQ + 1);
+                std::printf("  (a one-step shift would report T_face[0] = %.3f K instead "
+                            "of %.3f K -- so this arm discriminates)\n",
+                            shifted, fx.tempAt(Fixture::EQ));
+                if (std::fabs(shifted - fx.tempAt(Fixture::EQ)) < 1e-6) {
+                    std::printf("  FAIL: arm E is not discriminating (dT_per_step is 0)\n");
+                    ++fails;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------- NEGATIVE CONTROLS
+    std::printf("\n--- NEGATIVE CONTROLS (each MUST be refused) ---\n");
+    {
+        // The output window runs PAST the end of the integrated series. The
+        // fixture's series are sized to tt() = TT = 5, so accepting this would
+        // read absolute step 5 out of a stride-5 array -- the refusal is what
+        // stands between this input and an out-of-bounds read.
+        Fixture fx; fx.build();
+        const std::string dir = base + "/armJ";
+        const std::string cache = writeCache(dir, fx.partner, GH, Fixture::NF, 0.108, 0.108);
+        auto in = fx.inputs(cache, dir, GH);
+        std::vector<double> long_times{0.0, 21600.0, 43200.0};
+        std::vector<std::string> long_tstr{"2028-08-03T22:21:00.000",
+                                           "2028-08-04T04:21:00.000",
+                                           "2028-08-04T10:21:00.000"};
+        in.times = &long_times;             // eq 3 + output 3 = 6 > total 5
+        in.time_strings = &long_tstr;
         std::string err;
         const bool ran = runFluxCubePass(in, err);
-        std::printf("  %-46s %s\n", "E: inconsistent time axis",
+        std::printf("  %-46s %s\n", "J: output window past the end of the series",
                     ran ? "FAIL (accepted!)" : "PASS (refused)");
         if (ran) ++fails; else std::printf("      reason: %.140s\n", err.c_str());
     }
