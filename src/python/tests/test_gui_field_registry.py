@@ -8,7 +8,7 @@ writer and ``detect_available_statistics`` all read it, and the shadow-depth
 pass duly added its five products there. ``VisualizationPanel.FIELD_INFO`` is a
 SECOND, hand-maintained dict inside ``gui/gui_panels/visualization_panel.py``,
 and ``_populate_field_combo`` iterates THAT. Nobody updated it. The result was a
-finished 2.4-million-facet MP026 run whose shadow-depth fields exported
+finished 2.4-million-facet lunar polar run whose shadow-depth fields exported
 correctly, read correctly from Python, and did not appear in the viewer's
 drop-down at all -- with no warning anywhere, because a menu that is missing an
 item looks exactly like a run that did not produce one.
@@ -39,14 +39,45 @@ Section 5 repeats the menu arm on the REAL ``PTM3DMainWindow`` toolbar, because
 the panel's own combo is a sub-widget and a harness that only ever drives
 sub-widgets is how three rounds of a flux-cube defect got past green suites.
 
-⚠️ WHAT THIS GATE DOES **NOT** COVER, stated so nobody reads it as broader than
-it is. It binds ``FIELD_INFO`` to ``ptm.results.STATISTICS_FIELDS`` and to
-nothing else. Three products live in ``ptm.results.Results.EXTRA_FIELD_INFO``
-instead -- ``indirect_solar``, ``indirect_ir`` and ``effective_albedo`` -- by a
-deliberate decision recorded there, and a two-band radiosity run writes all
-three to disk while the viewer offers none of them. That gap is real and this
-gate is blind to it by construction; closing it is a decision about what the
-menu should contain, not a test change.
+⭐ THE PROPERTY THIS NOW PROVES: **every field the engine can write is
+viewable**, not merely every field one particular catalog lists. The earlier
+version of this file bound ``FIELD_INFO`` to ``ptm.results.STATISTICS_FIELDS``
+and to nothing else, and said so -- three more products lived in a SECOND
+catalog, ``ptm.results.Results.EXTRA_FIELD_INFO`` (``indirect_solar``,
+``indirect_ir``, ``effective_albedo``), a two-band radiosity run wrote all
+three to disk, the viewer offered none of them, and this gate was blind to it
+by construction. Same defect, one registry further out. So the gate now works
+three ways:
+
+* **Catalog, forward** -- every key every catalog ``ptm.results`` publishes has
+  a ``FIELD_INFO`` entry. It reads ``EXTRA_FIELD_INFO`` too, defensively, so it
+  keeps failing on a tree where that catalog still exists. On
+  ``fix/gui-shadow-depth-fields`` ``2360ef5`` it fails and names exactly the
+  nine keys the three extra products expand to.
+* **Catalog, reverse** -- every ``FIELD_INFO`` key is a key some catalog knows.
+  A viewer entry nothing writes is a menu item that is always missing, and a
+  typo in a key is the same thing.
+* **Disk** -- every statistics file and every per-step series directory in an
+  actual run directory is offered by the real menu. This one is bound to no
+  catalog at all, so it survives the next registry appearing.
+* **Catalog against catalog** -- where two of them describe the same field they
+  must say the same thing, or the difference is listed with a reason in
+  ``KNOWN_LABEL_DIFFERENCES``. Section 1b. Counting them honestly: THREE
+  editable catalogs remain (``ptm.results.FIELD_INFO``,
+  ``ptm.results.STATISTICS_FIELDS``, ``VisualizationPanel.FIELD_INFO``), and
+  ``gui_core.data_exporter``'s two are derived by a call rather than copied --
+  which is asserted, not assumed. 29 of the viewer's 36 labels compose exactly
+  from the shared registry; the 7 that do not are listed, and two of those
+  groups are wrong rather than merely different.
+
+⚠️ WHAT IT STILL DOES NOT COVER, stated so nobody reads it as broader than it
+is: subsurface temperature maps (``temperature_z0p298m_max`` and friends). Their
+names carry the depth, so no static catalog can hold them, and ``FIELD_INFO``
+is static -- a run with ``output.map_depths_m`` writes maps the 3D viewer's
+field menu cannot offer, exactly as the three products above could not be
+offered. The disk arm skips them BY NAME and says so; making the menu carry them
+means making it dynamic, which is a feature and not a test change. Owed ledger
+row: ``PTM-GUI-DEPTH-MAPS-UNVIEWABLE``.
 
 Run directly::
 
@@ -80,7 +111,7 @@ import numpy as np                                             # noqa: E402
 PANEL_SOURCE = REPO_ROOT / "gui" / "gui_panels" / "visualization_panel.py"
 
 #: A run directory the caller wants section 5 run against. Optional by design:
-#: the real MP026 output this bug was found on is 100 GB of machine-local
+#: the real production output this bug was found on is 100 GB of machine-local
 #: files, and a test that needs it is a test nobody else can run.
 REAL_RUN = os.environ.get("PTM_TEST_RUN_DIR", "")
 
@@ -146,23 +177,58 @@ def gui_scalar_stats_keys():
     return set(values)
 
 
+def shared_catalogs():
+    """Every field catalog `ptm.results` publishes, newest rule first.
+
+    ⛔ TWO, NOT ONE, AND THAT IS THE WHOLE POINT OF THIS FUNCTION.
+    `STATISTICS_FIELDS` is the shared catalog. `Results.EXTRA_FIELD_INFO` was a
+    second one holding `indirect_solar`, `indirect_ir` and `effective_albedo` --
+    products the engine writes, that the viewer could not offer, and that the
+    previous version of this gate could not see because it read only the first
+    catalog. Those three now live in `STATISTICS_FIELDS` and the second catalog
+    is gone, so the `getattr` below normally finds nothing.
+
+    It is kept, and read defensively, for two reasons. It makes this gate FAIL
+    on the tree that still has the second catalog -- which is the tree where it
+    matters -- and it means re-introducing an extra catalog does not silently
+    re-open the hole, because its keys land in the same requirement as
+    everything else.
+    """
+    from ptm.results import STATISTICS_FIELDS, Results
+    catalogs = [("ptm.results.STATISTICS_FIELDS", dict(STATISTICS_FIELDS))]
+    extra = getattr(Results, "EXTRA_FIELD_INFO", None)
+    if extra:
+        catalogs.append(("ptm.results.Results.EXTRA_FIELD_INFO", dict(extra)))
+    return catalogs
+
+
 def shared_registry_keys():
     """Every field key `ptm.results` knows, expanded to what a menu must offer.
+
+    ``{key: source}`` -- the value NAMES THE CATALOG the key came from, because
+    "nine keys are missing" is a bug report and "nine keys are missing, and they
+    are all in the second catalog" is the bug.
 
     A scalar product is one key (`ice_depth`). Everything else is the per-step
     series plus its three statistics -- which is exactly what the viewer's two
     scan branches look for on disk.
     """
-    from ptm.results import STATISTICS_FIELDS, STAT_TYPES
+    from ptm.results import STAT_TYPES
     expected = {}
-    for base, info in STATISTICS_FIELDS.items():
-        if info.get("scalar"):
-            expected[base] = info
-            continue
-        expected[base] = info
-        for stat in STAT_TYPES:
-            expected[f"{base}_{stat}"] = info
+    for source, catalog in shared_catalogs():
+        for base, info in catalog.items():
+            expected[base] = source
+            if info.get("scalar"):
+                continue
+            for stat in STAT_TYPES:
+                expected[f"{base}_{stat}"] = source
     return expected
+
+
+def shared_scalar_keys():
+    """The `scalar: True` keys across every catalog `ptm.results` publishes."""
+    return {key for _source, catalog in shared_catalogs()
+            for key, info in catalog.items() if info.get("scalar")}
 
 
 def test_every_shared_registry_field_is_viewable_in_the_gui():
@@ -175,12 +241,39 @@ def test_every_shared_registry_field_is_viewable_in_the_gui():
     have = set(gui_field_info_keys())
     want = shared_registry_keys()
     missing = sorted(set(want) - have)
+    named = ", ".join(f"{k} (from {want[k]})" for k in missing)
     assert not missing, (
-        f"{len(missing)} field key(s) that `ptm.results.STATISTICS_FIELDS` "
-        f"knows have no `VisualizationPanel.FIELD_INFO` entry, so the 3D "
-        f"viewer's field drop-down cannot offer them no matter what the run "
-        f"wrote: {missing}. Add them to FIELD_INFO in {PANEL_SOURCE.name} "
-        f"with a label and a colormap.")
+        f"{len(missing)} field key(s) that `ptm.results` knows have no "
+        f"`VisualizationPanel.FIELD_INFO` entry, so the 3D viewer's field "
+        f"drop-down cannot offer them no matter what the run wrote: {named}. "
+        f"Add them to FIELD_INFO in {PANEL_SOURCE.name} with a label and a "
+        f"colormap.")
+
+
+def test_no_menu_entry_names_a_product_nothing_writes():
+    """⭐ THE GATE, BACKWARDS. Every `FIELD_INFO` key is a key a catalog knows.
+
+    The forward arm alone is satisfied by a `FIELD_INFO` that lists extra
+    things. Two ways that bites: a typo'd key (`indirect_ir_agv`) is a menu
+    entry that can never match a file, and looks exactly like a run that did
+    not produce one -- the same indistinguishable-failure shape this whole file
+    exists for; and an entry for a product the engine stopped writing sits in
+    the catalog forever with nothing to say so.
+
+    Subsurface depth maps are not an exception here: they are discovered from
+    the run directory, never listed in `FIELD_INFO`, so they cannot appear on
+    this side.
+    """
+    have = set(gui_field_info_keys())
+    want = shared_registry_keys()
+    orphans = sorted(have - set(want))
+    assert not orphans, (
+        f"{len(orphans)} `VisualizationPanel.FIELD_INFO` key(s) are not in any "
+        f"catalog `ptm.results` publishes: {orphans}. Either the engine writes "
+        f"the product and `ptm.results.STATISTICS_FIELDS` is missing it -- in "
+        f"which case the exporter and the COG writer are blind to it too -- or "
+        f"nothing writes it and the menu is offering a field that can never "
+        f"appear.")
 
 
 def test_the_gate_can_fail():
@@ -211,14 +304,13 @@ def test_the_scalar_statistics_lists_agree():
     blind to them: `shadow_lit_frac` would have been listed in the menu and
     then looked for under a per-timestep directory no run writes.
     """
-    from ptm.results import STATISTICS_FIELDS
-    want = {k for k, v in STATISTICS_FIELDS.items() if v.get("scalar")}
+    want = shared_scalar_keys()
     have = gui_scalar_stats_keys()
     assert have == want, (
         f"VisualizationPanel.SCALAR_STATS_FIELDS is {sorted(have)} but "
-        f"`ptm.results.STATISTICS_FIELDS` marks {sorted(want)} as scalar. A "
-        f"scalar product missing here is routed to "
-        f"<run>/<field>/<field>_0000.bin, which does not exist.")
+        f"`ptm.results` marks {sorted(want)} as scalar. A scalar product "
+        f"missing here is routed to <run>/<field>/<field>_0000.bin, which does "
+        f"not exist.")
 
 
 def test_is_stats_field_classifies_every_registry_key():
@@ -231,8 +323,9 @@ def test_is_stats_field_classifies_every_registry_key():
         from gui_panels.visualization_panel import VisualizationPanel
     except ImportError as exc:                     # pragma: no cover
         raise Skip(f"the GUI panel stack is unavailable here ({exc})")
-    from ptm.results import STATISTICS_FIELDS, STAT_TYPES
-    for base, info in STATISTICS_FIELDS.items():
+    from ptm.results import STAT_TYPES
+    catalog = {k: v for _s, c in shared_catalogs() for k, v in c.items()}
+    for base, info in catalog.items():
         if info.get("scalar"):
             assert VisualizationPanel.is_stats_field(base), (
                 f"{base} is a scalar statistic but is_stats_field says it is a "
@@ -244,6 +337,152 @@ def test_is_stats_field_classifies_every_registry_key():
         for stat in STAT_TYPES:
             assert VisualizationPanel.is_stats_field(f"{base}_{stat}"), (
                 f"{base}_{stat} is a statistic and is_stats_field says otherwise")
+
+
+# --- 1b. The catalogs agree where they overlap ------------------------------
+#
+# Counting the catalogs, because a count that is wrong in either direction
+# costs something. In this tree there are THREE things a person can edit into
+# disagreement:
+#
+#   1. `ptm.results.FIELD_INFO`          -- per-step series: label + units
+#   2. `ptm.results.STATISTICS_FIELDS`   -- statistics: label + units [+ scalar]
+#   3. `VisualizationPanel.FIELD_INFO`   -- the viewer: "Label (units)" + colormap
+#
+# `gui_core.data_exporter.FIELD_INFO` and `.STATISTICS_FIELDS` LOOK like two
+# more and are not: each is `field_catalog(<the ptm.results dict>, 'unicode')`,
+# a call, whose only difference is the documented `W/m^2` -> `W/m²` spelling.
+# `test_the_exporter_catalogs_are_derived_not_copied` pins that, so converting
+# either into a literal -- which WOULD be a fourth -- fails here.
+# (A fourth did exist until this change: `Results.EXTRA_FIELD_INFO`.)
+
+#: ⚠️ The viewer labels that do NOT compose as "<Stat> <shared label> (units)",
+#: with the reason each one differs. Listed, not tolerated silently: any OTHER
+#: difference is a drift and fails. Two of these three groups are wrong rather
+#: than merely different, and neither is this change's to fix:
+KNOWN_LABEL_DIFFERENCES = {
+    # ⛔ "Annual" is a claim about the window, and it is FALSE on any run
+    # shorter than a year -- these statistics are reduced over the run's own
+    # integration window, which was 7 days at 1 h cadence on the run this was
+    # measured against. Owed row: PTM-GUI-ANNUAL-LABEL-FALSE.
+    "temperature_max": "Annual Max Temperature (K)",
+    "temperature_avg": "Annual Mean Temperature (K)",
+    "temperature_min": "Annual Min Temperature (K)",
+    # Drops "Total" from the shared label. Harmless, but it is a difference and
+    # it is here so that a real one cannot hide behind it.
+    "illumination_max": "Max Illumination (W/m²)",
+    "illumination_avg": "Mean Illumination (W/m²)",
+    "illumination_min": "Min Illumination (W/m²)",
+    # The viewer's is BETTER than the shared registry's "Ice Depth": this is
+    # the Schorghofer & Taylor ice-STABILITY depth, not a depth of ice.
+    "ice_depth": "Ice Stability Depth (m)",
+}
+
+#: How a statistic's label is built from its base field's.
+STAT_WORD = {"max": "Max", "avg": "Mean", "min": "Min"}
+
+
+def test_the_exporter_catalogs_are_derived_not_copied():
+    """`gui_core.data_exporter`'s two catalogs are calls, not copies.
+
+    ⛔ They are easy to miscount as two more registries. They are not: each is
+    `field_catalog(<the ptm.results dict>, units_style='unicode')`, so it cannot
+    drift -- and this arm is what makes that true rather than merely currently
+    true. Turn either into a literal and this fails.
+    """
+    try:
+        import gui_core.data_exporter as exporter
+    except ImportError as exc:                     # pragma: no cover
+        raise Skip(f"the exporter stack is unavailable here ({exc})")
+    from ptm.results import FIELD_INFO, STATISTICS_FIELDS, field_catalog
+    for name, source in (("FIELD_INFO", FIELD_INFO),
+                         ("STATISTICS_FIELDS", STATISTICS_FIELDS)):
+        have = getattr(exporter, name)
+        want = field_catalog(source, units_style="unicode")
+        assert have == want, (
+            f"gui_core.data_exporter.{name} is no longer `ptm.results.{name}` "
+            f"in the unicode unit spelling; it is a second copy now, and the "
+            f"two can disagree. Differences: "
+            f"{sorted(set(have) ^ set(want)) or [k for k in want if have.get(k) != want[k]]}")
+
+
+def test_the_per_step_catalog_is_a_subset_of_the_statistics_catalog():
+    """`ptm.results.FIELD_INFO` must not CONTRADICT `STATISTICS_FIELDS`.
+
+    It is allowed to be smaller -- and it is: `shadow_depth`, `indirect_solar`
+    and `indirect_ir` are written as per-step series and are missing from it,
+    so the GeoTIFF/HDF5 export dialog's per-step Fields list cannot offer them.
+    That gap is REAL and is not closed here, because closing it routes the
+    `+inf`-bearing `shadow_depth` series into the raster exporter, which is a
+    nodata decision that belongs to the exporter. Owed row:
+    PTM-GUI-STEP-FIELD-CATALOG-INCOMPLETE.
+
+    What must never happen is the two disagreeing about a field they SHARE.
+    """
+    from ptm.results import FIELD_INFO, STATISTICS_FIELDS
+    for key, info in FIELD_INFO.items():
+        shared = STATISTICS_FIELDS.get(key)
+        assert shared is not None, (
+            f"`ptm.results.FIELD_INFO` has '{key}' and `STATISTICS_FIELDS` does "
+            f"not; one of the two catalogs is wrong about what the engine writes")
+        assert (info["label"], info["units"]) == (shared["label"], shared["units"]), (
+            f"the two `ptm.results` catalogs disagree about '{key}': "
+            f"{info} vs {shared}")
+        assert not shared.get("scalar"), (
+            f"'{key}' is marked scalar in STATISTICS_FIELDS but listed as a "
+            f"per-step series in FIELD_INFO")
+    missing = sorted({k for k, v in STATISTICS_FIELDS.items() if not v.get("scalar")}
+                     - set(FIELD_INFO))
+    assert missing == ["indirect_ir", "indirect_solar", "shadow_depth"], (
+        f"the set of per-step products missing from `ptm.results.FIELD_INFO` "
+        f"moved to {missing}. If something was ADDED to that gap, the export "
+        f"dialog silently stopped offering it; if something was removed, update "
+        f"this arm and PTM-GUI-STEP-FIELD-CATALOG-INCOMPLETE.")
+
+
+def test_the_viewer_labels_agree_with_the_shared_registry():
+    """⭐ The two catalogs that overlap must say the same thing, or say why.
+
+    The viewer's label is its own string -- it embeds the unit and a per-
+    statistic prefix -- so it cannot simply BE the shared registry's. This
+    composes what it should read, compares, and allows exactly the differences
+    in `KNOWN_LABEL_DIFFERENCES`. Measured when written: 29 of 36 compose
+    exactly; the 7 exceptions are listed there with reasons.
+
+    ⛔ Without this, "the catalogs have drifted" is a thing somebody notices
+    years later. `ice_depth` has read "Ice Stability Depth" in the viewer and
+    "Ice Depth" in the registry for as long as both have existed.
+    """
+    from ptm.results import STATISTICS_FIELDS, STAT_TYPES, field_catalog
+    node = _class_attr("FIELD_INFO")
+    labels = {k.value: ast.literal_eval(v)[0]
+              for k, v in zip(node.keys, node.values)}
+    unicode_catalog = field_catalog(STATISTICS_FIELDS, units_style="unicode")
+    drift = []
+    for key, label in labels.items():
+        base, _, stat = key.rpartition("_")
+        if stat in STAT_TYPES and base in unicode_catalog:
+            info, prefix = unicode_catalog[base], STAT_WORD[stat] + " "
+        elif key in unicode_catalog:
+            info, prefix = unicode_catalog[key], ""
+        else:
+            drift.append((key, label, "<no shared entry at all>"))
+            continue
+        units = info["units"]
+        want = f"{prefix}{info['label']}" + (f" ({units})" if units else "")
+        if label == want or KNOWN_LABEL_DIFFERENCES.get(key) == label:
+            continue
+        drift.append((key, label, want))
+    assert not drift, (
+        f"{len(drift)} viewer label(s) neither compose from the shared registry "
+        f"nor appear in KNOWN_LABEL_DIFFERENCES: "
+        + "; ".join(f"{k}: viewer {have!r}, composed {want!r}"
+                    for k, have, want in drift))
+    stale = sorted(set(KNOWN_LABEL_DIFFERENCES) - set(labels))
+    assert not stale, (
+        f"KNOWN_LABEL_DIFFERENCES still excuses {stale}, which is no longer in "
+        f"the viewer catalog; an exception nobody removes is how the next real "
+        f"drift gets excused too")
 
 
 # --- 2. The sentinel arithmetic --------------------------------------------
@@ -303,7 +542,7 @@ def test_the_color_scale_bottom_is_pinned_at_exactly_zero():
     """0 m is a meaning, not a small number.
 
     The avg/max/min files exclude zero epochs, so their own minimum is the
-    bisection's finest step (~0.0098 m in the MP026 run). Autoscaling to that
+    bisection's finest step (~0.0098 m in the reference run). Autoscaling to that
     paints a one-centimeter shadow the same color as no shadow at all.
     """
     _, _, _, _, shadow_depth_clim = _sentinels()
@@ -494,6 +733,32 @@ def _synthetic_run(root):
     stat_depth = np.array([np.nan, np.nan, 0.5, 4.5, np.nan, np.nan, np.nan, np.nan])
     for stat in ("avg", "max", "min"):
         _write_faces(run / "statistics" / f"shadow_depth_{stat}.bin", stat_depth)
+    # The two fractions are bounded [0, 1] and NaN on a facet with no evaluated
+    # epoch at all. The catalog loop above gave them the same 1.0-2.0 ramp as
+    # every other field, which is both wrong for a fraction and a coincidence a
+    # test can pass on: "this field is not being drawn on temperature's range"
+    # cannot be checked when the two ranges are identical.
+    fraction = np.array([0.0, 0.25, 0.5, 0.75, 1.0, 0.0, np.nan, np.nan])
+    for field in ("shadow_lit_frac", "shadow_unresolved_frac"):
+        _write_faces(run / "statistics" / f"{field}.bin", fraction)
+    # `effective_albedo` with its own sentinel: NaN where the facet was never
+    # lit, so no ratio is defined. Two of eight, mirroring the 26,057 of
+    # 2,397,890 on the reference 1 h run. The loop above wrote a finite-everywhere
+    # version of this file; overwrite it, because a fixture with no NaN cannot
+    # fail the color-scale arm that needs one.
+    _write_faces(run / "statistics" / "effective_albedo.bin",
+                 np.array([0.14, 0.16, 0.18, 0.21, 0.24, 0.29, np.nan, np.nan]))
+    # ⛔ BY NAME, NOT BY CATALOG. Everything above came from
+    # `STATISTICS_FIELDS`, so on a tree whose catalog is missing a product the
+    # fixture would be missing it too -- and the disk arm, whose whole purpose
+    # is to be independent of the catalogs, would inherit their blind spot and
+    # quietly stop testing the thing it exists for. These three are the
+    # products that were invisible; they are written here unconditionally.
+    for band in ("indirect_solar", "indirect_ir"):
+        for step in range(2):
+            _write_faces(run / band / f"{band}_{step:04d}.bin", plain)
+        for stat in STAT_TYPES:
+            _write_faces(run / "statistics" / f"{band}_{stat}.bin", plain)
     (run / "statistics" / "shadow_depth.json").write_text(
         json.dumps({"ptm3d_shadow_depth_schema": 1, "h_max_m": 5,
                     "units": "meters"}), encoding="utf-8")
@@ -554,6 +819,32 @@ def _menu(panel):
     return [combo.itemData(i) for i in range(combo.count())]
 
 
+class _StubMesh:
+    """Enough of a PyVista mesh for the readers and for `set_field`.
+
+    The headless canvas has no mesh at all. The range readers need only a face
+    count, which is why a `SimpleNamespace(n_cells=...)` suffices elsewhere in
+    this file -- but `set_field` reloads the field and assigns it into the
+    mesh, and a namespace has no `__setitem__`. ⛔ That difference is not
+    cosmetic: PyQt6 ABORTS the process on an unhandled exception inside a slot,
+    so the whole run reports nothing at all (rc 134) rather than one failure.
+    """
+
+    def __init__(self, n_cells):
+        self.n_cells = n_cells
+        self._arrays = {}
+
+    def __setitem__(self, key, value):
+        self._arrays[key] = value
+
+    def __getitem__(self, key):
+        return self._arrays[key]
+
+    @property
+    def array_names(self):
+        return list(self._arrays)
+
+
 def _rect_in(child, ancestor):
     """`child`'s rectangle in `ancestor`'s coordinates.
 
@@ -592,6 +883,19 @@ def _drop_down_arm(run_dir, label):
                 "shadow_lit_frac", "shadow_unresolved_frac"]
     if (Path(run_dir) / "shadow_depth").is_dir():
         expected.insert(0, "shadow_depth")
+    # The two-band radiosity products, on the same terms: only what this run
+    # actually wrote. A run with radiation off writes no indirect band at all,
+    # and a streamed run writes no `effective_albedo` (the engine says so in
+    # its own warning); neither is a defect and neither may fail this arm.
+    stats_dir = Path(run_dir) / "statistics"
+    for key in ("indirect_solar", "indirect_ir"):
+        if (Path(run_dir) / key).is_dir():
+            expected.append(key)
+        for stat in ("avg", "max", "min"):
+            if (stats_dir / f"{key}_{stat}.bin").is_file():
+                expected.append(f"{key}_{stat}")
+    if (stats_dir / "effective_albedo.bin").is_file():
+        expected.append("effective_albedo")
     for key in expected:
         assert key in keys, (
             f"[{label}] '{key}' is on disk in {run_dir} but the field "
@@ -607,6 +911,252 @@ def _drop_down_arm(run_dir, label):
             f"[{label}] '{key}' is labeled {text!r}, FIELD_INFO says "
             f"{VisualizationPanel.FIELD_INFO[key][0]!r}")
     return panel, keys
+
+
+def products_on_disk(run_dir):
+    """``(offerable, skipped)`` -- what a run directory actually holds.
+
+    ⭐ BOUND TO NO CATALOG. Both catalog arms above compare one list of names
+    with another list of names, so they are only ever as good as the lists. The
+    defect this file exists for was a product ON DISK that no list mentioned.
+    This reads the directory the way the viewer's own two scan branches read
+    it -- `statistics/<key>.bin` and `<key>/<key>_NNNN.bin` -- and nothing else.
+
+    ``skipped`` holds the subsurface depth maps, by name, with the reason. They
+    cannot be in a static catalog (the name carries the depth) and the viewer's
+    menu is static, so they are a known gap and not a silent one:
+    PTM-GUI-DEPTH-MAPS-UNVIEWABLE.
+    """
+    from ptm.results import STAT_TYPES, depth_of_field
+    run = Path(run_dir)
+    offerable, skipped = set(), set()
+    stats_dir = run / "statistics"
+    if stats_dir.is_dir():
+        for path in sorted(stats_dir.glob("*.bin")):
+            stem = path.stem
+            base, _, stat = stem.rpartition("_")
+            probe = base if (base and stat in STAT_TYPES) else stem
+            if depth_of_field(probe) is not None:
+                skipped.add(stem)
+                continue
+            offerable.add(stem)
+    for child in sorted(run.iterdir()):
+        if not child.is_dir() or child.name == "statistics":
+            continue
+        if any(child.glob(f"{child.name}_*.bin")):
+            offerable.add(child.name)
+    return offerable, skipped
+
+
+def _disk_arm(run_dir, label):
+    """Every product on disk is in the real menu. Nothing else is asserted."""
+    panel = _loaded_panel(run_dir)
+    keys = set(_menu(panel))
+    offerable, skipped = products_on_disk(run_dir)
+    assert offerable, (
+        f"[{label}] no products were found on disk in {run_dir}; this arm "
+        f"would then be vacuous")
+    missing = sorted(offerable - keys)
+    assert not missing, (
+        f"[{label}] {len(missing)} product(s) are ON DISK in {run_dir} and the "
+        f"field drop-down does not offer them: {missing}. Whatever registry "
+        f"was supposed to carry them, the user cannot see them. Menu: "
+        f"{sorted(keys)}")
+    if skipped:
+        print(f"     [{label}] {len(skipped)} subsurface depth map(s) on disk "
+              f"are excluded by name, not offered by the menu, and owed "
+              f"PTM-GUI-DEPTH-MAPS-UNVIEWABLE: {sorted(skipped)[:3]}...")
+    return panel, keys
+
+
+def test_every_product_on_disk_is_offered():
+    """⭐ The property the catalog arms only approximate."""
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        _disk_arm(run, "synthetic")
+
+
+def test_the_disk_arm_can_fail():
+    """Not vacuous: a product on disk that the menu lacks is reported.
+
+    Writes a statistics file under a name no catalog knows, which is exactly
+    the shape of the defect -- `effective_albedo.bin` sat on disk under a name
+    the viewer's catalog did not carry for months.
+    """
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        _write_faces(run / "statistics" / "invented_product_max.bin",
+                     np.linspace(1.0, 2.0, N_FACES))
+        offerable, _skipped = products_on_disk(run)
+        assert "invented_product_max" in offerable, (
+            "the disk scan did not see a statistics file that is on disk; the "
+            "arm above would pass on a viewer that offers nothing")
+        panel = _loaded_panel(run)
+        assert "invented_product_max" not in set(_menu(panel)), (
+            "the menu offered a product no catalog knows; that would make the "
+            "arm above unable to fail")
+
+
+def test_the_albedo_map_does_not_read_as_broken():
+    """⚠️ `effective_albedo` is NaN where a facet was never lit -- 26,057 of
+    2,397,890 on the reference 1 h run -- and that is legitimate.
+
+    Three things have to hold or the map reads as a defect: the color range is
+    taken over the finite values (a NaN in the range is the flat-bar failure),
+    the range is never handed back as None (PyVista would autoscale over the
+    NaN), and the legend says what the gray facets mean.
+    """
+    import types
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        panel = _loaded_panel(run)
+        app = _app()
+        view = panel.view_3d
+        view.mesh = types.SimpleNamespace(n_cells=N_FACES)
+
+        view.current_field = "effective_albedo"
+        view.global_data_range = None
+        rng = view.compute_global_data_range()
+        assert rng is not None and np.isfinite(rng).all(), (
+            f"the effective-albedo color range is {rng}; a non-finite bound is "
+            f"the never-lit NaN leaking into the scale")
+        # Exact, through float32: the fixture's values are what the engine's
+        # own on-disk format holds, and 0.14 is not representable in it.
+        want = (float(np.float32(0.14)), float(np.float32(0.29)))
+        assert rng == want, (
+            f"the range must span the finite albedos only, {want}: {rng}")
+
+        # The reachable path that autoscales a NaN-bearing array.
+        view.fixed_color_scale = False
+        view.color_range_min = None
+        view.color_range_max = None
+        manual = view.effective_clim()
+        assert manual is not None and np.isfinite(manual).all(), (
+            f"unticking 'Fixed Scale' before touching a spin box yields "
+            f"clim={manual} for effective_albedo, so PyVista autoscales over "
+            f"an array whose never-lit facets are NaN")
+
+        # And the reader hands the NaN through rather than substituting a zero,
+        # which would read as a perfectly black facet.
+        data = view.load_field_data("effective_albedo", 0, N_FACES)
+        assert data is not None and np.isnan(data).sum() == 2, (
+            f"the never-lit sentinel did not survive the read: {data!r}")
+
+        # ⛔ Drop the stub mesh before driving the combo. `set_field` reloads
+        # the field and assigns into `self.mesh[...]`, which a SimpleNamespace
+        # cannot take -- and PyQt6 ABORTS the process (rc 134) on an unhandled
+        # exception inside a slot, so the whole run reports nothing at all.
+        view.mesh = None
+        idx = panel.field_combo.findData("effective_albedo")
+        assert idx >= 0, "effective_albedo is not in the menu"
+        panel.field_combo.setCurrentIndex(idx)
+        app.processEvents()
+        assert panel.field_note.isVisibleTo(panel), (
+            "the legend pane did not appear for effective_albedo, so the gray "
+            "facets are unexplained on screen")
+        text = panel.field_note.text().lower()
+        assert "gray" in text and "never lit" in text, (
+            f"the legend does not say what gray means: {text!r}")
+
+        # ⛔ The default colormap must not contain the NaN gray. `gray` itself
+        # -- the obvious ramp for a reflectance -- contains it exactly.
+        # Reached only after `_loaded_panel`, which already skips without the
+        # GUI stack, so this import cannot be the thing that fails here.
+        from gui_panels.visualization_panel import (
+            OFF_SCALE_NAN_COLOR, OFF_SCALE_MIN_RGB_DISTANCE, MATPLOTLIB_AVAILABLE)
+        if MATPLOTLIB_AVAILABLE:
+            import matplotlib.pyplot as plt
+            from matplotlib.colors import to_rgb
+            nan_rgb = np.asarray(to_rgb(OFF_SCALE_NAN_COLOR))
+            cmap = view.get_effective_cmap("effective_albedo")
+            ramp = plt.get_cmap(cmap)(np.linspace(0.0, 1.0, 256))[:, :3]
+            d = float(np.sqrt(((ramp - nan_rgb) ** 2).sum(axis=1)).min())
+            assert d >= OFF_SCALE_MIN_RGB_DISTANCE, (
+                f"the default colormap for effective_albedo ({cmap}) comes "
+                f"within {d:.4f} of the NaN color {OFF_SCALE_NAN_COLOR}, under "
+                f"the {OFF_SCALE_MIN_RGB_DISTANCE} this module requires of the "
+                f"other sentinel; the never-lit facets are then drawn a color "
+                f"the ramp itself uses")
+            gray = plt.get_cmap("gray")(np.linspace(0.0, 1.0, 256))[:, :3]
+            d_gray = float(np.sqrt(((gray - nan_rgb) ** 2).sum(axis=1)).min())
+            assert d_gray < OFF_SCALE_MIN_RGB_DISTANCE, (
+                "the premise of the choice above has changed: `gray` no longer "
+                "contains the NaN color, so the comment explaining why "
+                "effective_albedo does not use it is now wrong")
+
+
+def test_the_view_says_when_the_nan_gray_is_in_the_ramp():
+    """⚠️ A measured collision the fixed NaN color cannot avoid, disclosed.
+
+    `off_scale_above_color` chooses the +inf color against the ramp;
+    `OFF_SCALE_NAN_COLOR` is a constant and cannot. Measured over the 39
+    colormaps the toolbar offers, 9 come within `OFF_SCALE_MIN_RGB_DISTANCE`
+    of it -- including `cividis_r`, which is the DEFAULT for every shadow-depth
+    field and for `ice_depth`, and whose statistics are ~52% NaN on the
+    reference run. This arm holds the disclosure, not the fix
+    (PTM-GUI-NAN-GRAY-COLLIDES-WITH-RAMP).
+    """
+    try:
+        from gui_panels.visualization_panel import (
+            nan_color_collision_warning, MATPLOTLIB_AVAILABLE)
+    except ImportError as exc:                     # pragma: no cover
+        raise Skip(f"the GUI panel stack is unavailable here ({exc})")
+    if not MATPLOTLIB_AVAILABLE:
+        raise Skip("matplotlib is unavailable here, so no ramp can be sampled")
+    assert nan_color_collision_warning("cividis_r"), (
+        "cividis_r is 0.0300 from the NaN gray and the view says nothing")
+    assert not nan_color_collision_warning("Blues_r"), (
+        "Blues_r is 0.3670 away; warning about it would make the warning noise")
+    assert nan_color_collision_warning("") == "", (
+        "no colormap means no claim about one")
+
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        panel = _loaded_panel(run)
+        app = _app()
+        idx = panel.field_combo.findData("shadow_depth_avg")
+        assert idx >= 0
+        panel.field_combo.setCurrentIndex(idx)
+        app.processEvents()
+        text = panel.field_note.text()
+        assert "cividis_r" in text and "hard to tell apart" in text, (
+            f"the legend does not disclose that the default ramp contains the "
+            f"NaN gray: {text!r}")
+        # The field whose default was CHOSEN to clear it says nothing.
+        idx = panel.field_combo.findData("effective_albedo")
+        panel.field_combo.setCurrentIndex(idx)
+        app.processEvents()
+        assert "hard to tell apart" not in panel.field_note.text(), (
+            f"effective_albedo's default ramp should clear the NaN color: "
+            f"{panel.field_note.text()!r}")
+
+
+def test_the_indirect_bands_say_they_are_absorbed():
+    """A convention the numbers do not show, and the neighbors do not share.
+
+    `indirect_solar`/`indirect_ir` are ABSORBED flux; `direct_solar`,
+    `primary_reflected` and `primary_ir` -- same units, same mesh, same menu --
+    are INCIDENT. Nothing on screen distinguishes them, so the note pane does.
+    """
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        panel = _loaded_panel(run)
+        app = _app()
+        for key in ("indirect_solar", "indirect_ir", "indirect_ir_max"):
+            idx = panel.field_combo.findData(key)
+            assert idx >= 0, f"{key} is not in the menu"
+            panel.field_combo.setCurrentIndex(idx)
+            app.processEvents()
+            text = panel.field_note.text()
+            assert panel.field_note.isVisibleTo(panel) and "ABSORBED" in text, (
+                f"{key} shows no absorbed-vs-incident note: {text!r}")
+        # And it does not leak onto the incident components.
+        idx = panel.field_combo.findData("primary_ir")
+        panel.field_combo.setCurrentIndex(idx)
+        app.processEvents()
+        assert not panel.field_note.isVisibleTo(panel), (
+            f"the note pane stayed up for primary_ir: "
+            f"{panel.field_note.text()!r}")
 
 
 def test_the_drop_down_offers_every_shadow_depth_product():
@@ -733,6 +1283,48 @@ def test_unticking_fixed_scale_does_not_restore_the_flat_color_defect():
             "manual range is unset; the fix must not widen to every field")
 
 
+def test_a_manual_range_does_not_follow_you_to_the_next_field():
+    """⛔ A range adopted on one field must not govern the next one.
+
+    `on_fixed_scale_changed` adopts the displayed range, and `set_field` used
+    to clear only the cached global range -- so unticking "Fixed Scale" on
+    Temperature (24-369 K here) and then selecting Shadow Depth handed
+    PyVista a 24-369 K clim for an array that spans 0-5 m: every real value on
+    the bottom color, every +inf above range. The flat-color misread the
+    sentinel treatment exists to prevent, reached the long way round. It is
+    worst for the dimensionless fields this change adds.
+    """
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        panel = _loaded_panel(run)
+        view = panel.view_3d
+        view.mesh = _StubMesh(N_FACES)
+
+        view.current_field = "temperature"
+        view.global_data_range = None
+        view.fixed_color_scale = True
+        assert view.compute_global_data_range() == (1.0, 2.0)
+        from PyQt6.QtCore import Qt as _Qt
+        view.on_fixed_scale_changed(_Qt.CheckState.Unchecked.value)
+        assert (view.color_range_min, view.color_range_max) == (1.0, 2.0)
+
+        for field, want in (("shadow_depth", (0.0, 5.0)),
+                            ("effective_albedo",
+                             (float(np.float32(0.14)), float(np.float32(0.29)))),
+                            ("shadow_unresolved_frac", (0.0, 1.0))):
+            view.set_field(field)
+            got = view.effective_clim()
+            assert got != (1.0, 2.0), (
+                f"{field} is still being drawn on temperature's manual range "
+                f"{got}; the manual range followed the field switch")
+            if want is not None:
+                assert got == want, (
+                    f"{field} should adopt its own range {want}: {got}")
+            assert (view.color_range_min, view.color_range_max) == got, (
+                f"{field}: the stored manual range {(view.color_range_min, view.color_range_max)} "
+                f"is not what the view uses ({got})")
+
+
 def test_the_legend_pane_appears_only_for_sentinel_fields():
     with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
         run = _synthetic_run(tmp)
@@ -835,10 +1427,22 @@ def test_the_toolbar_drop_down_offers_every_shadow_depth_product():
             f"window's own {win.rect()}")
         for key in ("shadow_depth", "shadow_depth_avg", "shadow_depth_max",
                     "shadow_depth_min", "shadow_lit_frac",
-                    "shadow_unresolved_frac"):
+                    "shadow_unresolved_frac",
+                    # The two-band radiosity products. The toolbar is a SECOND
+                    # consumer of the same two class attributes and inherited
+                    # the same defect; it has to be shown to inherit the fix.
+                    "indirect_solar", "indirect_solar_avg", "indirect_solar_max",
+                    "indirect_solar_min", "indirect_ir", "indirect_ir_avg",
+                    "indirect_ir_max", "indirect_ir_min", "effective_albedo"):
             assert key in keys, (
                 f"'{key}' is on disk in {run} but the main toolbar's Field "
                 f"drop-down does not offer it. Menu: {keys}")
+        # And the same disk-driven property, on the window's own menu.
+        offerable, _skipped = products_on_disk(run)
+        missing = sorted(offerable - set(keys))
+        assert not missing, (
+            f"{len(missing)} product(s) on disk are missing from the main "
+            f"toolbar's Field drop-down: {missing}")
 
 
 # --- 6. The real run, when the caller has one -------------------------------
@@ -851,6 +1455,9 @@ def test_the_drop_down_offers_them_on_a_real_run():
     if not (run / "statistics" / "shadow_depth_avg.bin").is_file():
         raise Skip(f"{run} has no shadow-depth statistics")
     _, keys = _drop_down_arm(run, str(run))
+    # The catalog-free arm on real engine output, which is where a product the
+    # catalogs have never heard of actually turns up.
+    _disk_arm(run, str(run))
     from ptm.results import depth_of_field, detect_available_statistics
     detected = detect_available_statistics(run / "statistics")
     for base, stat in detected:
@@ -870,9 +1477,13 @@ def test_the_drop_down_offers_them_on_a_real_run():
 
 TESTS = [
     test_every_shared_registry_field_is_viewable_in_the_gui,
+    test_no_menu_entry_names_a_product_nothing_writes,
     test_the_gate_can_fail,
     test_the_scalar_statistics_lists_agree,
     test_is_stats_field_classifies_every_registry_key,
+    test_the_exporter_catalogs_are_derived_not_copied,
+    test_the_per_step_catalog_is_a_subset_of_the_statistics_catalog,
+    test_the_viewer_labels_agree_with_the_shared_registry,
     test_a_plain_min_max_over_a_shadow_depth_array_is_the_defect,
     test_finite_data_range_refuses_to_invent_a_range,
     test_the_color_scale_bottom_is_pinned_at_exactly_zero,
@@ -881,9 +1492,15 @@ TESTS = [
     test_no_single_off_scale_color_is_safe_and_the_code_knows_it,
     test_the_legend_names_the_color_that_is_actually_drawn,
     test_the_drop_down_offers_every_shadow_depth_product,
+    test_every_product_on_disk_is_offered,
+    test_the_disk_arm_can_fail,
+    test_the_albedo_map_does_not_read_as_broken,
+    test_the_view_says_when_the_nan_gray_is_in_the_ramp,
+    test_the_indirect_bands_say_they_are_absorbed,
     test_selecting_a_shadow_field_reads_the_file_that_exists,
     test_the_color_scale_skips_the_sentinels,
     test_unticking_fixed_scale_does_not_restore_the_flat_color_defect,
+    test_a_manual_range_does_not_follow_you_to_the_next_field,
     test_the_legend_pane_appears_only_for_sentinel_fields,
     test_the_toolbar_drop_down_offers_every_shadow_depth_product,
     test_the_drop_down_offers_them_on_a_real_run,

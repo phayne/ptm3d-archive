@@ -120,6 +120,28 @@ SHADOW_FRACTION_FIELDS = frozenset((
 #: Everything the off-scale treatment applies to.
 SHADOW_SENTINEL_FIELDS = SHADOW_DEPTH_FIELDS | SHADOW_FRACTION_FIELDS
 
+#: `effective_albedo` (PTM-107(a)) carries the OTHER sentinel, on its own. It is
+#: NaN wherever the face was never lit during the integration window, because
+#: the ratio it reports has no denominator there and the engine writes no number
+#: rather than inventing one. No +inf -- the quantity is bounded -- so these
+#: fields take the NaN color and the legend, and NOT the above-range color.
+#: The population is not a rounding detail: 26,057 of 2,397,890 faces on the
+#: reference 1 h lunar polar run, exactly the count that run's own log reports
+#: as never lit.
+UNDEFINED_RATIO_FIELDS = frozenset(('effective_albedo',))
+
+#: Every field whose array can hold NaN meaning "no value here". The NaN color,
+#: the legend pane and the never-autoscale rule key off THIS set; the
+#: above-range color keys off `SHADOW_SENTINEL_FIELDS`, because those are the
+#: only arrays that can hold +inf.
+NAN_BEARING_FIELDS = SHADOW_SENTINEL_FIELDS | UNDEFINED_RATIO_FIELDS
+
+#: The two indirect radiosity bands, per-step series and statistics alike.
+#: They carry no sentinel; they carry a CONVENTION that the numbers do not show
+#: and that the fields next to them in the menu do not share -- see
+#: :func:`field_convention_note`.
+INDIRECT_BAND_FIELDS = frozenset(('indirect_solar', 'indirect_ir'))
+
 #: The sidecar the shadow-depth pass writes beside its statistics. It carries
 #: `h_max_m`, the search ceiling the +inf sentinel refers to.
 SHADOW_DEPTH_SIDECAR = 'shadow_depth.json'
@@ -161,6 +183,25 @@ OFF_SCALE_MIN_RGB_DISTANCE = 0.25
 #: NaN -- "no value here". Mid-gray, and NOT chosen against the colormap: it
 #: marks absence rather than an extreme, so being readable as "not data" is the
 #: whole requirement and it is stated in the legend either way.
+#:
+#: ⚠️ MEASURED LIMITATION, stated rather than assumed away. Because this color
+#: is fixed, it CAN collide with the ramp -- the thing
+#: `off_scale_above_color` exists to prevent for the other sentinel. Over the
+#: 39 entries of `VisualizationPanel.AVAILABLE_COLORMAPS`, 9 come within
+#: `OFF_SCALE_MIN_RGB_DISTANCE` of it: `gray`/`gray_r` (0.0000),
+#: `cividis`/`cividis_r` (0.0300), `terrain` (0.1052), `Purples`/`Purples_r`
+#: (0.2106), `gist_earth` (0.2351), `cubehelix` (0.2462). Two consequences,
+#: one handled here and one not:
+#:   * A NaN-bearing field must not DEFAULT to one of those 9. That is why
+#:     `effective_albedo` -- whose obvious ramp for a reflectance is `gray` --
+#:     defaults to `Blues_r` (0.3670) instead.
+#:   * The shadow-depth family and `ice_depth` already default to `cividis_r`,
+#:     0.0300 away, and the shadow-depth statistics on the reference run are ~52%
+#:     NaN. Those facets are drawn in a gray the middle of their own ramp very
+#:     nearly matches. That is a real defect, it is NOT introduced here, and
+#:     fixing it means choosing this color against the ramp the way
+#:     `off_scale_above_color` does -- which changes what those fields look
+#:     like. Owed ledger row: PTM-GUI-NAN-GRAY-COLLIDES-WITH-RAMP.
 OFF_SCALE_NAN_COLOR = '#808080'
 
 
@@ -197,6 +238,41 @@ def off_scale_above_color(cmap_name):
         f"for the off-scale sentinel, so \"deeper than the search ceiling\" is "
         f"drawn in {default}, which also appears on the ramp. Choose another "
         f"colormap to tell the two apart.")
+
+
+def nan_color_collision_warning(cmap_name):
+    """A sentence when ``cmap_name`` itself contains the NaN gray, or ``''``.
+
+    ⭐ THE DISCLOSURE THE FIXED NaN COLOR OWES. `off_scale_above_color` picks
+    the +inf color AGAINST the ramp and complains when it cannot; the NaN color
+    is a constant and cannot do either, so the collision it is measured to have
+    -- `cividis_r`, the default for the whole shadow-depth family and for
+    `ice_depth`, is 0.0300 away, and those maps are ~52% NaN on the reference
+    run --
+    would otherwise be visible only to somebody reading this file. A facet
+    drawn in a gray the middle of its own color bar also uses reads as data.
+
+    This does not change any color. It says, in front of the user, that two
+    things on screen are hard to tell apart, which is the difference between a
+    known limitation and a silent one. The fix is to choose the NaN color
+    against the ramp as well: PTM-GUI-NAN-GRAY-COLLIDES-WITH-RAMP.
+    """
+    if not MATPLOTLIB_AVAILABLE or not cmap_name:
+        return ""
+    try:
+        from matplotlib.colors import to_rgb
+        ramp = plt.get_cmap(cmap_name)(np.linspace(0.0, 1.0, 256))[:, :3]
+        nan_rgb = np.asarray(to_rgb(OFF_SCALE_NAN_COLOR))
+    except Exception:                                        # noqa: BLE001
+        return ""
+    distance = float(np.sqrt(((ramp - nan_rgb) ** 2).sum(axis=1)).min())
+    if distance >= OFF_SCALE_MIN_RGB_DISTANCE:
+        return ""
+    return (
+        f"Caution: the colormap \"{cmap_name}\" itself contains the gray this "
+        f"view uses for \"no value\" (within {distance:.2f} in RGB), so a facet "
+        f"with no value and a facet in the middle of the color bar are hard to "
+        f"tell apart. Choose another colormap to separate them.")
 
 
 def finite_data_range(data):
@@ -326,9 +402,47 @@ def sentinel_legend(field_name, ceiling_m=None, above_color=None, warning=""):
             "Fraction of the evaluated epochs at which the Sun was visible "
             "standing on the facet -- shadow depth exactly 0. Gray means the "
             "facet had no evaluated epoch at all.")
+    elif field_name in UNDEFINED_RATIO_FIELDS:
+        text = (
+            "Effective albedo: the flux-weighted albedo the surface boundary "
+            "condition actually absorbed with, reduced over the integration "
+            "window. Dimensionless. Gray means the facet was never lit during "
+            "the window, so there is no incident flux to form the ratio from "
+            "and the engine wrote no number rather than inventing one -- a "
+            "legitimate population, not a gap in the data.")
     else:
         return ""
     return f"{text} {warning}".strip() if warning else text
+
+
+def field_convention_note(field_name):
+    """A sentence about a convention the numbers do not show, or ``''``.
+
+    Not a sentinel legend: nothing is off-scale and no color needs naming. The
+    two indirect radiosity bands are stored as ABSORBED flux at the facet,
+    while ``direct_solar``, ``primary_reflected`` and ``primary_ir`` -- sitting
+    directly above them in the same menu, in the same units, on the same mesh
+    -- are stored INCIDENT. The engine states that choice at its own writer and
+    nothing on screen shows it, so a reader who compares the two numbers is
+    misled by a view that is working correctly.
+
+    Statistics share their base field's note: ``indirect_ir_max`` is the same
+    quantity reduced, and the convention is what it is.
+    """
+    base = str(field_name or "")
+    for suffix in ('_avg', '_max', '_min'):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    if base in INDIRECT_BAND_FIELDS:
+        return (
+            "Indirect bands are ABSORBED flux at the facet. Direct Solar, "
+            "Primary Reflected and Primary IR in this same menu are INCIDENT "
+            "flux, so the two are not directly comparable. The two-band "
+            "radiosity solve produces exactly these absorbed band fluxes, and "
+            "their sum is the value coupled into the thermal boundary "
+            "condition.")
+    return ""
 
 
 class PyVistaWidget(QWidget):
@@ -447,7 +561,13 @@ class PyVistaWidget(QWidget):
 
             self.scale_min_input = QDoubleSpinBox()
             self.scale_min_input.setRange(-1000, 10000)
-            self.scale_min_input.setDecimals(1)
+            # 3 decimals, not 1: the menu now carries dimensionless fields --
+            # `effective_albedo` spans 0.137-0.290 on the reference run, and the
+            # two shadow fractions span 0-1. At one decimal those boxes read
+            # 0.1 and 0.3 for the whole map, and editing either one snapped the
+            # other to the rounded value. Temperature reads 24.277 instead of
+            # 24.3, which is the same number with more of it shown.
+            self.scale_min_input.setDecimals(3)
             self.scale_min_input.setValue(0)
             self.scale_min_input.setMaximumWidth(70)
             self.scale_min_input.setVisible(False)
@@ -462,7 +582,7 @@ class PyVistaWidget(QWidget):
 
             self.scale_max_input = QDoubleSpinBox()
             self.scale_max_input.setRange(-1000, 10000)
-            self.scale_max_input.setDecimals(1)
+            self.scale_max_input.setDecimals(3)
             self.scale_max_input.setValue(400)
             self.scale_max_input.setMaximumWidth(70)
             self.scale_max_input.setVisible(False)
@@ -943,10 +1063,16 @@ class PyVistaWidget(QWidget):
         # fields that actually carry sentinels -- setting a NaN color for every
         # field would change how every other field renders its gaps, which is a
         # separate decision and not this one.
-        if self.current_field in SHADOW_SENTINEL_FIELDS:
+        #
+        # The two sets are DIFFERENT and deliberately so: `effective_albedo` is
+        # NaN where a facet was never lit, so it needs the NaN color, but it
+        # can never be +inf and an above-range color for it would name a
+        # population that does not exist.
+        if self.current_field in NAN_BEARING_FIELDS:
+            mesh_kwargs['nan_color'] = OFF_SCALE_NAN_COLOR
+        if self.current_field in SHADOW_DEPTH_FIELDS:
             above, _warning = off_scale_above_color(cmap)
             mesh_kwargs['above_color'] = above
-            mesh_kwargs['nan_color'] = OFF_SCALE_NAN_COLOR
 
         self.plotter.add_mesh(self.mesh, **mesh_kwargs)
 
@@ -1224,24 +1350,53 @@ class PyVistaWidget(QWidget):
             if widget is not None:
                 widget.setVisible(show_inputs)
 
-        # If switching to manual, populate with current range -- AND adopt it
-        # as the manual range. Seeding only the spin boxes left
+        # If switching to manual, populate with the current range -- AND adopt
+        # it as the manual range. Seeding only the spin boxes left
         # `color_range_min/max` at None, so the boxes displayed numbers the
         # view was not using and `update_display` fell through to PyVista's
         # autoscale until the user happened to edit one of them.
-        if show_inputs and self.global_data_range is not None:
-            for name, value in (('scale_min_input', self.global_data_range[0]),
-                                ('scale_max_input', self.global_data_range[1])):
-                widget = getattr(self, name, None)
-                if widget is not None:
-                    widget.blockSignals(True)
-                    widget.setValue(value)
-                    widget.blockSignals(False)
-            self.color_range_min = self.global_data_range[0]
-            self.color_range_max = self.global_data_range[1]
+        if show_inputs:
+            self._adopt_manual_range()
 
         # Update display
         self.update_display()
+
+    def _adopt_manual_range(self):
+        """Seed the manual range and the spin boxes from the CURRENT field.
+
+        ⛔ A MANUAL RANGE BELONGS TO THE FIELD IT WAS TAKEN FROM. Without this
+        being re-run on a field switch, a range adopted on one field silently
+        governs the next one: untick "Fixed Scale" on Temperature (adopting,
+        say, 24-369 K) and then select Shadow Depth, and every real shadow
+        depth -- 0 to 5 m -- collapses onto the bottom color while every +inf
+        is drawn above-range. That is exactly the flat-color misread the
+        sentinel treatment exists to prevent, reached the long way round. It
+        bites the dimensionless fields hardest: an albedo map spanning 0.14 to
+        0.29 under a temperature range is one flat color.
+
+        The spin boxes are read BACK after being set, and that is deliberate:
+        they have finite decimals and a finite range, so the number the widget
+        holds is not always the number handed in. Adopting what the widget
+        shows keeps the one invariant that matters -- the boxes say what the
+        view is using -- even where the widget cannot represent the data
+        exactly.
+        """
+        data_range = self._global_range()
+        if data_range is None:
+            self.color_range_min = None
+            self.color_range_max = None
+            return
+        adopted = []
+        for name, value in (('scale_min_input', data_range[0]),
+                            ('scale_max_input', data_range[1])):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.blockSignals(True)
+                widget.setValue(value)
+                widget.blockSignals(False)
+                value = widget.value()
+            adopted.append(value)
+        self.color_range_min, self.color_range_max = adopted
 
     def on_color_range_changed(self):
         """Handle manual color range change"""
@@ -1341,7 +1496,7 @@ class PyVistaWidget(QWidget):
             return self._global_range()
         if self.color_range_min is not None and self.color_range_max is not None:
             return (self.color_range_min, self.color_range_max)
-        if self.current_field in SHADOW_SENTINEL_FIELDS:
+        if self.current_field in NAN_BEARING_FIELDS:
             return self._global_range()
         return None
 
@@ -1383,6 +1538,11 @@ class PyVistaWidget(QWidget):
         self.current_field = field_name
         # Reset global range when field changes
         self.global_data_range = None
+        # ...and re-adopt the manual range, which is per-field. See
+        # `_adopt_manual_range`: carrying one field's range onto the next is
+        # how a 0-5 m shadow depth ends up drawn on a 24-369 K bar.
+        if not self.fixed_color_scale:
+            self._adopt_manual_range()
         if self.mesh and self.results_dir:
             self.load_timestep_data(self.current_timestep)
 
@@ -3231,11 +3391,35 @@ class VisualizationPanel(QWidget):
         self.create_controls()
         layout.addWidget(self.controls_widget)
 
-    # Known field directories and their display labels.
-    # Per-timestep series (loaded from <results>/<key>/<key>_NNNN.bin)
-    # plus statistics rasters (loaded from <results>/statistics/<key>.bin
-    # — single file each, no timestep index). Statistics keys are recognized
-    # by the trailing _max / _avg / _min / a leading 'ice_depth_' suffix.
+    # Known field keys and their display labels. Per-timestep series (loaded
+    # from <results>/<key>/<key>_NNNN.bin) plus statistics rasters (loaded from
+    # <results>/statistics/<key>.bin — single file each, no timestep index).
+    # Statistics keys are recognized by `is_stats_field`: the trailing
+    # _max/_avg/_min, or membership of SCALAR_STATS_FIELDS below.
+    #
+    # ⭐ WHY THIS IS STILL A HAND-WRITTEN LITERAL, given that
+    # `ptm.results.STATISTICS_FIELDS` carries the same key set. Deriving it
+    # was considered and rejected, for reasons worth not re-deriving:
+    #   * This module must import with `src/python` absent from the path --
+    #     that is how the GUI is distributed -- so a derived catalog needs a
+    #     hand-written fallback anyway, and the duplication survives with a
+    #     second code path on top of it.
+    #   * The shared registry carries no colormap, and colormap choice is a
+    #     viewer decision with measured constraints (see OFF_SCALE_NAN_COLOR).
+    #     A derivation would trade this dict for a field->colormap dict of the
+    #     same length.
+    #   * The labels here are not the shared registry's: they carry the unit
+    #     inline and an "Annual Max"/"Max"/"Mean" prefix per statistic. Deriving
+    #     them would rewrite ~20 strings a user already reads today.
+    #   * The gate that binds the two (`src/python/tests/test_gui_field_registry.py`)
+    #     reads this literal with `ast`, so it needs neither PyQt6 nor a display
+    #     and CANNOT be skipped. An import-based check can be, and a skipped
+    #     gate reads as a pass.
+    # What was fixed instead is the thing duplication actually cost: the gate
+    # now proves BOTH directions against every catalog `ptm.results` publishes,
+    # and separately proves that every product in a real run directory is
+    # offered. Owed ledger row for the remaining duplication:
+    # PTM-GUI-FIELD-REGISTRY-DUP, narrowed, not closed.
     # Curated set of matplotlib colormaps for the toolbar Colormap dropdown.
     # Order: perceptually-uniform sequential first, then classic sequentials,
     # cyclic, diverging, qualitative, then their _r reversed counterparts.
@@ -3280,6 +3464,24 @@ class VisualizationPanel(QWidget):
         'primary_ir_max':        ('Max Primary IR (W/m²)',             'magma'),
         'primary_ir_avg':        ('Mean Primary IR (W/m²)',            'magma'),
         'primary_ir_min':        ('Min Primary IR (W/m²)',             'magma'),
+        # The two indirect (multiply-scattered) radiosity bands, written by a
+        # two-band radiosity run as both a per-step series and avg/max/min
+        # maps. The ramp follows the BAND, not the component, so a reader can
+        # put direct and indirect solar side by side without relearning the
+        # bar: solar-reflected keeps `cividis` (as Primary Reflected does) and
+        # thermal-IR keeps `magma` (as Primary IR does). These carry no
+        # sentinel -- measured on the reference 1 h run, 0 NaN and 0 +inf in all
+        # six statistics and in the 169 frames of each series -- but they DO
+        # carry a convention their neighbors do not: see
+        # `field_convention_note`.
+        'indirect_solar':        ('Indirect Solar (W/m²)',             'cividis'),
+        'indirect_solar_max':    ('Max Indirect Solar (W/m²)',         'cividis'),
+        'indirect_solar_avg':    ('Mean Indirect Solar (W/m²)',        'cividis'),
+        'indirect_solar_min':    ('Min Indirect Solar (W/m²)',         'cividis'),
+        'indirect_ir':           ('Indirect IR (W/m²)',                'magma'),
+        'indirect_ir_max':       ('Max Indirect IR (W/m²)',            'magma'),
+        'indirect_ir_avg':       ('Mean Indirect IR (W/m²)',           'magma'),
+        'indirect_ir_min':       ('Min Indirect IR (W/m²)',            'magma'),
         # Shadow depth: the height above the local surface at which the Sun is
         # not even partially visible (the umbral ceiling), meters, measured
         # along the body radial. Reversed cividis, matching ice_depth: deeper
@@ -3299,6 +3501,19 @@ class VisualizationPanel(QWidget):
                                                                        'cividis'),
         'shadow_unresolved_frac': ('Fraction of Epochs Umbral Above the '
                                    'Search Ceiling',                   'magma'),
+        # PTM-107(a): the flux-weighted albedo the surface boundary condition
+        # absorbed with, over the integration window. Dimensionless, so no unit
+        # in the title -- same as the two fractions above. Single per-face
+        # value; file: statistics/effective_albedo.bin.
+        # ⛔ NOT `gray`, which is what a reflectance map wants to be: the fixed
+        # NaN color is mid-gray and a `gray` ramp contains it EXACTLY (measured
+        # 0.0000), so the never-lit facets would be indistinguishable from a
+        # mid-range albedo -- and on the reference 1 h run there are 26,057 of
+        # them.
+        # `Blues_r` is 0.3670 away, clears `OFF_SCALE_MIN_RGB_DISTANCE`, and
+        # still reads the right way round for a reflectance (bright facets
+        # bright). See the `OFF_SCALE_NAN_COLOR` note at the top of this file.
+        'effective_albedo':      ('Effective Albedo',                  'Blues_r'),
     }
 
     #: Statistics products that are ONE value per face with no avg/max/min
@@ -3308,11 +3523,13 @@ class VisualizationPanel(QWidget):
     #: rather than by an import, so this panel keeps working in a checkout
     #: where `src/python` is not on the path -- and so that adding a scalar
     #: product to the engine fails a test here instead of silently producing a
-    #: field the viewer cannot offer.
+    #: field the viewer cannot offer. `effective_albedo` is one: a single
+    #: per-face ratio with no avg/max/min split, like `ice_depth`.
     SCALAR_STATS_FIELDS = frozenset((
         'ice_depth',
         'shadow_lit_frac',
         'shadow_unresolved_frac',
+        'effective_albedo',
     ))
 
     # Field keys that come from the statistics directory rather than a
@@ -3488,12 +3705,32 @@ class VisualizationPanel(QWidget):
         """
         note = getattr(self, "field_note", None)
         above, warning = (OFF_SCALE_ABOVE_CANDIDATES[0][0], "")
-        if field_key in SHADOW_SENTINEL_FIELDS:
+        # ⛔ SHADOW_DEPTH_FIELDS, not SHADOW_SENTINEL_FIELDS. The two fraction
+        # fields are bounded [0, 1] and cannot hold +inf, so nothing of theirs
+        # is ever drawn above range -- and `off_scale_above_color`'s complaint
+        # is about a population they do not have. Under a colormap that
+        # swallows every candidate, running it here put "deeper than the search
+        # ceiling is drawn in magenta" into the legend of a field that has no
+        # such facets.
+        if field_key in SHADOW_DEPTH_FIELDS:
             above, warning = off_scale_above_color(
                 self.view_3d.get_effective_cmap(field_key))
         text = sentinel_legend(
             field_key, shadow_depth_ceiling_m(self.results_dir),
             above_color=above, warning=warning)
+        # A field with no sentinel can still need a sentence: the indirect
+        # bands are absorbed flux where their neighbors are incident. `or`,
+        # not an append -- no field has both today, and a pane holding two
+        # unrelated paragraphs is a pane nobody reads.
+        text = text or field_convention_note(field_key)
+        # ⭐ And the one complaint the fixed NaN color cannot make for itself.
+        # Appended, not substituted: the sentinel legend still has to say what
+        # the colors MEAN before this says they are hard to tell apart.
+        if field_key in NAN_BEARING_FIELDS:
+            collision = nan_color_collision_warning(
+                self.view_3d.get_effective_cmap(field_key))
+            if collision:
+                text = f"{text} {collision}".strip()
         if note is not None:
             note.setText(text)
             note.setVisible(bool(text))
