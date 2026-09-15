@@ -4,6 +4,7 @@ Visualization Panel for PTM3D GUI
 Enhanced with face selection via click or lat/lon input, and data export
 """
 
+import json
 import logging
 import numpy as np
 import os
@@ -73,6 +74,261 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
     print("Warning: Matplotlib not available. 2D plotting disabled.")
+
+
+# --- Fields that carry sentinel values -------------------------------------
+#
+# ⭐ WHY THIS SECTION EXISTS: 0.0 AND +inf MEAN OPPOSITE THINGS IN THE SAME
+# ARRAY, AND AN AUTOSCALED COLOR BAR CANNOT TELL THEM APART.
+#
+# `shadow_depth` is the height above the local surface at which the Sun is not
+# even partially visible -- the umbral ceiling. The engine writes three things
+# that are not measurements into the same float32 array, and says so itself in
+# `statistics/shadow_depth.json` under "sentinel_encoding":
+#
+#     0.0    the Sun is visible standing on the facet -- CLEAR AT THE SURFACE.
+#     +inf   still umbral at the search ceiling `h_max_m` -- DEEPER THAN THE
+#            RUN LOOKED. Inside a permanently shadowed region this is the
+#            MAJORITY value BY DESIGN; it is not a failure, and the engine
+#            deliberately invents no number for it.
+#     NaN    not evaluated. In the avg/max/min files it additionally marks a
+#            facet with no resolved, nonzero epoch at all, because those
+#            statistics are taken over resolved nonzero epochs only.
+#
+# A color range taken as (min, max) over such an array is (0, +inf): every
+# facet renders one flat color, and the two OPPOSITE meanings -- sunlit at your
+# feet, and shadowed deeper than five meters -- become the same pixel. So the
+# rule here is: scale to the FINITE range, and give each sentinel its own
+# off-scale color plus a plain-text legend that names it.
+#
+# The five functions below are pure -- numpy in, plain data out, no Qt and no
+# PyVista -- so the decision they make is testable on a machine that cannot
+# open a render window, which is every machine this repository's GUI suites run
+# on. See `src/python/tests/test_gui_field_registry.py`.
+
+#: The shadow-depth products, per-step series and statistics alike. These are
+#: the ones that carry BOTH sentinels.
+SHADOW_DEPTH_FIELDS = frozenset((
+    'shadow_depth', 'shadow_depth_avg', 'shadow_depth_max', 'shadow_depth_min'))
+
+#: The two companion fractions. No +inf -- they are bounded [0, 1] -- but the
+#: engine leaves them NaN on a face with no evaluated epoch at all
+#: (`shadow_depth_pass.cpp`), so they need the NaN color and the legend too.
+SHADOW_FRACTION_FIELDS = frozenset((
+    'shadow_lit_frac', 'shadow_unresolved_frac'))
+
+#: Everything the off-scale treatment applies to.
+SHADOW_SENTINEL_FIELDS = SHADOW_DEPTH_FIELDS | SHADOW_FRACTION_FIELDS
+
+#: The sidecar the shadow-depth pass writes beside its statistics. It carries
+#: `h_max_m`, the search ceiling the +inf sentinel refers to.
+SHADOW_DEPTH_SIDECAR = 'shadow_depth.json'
+
+#: ⛔ NO SINGLE OFF-SCALE COLOR IS SAFE, WHICH IS WHY THIS IS A LIST.
+#:
+#: The obvious implementation picks one color and asserts it is not in any
+#: colormap. Measured against the 39 entries of
+#: `VisualizationPanel.AVAILABLE_COLORMAPS`, that assertion is false for every
+#: candidate: magenta is EXACTLY the top of `cool` and within 0.029 of a point
+#: on `hsv`; white is in 25 of them; black in 9; red in 7. And the toolbar's
+#: Colormap dropdown writes a per-field override, so a user can put any of
+#: those under a shadow-depth field. A +inf facet drawn the same magenta as the
+#: top of a `cool` ramp reads as "exactly at the ceiling" -- the one misreading
+#: this whole treatment exists to prevent.
+#:
+#: So the color is chosen AGAINST the colormap in use, first match wins, and
+#: when every candidate collides `off_scale_above_color` says so rather than
+#: picking one quietly. Ordered by how many of the 39 offered maps each
+#: collides with, measured: magenta 2, cyan 3, red 7, black 9, white 25. No
+#: single offered map rules out more than 3 of the 5 today -- `hsv`, the worst,
+#: still leaves black and white -- so the all-collide branch is not reachable
+#: from the dropdown alone. It is kept because `set_cmap_override` accepts any
+#: matplotlib colormap name, not only the curated list.
+OFF_SCALE_ABOVE_CANDIDATES = (
+    ('magenta', (1.0, 0.0, 1.0)),
+    ('cyan',    (0.0, 1.0, 1.0)),
+    ('red',     (1.0, 0.0, 0.0)),
+    ('black',   (0.0, 0.0, 0.0)),
+    ('white',   (1.0, 1.0, 1.0)),
+)
+
+#: How far a ramp color must stay from the sentinel color, as a Euclidean
+#: distance in unit RGB (max possible sqrt(3) = 1.73). 0.25 keeps `Reds`'
+#: darkest step (0.248 from pure red) on the wrong side, deliberately: at that
+#: separation the two are not reliably distinguishable on a shaded 3D surface.
+OFF_SCALE_MIN_RGB_DISTANCE = 0.25
+
+#: NaN -- "no value here". Mid-gray, and NOT chosen against the colormap: it
+#: marks absence rather than an extreme, so being readable as "not data" is the
+#: whole requirement and it is stated in the legend either way.
+OFF_SCALE_NAN_COLOR = '#808080'
+
+
+def off_scale_above_color(cmap_name):
+    """``(color_name, warning)`` for the +inf sentinel under ``cmap_name``.
+
+    The first candidate no sampled ramp color comes within
+    ``OFF_SCALE_MIN_RGB_DISTANCE`` of. ``warning`` is ``''`` when one was
+    found, and a sentence naming the problem when every candidate collides.
+    The warning is returned, not logged and dropped, because it goes in front
+    of the user: a sentinel that cannot be told from the ramp must say so
+    rather than look like data.
+
+    Falls back to the first candidate, and says so, when matplotlib is not
+    importable or the colormap is unknown -- there is then no ramp to compare
+    against, and refusing to draw would be worse than drawing with a caveat.
+    """
+    default = OFF_SCALE_ABOVE_CANDIDATES[0][0]
+    if not MATPLOTLIB_AVAILABLE or not cmap_name:
+        return default, ""
+    try:
+        ramp = plt.get_cmap(cmap_name)(np.linspace(0.0, 1.0, 256))[:, :3]
+    except Exception:                                        # noqa: BLE001
+        return default, (
+            f"The colormap \"{cmap_name}\" could not be sampled, so the "
+            f"off-scale color was not checked against it; if the ramp itself "
+            f"contains {default}, the two are not distinguishable.")
+    for name, rgb in OFF_SCALE_ABOVE_CANDIDATES:
+        distance = np.sqrt(((ramp - np.asarray(rgb)) ** 2).sum(axis=1)).min()
+        if distance >= OFF_SCALE_MIN_RGB_DISTANCE:
+            return name, ""
+    return default, (
+        f"The colormap \"{cmap_name}\" contains every color this view can use "
+        f"for the off-scale sentinel, so \"deeper than the search ceiling\" is "
+        f"drawn in {default}, which also appears on the ramp. Choose another "
+        f"colormap to tell the two apart.")
+
+
+def finite_data_range(data):
+    """``(min, max)`` over the FINITE entries of ``data``, or ``None``.
+
+    ``np.min``/``np.max`` propagate NaN and return ``inf`` -- which is exactly
+    how one sentinel turns a color bar into one flat color. This ignores both.
+    ``None`` when nothing finite is left: that is the honest answer and it is
+    distinct from ``(0.0, 0.0)``.
+    """
+    if data is None:
+        return None
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.size == 0:
+        return None
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return None
+    return (float(finite.min()), float(finite.max()))
+
+
+def shadow_depth_ceiling_m(results_dir):
+    """``h_max_m`` from ``statistics/shadow_depth.json``, or ``None``.
+
+    ``None`` for a run that wrote no sidecar, an unreadable one, or one whose
+    ceiling is not a positive number. The caller then falls back to the finite
+    range of the data, which is always available. Nothing is guessed here: the
+    ceiling is the engine's own number or it is absent.
+    """
+    if not results_dir:
+        return None
+    path = Path(results_dir) / 'statistics' / SHADOW_DEPTH_SIDECAR
+    try:
+        with open(path, 'r') as handle:
+            sidecar = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(sidecar, dict):
+        return None
+    ceiling = sidecar.get('h_max_m')
+    try:
+        ceiling = float(ceiling)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(ceiling) or ceiling <= 0:
+        return None
+    return ceiling
+
+
+def shadow_depth_clim(data_range, ceiling_m):
+    """The color range for a shadow-depth field: ``(0.0, ceiling)``.
+
+    The bottom is pinned at EXACTLY 0 because 0 is a meaning ("the Sun is
+    visible standing here"), not a small number. The avg/max/min files exclude
+    zero epochs, so their own minimum is the bisection's finest step (~0.01 m);
+    an autoscaled bar would paint a one-centimeter shadow the same color as no
+    shadow at all.
+
+    The top is the engine's search ceiling when the sidecar gave one, so the
+    bar means the same thing in every run of the same configuration, and the
+    finite maximum otherwise (or whichever is larger, so no real value is ever
+    pushed off-scale by a sidecar that disagrees with its own data). ``None``
+    when neither is available -- there is nothing to scale to, and the caller
+    must not invent one.
+
+    One consequence, measured rather than assumed: over the default
+    ``h_max_m = 5`` the 256-step ramp gives 19.5 mm per color step, which is
+    the engine's own final bisection bracket at the default ladder
+    (5 / (16 * 2**4)). So the bar resolves the search exactly as finely as the
+    search resolves itself, and no finer -- 0.0 and the smallest reportable
+    shadow, 0.0098 m, land in the same step. Distinguishing those two is what
+    ``shadow_lit_frac`` is for; distinguishing 0.0 from +inf, which is the
+    opposite-meaning pair, is what the off-scale color is for.
+    """
+    top = None
+    if ceiling_m is not None and np.isfinite(ceiling_m) and ceiling_m > 0:
+        top = float(ceiling_m)
+    if data_range is not None and np.isfinite(data_range[1]):
+        if top is None or data_range[1] > top:
+            top = float(data_range[1])
+    if top is None or not np.isfinite(top) or top <= 0:
+        return None
+    return (0.0, top)
+
+
+def sentinel_legend(field_name, ceiling_m=None, above_color=None, warning=""):
+    """One plain sentence naming what each off-scale color means, or ``''``.
+
+    This is the legend the color bar cannot draw: the bar spans the finite
+    range, and the sentinels sit outside it by construction. Qualitative on
+    purpose -- it states meanings, not counts, so it does not change from
+    timestep to timestep and carries no number the engine did not write.
+
+    ``above_color`` is the name :func:`off_scale_above_color` actually chose,
+    so the sentence names the color on screen rather than a color this module
+    hoped for; ``warning`` is that function's complaint, appended verbatim when
+    it has one.
+    """
+    ceiling = 'the search ceiling'
+    if ceiling_m is not None and np.isfinite(ceiling_m) and ceiling_m > 0:
+        ceiling = f"{ceiling_m:g} m"
+    above = above_color or OFF_SCALE_ABOVE_CANDIDATES[0][0]
+    if field_name == 'shadow_depth':
+        text = (
+            "Shadow depth: the height above the local surface at which the Sun "
+            "is not even partially visible. 0 m, the bottom of the color bar, "
+            f"means the Sun is visible standing on the facet. {above.capitalize()} "
+            f"means still in shadow above {ceiling} -- deeper than this run "
+            f"looked, NOT {ceiling}. Gray means not evaluated.")
+    elif field_name in SHADOW_DEPTH_FIELDS:
+        text = (
+            "Shadow depth: the height above the local surface at which the Sun "
+            "is not even partially visible, reduced over the output window. "
+            "0 m, the bottom of the color bar, means the Sun is visible "
+            "standing on the facet. This statistic covers resolved, nonzero "
+            "epochs only, so gray means the facet had none of them -- open "
+            "\"Fraction of Epochs Umbral Above the Search Ceiling\" to see "
+            "where those facets are.")
+    elif field_name == 'shadow_unresolved_frac':
+        text = (
+            "Fraction of the evaluated epochs at which the facet was still in "
+            f"shadow above {ceiling}. 1.0 is a facet that was never resolved: "
+            "a permanently shadowed floor, by design, not a failed search. "
+            "Gray means the facet had no evaluated epoch at all.")
+    elif field_name == 'shadow_lit_frac':
+        text = (
+            "Fraction of the evaluated epochs at which the Sun was visible "
+            "standing on the facet -- shadow depth exactly 0. Gray means the "
+            "facet had no evaluated epoch at all.")
+    else:
+        return ""
+    return f"{text} {warning}".strip() if warning else text
 
 
 class PyVistaWidget(QWidget):
@@ -554,13 +810,16 @@ class PyVistaWidget(QWidget):
         """Load a specific data field for a timestep, or a per-face annual
         statistic (in which case timestep_index is ignored).
 
-        Statistics are recognized by trailing _max/_avg/_min and live in
-        <results>/statistics/<field_name>.bin (single file, no timestep).
+        Statistics live in <results>/statistics/<field_name>.bin (single file,
+        no timestep) and are recognized by
+        `VisualizationPanel.is_stats_field`. That rule used to be spelled out a
+        second time here, and the copies drifted the moment a scalar product
+        that is not `ice_depth` arrived: `shadow_lit_frac` was listed in the
+        menu and then looked for under `shadow_lit_frac/shadow_lit_frac_0000.bin`,
+        a directory no run writes. One rule, one place.
         """
         # Statistics path: single file, no timestep index
-        if (field_name.endswith('_max') or field_name.endswith('_avg')
-                or field_name.endswith('_min')
-                or field_name == 'ice_depth'):
+        if VisualizationPanel.is_stats_field(field_name):
             stats_path = self.results_dir / 'statistics' / f"{field_name}.bin"
             if not stats_path.exists():
                 return None
@@ -640,37 +899,16 @@ class PyVistaWidget(QWidget):
         else:
             scalars = None
 
-        # Choose colormap based on field. Resolution order:
-        #   1. user override stored in self.cmap_overrides for this field
-        #   2. explicit default from VisualizationPanel.FIELD_INFO
-        #   3. 'temperature ⇒ plasma, else viridis' fallback
-        cmap = 'viridis'
-        try:
-            override = self.cmap_overrides.get(self.current_field)
-            if override:
-                cmap = override
-            else:
-                info = VisualizationPanel.FIELD_INFO.get(self.current_field)
-                if info is not None:
-                    cmap = info[1]
-                elif 'temperature' in self.current_field.lower():
-                    cmap = 'plasma'
-        except Exception:
-            if 'temperature' in self.current_field.lower():
-                cmap = 'plasma'
+        # Choose colormap based on field: user override, then FIELD_INFO,
+        # then the 'temperature => plasma, else viridis' fallback. That order
+        # used to be written out twice -- here and in `get_effective_cmap`,
+        # whose docstring said it "mirrors the resolution order in
+        # update_display()". The legend pane resolves the color of the
+        # off-scale sentinel from `get_effective_cmap`, so two copies is two
+        # answers and a legend that can name a color the view did not draw.
+        cmap = self.get_effective_cmap()
 
-        # Determine color range (clim)
-        clim = None
-        if self.fixed_color_scale:
-            # Use global range across all timesteps
-            if self.global_data_range is None:
-                self.global_data_range = self.compute_global_data_range()
-            if self.global_data_range is not None:
-                clim = self.global_data_range
-        else:
-            # Use manual range
-            if self.color_range_min is not None and self.color_range_max is not None:
-                clim = (self.color_range_min, self.color_range_max)
+        clim = self.effective_clim()
 
         # Add mesh to plotter with horizontal colorbar at bottom
         mesh_kwargs = {
@@ -697,6 +935,18 @@ class PyVistaWidget(QWidget):
         }
         if clim is not None:
             mesh_kwargs['clim'] = clim
+
+        # A sentinel-bearing field gives its off-scale values their own colors.
+        # VTK maps +inf to the above-range color and NaN to the NaN color
+        # directly, so NOTHING is substituted in the array: a probed facet
+        # still reports `inf`, not a number this panel made up. Scoped to the
+        # fields that actually carry sentinels -- setting a NaN color for every
+        # field would change how every other field renders its gaps, which is a
+        # separate decision and not this one.
+        if self.current_field in SHADOW_SENTINEL_FIELDS:
+            above, _warning = off_scale_above_color(cmap)
+            mesh_kwargs['above_color'] = above
+            mesh_kwargs['nan_color'] = OFF_SCALE_NAN_COLOR
 
         self.plotter.add_mesh(self.mesh, **mesh_kwargs)
 
@@ -963,21 +1213,32 @@ class PyVistaWidget(QWidget):
         """Handle fixed scale checkbox change"""
         self.fixed_color_scale = (state == Qt.CheckState.Checked.value)
 
-        # Show/hide manual range inputs
+        # Show/hide manual range inputs. These four widgets only exist when
+        # the 3D canvas was built (see `init_ui`), so they are reached the same
+        # guarded way as every other canvas-only control in this module --
+        # which also lets a headless test drive the state transition below.
         show_inputs = not self.fixed_color_scale
-        self.scale_min_label.setVisible(show_inputs)
-        self.scale_min_input.setVisible(show_inputs)
-        self.scale_max_label.setVisible(show_inputs)
-        self.scale_max_input.setVisible(show_inputs)
+        for name in ('scale_min_label', 'scale_min_input',
+                     'scale_max_label', 'scale_max_input'):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setVisible(show_inputs)
 
-        # If switching to manual, populate with current range
+        # If switching to manual, populate with current range -- AND adopt it
+        # as the manual range. Seeding only the spin boxes left
+        # `color_range_min/max` at None, so the boxes displayed numbers the
+        # view was not using and `update_display` fell through to PyVista's
+        # autoscale until the user happened to edit one of them.
         if show_inputs and self.global_data_range is not None:
-            self.scale_min_input.blockSignals(True)
-            self.scale_max_input.blockSignals(True)
-            self.scale_min_input.setValue(self.global_data_range[0])
-            self.scale_max_input.setValue(self.global_data_range[1])
-            self.scale_min_input.blockSignals(False)
-            self.scale_max_input.blockSignals(False)
+            for name, value in (('scale_min_input', self.global_data_range[0]),
+                                ('scale_max_input', self.global_data_range[1])):
+                widget = getattr(self, name, None)
+                if widget is not None:
+                    widget.blockSignals(True)
+                    widget.setValue(value)
+                    widget.blockSignals(False)
+            self.color_range_min = self.global_data_range[0]
+            self.color_range_max = self.global_data_range[1]
 
         # Update display
         self.update_display()
@@ -990,9 +1251,37 @@ class PyVistaWidget(QWidget):
             self.update_display()
 
     def compute_global_data_range(self):
-        """Compute the global min/max across all timesteps for the current field"""
+        """Color range for the current field, over FINITE values only.
+
+        Per-step series: sampled across timesteps, as before. Statistics: the
+        single file, which previously fell through to None and left the color
+        bar to VTK's own autoscale -- identical numbers for an all-finite
+        field, and the difference that matters for one that is not.
+
+        ⛔ FINITE ONLY, and that is the whole point. `np.min`/`np.max` over a
+        `shadow_depth` array return `(0.0, +inf)`, because +inf is the engine's
+        "still umbral at the search ceiling" sentinel and inside a permanently
+        shadowed region it is the majority value by design. Handing that to
+        PyVista as a `clim` paints every facet one flat color -- the sunlit
+        ones and the deeply shadowed ones alike. See the module header.
+        """
         if not self.results_dir:
             return None
+
+        field_name = self.current_field
+        ceiling_m = shadow_depth_ceiling_m(self.results_dir)
+
+        # Statistics: one file, no timestep index.
+        if VisualizationPanel.is_stats_field(field_name):
+            stats_path = self.results_dir / 'statistics' / f"{field_name}.bin"
+            if not stats_path.is_file():
+                return None
+            data = self.read_binary_data(
+                stats_path, self.mesh.n_cells if self.mesh else 0)
+            data_range = finite_data_range(data)
+            if field_name in SHADOW_DEPTH_FIELDS:
+                return shadow_depth_clim(data_range, ceiling_m)
+            return data_range
 
         field_dirs = {
             'temperature': 'temperature',
@@ -1002,7 +1291,7 @@ class PyVistaWidget(QWidget):
             'primary_ir': 'primary_ir'
         }
 
-        dir_name = field_dirs.get(self.current_field, self.current_field)
+        dir_name = field_dirs.get(field_name, field_name)
         data_dir = self.results_dir / dir_name
 
         if not data_dir.exists():
@@ -1019,24 +1308,70 @@ class PyVistaWidget(QWidget):
 
         for file_path in sampled_files:
             data = self.read_binary_data(file_path, self.mesh.n_cells if self.mesh else 0)
-            if data is not None and len(data) > 0:
-                global_min = min(global_min, np.min(data))
-                global_max = max(global_max, np.max(data))
+            file_range = finite_data_range(data)
+            if file_range is not None:
+                global_min = min(global_min, file_range[0])
+                global_max = max(global_max, file_range[1])
 
+        data_range = None
         if global_min < float('inf') and global_max > float('-inf'):
-            return (global_min, global_max)
+            data_range = (global_min, global_max)
+        if field_name in SHADOW_DEPTH_FIELDS:
+            return shadow_depth_clim(data_range, ceiling_m)
+        return data_range
+
+    def effective_clim(self):
+        """The color range this view will hand PyVista, or ``None``.
+
+        Fixed scale: the global range across timesteps. Manual scale: the two
+        spin-box values, when both are set. Extracted from `update_display` so
+        the decision can be driven without a render window -- it is the one
+        place a sentinel can silently get back onto an autoscaled bar.
+
+        ⛔ A SENTINEL-BEARING FIELD NEVER RETURNS None HERE. With `clim=None`
+        PyVista autoscales to `(nanmin, nanmax)`, which for a `shadow_depth`
+        array is `(0, +inf)`. Measured through the real `vtkLookupTable` at
+        that range: 0.0, 0.5, 2.5, 5.0 AND +inf all map to the SAME bottom
+        color -- the whole field goes flat and the sentinel becomes
+        indistinguishable from "lit at the surface", which is its opposite.
+        That was reachable by unticking "Fixed Scale" before touching either
+        spin box.
+        """
+        if self.fixed_color_scale:
+            return self._global_range()
+        if self.color_range_min is not None and self.color_range_max is not None:
+            return (self.color_range_min, self.color_range_max)
+        if self.current_field in SHADOW_SENTINEL_FIELDS:
+            return self._global_range()
         return None
 
+    def _global_range(self):
+        """`compute_global_data_range`, computed once per field.
+
+        Cached in `global_data_range`, which `set_field` clears -- so switching
+        field recomputes and redrawing does not. Without this the sentinel
+        branch above re-read a 9.6-million-byte statistics file on every frame
+        of an animation.
+        """
+        if self.global_data_range is None:
+            self.global_data_range = self.compute_global_data_range()
+        return self.global_data_range
+
     def get_field_label(self):
-        """Get display label for current field"""
-        labels = {
-            'temperature': 'Temperature (K)',
-            'direct_solar': 'Direct Solar (W/m²)',
-            'illumination': 'Total Illumination (W/m²)',
-            'primary_reflected': 'Primary Reflected (W/m²)',
-            'primary_ir': 'Primary IR (W/m²)'
-        }
-        return labels.get(self.current_field, self.current_field)
+        """Color-bar title for the current field.
+
+        `VisualizationPanel.FIELD_INFO` is the one catalog; this used to carry
+        a five-entry copy of the per-step half of it, so every statistic and
+        every product added since -- ice_depth, the shadow-depth family -- was
+        titled with its raw file-name key. The catalog's strings for those five
+        are character-identical to the copy this replaces, so no bar that was
+        already labeled changes. The raw key is still the fallback for a field
+        no catalog knows, which is honest: it names the file.
+        """
+        info = VisualizationPanel.FIELD_INFO.get(self.current_field)
+        if info is not None:
+            return info[0]
+        return self.current_field
 
     def set_timestep(self, index):
         """Set current timestep"""
@@ -2860,6 +3195,23 @@ class VisualizationPanel(QWidget):
         self.preview_note.setVisible(False)
         layout.addWidget(self.preview_note)
 
+        # ⭐ WHAT THE OFF-SCALE COLORS MEAN, FOR THE FIELD NOW ON SCREEN.
+        #
+        # The color bar spans the finite range; `shadow_depth`'s two sentinels
+        # sit OUTSIDE it by construction, so the bar cannot label them and a
+        # magenta facet is unreadable without this sentence. PLAIN TEXT, above
+        # the view, not a tooltip -- "0 m" and "+inf" are opposite meanings and
+        # a legend nobody hovers over is a legend nobody reads. Empty, and
+        # hidden, for every field that carries no sentinel, which is all of
+        # them but the six in `SHADOW_SENTINEL_FIELDS`.
+        self.field_note = QLabel("")
+        self.field_note.setWordWrap(True)
+        self.field_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.field_note.setStyleSheet(
+            "color: #ffcc80; font-size: 11px; padding: 4px;")
+        self.field_note.setVisible(False)
+        layout.addWidget(self.field_note)
+
         # Create tab widget for 3D/2D views
         self.tab_widget = QTabWidget()
 
@@ -2924,21 +3276,53 @@ class VisualizationPanel(QWidget):
         'direct_solar_min':      ('Min Direct Solar (W/m²)',           'inferno'),
         'primary_reflected_max': ('Max Primary Reflected (W/m²)',      'cividis'),
         'primary_reflected_avg': ('Mean Primary Reflected (W/m²)',     'cividis'),
+        'primary_reflected_min': ('Min Primary Reflected (W/m²)',      'cividis'),
         'primary_ir_max':        ('Max Primary IR (W/m²)',             'magma'),
         'primary_ir_avg':        ('Mean Primary IR (W/m²)',            'magma'),
+        'primary_ir_min':        ('Min Primary IR (W/m²)',             'magma'),
+        # Shadow depth: the height above the local surface at which the Sun is
+        # not even partially visible (the umbral ceiling), meters, measured
+        # along the body radial. Reversed cividis, matching ice_depth: deeper
+        # reads darker. The two sentinels in these arrays are NOT on this ramp
+        # -- see the module header and `sentinel_legend`.
+        'shadow_depth':          ('Shadow Depth (m)',                  'cividis_r'),
+        'shadow_depth_max':      ('Max Shadow Depth (m)',              'cividis_r'),
+        'shadow_depth_avg':      ('Mean Shadow Depth (m)',             'cividis_r'),
+        'shadow_depth_min':      ('Min Shadow Depth (m)',              'cividis_r'),
         # Schorghofer & Taylor (2007) depth-resolved ice-stability output.
         # Single per-face value (no avg/max/min split). File: ice_depth.bin.
         'ice_depth':             ('Ice Stability Depth (m)',           'cividis_r'),
+        # The two populations the shadow-depth statistics deliberately exclude,
+        # as fractions of the evaluated epochs. Dimensionless, 0 to 1. Single
+        # per-face value, like ice_depth.
+        'shadow_lit_frac':       ('Fraction of Epochs Lit at the Surface',
+                                                                       'cividis'),
+        'shadow_unresolved_frac': ('Fraction of Epochs Umbral Above the '
+                                   'Search Ceiling',                   'magma'),
     }
 
+    #: Statistics products that are ONE value per face with no avg/max/min
+    #: split, so the suffix rule in `is_stats_field` cannot see them.
+    #: `ptm.results.STATISTICS_FIELDS` marks these with `'scalar': True`. The
+    #: two lists are held together by `src/python/tests/test_gui_field_registry.py`
+    #: rather than by an import, so this panel keeps working in a checkout
+    #: where `src/python` is not on the path -- and so that adding a scalar
+    #: product to the engine fails a test here instead of silently producing a
+    #: field the viewer cannot offer.
+    SCALAR_STATS_FIELDS = frozenset((
+        'ice_depth',
+        'shadow_lit_frac',
+        'shadow_unresolved_frac',
+    ))
+
     # Field keys that come from the statistics directory rather than a
-    # per-timestep series. (All names ending in _max / _avg / _min, plus
-    # the special-cased single-value 'ice_depth' produced by the new
-    # Schorghofer-style accumulator.)
+    # per-timestep series: all names ending in _max / _avg / _min, plus the
+    # scalar single-value products above.
     @staticmethod
     def is_stats_field(field_key):
         return (field_key.endswith('_max') or field_key.endswith('_avg') or
-                field_key.endswith('_min') or field_key == 'ice_depth')
+                field_key.endswith('_min') or
+                field_key in VisualizationPanel.SCALAR_STATS_FIELDS)
 
     def create_controls(self):
         """Create visualization control panel"""
@@ -3090,6 +3474,31 @@ class VisualizationPanel(QWidget):
         note.setText(str(text or ""))
         note.setVisible(bool(text))
 
+    def _update_field_note(self, field_key):
+        """Put the off-scale legend for `field_key` in the pane, or clear it.
+
+        The color it names is the one `off_scale_above_color` chose for the
+        colormap CURRENTLY in effect for this field -- including the user's own
+        override from the Colormap dropdown -- so the sentence and the screen
+        cannot disagree, and its complaint about a colormap that swallows every
+        candidate is carried through rather than dropped.
+
+        Returns the sentence it showed (``''`` when there is none), so a caller
+        -- and a test -- can read the decision rather than re-deriving it.
+        """
+        note = getattr(self, "field_note", None)
+        above, warning = (OFF_SCALE_ABOVE_CANDIDATES[0][0], "")
+        if field_key in SHADOW_SENTINEL_FIELDS:
+            above, warning = off_scale_above_color(
+                self.view_3d.get_effective_cmap(field_key))
+        text = sentinel_legend(
+            field_key, shadow_depth_ceiling_m(self.results_dir),
+            above_color=above, warning=warning)
+        if note is not None:
+            note.setText(text)
+            note.setVisible(bool(text))
+        return text
+
     def load_results(self, results_dir):
         """Load simulation results"""
         self.results_dir = results_dir
@@ -3159,6 +3568,9 @@ class VisualizationPanel(QWidget):
             self.field_combo.setCurrentIndex(default_idx)
             self.view_3d.set_field(available[default_idx][0])
             self._sync_cmap_combo_to_field(available[default_idx][0])
+            self._update_field_note(available[default_idx][0])
+        else:
+            self._update_field_note(None)
 
         self.field_combo.blockSignals(False)
 
@@ -3170,6 +3582,7 @@ class VisualizationPanel(QWidget):
             # Sync the colormap dropdown to the new field's effective cmap
             # without triggering set_cmap_override.
             self._sync_cmap_combo_to_field(field_key)
+            self._update_field_note(field_key)
 
     def _sync_cmap_combo_to_field(self, field_key):
         """Update the Colormap dropdown to show the cmap currently in use
@@ -3197,6 +3610,10 @@ class VisualizationPanel(QWidget):
         field_key = self.field_combo.currentData()
         if field_key:
             self.view_3d.set_cmap_override(field_key, cmap)
+            # The off-scale sentinel color is chosen against the ramp, so it
+            # can move when the ramp does; the legend must move with it or it
+            # names a color that is no longer on screen.
+            self._update_field_note(field_key)
             if self.view_3d.current_timestep >= 0:
                 self.view_3d.load_timestep_data(self.view_3d.current_timestep)
 
@@ -3228,6 +3645,7 @@ class VisualizationPanel(QWidget):
         # Sync the colormap dropdown to this field's effective cmap.
         if hasattr(self, 'cmap_combo') and self.cmap_combo is not None:
             self._sync_cmap_combo_to_field(field_name)
+        self._update_field_note(field_name)
 
     def on_timestep_slider_changed(self, value):
         """Handle timestep slider change"""
