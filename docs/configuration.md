@@ -868,6 +868,35 @@ gpu:
 | `map_depth_stats` | list of string | `[avg, max, min]` | Which statistics to write per depth |
 | `skip_mesh` | bool | false | Do not copy `mesh.ply` into the output directory |
 
+### Two-band radiosity and effective-albedo products
+
+Three products are written without a key of their own, by whichever run
+produces them:
+
+| On disk | Written by | Shape |
+|---|---|---|
+| `indirect_solar/`, `statistics/indirect_solar_{avg,max,min}.bin` | a two-band radiosity run | per-step series + statistics |
+| `indirect_ir/`, `statistics/indirect_ir_{avg,max,min}.bin` | a two-band radiosity run | per-step series + statistics |
+| `statistics/effective_albedo.bin` | every run with a per-face flux path (PTM-107a) | one value per face |
+
+All three appear in the GUI's 3D viewer Field drop-down. Two things about them
+are not visible in the numbers:
+
+- ⛔ **The indirect bands are ABSORBED flux at the facet**, while
+  `direct_solar`, `primary_reflected` and `primary_ir` — same units, same mesh,
+  next to them in the same menu — are stored **incident**. That is the engine's
+  own convention: the two-band solve produces exactly these absorbed band
+  fluxes, and `indirect_solar + indirect_ir` equals the value coupled into the
+  thermal boundary condition (the engine measures that identity on every run).
+  The viewer says so in the pane above the view when one of them is selected.
+- ⚠️ **`effective_albedo` is `NaN` wherever a facet was never lit** during the
+  integration window — there is no incident flux to form the ratio from, so the
+  engine writes no number rather than inventing one. On a 2,397,890-facet lunar
+  polar run at 1 h cadence that is 26,057 facets, exactly the count the run's
+  own log reports as never lit. The viewer scales the color bar over the finite values only and
+  draws those facets **gray**, with a legend saying what gray means, so the map
+  does not read as broken.
+
 ### Subsurface temperature maps (`map_depths_m`)
 
 Mesh-wide temperature statistics **at depth**, written beside the surface ones
@@ -885,6 +914,13 @@ resolve to the same name are refused rather than silently overwriting.
 
 **`[]` is off and is byte-neutral.** Turning the product on changes no other
 output file; that is an acceptance test of the feature, not a side effect.
+
+⚠️ **Depth maps do not appear in the GUI's 3D viewer Field drop-down.** They
+export (GeoTIFF/HDF5/COG) and read from Python normally, and
+`ptm.results.detect_available_statistics` reports them, but the viewer's field
+menu is built from a static catalog and these names carry the depth, so no
+static catalog can hold them. Owed ledger row:
+`PTM-GUI-DEPTH-MAPS-UNVIEWABLE`.
 
 **Both list keys must be written as YAML lists, and the engine refuses anything
 else.** `map_depths_m: 0.05` and `map_depths_m: "0.05, 0.25"` are scalars, and a

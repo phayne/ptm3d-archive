@@ -73,6 +73,18 @@ STATISTICS_FIELDS = {
     'direct_solar':      {'label': 'Direct Solar',        'units': 'W/m^2'},
     'primary_reflected': {'label': 'Primary Reflected',   'units': 'W/m^2'},
     'primary_ir':        {'label': 'Primary IR',          'units': 'W/m^2'},
+    # The two indirect (multiply-scattered) radiosity bands. A two-band
+    # radiosity run writes both as a per-step series AND as avg/max/min maps,
+    # exactly like the primary components.
+    # ⛔ CONVENTION: these are ABSORBED flux at the face, while direct_solar,
+    # primary_reflected and primary_ir are stored INCIDENT. That is the
+    # engine's own choice, stated at the writer ("Band-separated INDIRECT flux
+    # outputs" in `ptm_thermal_sim.cpp`): the two-band solve produces exactly
+    # these absorbed band fluxes, and their sum is the value coupled into the
+    # thermal boundary condition. Converting them to incident would need a
+    # per-face division by (1 - A_i) and eps_i, and would break that equality.
+    'indirect_solar':    {'label': 'Indirect Solar',       'units': 'W/m^2'},
+    'indirect_ir':       {'label': 'Indirect IR',          'units': 'W/m^2'},
     # Shadow depth: the maximum height above the local surface at which the Sun
     # is not even partially visible (the umbral ceiling), meters, measured along
     # the body radial. avg/max/min are over RESOLVED, NONZERO epochs only --
@@ -81,6 +93,19 @@ STATISTICS_FIELDS = {
     'shadow_depth':      {'label': 'Shadow Depth', 'units': 'm'},
     # scalar=True: single per-face value (no avg/max/min split).
     'ice_depth':         {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
+    # PTM-107(a): the flux-weighted albedo the surface boundary condition
+    # actually absorbed with, reduced over the same integration window as every
+    # other map here, so an energy-closure audit may divide the two directly.
+    # Dimensionless.
+    # ⚠️ NaN on a face that was never lit during the window: there is no
+    # incident flux to form the ratio from, and the engine writes no number
+    # rather than inventing one. That population is legitimate and can be
+    # large -- 26,057 of 2,397,890 faces on the reference 1 h lunar polar run,
+    # exactly the count that run's own log reports as never lit -- so a consumer
+    # that reduces this map has to skip them, and a viewer has to draw them as
+    # "no value".
+    'effective_albedo':  {'label': 'Effective Albedo', 'units': '',
+                          'scalar': True},
     # The two populations the depth statistics deliberately exclude. A PSR face
     # is unresolved (+inf) at most epochs BY DESIGN -- no number is invented for
     # it -- so these fractions are how that shows up in a map.
@@ -832,19 +857,19 @@ class Results:
                         'primary_ir', 'indirect_solar', 'indirect_ir',
                         'temperature')
 
-    #: Labels and units for products ``STATISTICS_FIELDS`` does not carry.
-    #: ``effective_albedo.bin`` is written by every run and the two ``indirect``
-    #: bands by every two-band radiosity run, yet none of the three appears in
-    #: that catalog, so ``detect_available_statistics`` does not report them.
-    #: Kept separate rather than added to the catalog, because the GUI builds
-    #: its field menu from the catalog and gaining three entries there is a
-    #: change to the GUI, not to this class.
-    EXTRA_FIELD_INFO = {
-        'indirect_solar': {'label': 'Indirect Solar', 'units': 'W/m^2'},
-        'indirect_ir': {'label': 'Indirect IR', 'units': 'W/m^2'},
-        'effective_albedo': {'label': 'Effective Albedo', 'units': '',
-                             'scalar': True},
-    }
+    # ⛔ `EXTRA_FIELD_INFO` USED TO BE HERE, AND ITS REMOVAL IS THE POINT.
+    # This class carried a SECOND catalog holding `indirect_solar`,
+    # `indirect_ir` and `effective_albedo` -- three products the engine writes
+    # that STATISTICS_FIELDS did not list. The stated reason was that "the GUI
+    # builds its field menu from the catalog and gaining three entries there is
+    # a change to the GUI, not to this class". The consequence was that
+    # `detect_available_statistics` did not report them, the 3D viewer could
+    # not offer them, and the regression gate holding the two field registries
+    # together was blind to them by construction. The GUI now wants exactly
+    # that change, so the three sit in STATISTICS_FIELDS with everything else
+    # and this class has one catalog fewer. Read `field_catalog()` (or
+    # STATISTICS_FIELDS) instead; the attribute is gone rather than emptied, so
+    # a caller that still reads it raises instead of quietly getting nothing.
 
     def __init__(self, run_dir, units_style='ascii', mesh_units=None,
                  body_radius_km=None):
@@ -1038,9 +1063,11 @@ class Results:
 
         ``detect_available_statistics`` is asked first, then the directory is
         scanned for anything it does not know about -- it iterates a fixed
-        catalog, so on a two-band radiosity run it silently omits
-        ``indirect_solar_*``, ``indirect_ir_*`` and ``effective_albedo``, all
-        of which are on disk.
+        catalog, so a product the catalog has never heard of would otherwise be
+        reported as absent while sitting on disk. It used to omit
+        ``indirect_solar_*``, ``indirect_ir_*`` and ``effective_albedo`` that
+        way; those are in :data:`STATISTICS_FIELDS` now, and this scan stays
+        because the next new product will arrive the same way.
         """
         stats_dir = self.path / "statistics"
         known = detect_available_statistics(stats_dir)
@@ -1394,11 +1421,11 @@ class Results:
     def field_catalog(self):
         """The field catalog in this run's :attr:`units_style`.
 
-        ``STATISTICS_FIELDS`` plus :data:`EXTRA_FIELD_INFO` plus whatever
-        subsurface temperature maps this run wrote, so a field that exists on
-        disk always has a label and a unit. The depth maps are discovered from
-        this run's own ``statistics/`` directory, because their names carry the
-        depth and no fixed catalog can hold them.
+        ``STATISTICS_FIELDS`` plus whatever subsurface temperature maps this
+        run wrote, so a field that exists on disk always has a label and a
+        unit. The depth maps are discovered from this run's own
+        ``statistics/`` directory, because their names carry the depth and no
+        fixed catalog can hold them.
         """
         # The depth discovery scans a directory and parses a JSON sidecar, and
         # `axis_label` calls this per label, so the result is cached on the
@@ -1409,7 +1436,6 @@ class Results:
         if cached is not None:
             return dict(cached)
         merged = dict(STATISTICS_FIELDS)
-        merged.update(self.EXTRA_FIELD_INFO)
         merged.update(discover_depth_fields(self.path / "statistics"))
         self._field_catalog_cache = field_catalog(
             merged, units_style=self.units_style)

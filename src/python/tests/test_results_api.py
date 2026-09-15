@@ -144,7 +144,7 @@ def make_run(root, unit="km", n_steps=8, extra_fields=()):
         for s in range(n_steps)])
     for moment, func in (("avg", np.mean), ("max", np.max), ("min", np.min)):
         _write_bin(stats / f"temperature_{moment}.bin", func(stack, axis=0))
-    # Written by every run, and absent from STATISTICS_FIELDS.
+    # Written by every run.
     _write_bin(stats / "effective_albedo.bin", np.full(n_faces, 0.12))
     for name in extra_fields:
         _write_bin(stats / f"{name}_avg.bin", np.full(n_faces, 2.0))
@@ -301,8 +301,9 @@ def test_fields_and_statistics_are_discovered_not_listed(tmp):
         "drops them")
     stats = dict(run.stats)
     assert ("effective_albedo", None) in run.stats, (
-        "effective_albedo.bin is written by every run and is not in "
-        "STATISTICS_FIELDS, so it must be discovered")
+        "effective_albedo.bin is written by every run, so it must be reported "
+        "-- from STATISTICS_FIELDS, or by the directory scan for a product the "
+        "catalog has not heard of")
     assert stats.get("indirect_solar") is not None
 
 
