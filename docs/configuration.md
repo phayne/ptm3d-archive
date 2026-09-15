@@ -770,6 +770,20 @@ Sentinels: `0.0` means the Sun is visible at the surface; `+inf` (float32
 is invented for it, the fractions report it structurally; `NaN` means the face
 was not evaluated.
 
+**In the GUI's 3D viewer**, these six products (the per-epoch series, the three
+statistics and the two fractions) appear in the Field drop-down like any other.
+Because two of the three encodings are not on the color ramp, the shadow-depth
+fields are scaled to `[0, h_max_m]` rather than autoscaled — measured through
+the real lookup table, an autoscale over `+inf` maps every finite value *and*
+`+inf` to one color — and the sentinels are drawn off-scale: **gray** for `NaN`
+(all six fields), and for `+inf` a color chosen against the colormap in use,
+**magenta** by default. No fixed color is safe: magenta is exactly the top of
+`cool` and near a point on `hsv`, both of which the Colormap dropdown offers, so
+the viewer picks the first candidate the ramp does not contain and says which
+one it picked. A pane above the view carries that legend for the selected field,
+and warns if no candidate is distinguishable. The array itself is never
+rewritten, so a probed facet still reports `inf`.
+
 ⚠️ **Chunked runs**: `scripts/run_chunked_simulation.py` force-sets
 `output.skip_time_series` for every chunk, so it **refuses** a config that asks
 for `write_frames: true`. Set `write_frames: false` (the window statistics and the
