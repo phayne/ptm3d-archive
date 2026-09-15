@@ -164,6 +164,26 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python3 src/python/tests/test_gui_viewer_camera.py
 
+      # The coordinate readout. Section 1 is `ast` over the panel source and
+      # runs here; the behavioral half needs PyVista and skips out loud. The
+      # rule it pins is the one that matters most for a coordinate display:
+      # nothing may fall back to a number when the mesh cannot supply one, and
+      # every method that replaces the plotter must re-point the pointer
+      # observers or the readout silently freezes after an animation export.
+      - name: Viewer coordinate readout invariants (ast; PyVista arms skip here)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 src/python/tests/test_gui_latlon_readout.py
+
+      # The COG export. Section 1 is `ast` over the dialog and the worker;
+      # the raster arms need scipy, rasterio and a system GDAL and skip here.
+      # The rule that runs everywhere: a format the worker cannot produce has
+      # to be refused out loud rather than quietly dropped.
+      - name: COG export invariants (ast; raster arms skip here)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 src/python/tests/test_gui_cog_export.py
+
       - name: The GUI still imports
         env:
           QT_QPA_PLATFORM: offscreen

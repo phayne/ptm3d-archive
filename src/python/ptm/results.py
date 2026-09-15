@@ -30,6 +30,7 @@ import json
 import re
 import struct
 import warnings
+from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
@@ -322,47 +323,202 @@ def choose_projection(latitudes):
     return 'eqc'
 
 
+#: How close the median vertex radius has to sit to a catalog radius before a
+#: mesh is called that body. 5 percent leaves room for real topography and for
+#: a triaxial body quoted by one axis, and is far tighter than the gap between
+#: any two entries of ``BODY_RADII``.
+BODY_RADIUS_TOLERANCE = 0.05
+
+
 def detect_body_from_mesh(mesh_data):
+    """Name the body a mesh sits on, from its median vertex radius, or None.
+
+    ⚠️ The mesh frame is METERS on a lunar or Europa DEM mesh and KILOMETERS on
+    an asteroid shape model -- the project has paid for that difference before
+    (a frame slip mis-scales a ray offset by 1000x). This tries BOTH readings
+    and keeps the better match, because trying only one is a silent wrong
+    answer rather than a refusal: read only in kilometers, a real 2,397,890-face
+    lunar polar mesh (median vertex radius 1,742,799 m) matches nothing, returns
+    None, and every caller here falls back to the Moon's radius. That fallback
+    happens to be right for the Moon and is wrong by 11 percent on Europa, where
+    it silently georeferences the export onto the wrong sphere.
+    """
     vertices = mesh_data.get('vertices')
     if vertices is None or len(vertices) == 0:
         return None
 
-    vertices = np.asarray(vertices)
+    vertices = np.asarray(vertices, dtype=np.float64)
     radii = np.sqrt(np.sum(vertices**2, axis=1))
     mesh_radius = float(np.median(radii))
+    if not np.isfinite(mesh_radius) or mesh_radius <= 0:
+        return None
 
     best_body = None
-    best_diff = float('inf')
+    best_error = float('inf')
     for name, radius_m in BODY_RADII.items():
-        diff = abs(radius_m / 1000.0 - mesh_radius)
-        if diff < best_diff:
-            best_diff = diff
-            best_body = name
+        for scale in (1.0, 1000.0):          # mesh in meters, mesh in km
+            expected = radius_m / scale
+            error = abs(expected - mesh_radius) / expected
+            if error < best_error:
+                best_error = error
+                best_body = name
 
-    expected_km = BODY_RADII[best_body] / 1000.0
-    if best_diff / expected_km < 0.05:
+    if best_error < BODY_RADIUS_TOLERANCE:
         return best_body
     return None
+
+
+#: What :func:`describe_mesh_frame` decided, and why.
+#:
+#: ``usable`` is the only field a caller may act on: it is False whenever a
+#: latitude and longitude computed from this mesh would be a number with no
+#: meaning behind it. ``reason`` always says which way it went, so a refusal can
+#: be shown to a user instead of a plausible coordinate. ``body`` is the catalog
+#: name when one matched and ``None`` otherwise; ``units_scale_m`` is how many
+#: meters one mesh unit is (1 for a DEM mesh, 1000 for a shape model in
+#: kilometers), and is ``None`` when no body was identified to calibrate it
+#: against. ``label`` is the one-line convention statement meant for the UI.
+MeshFrame = namedtuple(
+    'MeshFrame',
+    'usable body units_scale_m label reason median_radius min_radius extent')
+
+
+#: A face centroid this close to the frame origin, relative to the mesh's own
+#: size, means the origin is INSIDE the terrain rather than at a body center --
+#: a local tangent-plane patch, where ``asin(z/r)`` is not a latitude. Measured
+#: separation between the two populations is about two orders of magnitude: the
+#: lumpiest real shape model in this project sits at 0.22 and a whole-body
+#: icosphere at 0.49, while a patch built about its own center lands near 0.
+LOCAL_FRAME_RADIUS_FRACTION = 0.05
+
+
+def describe_mesh_frame(mesh_data):
+    """Decide whether this mesh's Cartesian frame carries real coordinates.
+
+    ⛔ A plausible-but-wrong coordinate is worse than no coordinate, so this
+    refuses rather than guesses. Three outcomes:
+
+    ``usable`` with a named ``body``
+        the median vertex radius matches a catalog body, so the frame is that
+        body's body-fixed frame: planetocentric latitude, east-positive
+        longitude from the body's prime meridian.
+
+    ``usable`` with ``body is None``
+        no centroid comes anywhere near the frame origin relative to the mesh's
+        own size, so the origin is a body center and latitude is measured from
+        the frame's own equator -- but the body is not one this module knows a
+        radius for. Longitude is then east-positive from whatever the SHAPE
+        MODEL calls zero, which for an asteroid is the model's convention and
+        not an IAU-ratified prime meridian. Report it as such.
+
+    not ``usable``
+        a local patch: some face centroid is essentially at the origin, so the
+        mesh is a sheet of terrain about its own center and a spherical
+        decomposition of it is meaningless. Show nothing.
+
+    This is deliberately a property of the MESH, not of the run's config: the
+    config can name a body the mesh was never embedded in.
+    """
+    vertices = mesh_data.get('vertices') if mesh_data else None
+    if vertices is None or len(vertices) == 0:
+        return MeshFrame(False, None, None, 'unknown frame',
+                         'the mesh carries no vertices', None, None, None)
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    radii = np.sqrt(np.sum(vertices ** 2, axis=1))
+    median_radius = float(np.median(radii))
+    min_radius = float(np.min(radii))
+    extent = float(max(np.ptp(vertices[:, 0]), np.ptp(vertices[:, 1]),
+                       np.ptp(vertices[:, 2])))
+
+    if not np.isfinite(median_radius) or median_radius <= 0 or extent <= 0:
+        return MeshFrame(False, None, None, 'unknown frame',
+                         'the mesh has no finite extent about the origin',
+                         median_radius, min_radius, extent)
+
+    if min_radius < LOCAL_FRAME_RADIUS_FRACTION * extent:
+        return MeshFrame(
+            False, None, None, 'unknown frame',
+            'the frame origin lies inside the terrain, so this is a local '
+            'patch and not a body-centered mesh',
+            median_radius, min_radius, extent)
+
+    body = detect_body_from_mesh(mesh_data)
+    if body is not None:
+        scale = 1.0 if median_radius > BODY_RADII[body] / 2.0 else 1000.0
+        return MeshFrame(
+            True, body, scale,
+            f'{body}, planetocentric, east-positive longitude',
+            'the median vertex radius matches this body',
+            median_radius, min_radius, extent)
+
+    return MeshFrame(
+        True, None, None,
+        'body-fixed model frame, planetocentric, east-positive longitude',
+        'the frame origin is a body center, but no catalog body has this '
+        'radius, so the prime meridian is the shape model\'s own',
+        median_radius, min_radius, extent)
+
+
+#: Counts of each non-finite class in a per-face array. A raster has ONE nodata
+#: value, so these have to be told apart BEFORE regridding or they become the
+#: same pixel.
+NonFiniteCensus = namedtuple('NonFiniteCensus',
+                             'total finite nan pos_inf neg_inf')
+
+
+def nonfinite_census(values):
+    """How many faces are finite, NaN, +inf and -inf.
+
+    The two sentinels a PTM3D product uses do not mean the same thing and must
+    not land on the same pixel unlabeled: ``shadow_depth`` writes ``+inf`` for
+    "still umbral at the search ceiling" -- a real, measured statement about the
+    Sun -- and ``NaN`` for "not evaluated". ``effective_albedo`` writes ``NaN``
+    for a facet that was never lit. Reducing either to nodata without saying so
+    turns a measurement into an absence.
+    """
+    # The array's own dtype, not a float64 copy: these are float32 per-face
+    # maps and a cast would allocate 19 MB per call on a 2.4M-facet mesh, once
+    # per field and once per timestep.
+    arr = np.asarray(values)
+    finite_mask = np.isfinite(arr)
+    nan_mask = np.isnan(arr)
+    infinite = ~finite_mask & ~nan_mask
+    pos = int(np.count_nonzero(infinite & (arr > 0)))
+    return NonFiniteCensus(int(arr.size), int(np.count_nonzero(finite_mask)),
+                           int(np.count_nonzero(nan_mask)), pos,
+                           int(np.count_nonzero(infinite)) - pos)
 
 
 class GridResolutionEstimator:
     """Estimates optimal grid resolution from unstructured mesh face spacing."""
 
     @staticmethod
-    def estimate_resolution(latitudes, longitudes):
+    def estimate_resolution(latitudes, longitudes, return_raw=False):
+        """Rounded grid resolution in degrees, from the face spacing.
+
+        ``return_raw=True`` also returns the UNROUNDED median nearest-neighbor
+        spacing the rounding was applied to. The rounding table's finest entry
+        is 0.001 deg -- 30.3 m on the Moon -- so on a meter-scale site mesh the
+        two are far apart and a caller that wants to say so should not have to
+        rebuild the KDTree to find out (it costs about 0.8 s on a
+        2,397,890-facet mesh, on the thread that opens the dialog).
+        """
         if not SCIPY_AVAILABLE:
             lat_range = np.ptp(latitudes)
             lon_range = np.ptp(longitudes)
             n_faces = len(latitudes)
             area = lat_range * lon_range
             raw = np.sqrt(area / n_faces)
-            return GridResolutionEstimator._round_to_nice(raw)
+            rounded = GridResolutionEstimator._round_to_nice(raw)
+            return (rounded, float(raw)) if return_raw else rounded
 
         points = np.column_stack([longitudes, latitudes])
         tree = cKDTree(points)
         distances, _ = tree.query(points, k=2, workers=-1)
         raw_resolution = float(np.median(distances[:, 1]))
-        return GridResolutionEstimator._round_to_nice(raw_resolution)
+        rounded = GridResolutionEstimator._round_to_nice(raw_resolution)
+        return (rounded, raw_resolution) if return_raw else rounded
 
     @staticmethod
     def _round_to_nice(value):

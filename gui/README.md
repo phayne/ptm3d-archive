@@ -104,6 +104,26 @@ shorthand.
 - Face picking with detailed information
 - Timestep animation with playback controls
 - Export high-resolution images
+- **Coordinate readout** under the canvas, following the pointer
+
+#### The coordinate readout
+
+The line under the canvas names the facet under the pointer and its
+planetocentric latitude and east-positive longitude. Those are the coordinates
+the ENGINE wrote into `mesh.ply`, not a conversion the viewer performs, so they
+are in whatever body-fixed frame the run simulated.
+
+It shows nothing rather than a number when a number would be meaningless:
+
+| What is under the pointer | What the readout says |
+|---|---|
+| A facet of a body-centered mesh whose radius matches a known body | `lat … ° S   lon … ° E · Moon, planetocentric, east-positive longitude · facet N` |
+| A facet of a body-centered mesh of an unrecognized body (a shape model) | the same, labeled `body-fixed model frame` — latitude is real, and longitude is east-positive from whatever the shape model calls zero, which is not an IAU-ratified prime meridian |
+| A local tangent-plane patch, built about its own center | `lat / lon: unavailable — this mesh has no georeferenced frame` |
+| Empty space | `lat / lon: — (pointer is off the mesh)` |
+
+A plausible wrong coordinate is worse than no coordinate, and nothing here
+falls back to a number.
 
 ### 3. 2D Analysis (Matplotlib)
 - Temperature distribution histograms
@@ -116,7 +136,39 @@ shorthand.
 - Browse simulation output directories
 - View available data fields and timesteps
 - Load and compare multiple results
-- Export to various formats (VTK, NumPy, HDF5, NetCDF)
+- Export to various formats (VTK, NumPy, HDF5, NetCDF, GeoTIFF, COG)
+
+#### Export Data: the COG option
+
+"Export Data" offers **COG** beside GeoTIFF, HDF5 and VTU/PVD. It writes Cloud
+Optimized GeoTIFFs through the same `src/python/ptm_cog.py` that
+`scripts/ptm3d_stats_to_cog.py` has produced delivered COGs with: single-band
+Float32, GDAL COG layout, 512 px internal tiles, LZW, an AVERAGE overview
+chain. One file per statistic under `cog/statistics/`, and — because a COG
+holds one band — one file per timestep under `cog/<field>/` for a time series.
+
+**Projection.** Auto-selected from the mesh: polar stereographic when the whole
+mesh is beyond 70° latitude, equirectangular otherwise. The body radius comes
+from the mesh's own median vertex radius. One choice is exposed, "Shared CRS:
+central meridian 0°", and only on the polar branch, where it is the difference
+between rasters that overlay across sites in a GIS session and rasters that do
+not. The dialog states which meridian will be used either way.
+
+**Resolution.** Auto-detected from the median face spacing, rounded to a fixed
+table whose finest entry is 0.001° (about 30 m on the Moon). On a finer mesh
+the dialog says so and names the mesh's own spacing; switch the unit selector
+to m/px to export at that scale.
+
+**Nodata, and the two sentinels.** A raster has one nodata value. PTM3D writes
+two that do not mean the same thing: `NaN` ("this facet was not evaluated") and
+`+inf` ("the Sun was still not visible at the top of the shadow-depth search
+ceiling" — a measurement). Both become nodata in the main band, but the `+inf`
+population is also written beside it as `<field>_unresolved.tif`, the fraction
+of the facets behind each pixel that were unresolved, and is stamped out of the
+main band so an unresolved area can never be read back as a finite depth. Every
+band carries `PTM_FACES_TOTAL`, `PTM_FACES_FINITE`, `PTM_FACES_NAN`,
+`PTM_FACES_POS_INF`, `PTM_FACES_NEG_INF` and `PTM_SENTINEL_POLICY`, and the
+export README repeats the rule.
 
 ### 5. Console Output
 - Real-time simulation progress
@@ -149,6 +201,12 @@ pip install -r requirements.txt
 - `h5py` - HDF5 export
 - `netCDF4` - NetCDF export
 - `rasterio` - GeoTIFF export of results
+- `gdal` (`osgeo`) **and a system GDAL on PATH** (`gdaladdo`, `gdal_translate`)
+  - COG export of results. Both are needed: the band is written through the
+  Python bindings and the overview chain through the command-line tools,
+  because only GDAL >= 3.12's CLI carries `OVERVIEW_RESAMPLING=AVERAGE` into
+  the COG's `IMAGE_STRUCTURE` metadata. Without them the COG radio button is
+  disabled and says why.
 - `gdal` (`osgeo`) - GeoTIFF **DEM preview** in the dashboard's DEM module.
   Not pip-installable on its own; use `conda install -c conda-forge gdal`.
   The same GDAL install is the build-time prerequisite for the DTM tools the

@@ -39,6 +39,7 @@ from ptm.results import (                                          # noqa: E402,
     choose_projection,
     detect_body_from_mesh,
     field_catalog,
+    nonfinite_census,
     read_binary_data,
 )
 from ptm.results import FIELD_INFO as _FIELD_INFO_ASCII            # noqa: E402
@@ -66,6 +67,29 @@ try:
     VTK_AVAILABLE = True
 except ImportError:
     VTK_AVAILABLE = False
+
+# The Cloud Optimized GeoTIFF writer. NOT a second raster implementation: this
+# is the same `src/python/ptm_cog.py` that `scripts/ptm3d_stats_to_cog.py` has
+# shipped production COGs with since 2026-05, reached here so the GUI's
+# "Export Data" offers the identical product instead of growing its own.
+# It needs `osgeo.gdal` for the first pass AND the system `gdaladdo` /
+# `gdal_translate` for the overview chain, so availability is not just an
+# import.
+try:
+    import ptm_cog
+    from ptm.results import depth_entries as _depth_entries
+    COG_AVAILABLE = ptm_cog.GDAL_AVAILABLE
+    try:
+        ptm_cog._find_gdal_tool('gdaladdo')
+        ptm_cog._find_gdal_tool('gdal_translate')
+        COG_UNAVAILABLE_REASON = '' if COG_AVAILABLE else 'osgeo.gdal is not importable'
+    except RuntimeError as _exc:
+        COG_AVAILABLE = False
+        COG_UNAVAILABLE_REASON = str(_exc)
+except ImportError as _exc:                                       # pragma: no cover
+    ptm_cog = None
+    COG_AVAILABLE = False
+    COG_UNAVAILABLE_REASON = str(_exc)
 
 
 # Field metadata. Same catalog as ptm.results, with the flux units spelled
@@ -540,7 +564,8 @@ class HDF5Exporter:
 
 
 def write_export_readme(output_dir, regridder, fields, timesteps,
-                        formats, per_timestep=False, statistics=None):
+                        formats, per_timestep=False, statistics=None,
+                        cog_nodata=None):
     """Write a README.txt describing the exported data and projection.
 
     Args:
@@ -551,6 +576,9 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
         formats: List of format strings ('geotiff', 'hdf5')
         per_timestep: Whether GeoTIFFs were written per-timestep
         statistics: Optional list of (base_field, stat_type) tuples
+        cog_nodata: The nodata value the COGs were written with, when 'cog' is
+            in ``formats``. Named here because a raster has ONE nodata value
+            and PTM3D carries two distinct sentinels -- see the COG section.
     """
     output_dir = Path(output_dir)
     lines = []
@@ -660,6 +688,41 @@ def write_export_readme(output_dir, regridder, fields, timesteps,
             lines.append("  Band descriptions contain UTC time labels.")
         lines.append("")
 
+    if 'cog' in formats:
+        lines.append("* cog/statistics/{field}.tif")
+        lines.append("* cog/{field}/{field}_NNNN.tif")
+        lines.append("")
+        lines.append("  Cloud Optimized GeoTIFFs. Single-band Float32, GDAL COG")
+        lines.append("  layout, 512x512 internal tiles, LZW, overview chain")
+        lines.append("  resampled by AVERAGE. A COG holds one band, so a time")
+        lines.append("  series is one file per timestep.")
+        lines.append("")
+        nodata_str = ('NaN' if cog_nodata is None or cog_nodata != cog_nodata
+                      else f"{cog_nodata:.7e}")
+        lines.append(f"  NoData: {nodata_str}")
+        lines.append("")
+        lines.append("  Sentinels. A raster has ONE nodata value and PTM3D")
+        lines.append("  writes two sentinels that do not mean the same thing:")
+        lines.append("")
+        lines.append("    NaN   this facet was not evaluated / carries no")
+        lines.append("          value (for example effective_albedo on a facet")
+        lines.append("          that was never lit).")
+        lines.append("    +inf  the Sun was still not visible at the top of the")
+        lines.append("          shadow-depth search ceiling. This is a")
+        lines.append("          measurement, not an absence.")
+        lines.append("")
+        lines.append("  Both become nodata in the main band, because no finite")
+        lines.append("  number means either one. The +inf population is written")
+        lines.append("  separately as {field}_unresolved.tif -- the fraction of")
+        lines.append("  the facets behind each pixel that were unresolved -- and")
+        lines.append("  is stamped out of the main band, so an unresolved area")
+        lines.append("  can never be read back as a finite depth. Every band")
+        lines.append("  carries the face-level counts as PTM_FACES_TOTAL,")
+        lines.append("  PTM_FACES_FINITE, PTM_FACES_NAN, PTM_FACES_POS_INF and")
+        lines.append("  PTM_FACES_NEG_INF, with PTM_SENTINEL_POLICY naming the")
+        lines.append("  rule that was applied.")
+        lines.append("")
+
     if 'hdf5' in formats:
         lines.append("* ptm3d_data.h5")
         lines.append("")
@@ -747,6 +810,8 @@ class DataExportWorker(QThread):
                 - output_dir: Output directory path
                 - geotiff_per_timestep: bool, if True write one file per timestep
                 - body_radius: Planetary body radius in meters
+                - center_lon: central meridian for the output projection, in
+                  degrees, or None for the mesh's own midpoint (site-centered)
         """
         super().__init__(parent)
         self.config = config
@@ -781,10 +846,28 @@ class DataExportWorker(QThread):
         n_timesteps = len(timesteps)
         n_fields = len(fields)
         n_statistics = len(statistics)
+        cog_interpolation = self.config.get('cog_interpolation', 'linear')
+        cog_nodata = self.config.get(
+            'cog_nodata', ptm_cog.DEFAULT_NODATA if ptm_cog else float('nan'))
 
         do_geotiff = 'geotiff' in formats and RASTERIO_AVAILABLE
         do_hdf5 = 'hdf5' in formats and H5PY_AVAILABLE
-        needs_regrid = (do_geotiff or do_hdf5) and SCIPY_AVAILABLE
+        do_cog = 'cog' in formats and COG_AVAILABLE
+        needs_regrid = (do_geotiff or do_hdf5 or do_cog) and SCIPY_AVAILABLE
+
+        # A format that was asked for and cannot be produced has to say so.
+        # Silently writing four of the five products the dialog offered is the
+        # class of failure this project keeps paying for.
+        if 'cog' in formats and not do_cog:
+            self.export_finished.emit(
+                False, "COG export was requested but is unavailable: "
+                       f"{COG_UNAVAILABLE_REASON or 'unknown reason'}")
+            return
+        if do_cog and not SCIPY_AVAILABLE:
+            self.export_finished.emit(
+                False, "COG export was requested but scipy is missing, so the "
+                       "mesh cannot be regridded onto a raster.")
+            return
 
         # For per-timestep GeoTIFF, we don't need to accumulate grid data
         # unless HDF5 also needs it
@@ -802,7 +885,8 @@ class DataExportWorker(QThread):
                 mesh_data['latitudes'],
                 mesh_data['longitudes'],
                 resolution,
-                body_radius=body_radius
+                body_radius=body_radius,
+                center_lon=self.config.get('center_lon'),
             )
         current_step += 1
         self.progress_updated.emit(current_step, total_steps)
@@ -839,6 +923,12 @@ class DataExportWorker(QThread):
                 tiff_dir = output_dir / field_name
                 tiff_dir.mkdir(parents=True, exist_ok=True)
 
+            # A COG holds ONE band, so a time series is always one file per
+            # timestep -- there is no multi-band COG to choose instead.
+            if do_cog and regridder:
+                cog_dir = output_dir / 'cog' / field_name
+                cog_dir.mkdir(parents=True, exist_ok=True)
+
             for t in range(n_timesteps):
                 if self._cancelled:
                     self._cleanup(output_dir)
@@ -850,7 +940,7 @@ class DataExportWorker(QThread):
                     data = read_binary_data(str(file_path), n_faces)
                     if data is not None:
                         face_array[t] = data
-                        if regridder:
+                        if regridder and (do_geotiff or do_hdf5):
                             grid_2d = regridder.regrid(data)
                             if keep_grid_data:
                                 grid_array[t] = grid_2d
@@ -861,6 +951,26 @@ class DataExportWorker(QThread):
                                 GeoTIFFExporter.export_single_timestep(
                                     tiff_path, grid_2d, regridder,
                                     field_name, time_label
+                                )
+                        if do_cog and regridder:
+                            # Face values, not the grid above: `export_field`
+                            # owns the regrid so it can separate the sentinel
+                            # classes BEFORE interpolating them together.
+                            census = nonfinite_census(data)
+                            if (census.finite == 0 and census.pos_inf == 0
+                                    and census.neg_inf == 0):
+                                # All-NaN timestep: an all-nodata COG costs two
+                                # GDAL subprocess calls and says nothing. Said
+                                # out loud rather than skipped silently.
+                                self.status_updated.emit(
+                                    f"Skipping COG for {field_name} timestep "
+                                    f"{t}: no facet carries a value")
+                            else:
+                                ptm_cog.export_field(
+                                    cog_dir / f"{field_name}_{t:04d}.tif",
+                                    data, regridder, field_name,
+                                    interpolation=cog_interpolation,
+                                    nodata_value=cog_nodata,
                                 )
 
                 current_step += 1
@@ -897,6 +1007,10 @@ class DataExportWorker(QThread):
                 tiff_dir = output_dir / field_name
                 output_files.append(f"{tiff_dir}/ ({n_timesteps} files)")
 
+            if do_cog and regridder:
+                output_files.append(
+                    f"{output_dir / 'cog' / field_name}/ ({n_timesteps} COGs)")
+
             current_step += 1
             self.progress_updated.emit(current_step, total_steps)
 
@@ -908,9 +1022,14 @@ class DataExportWorker(QThread):
         # Export statistics (single-band per-face data)
         all_stat_face_data = {}
         all_stat_grid_data = {}
+        cog_stat_names = []
 
         if statistics:
             stats_dir = results_dir / 'statistics'
+            # What the run recorded about each subsurface depth, so a COG band
+            # can carry the depth it actually holds rather than the one its
+            # file name rounds to. Empty when the run wrote no manifest.
+            depth_manifest = _depth_entries(stats_dir) if do_cog else {}
 
             for base_field, stat_type in statistics:
                 if self._cancelled:
@@ -942,8 +1061,38 @@ class DataExportWorker(QThread):
                 if face_data is not None:
                     stat_key = (base_field, stat_type)
                     all_stat_face_data[stat_key] = face_data
+                    field_name_on_disk = (
+                        base_field if is_scalar
+                        else f"{base_field}_{stat_type}")
 
-                    if regridder:
+                    if do_cog and regridder:
+                        census = nonfinite_census(face_data)
+                        # ⛔ NOT `census.finite == 0` alone. A field where every
+                        # facet is +inf is fully MEASURED -- the Sun was never
+                        # visible below the ceiling anywhere -- and skipping it
+                        # writes neither the band nor its companion layer, so
+                        # the measurement is unrecoverable from the export.
+                        # That is the exact conflation the sentinel policy
+                        # exists to prevent.
+                        if (census.finite == 0 and census.pos_inf == 0
+                                and census.neg_inf == 0):
+                            self.status_updated.emit(
+                                f"Skipping COG for {field_name_on_disk}: "
+                                f"no facet carries a value or a sentinel")
+                        else:
+                            cog_stats_dir = output_dir / 'cog' / 'statistics'
+                            cog_stats_dir.mkdir(parents=True, exist_ok=True)
+                            ptm_cog.export_field(
+                                cog_stats_dir / f"{field_name_on_disk}.tif",
+                                face_data, regridder, field_name_on_disk,
+                                interpolation=cog_interpolation,
+                                nodata_value=cog_nodata,
+                                extra_tags=ptm_cog.depth_band_tags(
+                                    field_name_on_disk, depth_manifest),
+                            )
+                            cog_stat_names.append(field_name_on_disk)
+
+                    if regridder and (do_geotiff or do_hdf5):
                         grid_2d = regridder.regrid(face_data)
 
                         # Skip all-NaN grids (no valid data after regridding)
@@ -974,6 +1123,12 @@ class DataExportWorker(QThread):
                 stat_tiff_dir = output_dir / 'statistics'
                 output_files.append(
                     f"{stat_tiff_dir}/ ({len(all_stat_grid_data)} files)"
+                )
+
+            if cog_stat_names:
+                output_files.append(
+                    f"{output_dir / 'cog' / 'statistics'}/ "
+                    f"({len(cog_stat_names)} COGs)"
                 )
 
         # Write HDF5 (single file with all fields and statistics)
@@ -1126,7 +1281,8 @@ class DataExportWorker(QThread):
         readme_path = write_export_readme(
             output_dir, regridder, fields, timesteps,
             formats, per_timestep=per_timestep,
-            statistics=statistics if statistics else None
+            statistics=statistics if statistics else None,
+            cog_nodata=cog_nodata if do_cog else None,
         )
         output_files.append(str(readme_path))
 
@@ -1136,6 +1292,12 @@ class DataExportWorker(QThread):
             summary = f"Export complete! (VTU/PVD format)\n\nFiles created:\n{file_list}"
         else:
             proj_name = 'polar stereographic' if (regridder and regridder.projection == 'stere') else 'equirectangular'
+            # ⛔ Only on the stereographic branch. `regridder.center_lon` is
+            # what the EQUIRECTANGULAR grid was centered on, but both raster
+            # writers recompute that meridian from the grid bounds, so quoting
+            # it here would state a CRS the files do not carry.
+            if regridder is not None and regridder.projection == 'stere':
+                proj_name += f", central meridian {regridder.center_lon:.4f} deg"
             summary = f"Export complete! (projection: {proj_name})\n\nFiles created:\n{file_list}"
         self.export_finished.emit(True, summary)
 
@@ -1147,6 +1309,10 @@ class DataExportWorker(QThread):
             h5_path = output_dir / "ptm3d_data.h5"
             if h5_path.exists():
                 h5_path.unlink(missing_ok=True)
+            cog_root = output_dir / "cog"
+            if cog_root.exists():
+                for f in cog_root.rglob("*.tif"):
+                    f.unlink(missing_ok=True)
             vtu_dir = output_dir / "vtu"
             if vtu_dir.exists():
                 for f in vtu_dir.glob("*.vtu"):
