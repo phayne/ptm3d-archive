@@ -42,6 +42,16 @@ from PyQt6.QtGui import QFont, QValidator
 #: exists to catch.
 DISABLE_3D_CANVAS = os.environ.get("PTM_GUI_DISABLE_3D", "") == "1"
 
+# The one shared decision about what a mesh's Cartesian frame means. Imported
+# from `ptm.results` rather than reimplemented here: `gui_core.data_exporter`
+# already reaches that module for the projection helpers, and a second copy of
+# "is this mesh body-centered" is exactly the kind of duplicate catalog this
+# file has had deleted from it twice.
+from gui_core._ptm_bootstrap import ensure_ptm_importable  # noqa: E402
+
+ensure_ptm_importable()
+from ptm.results import describe_mesh_frame  # noqa: E402
+
 # PyVista for 3D visualization
 try:
     import pyvista as pv
@@ -450,6 +460,16 @@ class PyVistaWidget(QWidget):
 
     face_selected = pyqtSignal(int, dict)  # face_id, data dict
 
+    #: What the coordinate readout says with the pointer off the mesh, and what
+    #: it says when the mesh's frame does not support a coordinate at all. The
+    #: second one is not a failure message -- it is the correct answer for a
+    #: local tangent-plane patch, and it has to be distinguishable from a
+    #: coordinate that merely has not been computed yet.
+    COORD_READOUT_IDLE = "lat / lon: move the pointer over the mesh"
+    COORD_READOUT_OFF_MESH = "lat / lon: \u2014 (pointer is off the mesh)"
+    COORD_READOUT_NO_FRAME = (
+        "lat / lon: unavailable \u2014 this mesh has no georeferenced frame")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.mesh = None
@@ -471,6 +491,30 @@ class PyVistaWidget(QWidget):
         self.hover_face_id = None
         self.hover_highlight_actor = None
         self.selected_face_id = None
+
+        # -- coordinate readout ------------------------------------------
+        # What `ptm.results.describe_mesh_frame` decided about THIS mesh's
+        # Cartesian frame. `None` until a mesh is loaded; `.usable` False means
+        # no latitude and longitude are shown at all, because a number computed
+        # on an assumption about the frame is worse than no number.
+        self._mesh_frame = None
+        # A `vtkCellPicker` with a `vtkCellLocator` over the results mesh.
+        # ⭐ MEASURED on the 2,397,890-facet reference run: the picker WITHOUT a
+        # locator takes 537 ms per pick, which is what the shipped hover path
+        # did on every mouse move -- under 2 picks per second. With the locator
+        # it is 0.054 ms, a factor of ~9,900, and no throttle is needed.
+        # ⛔ The tolerance MUST stay small. At the 0.005 the old picker used,
+        # the locator returns a cell 39.8 m (about 11 facets) from the point the
+        # ray actually hit; at tolerance 0 the same picks land 1.1 m away,
+        # which is inside a facet.
+        self._hover_picker = None
+        self._hover_locator = None
+        # (interactor, observer_id) pairs, so a rebind REMOVES the old
+        # observers instead of stacking a second copy on a new interactor.
+        # `export_animation` replaces the plotter, and the observers used to
+        # stay bound to the retired one while every flag still read "on"
+        # (PTM-GUI-PICKING-DEAD-AFTER-EXPORT).
+        self._interactor_observers = []
 
         # Color scale state
         self.fixed_color_scale = True
@@ -597,6 +641,30 @@ class PyVistaWidget(QWidget):
 
             layout.insertLayout(0, controls_layout)
 
+            # -- coordinate readout, bottom-right corner of the canvas ----
+            #
+            # A Qt row under the canvas, NOT a `plotter.add_text` overlay and
+            # NOT a floating child raised over the interactor. Two reasons, both
+            # deliberate: a VTK text actor is rendered INTO the scene, so it
+            # would appear in every exported animation frame and change the
+            # deliverable; and `QtInteractor.interactor` wraps a native render
+            # window, over which sibling Qt widgets do not composite reliably on
+            # macOS. This paints, always, and is readable without a display.
+            readout_row = QHBoxLayout()
+            readout_row.setContentsMargins(5, 0, 8, 3)
+            readout_row.addStretch()
+            self.coord_readout_label = QLabel(self.COORD_READOUT_IDLE)
+            self.coord_readout_label.setObjectName("coordinateReadout")
+            self.coord_readout_label.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.coord_readout_label.setStyleSheet(
+                "color: #c8c8c8; font-size: 11px; "
+                "font-family: Menlo, Monaco, monospace; "
+                "background-color: rgba(30, 30, 30, 200); "
+                "padding: 2px 6px; border-radius: 3px;")
+            readout_row.addWidget(self.coord_readout_label)
+            layout.addLayout(readout_row)
+
         else:
             # Fallback message
             label = QLabel("PyVista not available.\nInstall with: pip install pyvista pyvistaqt")
@@ -692,6 +760,17 @@ class PyVistaWidget(QWidget):
 
         # Reset camera tracking so first load gets default view centered on mesh
         self._has_loaded_data = False
+        # ... and forget the previous mesh's coordinate frame with it, so a
+        # results directory whose mesh fails to load cannot show the PREVIOUS
+        # run's coordinates under the pointer.
+        self._mesh_frame = None
+        self._hover_picker = None
+        self._hover_locator = None
+        self.hover_face_id = None
+        # ⛔ `load_mesh` -- and with it `_reset_coordinate_readout` -- only runs
+        # when a mesh.ply is there. Without this, opening a results directory
+        # that has none leaves the PREVIOUS run's coordinate on screen.
+        self._reset_coordinate_readout()
         # ... and forget the previous dataset's home view along with it. A
         # stale camera from another mesh is worse than no camera: "Reset View"
         # would fly to a place this mesh does not occupy.
@@ -744,6 +823,13 @@ class PyVistaWidget(QWidget):
                 'longitudes': longitudes
             }
 
+            # Decide, from the MESH, whether a latitude and longitude read off
+            # it mean anything. This is the whole risk of the coordinate
+            # readout: `asin(z/r)` returns a number for any mesh, including a
+            # local tangent-plane patch where it is not a latitude.
+            self._mesh_frame = describe_mesh_frame(self.mesh_data)
+            self._build_hover_picker()
+
             # Detect hemisphere for camera orientation
             self.detected_hemisphere = self.detect_hemisphere(latitudes)
 
@@ -752,6 +838,11 @@ class PyVistaWidget(QWidget):
             # within the same session unless the user clicks "Use
             # latitude default" in the lighting dialog.
             self._set_default_sun_from_latitude(latitudes)
+
+            # Bind (or re-bind) the hover observers now that there is something
+            # to hover over.
+            self._bind_interactor_observers()
+            self._reset_coordinate_readout()
 
             self.update_display()
 
@@ -1156,22 +1247,192 @@ class PyVistaWidget(QWidget):
             # Remove any hover highlight
             self.clear_hover_highlight()
 
+    # -- hover coordinate readout ------------------------------------------
+
+    def _build_hover_picker(self):
+        """Build a `vtkCellPicker` backed by a `vtkCellLocator` over the mesh.
+
+        Both halves are load-bearing and both were MEASURED on the
+        2,397,890-facet reference run:
+
+        * Without the locator, one pick costs **537 ms**. The shipped hover path
+          did exactly that on every `MouseMoveEvent`, so face-selection mode was
+          under two picks per second on a production mesh. With the locator it
+          is **0.054 ms** -- fast enough that no throttle is needed, which is
+          why there is none.
+        * Tolerance has to stay at 0. With the locator attached and the old
+          0.005 tolerance, the returned cell sits **39.8 m** (about 11 facets)
+          from the point the ray actually hit; at 0 the same picks land
+          **1.1 m** away, inside one facet. A coordinate readout that names a
+          facet 40 m from the cursor is the "plausible but wrong" answer this
+          feature exists to avoid.
+        """
+        self._hover_picker = None
+        self._hover_locator = None
+        if not PYVISTA_AVAILABLE or self.mesh is None:
+            return
+        try:
+            import vtk
+            locator = vtk.vtkCellLocator()
+            locator.SetDataSet(self.mesh)
+            locator.BuildLocator()
+            picker = vtk.vtkCellPicker()
+            picker.SetTolerance(0.0)
+            picker.AddLocator(locator)
+        except Exception as e:                                  # noqa: BLE001
+            # Announced, not swallowed: falling back to a picker with no
+            # locator would make the viewer feel broken rather than say
+            # anything. The pair is already None.
+            print(f"[Readout] could not build the accelerated picker ({e}); "
+                  f"the coordinate readout is off.")
+            return
+        self._hover_locator = locator
+        self._hover_picker = picker
+
+    def _unbind_interactor_observers(self):
+        """Drop every observer this widget added, from whichever interactor it
+        was added to. Called before every (re)bind."""
+        for iren, observer_id in self._interactor_observers:
+            try:
+                iren.RemoveObserver(observer_id)
+            except Exception:                                   # noqa: BLE001
+                pass
+        self._interactor_observers = []
+
+    def _bind_interactor_observers(self):
+        """Point the hover observers at the CURRENT interactor.
+
+        ⛔ `export_animation` calls `_reinit_plotter`, which replaces
+        `self.plotter` with a new `QtInteractor` -- a different `iren` object.
+        The observers stayed on the retired one while `picking_active`,
+        `picking_enabled` and the "Select Face Mode" button all still read as
+        on, so face selection silently stopped working after any animation
+        export (PTM-GUI-PICKING-DEAD-AFTER-EXPORT). Anything that rebinds
+        `self.plotter` must call this.
+
+        It also fixes a second, older defect: the previous code added a fresh
+        pair of observers on every toggle of face-selection mode and never
+        removed any, so N toggles ran the pick N times per mouse move.
+        """
+        self._unbind_interactor_observers()
+        if not PYVISTA_AVAILABLE or not getattr(self, 'plotter', None):
+            return
+        if self.mesh is None:
+            return
+        try:
+            iren = self.plotter.iren.interactor
+            self._interactor_observers = [
+                (iren, iren.AddObserver('MouseMoveEvent', self.on_mouse_move)),
+                (iren, iren.AddObserver('LeftButtonPressEvent',
+                                        self.on_left_click)),
+            ]
+        except Exception as e:                                  # noqa: BLE001
+            print(f"[Readout] could not attach the pointer observers: {e}")
+            self._interactor_observers = []
+
+    def _reset_coordinate_readout(self):
+        """Put the readout back to its resting text for the current mesh."""
+        label = getattr(self, 'coord_readout_label', None)
+        if label is None:
+            return
+        frame = self._mesh_frame
+        if frame is not None and not frame.usable:
+            label.setText(self.COORD_READOUT_NO_FRAME)
+            label.setToolTip(frame.reason)
+        elif self.mesh is None:
+            label.setText(self.COORD_READOUT_IDLE)
+            label.setToolTip("")
+        else:
+            label.setText(self.COORD_READOUT_OFF_MESH)
+            label.setToolTip(frame.label if frame is not None else "")
+
+    def face_coordinate_text(self, face_id):
+        """The readout line for one facet, or the refusal that replaces it.
+
+        The latitude and longitude are the ones the ENGINE wrote into
+        `mesh.ply` -- `asin(z/r)` and `atan2(y, x)` over the face centroid,
+        `src/cpp/main/ptm_thermal_sim.cpp:13636` -- so this converts nothing and
+        assumes nothing about the frame. That is planetocentric latitude and
+        east-positive longitude, the IAU convention, and the readout says so on
+        screen rather than only in a document.
+
+        ⛔ It NEVER falls back to a number. The previous status line read
+        `self.mesh['latitude'][cell_id] if 'latitude' in ... else 0`, so a mesh
+        without the arrays reported (0.00, 0.00) -- a perfectly plausible
+        coordinate in the Gulf of Guinea.
+        """
+        frame = self._mesh_frame
+        if frame is None or not frame.usable:
+            return self.COORD_READOUT_NO_FRAME
+        if self.mesh is None or face_id is None or face_id < 0:
+            return self.COORD_READOUT_OFF_MESH
+        names = self.mesh.array_names
+        if 'latitude' not in names or 'longitude' not in names:
+            return ("lat / lon: unavailable \u2014 this mesh carries no "
+                    "per-face coordinates")
+        try:
+            lat = float(self.mesh['latitude'][face_id])
+            lon = float(self.mesh['longitude'][face_id])
+        except Exception:                                       # noqa: BLE001
+            return self.COORD_READOUT_OFF_MESH
+        if not (np.isfinite(lat) and np.isfinite(lon)):
+            return self.COORD_READOUT_OFF_MESH
+        hemi = 'N' if lat >= 0 else 'S'
+        return (f"lat {abs(lat):8.4f}\u00b0 {hemi}   "
+                f"lon {lon % 360.0:8.4f}\u00b0 E   "
+                f"\u00b7 {frame.label}  \u00b7 facet {face_id}")
+
+    def _pick_face_at(self, x, y):
+        """Cell id of the results mesh under screen position (x, y), or None.
+
+        ⛔ `picker.GetCellId()` is an index into whatever dataset the ray hit,
+        which is not necessarily the results mesh: the Sun label and any other
+        pickable actor in the scene have their own cells, and reading a face
+        latitude at another dataset's cell index is a wrong coordinate with no
+        symptom. The dataset is checked.
+        """
+        picker = self._hover_picker
+        if picker is None or self.mesh is None:
+            return None
+        if not getattr(self, 'plotter', None):
+            return None
+        picker.Pick(x, y, 0, self.plotter.renderer)
+        cell_id = picker.GetCellId()
+        if cell_id is None or not (0 <= cell_id < self.mesh.n_cells):
+            return None
+        dataset = picker.GetDataSet()
+        if dataset is None:
+            return None
+        try:
+            if dataset.GetNumberOfCells() != self.mesh.n_cells:
+                return None
+        except Exception:                                       # noqa: BLE001
+            return None
+        return int(cell_id)
+
     def enable_hover_picking(self):
         """Enable hover-based face picking with highlighting"""
         if not PYVISTA_AVAILABLE or not self.mesh:
             return
 
         try:
-            # Get the VTK interactor
-            iren = self.plotter.iren.interactor
-
-            # Connect mouse move event for hover highlighting
-            iren.AddObserver('MouseMoveEvent', self.on_mouse_move)
-            # Connect left button press for selection
-            iren.AddObserver('LeftButtonPressEvent', self.on_left_click)
-
-            self.picking_active = True
-            self.picking_enabled = True
+            # The observers are bound whenever a mesh is loaded, because the
+            # coordinate readout follows the pointer with or without selection
+            # mode. This only arms the highlight-and-select half.
+            if not self._interactor_observers:
+                self._bind_interactor_observers()
+            self.picking_active = bool(self._interactor_observers)
+            self.picking_enabled = self.picking_active
+            if self.picking_active:
+                # The readout follows the pointer with selection mode off, so
+                # `hover_face_id` already names the facet under it. Clearing it
+                # makes the next move redraw, rather than take the "same facet,
+                # do nothing" path and leave the user with no highlight until
+                # they cross a facet boundary.
+                self.hover_face_id = None
+            else:
+                print("Hover picking setup failed: no pointer observers could "
+                      "be attached")
 
         except Exception as e:
             print(f"Hover picking setup failed: {e}")
@@ -1183,55 +1444,58 @@ class PyVistaWidget(QWidget):
             return
 
         try:
-            # Note: VTK observers are tricky to remove without IDs
-            # We'll just set picking_active to False to ignore events
+            # The observers STAY bound: the coordinate readout is not part of
+            # selection mode and keeps following the pointer. Only the
+            # highlight-and-select behavior is switched off.
             self.picking_active = False
             self.clear_hover_highlight()
         except Exception as e:
             print(f"Error disabling hover picking: {e}")
 
     def on_mouse_move(self, obj, event):
-        """Handle mouse move for hover highlighting"""
-        if not self.picking_active or not self.mesh:
+        """Follow the pointer: update the coordinate readout, and -- only in
+        selection mode -- the hover highlight.
+
+        The readout is NOT gated on `picking_active`. It is a coordinate
+        display, not a selection tool, and it has to change as the pointer moves
+        over the mesh whether or not the user is selecting facets.
+        """
+        if not self.mesh:
             return
 
         try:
-            # Get mouse position
             iren = self.plotter.iren.interactor
             x, y = iren.GetEventPosition()
+            cell_id = self._pick_face_at(x, y)
 
-            # Use VTK cell picker
-            picker = self.plotter.iren.get_picker()
-            if picker is None:
-                import vtk
-                picker = vtk.vtkCellPicker()
-                picker.SetTolerance(0.005)
-
-            # Perform pick
-            renderer = self.plotter.renderer
-            picker.Pick(x, y, 0, renderer)
-
-            cell_id = picker.GetCellId()
-
-            if cell_id >= 0 and cell_id != self.hover_face_id:
-                # New face under cursor - update highlight
+            if cell_id is not None and cell_id != self.hover_face_id:
                 self.hover_face_id = cell_id
-                self.update_hover_highlight(cell_id)
+                label = getattr(self, 'coord_readout_label', None)
+                if label is not None:
+                    label.setText(self.face_coordinate_text(cell_id))
+                if self.picking_active:
+                    self.update_hover_highlight(cell_id)
+                    self.pick_status_label.setText(
+                        f"Face {cell_id} - Click to select")
 
-                # Update status label with face info
-                lat = self.mesh['latitude'][cell_id] if 'latitude' in self.mesh.array_names else 0
-                lon = self.mesh['longitude'][cell_id] if 'longitude' in self.mesh.array_names else 0
-                self.pick_status_label.setText(f"Face {cell_id} ({lat:.2f}°, {lon:.2f}°) - Click to select")
-
-            elif cell_id < 0 and self.hover_face_id is not None:
-                # No face under cursor - clear highlight
-                self.clear_hover_highlight()
+            elif cell_id is None and self.hover_face_id is not None:
                 self.hover_face_id = None
-                self.pick_status_label.setText("Hover to highlight, click to select")
+                self._reset_coordinate_readout()
+                if self.picking_active:
+                    self.clear_hover_highlight()
+                    self.pick_status_label.setText(
+                        "Hover to highlight, click to select")
 
-        except Exception as e:
-            # Silently ignore errors during mouse move to avoid spam
-            pass
+        except Exception as e:                                  # noqa: BLE001
+            # A mouse-move handler must not raise -- PyQt6 aborts the process on
+            # an exception out of a slot -- but it must not be silent either: a
+            # dead readout looks exactly like a pointer that is off the mesh.
+            # Reported once, then suppressed so a moving pointer cannot flood
+            # the console.
+            if not getattr(self, '_hover_error_reported', False):
+                self._hover_error_reported = True
+                print(f"[Readout] the pointer handler failed and the "
+                      f"coordinate readout is now stale: {e}")
 
     def on_left_click(self, obj, event):
         """Handle left click for face selection"""
@@ -1239,21 +1503,15 @@ class PyVistaWidget(QWidget):
             return
 
         try:
-            # Get mouse position
             iren = self.plotter.iren.interactor
             x, y = iren.GetEventPosition()
+            # The same locator-backed picker the readout uses. The previous
+            # code built a fresh brute-force `vtkCellPicker` per click, which
+            # measured 537 ms on the 2,397,890-facet reference run and landed
+            # 3.6 m from the ray's hit point; this one is 0.054 ms and 1.1 m.
+            cell_id = self._pick_face_at(x, y)
 
-            # Use VTK cell picker
-            import vtk
-            picker = vtk.vtkCellPicker()
-            picker.SetTolerance(0.005)
-
-            renderer = self.plotter.renderer
-            picker.Pick(x, y, 0, renderer)
-
-            cell_id = picker.GetCellId()
-
-            if cell_id >= 0:
+            if cell_id is not None:
                 self.selected_face_id = cell_id
                 self._emit_face_selection(cell_id)
                 # Keep hover highlight but add selection indicator
@@ -1261,6 +1519,21 @@ class PyVistaWidget(QWidget):
 
         except Exception as e:
             print(f"Click selection error: {e}")
+
+    def _single_face_polydata(self, face_id):
+        """One facet as its own tiny mesh, or None.
+
+        O(1) in the size of the results mesh. `extract_cells` is O(N) and this
+        is called for every pointer move.
+        """
+        if self.mesh_data is None:
+            return None
+        faces = self.mesh_data['faces']
+        if face_id is None or face_id < 0 or face_id >= len(faces):
+            return None
+        points = np.asarray(
+            self.mesh_data['vertices'][faces[face_id]], dtype=np.float64)
+        return pv.PolyData(points, np.array([3, 0, 1, 2], dtype=np.int64))
 
     def update_hover_highlight(self, face_id):
         """Update the hover highlight to show a specific face"""
@@ -1273,9 +1546,13 @@ class PyVistaWidget(QWidget):
                 self.plotter.remove_actor(self.hover_highlight_actor, render=False)
                 self.hover_highlight_actor = None
 
-            # Extract the single cell and create a highlight mesh
-            cell = self.mesh.extract_cells([face_id])
-            if cell.n_cells > 0:
+            # The one triangle, built from its own three vertices.
+            # ⛔ NOT `self.mesh.extract_cells([face_id])`: that walks the whole
+            # dataset and measured 10.3 ms on the 2,397,890-facet reference run
+            # against 2.2 ms here, on a path that runs for every pointer move.
+            # Same three points, same triangle.
+            cell = self._single_face_polydata(face_id)
+            if cell is not None and cell.n_cells > 0:
                 # Add as wireframe with bright color
                 self.hover_highlight_actor = self.plotter.add_mesh(
                     cell,
@@ -1316,9 +1593,10 @@ class PyVistaWidget(QWidget):
             except Exception:
                 pass
 
-            # Extract the cell and highlight it
-            cell = self.mesh.extract_cells([face_id])
-            if cell.n_cells > 0:
+            # The same one-triangle build the hover highlight uses, for the
+            # same reason: `extract_cells` walks the whole dataset.
+            cell = self._single_face_polydata(face_id)
+            if cell is not None and cell.n_cells > 0:
                 # Add solid highlight with different color from hover
                 self.plotter.add_mesh(
                     cell,
@@ -1330,20 +1608,15 @@ class PyVistaWidget(QWidget):
                     pickable=False
                 )
 
-                # Also add face center marker
-                if self.mesh_data is not None:
-                    faces = self.mesh_data['faces']
-                    vertices = self.mesh_data['vertices']
-                    if face_id < len(faces):
-                        face_verts = vertices[faces[face_id]]
-                        center = face_verts.mean(axis=0)
-                        self.plotter.add_points(
-                            np.array([center]),
-                            color='yellow',
-                            point_size=12,
-                            render=False,
-                            name='selected_center_marker'
-                        )
+                # Also add face center marker -- the centroid of the three
+                # points already built above, rather than a second lookup.
+                self.plotter.add_points(
+                    np.asarray([np.asarray(cell.points).mean(axis=0)]),
+                    color='yellow',
+                    point_size=12,
+                    render=False,
+                    name='selected_center_marker'
+                )
 
                 self.plotter.render()
 
@@ -1966,6 +2239,16 @@ class PyVistaWidget(QWidget):
 
         # Add back to layout (index 1, after controls)
         layout.insertWidget(1, self.plotter.interactor, 1)
+
+        # The new plotter has a DIFFERENT `iren`. Without this the hover
+        # observers stay on the retired one, the coordinate readout freezes and
+        # face selection stops working, while `picking_active`,
+        # `picking_enabled` and the "Select Face Mode" button all still read as
+        # on (PTM-GUI-PICKING-DEAD-AFTER-EXPORT).
+        self._bind_interactor_observers()
+        self.hover_face_id = None
+        self.hover_highlight_actor = None
+        self._reset_coordinate_readout()
 
     def find_face_by_latlon(self, lat, lon):
         """Find the nearest face to given lat/lon coordinates"""
@@ -2882,7 +3165,16 @@ class ScientificDoubleSpinBox(QDoubleSpinBox):
 
 
 class ExportDataDialog(QDialog):
-    """Dialog for configuring and executing data export in GeoTIFF/HDF5 formats."""
+    """Dialog for configuring and executing data export in GeoTIFF/HDF5/COG formats."""
+
+    #: Radio-button ids in `format_btn_group`. 0-3 predate this dialog's COG
+    #: support and are matched positionally in `_start_export`; named here so a
+    #: fifth format is added in one place instead of four.
+    FORMAT_ID_GEOTIFF = 0
+    FORMAT_ID_HDF5 = 1
+    FORMAT_ID_BOTH = 2
+    FORMAT_ID_VTU = 3
+    FORMAT_ID_COG = 4
 
     def __init__(self, results_dir, mesh_data, timesteps, parent=None):
         super().__init__(parent)
@@ -2901,6 +3193,7 @@ class ExportDataDialog(QDialog):
         # Import availability and detection functions
         from gui_core.data_exporter import (
             SCIPY_AVAILABLE, RASTERIO_AVAILABLE, H5PY_AVAILABLE,
+            COG_AVAILABLE, COG_UNAVAILABLE_REASON,
             GridResolutionEstimator, FIELD_INFO, BODY_RADII,
             detect_body_from_mesh, choose_projection, POLAR_LAT_THRESHOLD,
             detect_available_statistics, STATISTICS_FIELDS, STAT_LABELS
@@ -2908,6 +3201,8 @@ class ExportDataDialog(QDialog):
         self.scipy_available = SCIPY_AVAILABLE
         self.rasterio_available = RASTERIO_AVAILABLE
         self.h5py_available = H5PY_AVAILABLE
+        self.cog_available = COG_AVAILABLE
+        self.cog_unavailable_reason = COG_UNAVAILABLE_REASON
         self.body_radii = BODY_RADII
 
         # Auto-detect body from mesh vertices
@@ -2928,10 +3223,18 @@ class ExportDataDialog(QDialog):
 
         # Auto-detect resolution
         self.auto_resolution = 0.05  # fallback
+        # The mesh's OWN median face spacing, before the estimator rounds it to
+        # one of `NICE_RESOLUTIONS`. Kept because that table's floor is 0.001
+        # deg -- 30.3 m on the Moon -- so on a meter-scale site mesh the
+        # "auto-detected" number is coarser than the data by a large factor and
+        # nothing said so. The dialog now says so. See
+        # PTM-EXPORT-NICE-RESOLUTION-FLOOR.
+        self.raw_face_spacing_deg = None
         if SCIPY_AVAILABLE and mesh_data:
-            self.auto_resolution = GridResolutionEstimator.estimate_resolution(
-                mesh_data['latitudes'], mesh_data['longitudes']
-            )
+            self.auto_resolution, self.raw_face_spacing_deg = \
+                GridResolutionEstimator.estimate_resolution(
+                    mesh_data['latitudes'], mesh_data['longitudes'],
+                    return_raw=True)
 
         # Detect available fields
         self.available_fields = []
@@ -2963,21 +3266,34 @@ class ExportDataDialog(QDialog):
         self.hdf5_radio = QRadioButton("HDF5")
         self.both_radio = QRadioButton("Both")
         self.vtu_radio = QRadioButton("VTU/PVD")
+        self.cog_radio = QRadioButton("COG")
+        self.cog_radio.setToolTip(
+            "Cloud Optimized GeoTIFF: the same product "
+            "scripts/ptm3d_stats_to_cog.py writes. Single-band Float32, GDAL "
+            "COG layout, 512 px internal tiles, AVERAGE overview chain. One "
+            "file per statistic, and one file per timestep for a time series."
+        )
         self.both_radio.setChecked(True)
 
         self.format_btn_group.addButton(self.geotiff_radio, 0)
         self.format_btn_group.addButton(self.hdf5_radio, 1)
         self.format_btn_group.addButton(self.both_radio, 2)
         self.format_btn_group.addButton(self.vtu_radio, 3)
+        self.format_btn_group.addButton(self.cog_radio, self.FORMAT_ID_COG)
 
         if not self.vtk_available:
             self.vtu_radio.setEnabled(False)
             self.vtu_radio.setToolTip("VTK not available (pip install vtk)")
+        if not self.cog_available:
+            self.cog_radio.setEnabled(False)
+            self.cog_radio.setToolTip(
+                f"COG export unavailable: {self.cog_unavailable_reason}")
 
         format_row.addWidget(self.geotiff_radio)
         format_row.addWidget(self.hdf5_radio)
         format_row.addWidget(self.both_radio)
         format_row.addWidget(self.vtu_radio)
+        format_row.addWidget(self.cog_radio)
         format_row.addStretch()
         format_layout.addLayout(format_row)
 
@@ -2999,6 +3315,9 @@ class ExportDataDialog(QDialog):
             warnings.append("scipy not available - regridding disabled (pip install scipy)")
         if not self.vtk_available:
             warnings.append("vtk not available - VTU/PVD export disabled (pip install vtk)")
+        if not self.cog_available:
+            warnings.append(
+                f"COG export disabled: {self.cog_unavailable_reason}")
 
         if warnings:
             warn_label = QLabel("\n".join(warnings))
@@ -3166,13 +3485,81 @@ class ExportDataDialog(QDialog):
         self.grid_size_label.setStyleSheet("color: #888888; font-size: 11px;")
         grid_layout.addWidget(self.grid_size_label, 2, 0, 1, 3)
 
+        # The estimator rounds to a fixed table whose floor is 0.001 deg. On a
+        # meter-scale site mesh that is coarser than the data by a large factor,
+        # and until now nothing said so -- the dialog only showed the rounded
+        # number. It does not change the number: it names the mesh's own spacing
+        # beside it so the user can choose.
+        self.spacing_label = QLabel("")
+        self.spacing_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+        self.spacing_label.setWordWrap(True)
+        self.spacing_label.setVisible(False)
+        if self.raw_face_spacing_deg:
+            spacing_m = self._get_body_radius() * np.radians(
+                self.raw_face_spacing_deg)
+            auto_m = self._get_body_radius() * np.radians(self.auto_resolution)
+            if self.auto_resolution > 1.5 * self.raw_face_spacing_deg:
+                self.spacing_label.setText(
+                    f"This mesh's median face spacing is "
+                    f"{self.raw_face_spacing_deg:.3g}\u00b0 "
+                    f"\u2248 {spacing_m:.2f} m. The auto-detected resolution "
+                    f"above is rounded to a fixed table whose finest entry is "
+                    f"0.001\u00b0 \u2248 {auto_m:.1f} m, so it is coarser "
+                    f"than the mesh. Switch the unit to m/px to export at the "
+                    f"mesh's own scale."
+                )
+                self.spacing_label.setVisible(True)
+        grid_layout.addWidget(self.spacing_label, 3, 0, 1, 3)
+
+        # One projection choice, and the minimum one: which meridian the output
+        # CRS is centered on. Default OFF, which is what every GUI export has
+        # done to date (the mesh's own midpoint). Turning it on reproduces
+        # `scripts/ptm3d_stats_to_cog.py --fixed-meridian 0`, whose reason is on
+        # record: many GIS tools lock the session CRS to the first layer loaded
+        # and silently reuse it, so site-centered rasters from different sites
+        # landed tens of km apart. The note below fires when it is off and COG
+        # is selected, rather than leaving that silent.
+        self.shared_crs_check = QCheckBox(
+            "Shared CRS: central meridian 0\u00b0")
+        self.shared_crs_check.setChecked(False)
+        self.shared_crs_check.stateChanged.connect(self._on_shared_crs_changed)
+        # ⛔ It only reaches the raster on the POLAR STEREOGRAPHIC branch.
+        # `MeshRegridder` carries `center_lon` into `_init_stereo`, but
+        # `_init_eqc` builds the grid from the raw longitude bounds and both
+        # raster writers then recompute the equirectangular central meridian
+        # from those bounds -- so on an equatorial mesh the checkbox would
+        # change the README and the PROJ string while the pixels stayed where
+        # they were. Offering an inert control that makes the documentation
+        # disagree with the data is worse than not offering it.
+        if self.projection == 'stere':
+            self.shared_crs_check.setToolTip(
+                "Center the output projection on 0\u00b0 instead of this "
+                "mesh's own midpoint, so rasters from different sites share "
+                "one CRS and overlay correctly in a GIS session. Recommended "
+                "for COGs that will be loaded beside other sites."
+            )
+        else:
+            self.shared_crs_check.setEnabled(False)
+            self.shared_crs_check.setToolTip(
+                "Only available for polar stereographic output. An "
+                "equirectangular raster is built on its own longitude bounds, "
+                "so forcing a central meridian here would change the stated "
+                "CRS without moving a pixel."
+            )
+        grid_layout.addWidget(self.shared_crs_check, 4, 0, 1, 2)
+
+        self.crs_note_label = QLabel("")
+        self.crs_note_label.setStyleSheet("color: #888888; font-size: 11px;")
+        self.crs_note_label.setWordWrap(True)
+        grid_layout.addWidget(self.crs_note_label, 5, 0, 1, 3)
+
         self.per_timestep_check = QCheckBox("One GeoTIFF per timestep (smaller files)")
         self.per_timestep_check.setChecked(True)
         self.per_timestep_check.setToolTip(
             "Write individual GeoTIFF files per timestep instead of one "
             "large multi-band file. Recommended for large meshes."
         )
-        grid_layout.addWidget(self.per_timestep_check, 3, 0, 1, 3)
+        grid_layout.addWidget(self.per_timestep_check, 6, 0, 1, 3)
 
         grid_group.setLayout(grid_layout)
         layout.addWidget(grid_group)
@@ -3214,6 +3601,7 @@ class ExportDataDialog(QDialog):
 
         # Initialize displays
         self._update_grid_info()
+        self._on_format_changed()
         self._update_estimate()
 
     def _get_body_radius(self):
@@ -3272,7 +3660,8 @@ class ExportDataDialog(QDialog):
             # For stereographic, grid is in projected meters
             from gui_core.data_exporter import _forward_polar_stereo
             pole_lat = getattr(self, 'pole_lat', 90.0)
-            center_lon = float((np.nanmin(lons) + np.nanmax(lons)) / 2)
+            choice = self._center_lon_choice()
+            center_lon = self._site_center_lon() if choice is None else choice
             x, y = _forward_polar_stereo(lats, lons, pole_lat, center_lon, body_radius)
             # Pixel size in meters from degree-resolution mapped to projected space
             pixel_m = body_radius * np.radians(res)
@@ -3324,7 +3713,8 @@ class ExportDataDialog(QDialog):
         if self.projection == 'stere':
             from gui_core.data_exporter import _forward_polar_stereo
             pole_lat = getattr(self, 'pole_lat', 90.0)
-            center_lon = float((np.nanmin(lons) + np.nanmax(lons)) / 2)
+            choice = self._center_lon_choice()
+            center_lon = self._site_center_lon() if choice is None else choice
             body_radius = self._get_body_radius()
             x, y = _forward_polar_stereo(lats, lons, pole_lat, center_lon, body_radius)
             pixel_m = body_radius * np.radians(res)
@@ -3352,6 +3742,13 @@ class ExportDataDialog(QDialog):
             total_bytes += n_statistics * n_faces * 4 * 0.5
             total_bytes += n_statistics * n_lat * n_lon * 4 * 0.5
 
+        if fmt_id == self.FORMAT_ID_COG:
+            # One single-band COG per timestep per field, plus one per
+            # statistic. LZW on a smooth field plus the overview chain runs
+            # near half the raw size, same assumption the GeoTIFF rows use.
+            total_bytes += n_fields * n_timesteps * n_lat * n_lon * 4 * 0.5
+            total_bytes += n_statistics * n_lat * n_lon * 4 * 0.5
+
         if fmt_id == 3:  # VTU/PVD
             # VTU: mesh geometry + per-field data per timestep, compressed ~50%
             mesh_bytes = n_faces * 3 * 3 * 4  # vertices (3 verts * 3 coords * float32)
@@ -3374,9 +3771,83 @@ class ExportDataDialog(QDialog):
     def _on_format_changed(self, button=None):
         """Toggle Grid & Projection group based on selected format."""
         fmt_id = self.format_btn_group.checkedId()
-        is_vtu = (fmt_id == 3)
+        is_vtu = (fmt_id == self.FORMAT_ID_VTU)
+        is_cog = (fmt_id == self.FORMAT_ID_COG)
         self.grid_group.setEnabled(not is_vtu)
+        # A COG holds one band. There is no multi-band COG to choose, so the
+        # control is pinned rather than accepting a setting it would ignore.
+        self.per_timestep_check.setEnabled(not is_cog and not is_vtu)
+        if is_cog:
+            self.per_timestep_check.setToolTip(
+                "A COG holds one band, so a time series is always one file "
+                "per timestep.")
+        else:
+            self.per_timestep_check.setToolTip(
+                "Write individual GeoTIFF files per timestep instead of one "
+                "large multi-band file. Recommended for large meshes.")
+        self._refresh_crs_note()
         self._update_estimate()
+
+    def _on_shared_crs_changed(self, _state=None):
+        self._refresh_crs_note()
+        self._update_grid_info()
+
+    def _refresh_crs_note(self):
+        """Say which meridian the output CRS will be centered on.
+
+        Never silent: the site-centered default is the one that composes badly
+        across sites, so when a COG is about to be written on it the dialog says
+        so instead of leaving the user to find out in a GIS session.
+        """
+        if not hasattr(self, 'crs_note_label'):
+            return
+        is_cog = (self.format_btn_group.checkedId() == self.FORMAT_ID_COG)
+        if self.projection != 'stere':
+            self.crs_note_label.setStyleSheet(
+                "color: #888888; font-size: 11px;")
+            self.crs_note_label.setText(
+                "Equirectangular output is centered on this mesh's own "
+                "longitude bounds.")
+            return
+        if self.shared_crs_check.isChecked():
+            self.crs_note_label.setStyleSheet(
+                "color: #888888; font-size: 11px;")
+            self.crs_note_label.setText(
+                "Central meridian 0\u00b0. Rasters from different sites share "
+                "one CRS and overlay correctly.")
+            return
+        center_lon = self._site_center_lon()
+        text = (f"Central meridian {center_lon:.4f}\u00b0 (this mesh's own "
+                f"midpoint).")
+        if is_cog:
+            text += (" Rasters written this way do NOT share a CRS with other "
+                     "sites; a GIS session that locks onto the first layer's "
+                     "CRS will place them wrongly.")
+            self.crs_note_label.setStyleSheet(
+                "color: #ff9800; font-size: 11px;")
+        else:
+            self.crs_note_label.setStyleSheet(
+                "color: #888888; font-size: 11px;")
+        self.crs_note_label.setText(text)
+
+    def _site_center_lon(self):
+        """The mesh midpoint meridian the regridder would pick on its own."""
+        if not self.mesh_data or 'longitudes' not in self.mesh_data:
+            return 0.0
+        lon = np.asarray(self.mesh_data['longitudes'], dtype=np.float64)
+        if np.ptp(lon) > 300:
+            lon = lon % 360.0
+        return float((np.nanmin(lon) + np.nanmax(lon)) / 2)
+
+    def _center_lon_choice(self):
+        """What to hand `MeshRegridder(center_lon=...)`: 0.0, or None.
+
+        Never 0.0 on the equirectangular branch, where the regridder accepts it
+        and the raster writers ignore it -- see the control's own comment.
+        """
+        if self.projection != 'stere':
+            return None
+        return 0.0 if self.shared_crs_check.isChecked() else None
 
     def _browse_output(self):
         """Browse for output directory."""
@@ -3412,12 +3883,14 @@ class ExportDataDialog(QDialog):
         # Determine formats
         fmt_id = self.format_btn_group.checkedId()
         formats = []
-        if fmt_id == 0:
+        if fmt_id == self.FORMAT_ID_GEOTIFF:
             formats = ['geotiff']
-        elif fmt_id == 1:
+        elif fmt_id == self.FORMAT_ID_HDF5:
             formats = ['hdf5']
-        elif fmt_id == 3:
+        elif fmt_id == self.FORMAT_ID_VTU:
             formats = ['vtu']
+        elif fmt_id == self.FORMAT_ID_COG:
+            formats = ['cog']
         else:
             formats = ['geotiff', 'hdf5']
 
@@ -3432,6 +3905,7 @@ class ExportDataDialog(QDialog):
             'geotiff_per_timestep': self.per_timestep_check.isChecked(),
             'body_radius': self._get_body_radius(),
             'statistics': selected_stats,
+            'center_lon': self._center_lon_choice(),
         }
 
         # Disable controls during export

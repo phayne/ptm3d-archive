@@ -41,7 +41,7 @@ except ImportError:
     GDAL_AVAILABLE = False
 
 from ptm.results import (FIELD_INFO, STATISTICS_FIELDS, STAT_LABELS,
-                         depth_of_field, field_info)
+                         depth_of_field, field_info, nonfinite_census)
 
 
 def _find_gdal_tool(name):
@@ -280,6 +280,97 @@ def _pick_overview_levels(width, height, blocksize):
     return levels
 
 
+# --- Sentinels -------------------------------------------------------------
+#
+# ⛔⛔ A raster has ONE nodata value and PTM3D products carry TWO sentinels that
+# do not mean the same thing:
+#
+#   NaN    "not evaluated" / "no value here" -- `effective_albedo` on a facet
+#          that was never lit (26,057 of 2,397,890 on the reference lunar polar
+#          run), `shadow_depth_{avg,max,min}` on a facet with no resolved epoch
+#          (1,240,686 of 2,397,890 on the same run).
+#   +inf   "still umbral at the search ceiling" -- a MEASUREMENT: the Sun is not
+#          even partially visible anywhere below `h_max_m` above this facet.
+#          The per-step `shadow_depth` series carries it on 0.3% to 27% of
+#          facets depending on the epoch.
+#
+# Both have to become nodata in the main band, because there is no finite number
+# that means either one. What must never happen is the third outcome, and both
+# regrid paths produce it unless they are stopped:
+#
+#   * `MeshRegridder.regrid` (IDW) zeroes the weight of every NON-FINITE
+#     neighbor, so a `+inf` facet is DROPPED and its pixel is filled from the
+#     finite facets around it. "The Sun is never visible below 5 m" comes back
+#     as a depth in meters.
+#   * `MeshRegridder.regrid_linear` (barycentric, the default here) multiplies
+#     `+inf` by a barycentric weight, so `+inf` SPREADS across every triangle
+#     that touches such a facet and silently erases the finite neighbors.
+#
+# The policy below: split the two classes before regridding, regrid an
+# indicator for the `+inf` population on the same grid, and stamp the main band
+# to nodata wherever that indicator says the facet was unresolved -- so an
+# unresolved region can never be reported as a finite value -- then write the
+# indicator beside the main raster as `<name>_unresolved.tif` so the second
+# meaning survives as its own layer instead of being conflated with "no value".
+
+#: Band metadata naming the face-level census. Written on every band, so a
+#: reader holding only the GeoTIFF can tell an absent measurement from a
+#: measured absence.
+_CENSUS_TAG_NAMES = ('PTM_FACES_TOTAL', 'PTM_FACES_FINITE', 'PTM_FACES_NAN',
+                     'PTM_FACES_POS_INF', 'PTM_FACES_NEG_INF',
+                     'PTM_SENTINEL_POLICY')
+
+#: Threshold on the regridded 0/1 indicator. A pixel whose interpolated
+#: indicator reaches this is stamped nodata in the main band. 0.5 = "the
+#: unresolved facets outweigh the resolved ones at this pixel".
+UNRESOLVED_STAMP_THRESHOLD = 0.5
+
+#: Suffix of the companion layer.
+UNRESOLVED_SUFFIX = '_unresolved'
+
+
+def unresolved_mask_path(output_path):
+    """Where the companion `+inf` layer for ``output_path`` goes."""
+    output_path = os.fspath(output_path)
+    stem, ext = os.path.splitext(output_path)
+    return f"{stem}{UNRESOLVED_SUFFIX}{ext or '.tif'}"
+
+
+def _census_tags(census):
+    parts = ['NaN (not evaluated) is nodata in this band']
+    if census.pos_inf:
+        parts.append(
+            '+inf (umbral above the search ceiling) is nodata here too and is '
+            'written separately as the companion '
+            + UNRESOLVED_SUFFIX.lstrip('_') + ' layer, stamped out of this '
+            'band so it can never read as a finite value')
+    if census.neg_inf:
+        parts.append(
+            '-inf is nodata and has NO meaning in any PTM3D product: it is '
+            'counted and dropped, and deliberately NOT placed in the '
+            + UNRESOLVED_SUFFIX.lstrip('_') + ' layer, which is a statement '
+            'about solar visibility')
+    if not (census.pos_inf or census.neg_inf):
+        parts.append('this field carries no infinite sentinel')
+    policy = '; '.join(parts)
+    return {
+        'PTM_FACES_TOTAL': str(census.total),
+        'PTM_FACES_FINITE': str(census.finite),
+        'PTM_FACES_NAN': str(census.nan),
+        'PTM_FACES_POS_INF': str(census.pos_inf),
+        'PTM_FACES_NEG_INF': str(census.neg_inf),
+        'PTM_SENTINEL_POLICY': policy,
+    }
+
+
+def _regrid(regridder, face_values, interpolation):
+    if interpolation == 'linear':
+        return regridder.regrid_linear(face_values)
+    if interpolation == 'idw':
+        return regridder.regrid(face_values)
+    raise ValueError(f"unknown interpolation mode: {interpolation!r}")
+
+
 # --- Main export -----------------------------------------------------------
 
 # Default nodata for out-of-mesh / invalid pixels. A numeric sentinel
@@ -291,61 +382,32 @@ def _pick_overview_levels(width, height, blocksize):
 DEFAULT_NODATA = float(np.finfo(np.float32).min)  # -3.4028235e+38
 
 
-def export_field(output_path, face_values, regridder, field_name,
-                 *, blocksize=512, compress='LZW',
-                 overview_resampling='AVERAGE',
-                 software='PTM3D',
-                 interpolation='linear',
-                 nodata_value=DEFAULT_NODATA,
-                 extra_tags=None):
-    """Regrid ``face_values`` and write a COG to ``output_path``.
+def _write_raster(output_path, grid_flipped, regridder, field_name, *,
+                  blocksize=512, compress='LZW', overview_resampling='AVERAGE',
+                  software='PTM3D', nodata_value=DEFAULT_NODATA,
+                  extra_tags=None, band_desc=None, file_desc=None, units=None):
+    """Write one already-regridded, north-up band as a COG.
 
-    Args:
-        output_path: Destination .tif path.
-        face_values: 1D per-face values (length must equal regridder face count).
-        regridder: Built ``MeshRegridder`` instance.
-        field_name: PTM3D stats field name, e.g. ``temperature_max``,
-            ``ice_depth``.
-        blocksize: Internal tile size (default 512 - matches example COGs).
-        compress: TIFF compression (default LZW).
-        overview_resampling: Resampling for overview levels (default AVERAGE).
-        software: ``software`` tag written to the file.
-        extra_tags: extra band metadata, ``{name: str}``. Used for the depth a
-            subsurface temperature map holds -- see :func:`depth_band_tags`.
-            Written on the BAND, beside the ``STATISTICS_*`` tags, because it
-            describes what the pixels ARE. It cannot overwrite one of those:
-            they are applied last, and a collision raises rather than
-            silently winning, since a statistic quietly replaced by a depth
-            would be a wrong number in the same field name.
+    Split out of :func:`export_field` so the companion `+inf` layer is written
+    by exactly the same code path -- same grid, same CRS, same overview chain,
+    same nodata -- rather than by a second, drifting writer. `grid_flipped` is
+    in GeoTIFF row order (north first) and still carries non-finite values; the
+    nodata substitution happens here, AFTER the statistics tags are computed
+    from the finite mask, so a finite sentinel can never inflate the
+    valid-percent or skew the min/max/mean.
 
-    Returns ``(grid, stats_tags)``.
+    Returns ``(grid_with_nodata_filled, stats_tags)``.
     """
     extra_tags = dict(extra_tags or {})
-    clash = sorted(set(extra_tags) & set(_STATS_TAG_NAMES))
-    if clash:
-        raise ValueError(
-            f"extra_tags would overwrite the computed statistics tag(s) "
-            f"{clash} on band 1 of {output_path}")
-    if not GDAL_AVAILABLE:
-        raise RuntimeError("osgeo.gdal is required for COG export")
-
-    if interpolation == 'linear':
-        grid = regridder.regrid_linear(face_values)
-    elif interpolation == 'idw':
-        grid = regridder.regrid(face_values)
-    else:
-        raise ValueError(f"unknown interpolation mode: {interpolation!r}")
-    grid_flipped = grid[::-1, :]  # north-up GeoTIFF row order
-
     wkt, geo_transform, width, height = _geo_from_regridder(regridder)
-    units, file_desc, band_desc = field_metadata(field_name)
+    default_units, default_file_desc, default_band_desc = \
+        field_metadata(field_name)
+    units = default_units if units is None else units
+    file_desc = default_file_desc if file_desc is None else file_desc
+    band_desc = default_band_desc if band_desc is None else band_desc
     stats_tags = _compute_stats_tags(grid_flipped)
     created = datetime.now().isoformat()
 
-    # Replace non-finite (out-of-mesh / invalid) pixels with the nodata
-    # sentinel AFTER stats are computed from the NaN mask, so a finite sentinel
-    # can never inflate the valid-percent or skew the min/max/mean tags. When
-    # nodata_value is itself NaN (legacy mode) this is a no-op.
     if np.isfinite(nodata_value):
         grid_flipped = np.where(
             np.isfinite(grid_flipped), grid_flipped, np.float32(nodata_value)
@@ -426,11 +488,116 @@ def export_field(output_path, face_values, regridder, field_name,
         )
     finally:
         for ext in ('', '.ovr', '.aux.xml'):
-            p = tmp_path + ext
-            if os.path.isfile(p):
+            leftover = tmp_path + ext
+            if os.path.isfile(leftover):
                 try:
-                    os.remove(p)
+                    os.remove(leftover)
                 except OSError:
                     pass
+
+    return grid_flipped, stats_tags
+
+
+def export_field(output_path, face_values, regridder, field_name,
+                 *, blocksize=512, compress='LZW',
+                 overview_resampling='AVERAGE',
+                 software='PTM3D',
+                 interpolation='linear',
+                 nodata_value=DEFAULT_NODATA,
+                 extra_tags=None):
+    """Regrid ``face_values`` and write a COG to ``output_path``.
+
+    Args:
+        output_path: Destination .tif path.
+        face_values: 1D per-face values (length must equal regridder face count).
+        regridder: Built ``MeshRegridder`` instance.
+        field_name: PTM3D stats field name, e.g. ``temperature_max``,
+            ``ice_depth``.
+        blocksize: Internal tile size (default 512 - matches example COGs).
+        compress: TIFF compression (default LZW).
+        overview_resampling: Resampling for overview levels (default AVERAGE).
+        software: ``software`` tag written to the file.
+        extra_tags: extra band metadata, ``{name: str}``. Used for the depth a
+            subsurface temperature map holds -- see :func:`depth_band_tags`.
+            Written on the BAND, beside the ``STATISTICS_*`` tags, because it
+            describes what the pixels ARE. It cannot overwrite one of those:
+            they are applied last, and a collision raises rather than
+            silently winning, since a statistic quietly replaced by a depth
+            would be a wrong number in the same field name.
+    Returns ``(grid, stats_tags)``.
+    """
+    extra_tags = dict(extra_tags or {})
+    clash = sorted(set(extra_tags) & set(_STATS_TAG_NAMES + _CENSUS_TAG_NAMES))
+    if clash:
+        raise ValueError(
+            f"extra_tags would overwrite the computed statistics tag(s) "
+            f"{clash} on band 1 of {output_path}")
+    if not GDAL_AVAILABLE:
+        raise RuntimeError("osgeo.gdal is required for COG export")
+
+    # No dtype cast: the regrid paths do their own, and forcing float64 here
+    # would copy a 2.4M-facet float32 map for nothing.
+    face_values = np.asarray(face_values)
+    census = nonfinite_census(face_values)
+    extra_tags.update(_census_tags(census))
+
+    if census.pos_inf or census.neg_inf:
+        # Split the sentinel classes BEFORE regridding. See the module's
+        # "Sentinels" section: left in, an infinite value is either dropped
+        # (IDW, so its pixel is filled from finite neighbors) or smeared
+        # (barycentric, so it erases them). Neither is acceptable for a value
+        # that means "the Sun is not visible anywhere below the ceiling".
+        #
+        # ⛔ Only `+inf` is the umbral-ceiling sentinel. `-inf` has no meaning
+        # in any PTM3D product -- it would be an underflow or a bad fill -- so
+        # it is removed from the interpolation and counted, but it is NOT put
+        # into the companion layer, whose whole content is a statement about
+        # solar visibility. Labeling an underflow as "the Sun was never
+        # visible" would be inventing a measurement.
+        main_values = np.where(np.isfinite(face_values), face_values, np.nan)
+        grid = _regrid(regridder, main_values, interpolation)
+        if census.pos_inf:
+            indicator = _regrid(regridder,
+                                np.isposinf(face_values).astype(np.float64),
+                                interpolation)
+            stamp = (np.isfinite(indicator)
+                     & (indicator >= UNRESOLVED_STAMP_THRESHOLD))
+            grid = np.where(stamp, np.nan, grid).astype(np.float32, copy=False)
+        else:
+            indicator = None
+    else:
+        indicator = None
+        grid = _regrid(regridder, face_values, interpolation)
+    grid_flipped = grid[::-1, :]  # north-up GeoTIFF row order
+
+    grid_flipped, stats_tags = _write_raster(
+        output_path, grid_flipped, regridder, field_name,
+        blocksize=blocksize, compress=compress,
+        overview_resampling=overview_resampling, software=software,
+        nodata_value=nodata_value, extra_tags=extra_tags)
+
+    if indicator is not None:
+        # The second meaning, as its own layer. 1 = the Sun was still hidden
+        # above the search ceiling here, 0 = it was not, nodata = outside the
+        # mesh. Written through this same function so it is a real COG with the
+        # same grid, CRS and overviews, and can be laid straight over the band
+        # it explains.
+        _write_raster(
+            unresolved_mask_path(output_path),
+            np.where(np.isfinite(indicator), indicator,
+                     np.nan).astype(np.float32)[::-1, :],
+            regridder, f"{field_name}{UNRESOLVED_SUFFIX}",
+            blocksize=blocksize, compress=compress,
+            overview_resampling=overview_resampling, software=software,
+            nodata_value=nodata_value,
+            band_desc=('Fraction of the facets behind this pixel that were '
+                       'still umbral above the search ceiling (1 = all)'),
+            file_desc=(f"{field_metadata(field_name)[1]} -- unresolved "
+                       f"(umbral above the search ceiling) fraction"),
+            units='',
+            extra_tags={'PTM_SENTINEL_POLICY':
+                        'companion layer for the +inf population of '
+                        f'{field_name}; dimensionless fraction in [0, 1]'},
+        )
 
     return grid_flipped, stats_tags

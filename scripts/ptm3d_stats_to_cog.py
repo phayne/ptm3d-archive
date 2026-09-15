@@ -47,7 +47,7 @@ from ptm_regridder import (
     detect_body_from_mesh, detect_available_statistics,
     read_binary_data, read_ply_mesh_minimal,
 )
-from ptm_cog import depth_band_tags, export_field
+from ptm_cog import depth_band_tags, export_field, unresolved_mask_path
 
 
 def _expected_field_files(stats_dir=None):
@@ -281,12 +281,30 @@ def main():
         bin_path = stats_dir / bin_name
         out_path = output_dir / f"{field_name}.tif"
 
-        if args.resume and out_path.is_file():
-            print(f"      skip  {field_name:30s} (exists)", flush=True)
-            skipped += 1
-            continue
-
         face_values = read_binary_data(bin_path, n_faces)
+
+        if args.resume and out_path.is_file():
+            # ⛔ The main band alone is not a complete product. `export_field`
+            # writes the band first and the `+inf` companion second, and the
+            # band has ALREADY had the unresolved pixels stamped to nodata --
+            # so resuming past a pair that was interrupted between the two
+            # writes leaves that population unrecoverable, which is the failure
+            # the companion exists to prevent. Re-export when the field carries
+            # +inf and the companion is missing.
+            needs_companion = (
+                face_values is not None
+                and int(np.isposinf(np.asarray(face_values,
+                                               dtype=np.float64)).sum()) > 0
+                and not Path(unresolved_mask_path(out_path)).is_file()
+            )
+            if not needs_companion:
+                print(f"      skip  {field_name:30s} (exists)", flush=True)
+                skipped += 1
+                continue
+            print(f"      redo  {field_name:30s} (companion "
+                  f"{Path(unresolved_mask_path(out_path)).name} is missing)",
+                  flush=True)
+
         if face_values is None:
             print(f"      FAIL  {field_name:30s} (could not read {bin_name})",
                   flush=True)
