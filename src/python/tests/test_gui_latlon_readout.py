@@ -88,6 +88,12 @@ READOUT_RE = re.compile(
 
 _QAPP = None
 
+#: What the environment said about the Qt platform BEFORE `_harness` forces
+#: "offscreen" into it with `setdefault`. Section 3 needs a real window, so it
+#: has to know whether the caller asked for a headless platform or whether
+#: this file imposed one.
+_PLATFORM_AS_INVOKED = os.environ.get("QT_QPA_PLATFORM")
+
 
 class Skip(Exception):
     """A check that cannot run here, as distinct from one that failed."""
@@ -282,6 +288,206 @@ def check_the_readout_is_not_drawn_into_the_scene():
             f"{name} draws the readout into the 3D scene with add_text, so it "
             f"would be burned into every exported animation frame")
     return "the readout is a Qt widget, not a scene actor"
+
+
+def check_the_pick_corrects_the_event_position_for_the_canvas():
+    """⛔⛔ EVERY pick must go through the canvas-scale correction.
+
+    An interactor event position is NOT a VTK display position when the two
+    are sized differently, which on macOS they always are: the Cocoa render
+    window is sized in Qt's LOGICAL points while `pyvistaqt` multiplies the
+    event position by the screen's device pixel ratio. Feeding one to
+    `vtkCellPicker.Pick` misses by exactly that factor, which is how the
+    readout and the Select Face Mode highlight both died on a Retina screen
+    while fourteen offscreen checks passed.
+
+    Both the hover readout and click selection have to be covered, so the
+    correction belongs in the ONE place both reach.
+    """
+    methods = _methods(_widget_class())
+    for name in ("_display_position", "_event_position_scale",
+                 "_canvas_widget", "_pick_cell_at_display"):
+        assert name in methods, f"PyVistaWidget.{name} is gone"
+    pick = methods.get("_pick_face_at")
+    assert pick is not None, "PyVistaWidget._pick_face_at is gone"
+    assert _calls_self_method(pick, "_display_position"), (
+        "_pick_face_at does not correct the event position for the canvas; a "
+        "raw interactor position misses the mesh by the device pixel ratio on "
+        "every HiDPI screen")
+    move = methods.get("on_mouse_move")
+    assert move is not None, "PyVistaWidget.on_mouse_move is gone"
+    assert (_calls_self_method(move, "_display_position")
+            or _calls_self_method(move, "_pick_face_at")), (
+        "on_mouse_move picks without the canvas correction")
+    click = methods.get("on_left_click")
+    assert click is not None, "PyVistaWidget.on_left_click is gone"
+    assert _calls_self_method(click, "_pick_face_at"), (
+        "click selection does not go through the corrected pick, so it keeps "
+        "the HiDPI offset the hover readout no longer has")
+    return "hover and click both pick through _display_position"
+
+
+def check_the_canvas_scale_is_measured_not_assumed():
+    """The correction must come from the two sizes, not from a platform test.
+
+    `sys.platform == "darwin"` would be right today and wrong the moment VTK's
+    Cocoa backend starts reporting device pixels, or on any other backend that
+    does. The ratio of the render window's size to the canvas's logical size
+    times its device pixel ratio is 1 exactly when no correction is needed.
+    """
+    methods = _methods(_widget_class())
+    fn = methods.get("_event_position_scale")
+    assert fn is not None, "PyVistaWidget._event_position_scale is gone"
+    assert "_event_pixel_ratio" in methods, (
+        "PyVistaWidget._event_pixel_ratio is gone; the correction would then "
+        "be taken from the SCREEN's ratio rather than the one the Qt adapter "
+        "applied, and those differ between installed pyvistaqt copies")
+    src = (_source_of(fn) + _source_of(methods["_canvas_widget"])
+           + _source_of(methods["_event_pixel_ratio"]))
+    for banned in ("sys.platform", "platform.system", "darwin", "Darwin"):
+        assert banned not in src, (
+            f"the canvas scale is decided by {banned!r} rather than measured "
+            f"from the render window and the canvas")
+    assert "GetSize" in src, "the render window's size is never read"
+    assert "devicePixelRatioF" in src, "the device pixel ratio is never read"
+
+    # And the arithmetic, on the three shapes that matter. A stand-in `self`
+    # keeps this runnable with no display at all.
+    import types
+
+    class _FakeWin:
+        def __init__(self, size):
+            self._s = size
+
+        def GetSize(self):
+            return self._s
+
+    class _FakeCanvas:
+        """A canvas that can report the screen's ratio and the ratio the Qt
+        adapter actually APPLIED as different numbers, because two installed
+        copies of `pyvistaqt` disagree about that under PyQt6 and only one of
+        them scales."""
+
+        def __init__(self, win, w, h, ratio, applied=None):
+            self._win, self._w, self._h, self._r = win, w, h, ratio
+            if applied is not None:
+                self._applied = applied
+                self._getPixelRatio = lambda: self._applied
+
+        def GetRenderWindow(self):
+            return self._win
+
+        def width(self):
+            return self._w
+
+        def height(self):
+            return self._h
+
+        def devicePixelRatioF(self):
+            return self._r
+
+    try:
+        import gui_panels.visualization_panel as panel
+    except Exception as exc:                                    # noqa: BLE001
+        raise Skip(f"the visualization panel is not importable ({exc})")
+
+    def scale_for(rw_size, logical, ratio, applied=None):
+        win = _FakeWin(rw_size)
+        canvas = _FakeCanvas(win, logical[0], logical[1], ratio, applied)
+        fake = types.SimpleNamespace(
+            plotter=types.SimpleNamespace(ren_win=win, interactor=canvas))
+        # The three helpers are exercised, not stubbed: they are the halves
+        # that decide WHICH widget and WHICH ratio the correction reads, and a
+        # stub would make this arm agree with itself.
+        fake._canvas_widget = lambda: panel.PyVistaWidget._canvas_widget(fake)
+        fake._event_pixel_ratio = (
+            lambda c: panel.PyVistaWidget._event_pixel_ratio(fake, c))
+        assert fake._canvas_widget() is canvas, (
+            "_canvas_widget did not identify the widget owning the plotter's "
+            "render window")
+        return panel.PyVistaWidget._event_position_scale(fake)
+
+    # The MEASURED live case: a 900x619 logical canvas at device pixel ratio
+    # 2.0 whose Cocoa render window reports 900x619, on the `pyvistaqt` this
+    # GUI runs, whose `_getPixelRatio` returns 2.0 under PyQt6.
+    cocoa = scale_for((900, 619), (900, 619), 2.0, applied=2.0)
+    assert cocoa == (0.5, 0.5), (
+        f"a Retina Cocoa canvas gives scale {cocoa}, not (0.5, 0.5)")
+    # ⛔⛔ THE REGRESSION THIS ARM EXISTS FOR. Other installed copies of
+    # `pyvistaqt` gate the scaling on `PyQtImpl in ["PyQt5", "PySide2",
+    # "PySide6"]` and so apply NOTHING under PyQt6. There the event position
+    # is already a display position, and a correction taken from the screen's
+    # ratio would halve a position that was right -- breaking a working viewer
+    # on exactly the screens this change is meant to fix.
+    unscaled_adapter = scale_for((900, 619), (900, 619), 2.0, applied=1.0)
+    assert unscaled_adapter == (1.0, 1.0), (
+        f"a Retina canvas whose adapter does NOT scale gives "
+        f"{unscaled_adapter}, not (1.0, 1.0); this halves a correct position "
+        f"and breaks picking where it currently works")
+    # A backend whose render window really is in device pixels.
+    device_px = scale_for((1800, 1238), (900, 619), 2.0, applied=2.0)
+    assert device_px == (1.0, 1.0), (
+        f"a backend whose render window is already in device pixels gives "
+        f"{device_px}, not (1.0, 1.0); that backend must not be touched")
+    plain = scale_for((900, 619), (900, 619), 1.0, applied=1.0)
+    assert plain == (1.0, 1.0), f"a non-HiDPI canvas gives {plain}"
+    # No `_getPixelRatio` at all: fall back to the public ratio.
+    no_private = scale_for((900, 619), (900, 619), 2.0)
+    assert no_private == (0.5, 0.5), (
+        f"with no `_getPixelRatio` to read, the public device pixel ratio "
+        f"must be used; got {no_private}")
+    absurd = scale_for((900, 619), (2, 2), 1.0, applied=1.0)
+    assert absurd == (1.0, 1.0), (
+        f"an incredible ratio gives {absurd}; it must fall back to 1 rather "
+        f"than guess")
+    return ("0.5 on a scaling Retina adapter, 1.0 on a non-scaling one, on "
+            "device-pixel backends and on non-HiDPI")
+
+
+def check_the_resting_readout_is_its_own_state():
+    """"Off the mesh" must not be what a fresh mesh says.
+
+    Paul's report was "it just says the pointer is off the mesh even when it
+    is directly on the mesh". That sentence could not distinguish a pointer
+    handler that never ran from one that ran and missed, because the window
+    printed the same words for both. Whatever the cause, those are different
+    states and have to read differently.
+    """
+    cls = _widget_class()
+    names = set()
+    for node in cls.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    names.add(tgt.id)
+    for needed in ("COORD_READOUT_WAITING", "COORD_READOUT_OFF_MESH",
+                   "COORD_READOUT_NO_FRAME", "COORD_READOUT_IDLE",
+                   "COORD_READOUT_FAILED"):
+        assert needed in names, f"PyVistaWidget.{needed} is gone"
+    texts = {}
+    for node in cls.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name.startswith("COORD_READOUT_"):
+                try:
+                    texts[name] = ast.literal_eval(node.value)
+                except ValueError:
+                    pass
+    assert len(set(texts.values())) == len(texts), (
+        f"two readout states share a string: {texts}")
+    reset = _methods(cls).get("_reset_coordinate_readout")
+    assert reset is not None, "PyVistaWidget._reset_coordinate_readout is gone"
+    assert "seen_pointer" in {a.arg for a in reset.args.args}, (
+        "_reset_coordinate_readout cannot tell a pointer that missed from a "
+        "pointer that has never arrived, so it says the same thing for both")
+    src = _source_of(reset)
+    assert "COORD_READOUT_WAITING" in src, (
+        "the resting text is still the off-the-mesh text")
+    handler = _source_of(_methods(cls)["on_mouse_move"])
+    assert "COORD_READOUT_FAILED" in handler, (
+        "a pointer handler that raises leaves the previous text on screen, "
+        "which reads as a pointer that wandered off the mesh")
+    return f"{len(texts)} readout states, all distinct"
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +826,68 @@ def check_the_readout_survives_an_animation_export(tmp):
     return "readout and face selection both live after the export"
 
 
+def check_a_replaced_canvas_has_not_been_pointed_at(tmp):
+    """A new canvas has seen no pointer, whatever the retired one saw.
+
+    `_reinit_plotter` builds a DIFFERENT `QtInteractor`. If the widget still
+    believes a pointer has arrived, a move over empty space on the new canvas
+    changes neither the facet (already none) nor the first-event branch, and
+    the readout sits on its resting text forever -- the two states running
+    together again, which is the defect this change exists to separate.
+    """
+    panel = _harness()
+    widget = _loaded(panel, _write_run(Path(tmp) / "rebuild_seen",
+                                       body_centered=True))
+    _move_pointer(widget, *_center_of_canvas(widget))
+    assert widget._pointer_seen, "the pointer was not registered before"
+    widget._reinit_plotter()
+    assert not widget._pointer_seen, (
+        "the widget still believes a pointer has arrived after the canvas was "
+        "replaced, so the new one can never leave its resting text")
+    assert (widget.coord_readout_label.text()
+            == panel.PyVistaWidget.COORD_READOUT_WAITING), (
+        f"the replaced canvas rests on "
+        f"{widget.coord_readout_label.text()!r}")
+    return "a replaced canvas starts unpointed-at"
+
+
+def check_a_failed_pointer_handler_says_so_and_stops_saying_so(tmp):
+    """Two halves of the same rule, and the second is the one that gets
+    forgotten: a failure has to be VISIBLE, and a recovery has to CLEAR it.
+
+    The failure text is latched behind a "report once" flag so a moving
+    pointer cannot flood the console. Latched and never cleared, a transient
+    failure leaves "the pointer handler failed" on screen over a readout that
+    is working, and a later real failure prints nothing at all.
+    """
+    panel = _harness()
+    widget = _loaded(panel, _write_run(Path(tmp) / "handler_fail",
+                                       body_centered=True))
+    good = _move_pointer(widget, *_center_of_canvas(widget))
+    assert READOUT_RE.search(good), f"no coordinate to start from: {good!r}"
+
+    real_pick = widget._pick_cell_at_display
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic pointer failure")
+
+    widget._pick_cell_at_display = boom
+    failed = _move_pointer(widget, 3, 3)
+    assert failed == panel.PyVistaWidget.COORD_READOUT_FAILED, (
+        f"a pointer handler that raised left {failed!r} on screen, which "
+        f"reads as a pointer that wandered off the mesh")
+
+    widget._pick_cell_at_display = real_pick
+    recovered = _move_pointer(widget, *_center_of_canvas(widget))
+    assert READOUT_RE.search(recovered), (
+        f"the readout still says {recovered!r} after the handler recovered; "
+        f"the failure text is latched")
+    assert not widget._hover_error_reported, (
+        "the report-once latch survived the recovery, so the NEXT real "
+        "failure would print nothing")
+    return "failure is shown, recovery clears it, and the latch resets"
+
+
 def check_the_hover_highlight_is_the_facet_under_the_pointer(tmp):
     """Selection mode still highlights the picked facet, and does it without
     walking the whole mesh.
@@ -672,6 +940,303 @@ def check_toggling_selection_mode_does_not_stack_observers(tmp):
 
 
 # ---------------------------------------------------------------------------
+# Section 3 -- the REAL canvas.
+#
+# ⛔⛔⛔ THIS SECTION EXISTS BECAUSE SECTION 2 PASSED 14/14 WHILE THE FEATURE
+# DID NOT WORK.
+#
+# Section 2 drives `iren.SetEventPosition(x, y)` directly. That writes a VTK
+# DISPLAY position straight into the interactor and skips the one step the
+# running program actually performs: `pyvistaqt`'s translation of a Qt mouse
+# position into a VTK one. On macOS those differ by the device pixel ratio --
+# VTK's Cocoa render window is sized in Qt's LOGICAL points while
+# `QVTKRenderWindowInteractor._setEventInformation` multiplies the position by
+# the screen's ratio -- so on a Retina display every pick landed at twice the
+# intended place and returned nothing. An offscreen plotter has a ratio of 1,
+# which is why Section 2 could never see it. A harness that supplies the
+# quantity under test is not a test of it.
+#
+# So this section builds a REAL `pyvistaqt.QtInteractor` in a REAL window and
+# sends REAL `QMouseEvent`s through `QApplication.sendEvent`, which is the path
+# a physical mouse takes. ⭐ `QtInteractor` does NOT segfault when a genuine
+# window system is available -- the rc=139 recorded on 2026-09-15 was under
+# `QT_QPA_PLATFORM=offscreen`, not a property of the class. It is still fragile
+# enough to be worth isolating, so the whole section runs in a SUBPROCESS: a
+# crash there is a reported failure with its output, not an `abort()` that
+# takes this file's buffered stdout with it.
+#
+# Where there is no window system -- CI, ssh, `QT_QPA_PLATFORM=offscreen` --
+# the worker says so and the section SKIPS out loud. It does not pretend.
+# ---------------------------------------------------------------------------
+
+#: The worker prints exactly one of these as its last line.
+_WORKER_OK = "REAL-CANVAS-OK"
+_WORKER_SKIP = "REAL-CANVAS-SKIP"
+
+
+def _real_canvas_worker():
+    """Run the real-window arms. Called in a child process only.
+
+    Prints one `PASS`/`FAIL` line per arm and then `_WORKER_OK` or
+    `_WORKER_SKIP`; exits 1 if any arm failed.
+    """
+    import numpy as np
+
+    failures = []
+
+    def arm(name, fn):
+        try:
+            detail = fn()
+        except Skip as exc:
+            print(f"SKIP {name} :: {exc}", flush=True)
+        except Exception as exc:                                # noqa: BLE001
+            failures.append(name)
+            print(f"FAIL {name} :: {type(exc).__name__}: {exc}", flush=True)
+        else:
+            print(f"PASS {name} :: {detail or ''}", flush=True)
+
+    plat = os.environ.get("QT_QPA_PLATFORM", "")
+    if plat in ("offscreen", "minimal", "vnc"):
+        print(f"{_WORKER_SKIP} QT_QPA_PLATFORM={plat!r} cannot show a real "
+              f"window", flush=True)
+        return 0
+    try:
+        import PyQt6
+        from PyQt6.QtWidgets import QApplication, QMainWindow
+        from PyQt6.QtCore import QPoint, Qt, QEvent
+        from PyQt6.QtGui import QMouseEvent
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"{_WORKER_SKIP} PyQt6 is not importable ({exc})", flush=True)
+        return 0
+    plug = Path(PyQt6.__file__).parent / "Qt6" / "plugins"
+    os.environ.setdefault("QT_PLUGIN_PATH", str(plug))
+    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(plug / "platforms"))
+    os.environ.pop("PTM_GUI_DISABLE_3D", None)
+    try:
+        app = QApplication.instance() or QApplication([])
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"{_WORKER_SKIP} no Qt platform plugin ({exc})", flush=True)
+        return 0
+    if not app.screens():
+        print(f"{_WORKER_SKIP} Qt reports no screens", flush=True)
+        return 0
+    try:
+        import gui_panels.visualization_panel as panel
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"{_WORKER_SKIP} the panel is not importable ({exc})", flush=True)
+        return 0
+    if not panel.PYVISTA_AVAILABLE:
+        print(f"{_WORKER_SKIP} the panel reports PyVista unavailable",
+              flush=True)
+        return 0
+    if not hasattr(panel.QtInteractor, "GetRenderWindow"):
+        print(f"{_WORKER_SKIP} the panel's QtInteractor is a stand-in",
+              flush=True)
+        return 0
+
+    tmp = Path(tempfile.mkdtemp(prefix="ptm_latlon_realcanvas_"))
+    run = _write_run(tmp / "run")
+
+    win = QMainWindow()
+    widget = panel.PyVistaWidget()
+    win.setCentralWidget(widget)
+    win.resize(900, 700)
+    win.show()
+    app.processEvents()
+    if not widget.load_results(str(run)):
+        print(f"{_WORKER_SKIP} the fixture did not load", flush=True)
+        return 0
+    app.processEvents()
+    widget.plotter.render()
+    app.processEvents()
+
+    # ⛔ The canvas is found HERE, with no help from the panel. An arm that
+    # calls a helper the fix introduced can only pass on a tree that has the
+    # fix, which makes it a tautology rather than a test of the behavior --
+    # the exact mistake recorded against this feature's COG sibling.
+    canvas = None
+    for cand in (widget.plotter, getattr(widget.plotter, "interactor", None)):
+        if cand is not None and callable(getattr(cand, "GetRenderWindow", None)):
+            canvas = cand
+            break
+    if canvas is None:
+        print("FAIL real_canvas_is_identified :: no widget owns the plotter's "
+              "render window", flush=True)
+        return 1
+    ratio = canvas.devicePixelRatioF()
+    rw = widget.plotter.ren_win.GetSize()
+    print(f"canvas {canvas.width()}x{canvas.height()} ratio {ratio} "
+          f"render window {rw[0]}x{rw[1]}", flush=True)
+
+    def send_move(lx, ly):
+        QApplication.sendEvent(canvas, QMouseEvent(
+            QEvent.Type.MouseMove, QPoint(int(lx), int(ly)).toPointF(),
+            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier))
+        app.processEvents()
+
+    cx, cy = canvas.width() // 2, canvas.height() // 2
+
+    def the_readout_names_the_facet_under_a_real_mouse():
+        """⭐ THE DISCRIMINATING ARM. A real Qt mouse move at the middle of a
+        real canvas must produce the coordinate of the facet in the middle of
+        the mesh -- the fixture is centered on the canvas, so that is a number
+        this file knows without asking the code under test."""
+        send_move(cx, cy)
+        text = widget.coord_readout_label.text()
+        m = READOUT_RE.search(text)
+        assert m, (f"the readout says {text!r} after a real mouse move at the "
+                   f"center of a real canvas; expected a coordinate")
+        lat = float(m.group(1)) * (-1.0 if m.group(2) == "S" else 1.0)
+        lon = float(m.group(3))
+        assert abs(lat - FIXTURE_LAT_DEG) < 0.02, (
+            f"latitude {lat} is not the center of the patch "
+            f"({FIXTURE_LAT_DEG})")
+        assert abs(((lon - FIXTURE_LON_DEG + 180.0) % 360.0) - 180.0) < 0.02, (
+            f"longitude {lon} is not the center of the patch "
+            f"({FIXTURE_LON_DEG})")
+        return f"{text}"
+
+    def select_face_mode_highlights_under_a_real_mouse():
+        """Paul's own symptom, verbatim: "Hover does not work in select face
+        mode". The highlight never touches latitude or longitude, so this is a
+        second, independent witness that the PICK is what failed."""
+        widget.select_face_btn.click()
+        app.processEvents()
+        assert widget.picking_active, "Select Face Mode did not arm"
+        widget.hover_face_id = None
+        send_move(cx, cy)
+        assert widget.hover_face_id is not None, (
+            "no facet is under the pointer at the center of the canvas")
+        assert widget.hover_highlight_actor is not None, (
+            f"facet {widget.hover_face_id} is under the pointer and the "
+            f"hover highlight was not drawn")
+        assert widget.pick_status_label.text().startswith("Face "), (
+            f"the status line says {widget.pick_status_label.text()!r}")
+        widget.select_face_btn.click()
+        app.processEvents()
+        return f"facet {widget.hover_face_id} highlighted"
+
+    def the_event_position_is_not_a_vtk_display_position():
+        """The measurement that names the defect, made in THIS file.
+
+        On a canvas whose device pixel ratio is not 1, the position VTK is
+        handed after a Qt mouse move and the position VTK's display space
+        actually uses are different numbers. Both picks are done here with the
+        panel's own picker and renderer -- shipped on every tree, before and
+        after the fix -- so this arm measures the same thing either way and
+        fails on the tree that does not correct for it.
+        """
+        if abs(ratio - 1.0) < 1e-9:
+            raise Skip("this screen's device pixel ratio is 1, so the two "
+                       "positions are the same number; only a HiDPI screen "
+                       "can exercise this")
+        send_move(cx, cy)
+        raw = tuple(widget.plotter.iren.interactor.GetEventPosition())
+        # Derived here from the two sizes, not from the code under test.
+        sx = rw[0] / (canvas.width() * ratio)
+        sy = rw[1] / (canvas.height() * ratio)
+        corrected = (int(round(raw[0] * sx)), int(round(raw[1] * sy)))
+        assert raw != corrected, (
+            f"the event position {raw} and the display position {corrected} "
+            f"coincide on a ratio-{ratio} canvas, so this arm proves nothing")
+
+        def pick(px, py):
+            widget._hover_picker.Pick(px, py, 0, widget.plotter.renderer)
+            cid = widget._hover_picker.GetCellId()
+            return None if cid is None or cid < 0 else int(cid)
+
+        assert pick(*raw) is None, (
+            f"picking the raw event position {raw} returned a facet, so this "
+            f"arm cannot tell a corrected pick from an uncorrected one")
+        hit = pick(*corrected)
+        assert hit is not None, (
+            f"picking the display position {corrected} returned nothing")
+        assert widget.hover_face_id == hit, (
+            f"the panel settled on facet {widget.hover_face_id} while the "
+            f"display position {corrected} holds facet {hit}; the panel is "
+            f"picking somewhere other than where the pointer is")
+        return (f"raw {raw} picks nothing, display {corrected} picks {hit}, "
+                f"and the panel agrees")
+
+    def the_resting_readout_does_not_claim_the_pointer_is_off_the_mesh():
+        """Before any pointer event there is nothing to be off OF. The two
+        states shared one string, which is how a dead handler read as a
+        wandering pointer."""
+        w2 = panel.PyVistaWidget()
+        win2 = QMainWindow()
+        win2.setCentralWidget(w2)
+        win2.resize(700, 500)
+        win2.show()
+        app.processEvents()
+        assert w2.load_results(str(run)), "the fixture did not load"
+        app.processEvents()
+        resting = w2.coord_readout_label.text()
+        w2.close()
+        win2.close()
+        assert resting != panel.PyVistaWidget.COORD_READOUT_OFF_MESH, (
+            f"a freshly loaded mesh already says {resting!r}, so a pointer "
+            f"handler that never runs is indistinguishable from one that runs "
+            f"and misses -- which is exactly how this defect was reported")
+        return resting
+
+    arm("test_real_canvas_readout_names_the_facet_under_a_real_mouse",
+        the_readout_names_the_facet_under_a_real_mouse)
+    arm("test_real_canvas_select_face_mode_highlights_under_a_real_mouse",
+        select_face_mode_highlights_under_a_real_mouse)
+    arm("test_real_canvas_event_position_is_not_a_display_position",
+        the_event_position_is_not_a_vtk_display_position)
+    arm("test_real_canvas_resting_readout_is_not_the_off_mesh_text",
+        the_resting_readout_does_not_claim_the_pointer_is_off_the_mesh)
+
+    widget.close()
+    win.close()
+    print(_WORKER_OK if not failures else "REAL-CANVAS-FAILED", flush=True)
+    return 1 if failures else 0
+
+
+def check_the_real_canvas_arms(_tmp=None):
+    """Run Section 3 in a child process and report what it found."""
+    import subprocess
+
+    env = dict(os.environ)
+    if _PLATFORM_AS_INVOKED is None:
+        env.pop("QT_QPA_PLATFORM", None)
+    else:
+        env["QT_QPA_PLATFORM"] = _PLATFORM_AS_INVOKED
+    env["PTM_LATLON_REAL_CANVAS_WORKER"] = "1"
+    env.pop("PTM_GUI_DISABLE_3D", None)
+    proc = subprocess.run([sys.executable, str(Path(__file__).resolve())],
+                          env=env, capture_output=True, text=True, timeout=600)
+    out = (proc.stdout or "") + (proc.stderr or "")
+    tail = "\n".join(l for l in out.splitlines()
+                      if l.startswith(("PASS ", "FAIL ", "SKIP ", "canvas ",
+                                       "REAL-CANVAS")))
+    if _WORKER_SKIP in out:
+        raise Skip(next(l for l in out.splitlines()
+                        if l.startswith(_WORKER_SKIP))[len(_WORKER_SKIP):]
+                   .strip() or "no real window is available here")
+    if _WORKER_OK not in out:
+        raise AssertionError(
+            f"the real-canvas worker exited {proc.returncode}:\n"
+            f"{tail or out[-2000:]}")
+    n_pass = sum(1 for l in out.splitlines() if l.startswith("PASS "))
+    n_skip = sum(1 for l in out.splitlines() if l.startswith("SKIP "))
+    verdict = f"{n_pass} real-canvas arms passed, {n_skip} skipped :: {tail}"
+    if proc.returncode != 0:
+        # ⛔ Every arm reported its own result BEFORE the banner, so a nonzero
+        # exit after it is a crash in TEARDOWN -- a live VTK render window
+        # being destroyed, which this project has on record crashing -- and
+        # not a statement about the feature. Saying "the readout is broken"
+        # because the window died on the way out would be a false alarm; so
+        # would swallowing it. It is named, loudly, in the verdict.
+        verdict += (f" [⚠️ the worker crashed with rc={proc.returncode} AFTER "
+                    f"every arm reported; that is a teardown crash of the VTK "
+                    f"window, not a readout failure, and it is worth a look]")
+    return verdict
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     tmp = tempfile.mkdtemp(prefix="ptm_latlon_gate_")
@@ -703,6 +1268,17 @@ def main():
           check_the_hover_highlight_is_the_facet_under_the_pointer, tmp)
     check("test_toggling_selection_mode_does_not_stack_observers",
           check_toggling_selection_mode_does_not_stack_observers, tmp)
+    check("test_a_replaced_canvas_has_not_been_pointed_at",
+          check_a_replaced_canvas_has_not_been_pointed_at, tmp)
+    check("test_a_failed_pointer_handler_says_so_and_stops_saying_so",
+          check_a_failed_pointer_handler_says_so_and_stops_saying_so, tmp)
+    check("test_the_pick_corrects_the_event_position_for_the_canvas",
+          check_the_pick_corrects_the_event_position_for_the_canvas)
+    check("test_the_canvas_scale_is_measured_not_assumed",
+          check_the_canvas_scale_is_measured_not_assumed)
+    check("test_the_resting_readout_is_its_own_state",
+          check_the_resting_readout_is_its_own_state)
+    check("test_the_real_canvas_arms", check_the_real_canvas_arms)
 
     total = len(PASSES) + len(FAILURES) + len(SKIPS)
     print(f"\n[test_gui_latlon_readout] {len(PASSES)}/{total} passed"
@@ -712,4 +1288,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if os.environ.get("PTM_LATLON_REAL_CANVAS_WORKER") == "1":
+        sys.exit(_real_canvas_worker())
     sys.exit(main())
