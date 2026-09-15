@@ -461,6 +461,12 @@ class PyVistaWidget(QWidget):
         self.mesh_data = None
         self.detected_hemisphere = 'global'  # 'north', 'south', or 'global'
 
+        # The camera state the results opened with -- what "Reset View" means.
+        # Captured once per results directory (see `update_display`), cleared
+        # by `load_results` so a new dataset can never inherit the previous
+        # one's framing. `None` means nothing has been displayed yet.
+        self._home_camera_state = None
+
         # Hover highlighting state
         self.hover_face_id = None
         self.hover_highlight_actor = None
@@ -658,6 +664,14 @@ class PyVistaWidget(QWidget):
                 kwargs["point_size"] = 2.0
             plotter.add_mesh(poly, **kwargs)
             plotter.reset_camera()
+            # The preview is now what "opening" means for this canvas, so it
+            # owns the Reset View target. Without this, Reset View would fly to
+            # the home view of a RESULTS mesh that is no longer drawn -- a
+            # lunar-radius camera over a DEM in local meters, i.e. a blank
+            # canvas. `preview_terrain` refuses to draw over a loaded results
+            # directory today, so that sequence is not currently reachable;
+            # this keeps it unreachable if that guard ever moves.
+            self._home_camera_state = self.capture_camera_state()
             return ""
         except Exception as exc:                             # noqa: BLE001
             # Anything at all: a VTK allocation failure, a pyvista API change,
@@ -678,6 +692,10 @@ class PyVistaWidget(QWidget):
 
         # Reset camera tracking so first load gets default view centered on mesh
         self._has_loaded_data = False
+        # ... and forget the previous dataset's home view along with it. A
+        # stale camera from another mesh is worse than no camera: "Reset View"
+        # would fly to a place this mesh does not occupy.
+        self._home_camera_state = None
 
         # Load mesh
         mesh_file = self.results_dir / "mesh.ply"
@@ -1109,6 +1127,12 @@ class PyVistaWidget(QWidget):
         else:
             # First load - set camera based on detected hemisphere
             self.set_hemisphere_camera()
+            # This IS "the view when opening the results", so record it here,
+            # at the one place it is established. Switching field or timestep
+            # comes back through this method with `_has_loaded_data` already
+            # true and takes the branch above, so the home view survives both
+            # -- which is what Reset View is for.
+            self._home_camera_state = self.capture_camera_state()
             # Mark that we've loaded data, so future updates preserve camera
             self._has_loaded_data = True
 
@@ -1691,10 +1715,95 @@ class PyVistaWidget(QWidget):
         if field_name == self.current_field and self.mesh:
             self.update_display()
 
+    def capture_camera_state(self):
+        """Every field of the current view, as a plain dict, or ``None``.
+
+        A camera is more than a position: ``plotter.reset_camera()`` refits the
+        DISTANCE to the visible bounds and leaves direction, roll, view-up,
+        view angle and parallel scale exactly where the user last dragged
+        them. Restoring a view therefore needs all of it, not a distance.
+
+        Read through ``plotter.renderer.camera``, never ``plotter.camera``:
+        the latter's getter RESETS an unset camera to PyVista's own default
+        as a side effect of being read (``plotting/plotter.py`` ~1623), so
+        merely measuring a fresh plotter would move it.
+        """
+        if not PYVISTA_AVAILABLE or not getattr(self, 'plotter', None):
+            return None
+        try:
+            cam = self.plotter.renderer.camera
+            return {
+                'position': tuple(float(v) for v in cam.position),
+                'focal_point': tuple(float(v) for v in cam.focal_point),
+                'view_up': tuple(float(v) for v in cam.up),
+                'view_angle': float(cam.view_angle),
+                'parallel_projection': bool(cam.parallel_projection),
+                'parallel_scale': float(cam.parallel_scale),
+            }
+        except Exception as e:
+            # Never raise out of a Qt slot: PyQt6 aborts the process.
+            print(f"[Camera] could not capture the current view: {e}")
+            return None
+
+    def apply_camera_state(self, state):
+        """Put the camera back exactly where `capture_camera_state` found it.
+
+        Returns True if the view was applied. The clipping range is NOT
+        restored from the capture -- it is re-derived from the actors that are
+        on screen now, because a stale near/far pair clips away a mesh that is
+        otherwise correctly framed.
+        """
+        if not PYVISTA_AVAILABLE or not getattr(self, 'plotter', None):
+            return False
+        if not state:
+            return False
+        try:
+            self.plotter.camera_position = [
+                state['position'], state['focal_point'], state['view_up']]
+            cam = self.plotter.renderer.camera
+            cam.view_angle = state['view_angle']
+            cam.parallel_projection = state['parallel_projection']
+            cam.parallel_scale = state['parallel_scale']
+            self.plotter.renderer.reset_camera_clipping_range()
+            self.plotter.render()
+            return True
+        except Exception as e:
+            print(f"[Camera] could not restore the view: {e}")
+            return False
+
     def reset_camera(self):
-        """Reset camera to default view"""
-        if PYVISTA_AVAILABLE and self.plotter:
-            self.plotter.reset_camera()
+        """Return to the view the results opened with.
+
+        This is the "Reset View" the user presses, and Paul's specification for
+        it is literal: "it should reset to the same view as when opening the
+        results". It used to call `plotter.reset_camera()`, which is a
+        different operation -- that refits the camera DISTANCE to the visible
+        bounds and keeps whatever direction and roll the view was orbited to.
+        Measured on the 2,397,890-facet reference run: after a 35 deg azimuth /
+        12 deg elevation orbit, `plotter.reset_camera()` returned a camera
+        10.0 km away from the opening camera, still tilted, and covering 25.4%
+        of the canvas against the opening view's 52.7%.
+
+        The fallbacks below announce themselves rather than quietly doing
+        something else: a Reset View that silently reframes is the defect this
+        replaces.
+        """
+        # `getattr`, not `self.plotter`: this is a Qt slot, and PyQt6 aborts
+        # the whole process on an unhandled exception inside one.
+        if not PYVISTA_AVAILABLE or not getattr(self, 'plotter', None):
+            return
+        state = getattr(self, '_home_camera_state', None)
+        if state is not None and self.apply_camera_state(state):
+            return
+        if self.mesh is not None:
+            print("[Camera] Reset View: no opening view had been recorded, so "
+                  "the default view for this mesh is being rebuilt instead.")
+            self.set_hemisphere_camera()
+            self._home_camera_state = self.capture_camera_state()
+            return
+        print("[Camera] Reset View: no mesh is loaded, so the view was only "
+              "refit to whatever is on screen.")
+        self.plotter.reset_camera()
 
     def export_image(self, filename):
         """Export current view as image"""
@@ -1726,6 +1835,12 @@ class PyVistaWidget(QWidget):
 
             # Store camera position to maintain consistent view
             camera_position = self.plotter.camera_position
+            # The FULL view, for putting the canvas back afterwards. The
+            # triplet above is enough to hold the framing steady between
+            # frames, but not to restore it after `_reinit_plotter` replaces
+            # the plotter: the replacement starts on PyVista's default camera,
+            # which is what left the canvas dark.
+            camera_state = self.capture_camera_state()
 
             if format_type.lower() == "gif":
                 # Use PyVista's GIF export
@@ -1762,8 +1877,19 @@ class PyVistaWidget(QWidget):
             # Reinitialize plotter after close
             self._reinit_plotter()
 
-            # Restore original timestep
+            # Restore original timestep. `_reinit_plotter` has cleared
+            # `_has_loaded_data`, so this redraw frames the new plotter on the
+            # mesh and re-records the home view instead of inheriting the
+            # empty plotter's default camera.
             self.load_timestep_data(original_timestep)
+
+            # Put the user's own framing back. Without this the canvas returns
+            # to the opening view rather than the view the animation was shot
+            # from, which is still correct but is not what the user left.
+            if camera_state is not None and not self.apply_camera_state(camera_state):
+                print("[Animation] the view before the export could not be "
+                      "restored; the canvas is showing the default view for "
+                      "this mesh.")
 
             return True
 
@@ -1779,12 +1905,32 @@ class PyVistaWidget(QWidget):
                         pass
                 self._reinit_plotter()
                 self.load_timestep_data(original_timestep if 'original_timestep' in dir() else 0)
+                # Same reason as the success path: a replaced plotter starts on
+                # PyVista's default camera, and a failed export must not leave
+                # the canvas dark either.
+                if 'camera_state' in dir() and camera_state is not None:
+                    self.apply_camera_state(camera_state)
             except Exception:
                 pass
             return False
 
     def _reinit_plotter(self):
-        """Reinitialize the plotter after closing for animation export."""
+        """Reinitialize the plotter after closing for animation export.
+
+        ⛔ The replacement plotter is a DIFFERENT object with an empty renderer
+        and PyVista's default camera -- position (0, 0, 1), focal point
+        (0, 0, 0), view angle 30 deg. `update_display` decides whether to keep
+        the current camera from `_has_loaded_data`, which is a property of the
+        WIDGET, not of the plotter; left set, the first redraw after this
+        method read the new plotter's default camera as "the user's view" and
+        re-imposed it over the framing `add_mesh` had just computed. On the
+        2,397,890-facet reference run that put the mesh 1,734 km away inside a
+        1,239 km-wide field of view -- 1.8% of the canvas lit against 52.7%
+        before the export, which is the "goes dark" the user reported.
+        Clearing the flag here is the fix: the next redraw reframes on the
+        mesh. `export_animation` then restores the user's own pre-export view
+        on top of that.
+        """
         if not PYVISTA_AVAILABLE:
             return
 
@@ -1794,9 +1940,24 @@ class PyVistaWidget(QWidget):
         # Remove old plotter widget
         if hasattr(self, 'plotter') and self.plotter:
             try:
-                layout.removeWidget(self.plotter.interactor)
+                retired = self.plotter.interactor
+                layout.removeWidget(retired)
+                # `QLayout.removeWidget` does not hide the widget and does not
+                # reparent it: it stays a visible child of this widget at its
+                # last geometry, so without this the retired canvas is still
+                # painted underneath the new one. It is deliberately NOT closed
+                # or deleted here -- tearing down a live VTK render window is
+                # not something this change can test without a display, and a
+                # crash on export would be worse than the widget it retires.
+                # See PTM-GUI-RETIRED-INTERACTOR-LEAK.
+                retired.hide()
             except Exception:
                 pass
+
+        # The new plotter has never displayed anything, so the next
+        # `update_display` must frame it rather than preserve a camera it
+        # never had.
+        self._has_loaded_data = False
 
         # Create new plotter
         self.plotter = QtInteractor(self)

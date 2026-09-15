@@ -153,6 +153,17 @@ jobs:
       - name: A sweep reproduces the 40 shipped europa_lat configs
         run: python3 examples/python/sweep_replaces_45_configs.py
 
+      # The 3D viewer's camera invariants. PyVista is NOT installed on this
+      # runner, so the behavioral half of this suite SKIPS here and says so;
+      # what runs is section 1, which is `ast` over the panel source and needs
+      # nothing. That section pins the rule whose violation left the canvas
+      # dark after an animation export: a method that replaces the plotter
+      # must clear the flag that claims a camera is already framed.
+      - name: 3D viewer camera invariants (ast; PyVista arms skip here)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 src/python/tests/test_gui_viewer_camera.py
+
       - name: The GUI still imports
         env:
           QT_QPA_PLATFORM: offscreen
