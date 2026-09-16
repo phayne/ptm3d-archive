@@ -124,6 +124,44 @@ def stability_temperature(species_name, loss_rate_m_per_Gyr=1.0):
 # ──────────────────────────────────────────────────────────────────────
 # I/O helpers (adapted from plot_ridge_heat_flow.py)
 # ──────────────────────────────────────────────────────────────────────
+# (label, population size, excluded count) triples already warned about --
+# _frac_below() runs once per (DEM x species) and would otherwise emit the same
+# line hundreds of times for one bad mesh.
+_WARNED = set()
+
+
+def _warn_unresolved(label, resolved):
+    """Warn loudly when facets leave the population; return how many did."""
+    n_unresolved = int(resolved.size) - int(np.count_nonzero(resolved))
+    key = (label, int(resolved.size), n_unresolved)
+    if n_unresolved and key not in _WARNED:
+        _WARNED.add(key)
+        print(f"  WARNING: {label}: {n_unresolved} of {resolved.size} faces have "
+              "no value (non-finite) and leave BOTH the numerator and the "
+              "denominator of every fraction below.", file=sys.stderr)
+    return n_unresolved
+
+
+def _frac_below(T_arr, threshold):
+    """Fraction of faces below `threshold`, over the RESOLVED faces only.
+
+    Paul's ruling, 2026-09-15: "If a facet has no value, then it should leave
+    the denominator and the numerator." A facet whose value is not finite --
+    NaN, +inf or -inf -- is unresolved and leaves the population entirely. A
+    bare ``np.sum(T_arr < threshold) / len(T_arr)`` instead counts a NaN face
+    as not-qualifying and a -inf face AS qualifying, both silently.
+    """
+    T_arr = np.asarray(T_arr)
+    resolved = np.isfinite(T_arr)
+    n_resolved = int(np.count_nonzero(resolved))
+    _warn_unresolved("cold-trap fraction", resolved)
+    if not np.isfinite(threshold) or T_arr.size == 0:
+        return 0.0
+    if n_resolved == 0:
+        return float("nan")
+    return float(np.count_nonzero(resolved & (T_arr < threshold)) / n_resolved)
+
+
 def load_ply_mesh(filepath):
     """Load binary little-endian PLY mesh."""
     with open(filepath, "rb") as f:
@@ -269,7 +307,7 @@ def plot_cold_trap_histogram(T_max, T_min, T_mean, dem_label, stability_temps,
                 continue
             sp = SPECIES[species]
             if T_stab < data.max() * 1.3 and T_stab > data.min() * 0.5:
-                frac = np.sum(data < T_stab) / len(data) * 100
+                frac = _frac_below(data, T_stab) * 100
                 sp_label = SPECIES_LABELS.get(species, species)
                 label = f"{sp_label}: {T_stab:.0f} K ({frac:.1f}%)"
                 ax.axvline(T_stab, color=sp["color"], linestyle="--",
@@ -413,20 +451,40 @@ def _classify_species_colors(T_max, stability_temps):
         key=lambda x: x[1], reverse=True,
     )
 
+    # Paul's ruling, 2026-09-15: an unresolved face leaves BOTH the numerator
+    # and the denominator, so every legend percentage below is over the faces
+    # that actually have a temperature -- and an unresolved face is never
+    # painted with a species color either.
+    resolved = np.isfinite(T_max)
+    n_resolved = int(np.count_nonzero(resolved))
+    _warn_unresolved("species map", resolved)
     legend_entries = []
     # "Sublimation-dominated" entry
     legend_entries.append(("Sublimation-dominated", (0.784, 0.784, 0.784),
-                           np.sum(T_max >= species_order[0][1]) / n_faces * 100
-                           if species_order else 100.0))
+                           np.count_nonzero(resolved & (T_max >= species_order[0][1]))
+                           / n_resolved * 100
+                           if species_order and n_resolved else 100.0))
 
     for species, T_stab in species_order:
-        mask = T_max < T_stab
+        mask = resolved & (T_max < T_stab)
         color_rgb = mcolors.to_rgb(SPECIES[species]["color"])
         color_uint8 = (np.array(color_rgb) * 255).astype(np.uint8)
         rgb[mask] = color_uint8
-        frac = np.sum(mask) / n_faces * 100
+        frac = np.count_nonzero(mask) / n_resolved * 100 if n_resolved else float("nan")
         label = SPECIES_LABELS.get(species, species)
         legend_entries.append((label, color_rgb, frac))
+
+    # A face with no value must not READ as a classification. The default fill
+    # is the same light gray as the "Sublimation-dominated" swatch, so leaving
+    # it would render an absence as a confirmed sublimation-dominated face --
+    # a wrong figure, not a missing caveat. Paint it white.
+    #
+    # No legend entry and no other annotation: Paul, 2026-09-15, "Do not
+    # restyle figures or present disclosures/caveats on figures -- these can be
+    # recorded in notes outside of the paper that I can incorporate as needed."
+    # The count is warned to stderr by _warn_unresolved() above and written to
+    # the cold_trap_fractions.txt header, which is where it belongs.
+    rgb[~resolved] = np.array([255, 255, 255], dtype=np.uint8)
 
     return rgb, legend_entries
 
@@ -714,10 +772,11 @@ def process_latitude(latitude, plot_dir, loss_rate, dem_keys=None):
 
         all_T_max[key] = T_max
 
-        row = {"DEM": dem_label, "N_faces": n_faces}
+        row = {"DEM": dem_label, "N_faces": n_faces,
+               "N_resolved_faces": int(np.count_nonzero(np.isfinite(T_max)))}
         for species, T_stab in stability_temps.items():
             if not np.isnan(T_stab):
-                frac = np.sum(T_max < T_stab) / n_faces * 100
+                frac = _frac_below(T_max, T_stab) * 100
                 row[species] = frac
             else:
                 row[species] = 0.0
@@ -779,6 +838,16 @@ def process_latitude(latitude, plot_dir, loss_rate, dem_keys=None):
             f.write(", ".join(f"{sp}={stability_temps[sp]:.1f}K"
                               for sp in species_names))
             f.write("\n#\n")
+            # Population disclosure (Paul's ruling, 2026-09-15). Written as
+            # comment lines, which _load_cold_trap_table() already skips, so
+            # the fixed-width table round-trips exactly as before.
+            f.write("# Fractions are over the RESOLVED faces only -- a face with "
+                    "no value (non-finite)\n# leaves BOTH the numerator and the "
+                    "denominator:\n")
+            for row in cold_trap_table:
+                f.write(f"#   {row['DEM']}: {row['N_resolved_faces']} of "
+                        f"{row['N_faces']} faces resolved\n")
+            f.write("#\n")
             f.write(header + "\n")
             for row in cold_trap_table:
                 line = f"{row['DEM']:<25s} {row['N_faces']:>8d}"

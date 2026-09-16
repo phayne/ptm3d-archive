@@ -20,6 +20,14 @@ each window's *entire* step range -- there is no per-timestep archive in
 either run, so no true time-resolved seasonal series exists; see
 fig_seasonal_psr_floor.BLOCKED.md).
 
+Unresolved facets (Paul's ruling, 2026-09-15): a facet whose value is not
+finite -- NaN, +inf or -inf -- has no value and leaves BOTH the numerator and
+the denominator of every area/count fraction and every threshold count here.
+The resolved population travels with each block in the summary JSON
+(n_resolved_faces / n_faces / resolved_area_m2), because a fraction over a
+shrinking denominator is not interpretable without its N. This is a separate
+matter from the no-masking instruction below, which is about real physics.
+
 No masking (Paul's standing instruction for this deliverable): the small
 radiative-coupling hot-face population (ΣF<=1 corrected VF, still ~0.2% of
 faces > 400 K in the coupled run, absent in radoff) is shown as-is; color
@@ -44,9 +52,15 @@ import pyvista as pv
 
 sys.path.insert(0, "/Users/paha3326/projects/ptm/src/python")
 sys.path.insert(0, "/Users/paha3326/projects/ptm/scripts/yearlong_analysis")
+# APPENDED, deliberately not inserted: the two absolute paths above pin one
+# checkout, so a copy of this script running from a worktree would otherwise be
+# unable to find its own src/python. Appending leaves every import below
+# resolving exactly where it resolved before.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "src" / "python"))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
 from ptm_pubstyle import apply_style, DOUBLE_W, COLORS
 from ptm_stats_io import read_f32_array
+import ptm_population as pop
 
 BASE = Path("/Users/paha3326/projects/moon3d/outputs/moon3d_native_yearlong")
 OUT = Path("/Users/paha3326/projects/moon3d/figures_yearlong")
@@ -407,9 +421,21 @@ def hist_figure_v2(coupled, radoff):
     print("wrote fig_year_vs_lunation_hist_v2.png/.pdf (legend fix only, finding M4)")
 
 
-def area_frac_below(tmax, area, thresholds):
-    total = area.sum()
-    return np.array([area[tmax < th].sum() / total for th in thresholds])
+def area_frac_below(tmax, area, thresholds, label="cold-trap area fraction"):
+    """Area fraction below each threshold, over the RESOLVED facets only.
+
+    Paul's ruling, 2026-09-15: a facet whose value is not finite has no value,
+    so it leaves BOTH the numerator and the denominator -- its area comes out
+    of the total too. A bare `tmax < th` would have put a -inf facet in the
+    numerator and left a NaN facet padding the denominator.
+    """
+    resolved = pop.resolved_mask(tmax, area)
+    pop.warn_if_unresolved(label, resolved)
+    # via pop.area_fraction so an all-unresolved population raises the same
+    # clear "undefined, not zero" error here as everywhere else, instead of
+    # returning an array of NaN with only a RuntimeWarning
+    return np.array([pop.area_fraction(tmax < th, resolved, area, label)
+                     for th in thresholds])
 
 
 def main():
@@ -458,8 +484,12 @@ def main():
 
     # ---- Figure 3: cold-trap area fraction vs threshold ----
     thresholds = np.linspace(40, 200, 161)
-    coupled_frac = {w: area_frac_below(coupled[w]["tmax"], area, thresholds) for w in WINDOWS}
-    radoff_frac = {w: area_frac_below(radoff[w]["tmax"], area, thresholds) for w in WINDOWS}
+    coupled_frac = {w: area_frac_below(coupled[w]["tmax"], area, thresholds,
+                                      f"coupled/{w} cold-trap area fraction")
+                    for w in WINDOWS}
+    radoff_frac = {w: area_frac_below(radoff[w]["tmax"], area, thresholds,
+                                     f"radoff/{w} cold-trap area fraction")
+                   for w in WINDOWS}
     coldtrap_area_figure(coupled_frac, radoff_frac, thresholds)
 
     # ---- Figure 4: Tmax histograms, year vs first-lunation ----
@@ -468,31 +498,57 @@ def main():
         hist_figure_v2(coupled, radoff)
 
     # ---- Summary JSON ----
-    def stats_block(run_d, win):
+    def stats_block(run_d, win, run_label=""):
         tmax, tavg = run_d[win]["tmax"], run_d[win]["tavg"]
-        area_tot = area.sum()
+        # Paul's ruling, 2026-09-15: an unresolved facet leaves BOTH the
+        # numerator and the denominator, area-weighted or counted.
+        resolved = pop.resolved_mask(tmax, area)
+        pop.warn_if_unresolved(f"{run_label}{win} threshold fractions (temperature_max)",
+                               resolved)
+        res_tavg = pop.resolved_mask(tavg)
+        pop.warn_if_unresolved(f"{run_label}{win} order statistics (temperature_avg)",
+                               res_tavg)
+        area_tot = area[resolved].sum()
         def af(th):
-            return float(area[tmax < th].sum() / area_tot)
+            return pop.area_fraction(tmax < th, resolved, area,
+                                     f"{run_label}{win} area fraction")
         def cf(th):
-            return float(np.mean(tmax < th))
+            return pop.count_fraction(tmax < th, resolved,
+                                      f"{run_label}{win} count fraction")
+        # The order statistics leave the unresolved facets too. Unguarded, one
+        # NaN facet makes every median/mean NaN and one +inf facet makes
+        # max_tmax_K Infinity -- and json.dump writes those as bare NaN /
+        # Infinity literals, which are not valid JSON for a strict reader.
+        tmax_r = pop.resolved_values(tmax, resolved)
+        tavg_r = pop.resolved_values(tavg, res_tavg)
         return dict(
-            median_tmax_K=float(np.median(tmax)), mean_tmax_K=float(tmax.mean()),
-            median_tavg_K=float(np.median(tavg)), mean_tavg_K=float(tavg.mean()),
-            max_tmax_K=float(tmax.max()), min_tmax_K=float(tmax.min()),
+            median_tmax_K=float(np.median(tmax_r)), mean_tmax_K=float(tmax_r.mean()),
+            median_tavg_K=float(np.median(tavg_r)), mean_tavg_K=float(tavg_r.mean()),
+            max_tmax_K=float(tmax_r.max()), min_tmax_K=float(tmax_r.min()),
             area_frac_below_110K=af(COLD_THRESH), area_frac_below_54K=af(CO2_THRESH),
             count_frac_below_110K=cf(COLD_THRESH), count_frac_below_54K=cf(CO2_THRESH),
-            n_faces_gt_400K=int((tmax > 400).sum()),
+            n_faces_gt_400K=int(np.count_nonzero((tmax > 400) & resolved)),
+            # population every fraction/count above was taken over -- a fraction
+            # over a shrinking denominator is not interpretable without its N
+            n_resolved_faces=int(resolved.sum()), n_faces=int(resolved.size),
+            resolved_area_m2=float(area_tot), total_area_m2=float(area.sum()),
         )
 
     # deep-cold-trap population: defined on FIRST-LUNATION Tmax < 110 K (coupled)
-    floor_mask = coupled["first_lunation"]["tmax"] < COLD_THRESH
+    floor_resolved = pop.resolved_mask(coupled["first_lunation"]["tmax"],
+                                       coupled["annual"]["tmax"], area)
+    pop.warn_if_unresolved("deep cold-trap floor population", floor_resolved)
+    floor_mask = (coupled["first_lunation"]["tmax"] < COLD_THRESH) & floor_resolved
     n_floor = int(floor_mask.sum())
     floor_annual_tmax = coupled["annual"]["tmax"][floor_mask]
     floor_lunation_tmax = coupled["first_lunation"]["tmax"][floor_mask]
     pct = [10, 50, 90]
     floor_block = dict(
         n_faces=n_floor,
-        area_frac_of_mesh=float(area[floor_mask].sum() / area.sum()),
+        n_resolved_faces=int(floor_resolved.sum()),
+        n_mesh_faces=int(floor_resolved.size),
+        area_frac_of_mesh=pop.area_fraction(floor_mask, floor_resolved, area,
+                                            "deep cold-trap area_frac_of_mesh"),
         first_lunation_tmax_percentiles_K={f"p{p}": float(np.percentile(floor_lunation_tmax, p)) for p in pct},
         annual_tmax_percentiles_K={f"p{p}": float(np.percentile(floor_annual_tmax, p)) for p in pct},
         max_swing_at_percentile_K={
@@ -504,6 +560,15 @@ def main():
               "archive exists in either run to build fig_seasonal_psr_floor; see "
               "fig_seasonal_psr_floor.BLOCKED.md."),
     )
+
+    # +inf would sail through `tmax > 400` into the hot-face count, so the
+    # artifact census below is taken over the resolved facets too.
+    # the same population stats_block() uses, or the two n_faces_gt_400K
+    # numbers in this one JSON file would disagree with each other
+    res_annual = pop.resolved_mask(coupled["annual"]["tmax"], area)
+    res_lunation = pop.resolved_mask(coupled["first_lunation"]["tmax"], area)
+    pop.warn_if_unresolved("coupled/annual hot-face census", res_annual)
+    pop.warn_if_unresolved("coupled/first_lunation hot-face census", res_lunation)
 
     summary = dict(
         provenance=dict(
@@ -529,16 +594,24 @@ def main():
                         "(native_{coupled,radoff}, 360/lunation) is NOT used here -- cross-campaign comparison "
                         "was descoped (secondary per the mandate); only the year run's own internal windows "
                         "are compared."),
-        coupled=dict(annual=stats_block(coupled, "annual"), first_lunation=stats_block(coupled, "first_lunation")),
-        radoff=dict(annual=stats_block(radoff, "annual"), first_lunation=stats_block(radoff, "first_lunation")),
+        coupled=dict(annual=stats_block(coupled, "annual", "coupled/"),
+                     first_lunation=stats_block(coupled, "first_lunation", "coupled/")),
+        radoff=dict(annual=stats_block(radoff, "annual", "radoff/"),
+                    first_lunation=stats_block(radoff, "first_lunation", "radoff/")),
         deep_cold_trap_floor_population=floor_block,
         known_artifact=dict(
             description="Coupled-run-only hot-face population (radiative-coupling artifact; ABSENT in radoff): "
                         "max Tmax 458.5 K (annual) / 451.0 K (first lunation) vs radoff's clean subsolar cap "
                         "383.5-385.5 K. NOT masked per standing instruction for this deliverable.",
-            n_faces_gt_400K_annual=int((coupled["annual"]["tmax"] > 400).sum()),
-            frac_faces_gt_400K_annual=float((coupled["annual"]["tmax"] > 400).mean()),
-            n_faces_gt_400K_first_lunation=int((coupled["first_lunation"]["tmax"] > 400).sum()),
+            n_faces_gt_400K_annual=int(np.count_nonzero(
+                (coupled["annual"]["tmax"] > 400) & res_annual)),
+            frac_faces_gt_400K_annual=pop.count_fraction(
+                coupled["annual"]["tmax"] > 400, res_annual,
+                "coupled/annual frac_faces_gt_400K"),
+            n_faces_gt_400K_first_lunation=int(np.count_nonzero(
+                (coupled["first_lunation"]["tmax"] > 400) & res_lunation)),
+            n_resolved_faces_annual=int(res_annual.sum()),
+            n_resolved_faces_first_lunation=int(res_lunation.sum()),
         ),
     )
     with open(OUT / "summary_yearlong.json", "w") as fh:

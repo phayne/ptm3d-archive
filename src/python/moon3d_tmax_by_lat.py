@@ -14,10 +14,15 @@ Per-panel annotation reproduces the manuscript exactly:
     lat -84.8 deg
     T^med_max = 85 K, 59% < 110 K
 where T^med_max is the MEDIAN of the per-face max-temperature field and the
-"% < 110 K" is the face-COUNT fraction below the cold-trap threshold. (Note:
-Figure 16's per-panel "% < 110 K" is a count fraction; Figure 17's cold-trap
-"area fraction" is area-weighted -- these are deliberately different metrics.
-See moon3d_psr_coldtrap_by_lat.py for the area-weighted version.)
+"% < 110 K" is the face-COUNT fraction below the cold-trap threshold, taken
+over the RESOLVED facets only -- a facet whose value is not finite has no value
+and leaves both the numerator and the denominator (Paul's ruling, 2026-09-15).
+The resolved population is printed per latitude and NEVER drawn on the figure
+(Paul, 2026-09-15: disclosures belong in notes outside the paper, not on a
+figure). (Note: Figure 16's per-panel
+"% < 110 K" is a count fraction; Figure 17's cold-trap "area fraction" is
+area-weighted -- these are deliberately different metrics. See
+moon3d_psr_coldtrap_by_lat.py for the area-weighted version.)
 
     python3 moon3d_tmax_by_lat.py \
         --out docs/figures/moon3d_500k/tmax_by_lat.png
@@ -44,6 +49,7 @@ import pyvista as pv
 sys.path.insert(0, str(Path(__file__).parent))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
 from ptm_pubstyle import apply_style, DOUBLE_W
+import ptm_population as pop
 
 HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
 
@@ -124,14 +130,27 @@ def main() -> int:
         c = v.mean(0)
         R, up, east, north = enu_frame(c)
         ve = (R @ (v - c).T).T
-        tmed = float(np.median(tmax))
-        cold_ct = 100.0 * float(np.mean(tmax < a.cold_thresh))   # count fraction
-        panels.append(dict(lat=lat, ve=ve, f=f, tmax=tmax, tmed=tmed, cold=cold_ct))
-        nmask = int((tmax > a.mask_tmax).sum()) if a.mask_tmax > 0 else 0
+        # Paul's ruling 2026-09-15: a facet whose temperature is not finite has
+        # no value and leaves BOTH the numerator and the denominator of the
+        # count fraction. `np.mean(tmax < thresh)` would instead have counted a
+        # NaN facet as "not a cold trap" and a -inf facet AS one.
+        resolved = pop.resolved_mask(tmax)
+        pop.warn_if_unresolved(f"lat {lat:+.1f} cold-trap count (temperature_max)",
+                               resolved)
+        cold_ct = 100.0 * pop.count_fraction(tmax < a.cold_thresh, resolved,
+                                             f"lat {lat:+.1f} cold-trap count")
+        # the panel-label median leaves the unresolved facets behind too, or
+        # the published panel reads "T^med_max=nan K"
+        tmed = float(np.median(pop.resolved_values(tmax, resolved)))
+        panels.append(dict(lat=lat, ve=ve, f=f, tmax=tmax, tmed=tmed, cold=cold_ct,
+                           resolved=resolved))
+        nmask = (int(np.count_nonzero((tmax > a.mask_tmax) & resolved))
+                 if a.mask_tmax > 0 else 0)
         print(f"  lat {lat:+6.1f}: T^med_max {tmed:5.1f} K  "
               f"{cold_ct:5.1f}% < {a.cold_thresh:.0f} K  "
               f"[Tmax range {tmax.min():.0f}-{tmax.max():.0f} K]"
-              + (f"  masked {nmask} >{a.mask_tmax:.0f}K" if a.mask_tmax > 0 else ""))
+              + (f"  masked {nmask} >{a.mask_tmax:.0f}K" if a.mask_tmax > 0 else "")
+              + f"  [{pop.population_note(resolved)}]")
 
     if not panels:
         print("ERROR: no runs with a readable temperature_max.bin were found; "
@@ -154,7 +173,10 @@ def main() -> int:
                           projection="3d", computed_zorder=False)
         fc = cmap(norm(p["tmax"]))
         if a.mask_tmax > 0:
-            fc[p["tmax"] > a.mask_tmax] = (0.7, 0.7, 0.7, 1.0)   # gray VF over-count faces
+            # `& resolved` matches what the console reported: without it a
+            # +inf facet is painted as a VF over-count face on the figure
+            # while the printed mask count says it is not one.
+            fc[(p["tmax"] > a.mask_tmax) & p["resolved"]] = (0.7, 0.7, 0.7, 1.0)
         pc = Poly3DCollection(tris, facecolors=fc,
                               edgecolors="none", antialiased=False, rasterized=True)
         ax.add_collection3d(pc)
@@ -173,6 +195,13 @@ def main() -> int:
             lab = (f"lat {p['lat']:.1f}°\n"
                    f"$T^{{\\mathrm{{med}}}}_{{\\mathrm{{max}}}}$={p['tmed']:.0f} K, "
                    f"{p['cold']:.0f}% < {a.cold_thresh:.0f} K")
+            # The percentage is over the RESOLVED facets only (Paul's ruling,
+            # 2026-09-15), but the panel says nothing about that. Paul,
+            # 2026-09-15: "Do not restyle figures or present disclosures/
+            # caveats on figures -- these can be recorded in notes outside of
+            # the paper that I can incorporate as needed." The population goes
+            # to stdout (above) and to the session notes, never onto the
+            # figure. This is the standing crew convention, not a one-off.
         else:
             lab = f"lat {p['lat']:.1f}°"
         ax.text2D(0.5, 0.985, lab, transform=ax.transAxes, ha="center", va="top",

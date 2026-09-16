@@ -15,6 +15,13 @@ per-face statistics binaries:
                      (honest concave-focusing tail -- NO mask; reported for audit).
   * radoff median_tmax_all / median_tavg_all for the no-coupling counterpart.
 
+A facet whose value is not finite (NaN, +inf, -inf) has no value and is
+excluded from BOTH the numerator and the denominator of every fraction and
+count above (Paul's ruling, 2026-09-15) -- it is never counted as qualifying
+and never as not-qualifying. The resolved population is printed under the table
+and stored as n_resolved_psr / n_resolved_tmax, because a fraction over a
+shrinking denominator is not interpretable without its N.
+
 Each statistics/*.bin carries a leading int32/float32 face-count header, so the
 data field is raw[1:] (face f lives at index f+1 in the file, index f after the
 drop). PSR geometry is identical between coupled and radoff (same mesh), so the
@@ -38,6 +45,8 @@ import pyvista as pv
 
 sys.path.insert(0, str(Path(__file__).parent))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
+from ptm_population import (area_fraction, count_fraction, population_note,
+                            resolved_mask, resolved_values, warn_if_unresolved)
 
 PSR_THRESH = 1.0    # W/m^2  direct-solar max below this = permanent shadow
 COLD_THRESH = 110.0  # K
@@ -82,6 +91,7 @@ def main() -> int:
 
     root = Path(a.root)
     rows = {}
+    populations = {}
     any_flag = False
     hdr = (f"{'tag':5s} {'lat':>6s} {'psr_count':>10s} {'psr_area':>9s} "
            f"{'medTmax':>8s} {'medTavg':>8s} {'>400K':>6s} | "
@@ -101,12 +111,32 @@ def main() -> int:
             f"{tag}: coupled face/stat mismatch"
         assert len(tmr) == len(tar), f"{tag}: radoff face/stat mismatch"
 
-        psr = dsm < PSR_THRESH
-        psr_area_frac = float(area[psr].sum() / area.sum())
-        psr_count_frac = float(psr.mean())
-        med_tmax = float(np.median(tmc))
-        med_tavg = float(np.median(tac))
-        over400 = int((tmc > 400.0).sum())
+        # Paul's ruling 2026-09-15: a facet with no value leaves BOTH the
+        # numerator and the denominator. A bare `dsm < PSR_THRESH` would call a
+        # -inf facet a PSR and a NaN facet not-a-PSR; a finiteness test does
+        # neither. The area weights join the test because an unresolved facet's
+        # area must leave the total too.
+        res_psr = resolved_mask(dsm, area)
+        warn_if_unresolved(f"{tag} PSR (direct_solar_max)", res_psr)
+        psr = (dsm < PSR_THRESH) & res_psr
+        psr_area_frac = area_fraction(psr, res_psr, area, f"{tag} psr_area_frac")
+        psr_count_frac = count_fraction(psr, res_psr, f"{tag} psr_count_frac")
+        # The order statistics leave the unresolved facets behind too: an
+        # unguarded np.median() goes NaN on one bad facet, and NaN silently
+        # passes the tolerance check below (every NaN comparison is False), so
+        # the script would print ALL WITHIN TOL and exit 0 on data whose median
+        # is unknown.
+        res_tmc = resolved_mask(tmc)
+        res_tac = resolved_mask(tac)
+        warn_if_unresolved(f"{tag} median_tmax_all (temperature_max)", res_tmc)
+        warn_if_unresolved(f"{tag} median_tavg_all (temperature_avg)", res_tac)
+        med_tmax = float(np.median(resolved_values(tmc, res_tmc)))
+        med_tavg = float(np.median(resolved_values(tac, res_tac)))
+        res_400 = resolved_mask(tmc)
+        warn_if_unresolved(f"{tag} faces_over_400K (temperature_max)", res_400)
+        over400 = int(np.count_nonzero((tmc > 400.0) & res_400))
+        populations[tag] = (population_note(res_psr, area),
+                            population_note(res_400))
 
         rows[f"{tag}_coupled"] = {
             "lat": lat, "n": int(len(tmc)),
@@ -115,25 +145,44 @@ def main() -> int:
             "median_tmax_all": round(med_tmax, 2),
             "median_tavg_all": round(med_tavg, 2),
             "faces_over_400K": over400,
+            # population the psr_* fractions and faces_over_400K were computed
+            # over (Paul's ruling 2026-09-15) -- a fraction over a shrinking
+            # denominator is only interpretable next to its N.
+            "n_resolved_psr": int(res_psr.sum()),
+            "n_resolved_tmax": int(res_400.sum()),
         }
         rows[f"{tag}_radoff"] = {
             "lat": lat, "n": int(len(tmr)),
             "psr_area_frac": round(psr_area_frac, 4),
             "psr_count_frac": round(psr_count_frac, 4),
-            "median_tmax_all": round(float(np.median(tmr)), 2),
-            "median_tavg_all": round(float(np.median(tar)), 2),
+            "n_resolved_psr": int(res_psr.sum()),
+            "median_tmax_all": round(float(np.median(
+                resolved_values(tmr, resolved_mask(tmr)))), 2),
+            "median_tavg_all": round(float(np.median(
+                resolved_values(tar, resolved_mask(tar)))), 2),
         }
 
         lc, la, lt = LUNA[tag]
         dcount, darea, dtmax = psr_count_frac - lc, psr_area_frac - la, med_tmax - lt
-        flag_c = abs(dcount) > a.tol
-        flag_a = abs(darea) > a.tol
-        flag_t = abs(dtmax) > a.tol * 100
+        # A non-finite delta must FLAG, not sail through: `abs(nan) > tol` is
+        # False, so an unguarded check would report ALL WITHIN TOL on a value
+        # that is not a number.
+        flag_c = not np.isfinite(dcount) or abs(dcount) > a.tol
+        flag_a = not np.isfinite(darea) or abs(darea) > a.tol
+        flag_t = not np.isfinite(dtmax) or abs(dtmax) > a.tol * 100
         any_flag = any_flag or flag_c or flag_a or flag_t
         star = " <== FLAG" if (flag_c or flag_a or flag_t) else ""
         print(f"{tag:5s} {lat:6.1f} {psr_count_frac:10.4f} {psr_area_frac:9.4f} "
               f"{med_tmax:8.2f} {med_tavg:8.2f} {over400:6d} | "
               f"{dcount:+8.4f} {darea:+7.4f} {dtmax:+9.2f}{star}")
+
+    # Population disclosure (Paul's ruling 2026-09-15). The fractions above are
+    # "of the facets we could actually evaluate"; without N they are not
+    # interpretable. Printed as its own block so the table lines are unchanged.
+    print("\npopulation behind each row (unresolved facets leave numerator AND denominator):")
+    for tag, _ in DT:
+        psr_note, tmax_note = populations[tag]
+        print(f"  {tag:5s} psr_*_frac: {psr_note}   faces_over_400K: {tmax_note}")
 
     # monotonicity report (as computed, ordered dt85..dt60 = lat -85..-60)
     pc = [rows[f"{t}_coupled"]["psr_count_frac"] for t, _ in DT]

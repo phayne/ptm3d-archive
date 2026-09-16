@@ -78,6 +78,41 @@ def precompute(A_2d, lat_centers, n_albedo_samples=10, lat_half_width=5.0):
 # --------------------------------------------------------------------------
 # Per-frame fraction computation
 # --------------------------------------------------------------------------
+# (population size, excluded count) pairs already warned about
+_WARNED = set()
+
+
+def _frac_below(T_arr, threshold):
+    """Fraction of faces below `threshold`, over the RESOLVED faces only.
+
+    Paul's ruling, 2026-09-15: "If a facet has no value, then it should leave
+    the denominator and the numerator." A facet whose value is not finite --
+    NaN, +inf or -inf -- is unresolved and leaves the population entirely. A
+    bare ``np.mean(T_arr < threshold)`` instead counts a NaN facet as
+    not-qualifying and a -inf facet AS qualifying, both silently.
+    """
+    T_arr = np.asarray(T_arr)
+    resolved = np.isfinite(T_arr)
+    n_resolved = int(np.count_nonzero(resolved))
+    n_unresolved = int(resolved.size) - n_resolved
+    if n_unresolved and (resolved.size, n_unresolved) not in _WARNED:
+        # Deduplicated on purpose: this helper is called once per
+        # (latitude x terrain x species x timescale) and, in the animation, per
+        # frame -- warning on every call would emit tens of thousands of
+        # identical lines and stall the run. The first occurrence of each
+        # distinct (population size, excluded count) still warns.
+        _WARNED.add((resolved.size, n_unresolved))
+        print(f"  WARNING: cold-trap fraction: {n_unresolved} of {resolved.size} "
+              "facets have no value (non-finite) and leave BOTH the numerator "
+              f"and the denominator; fraction is over {n_resolved} facets.",
+              file=sys.stderr)
+    if not np.isfinite(threshold) or T_arr.size == 0:
+        return 0.0
+    if n_resolved == 0:
+        return float("nan")
+    return float(np.count_nonzero(resolved & (T_arr < threshold)) / n_resolved)
+
+
 def fractions_for_timescale(cache, loss_rate_mm_per_Gyr):
     """Return (T_sub_dict, frac[(model, sp)] = ndarray over LATITUDES)."""
     T_sub = {sp: cts.stability_temperature(sp, loss_rate_m_per_Gyr=loss_rate_mm_per_Gyr)
@@ -103,9 +138,9 @@ def fractions_for_timescale(cache, loss_rate_mm_per_Gyr):
                 per_terrain[("no_topo", sp)].append(
                     100.0 if (np.isfinite(T_flat) and T_flat < Ts) else 0.0)
                 per_terrain[("topo", sp)].append(
-                    100.0 * float(np.mean(T_max < Ts)))
+                    100.0 * _frac_below(T_max, Ts))
                 per_terrain[("topo_albedo", sp)].append(
-                    100.0 * float(np.mean(T_albedo < Ts)))
+                    100.0 * _frac_below(T_albedo, Ts))
         for key, vals in per_terrain.items():
             if vals:
                 frac[key][li] = float(np.mean(vals))
