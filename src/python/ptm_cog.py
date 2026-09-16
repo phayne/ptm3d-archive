@@ -363,6 +363,53 @@ def _census_tags(census):
     }
 
 
+def psr_mask_values(direct_solar_max, threshold):
+    """Three-state permanent-shadow classification, one value per face.
+
+    ``1.0`` permanently shadowed, ``0.0`` not permanently shadowed, ``NaN``
+    NO DATA -- this facet carried no value, so it is neither.
+
+    ⛔ THE DEFECT THIS EXISTS TO STOP. The rule was written
+    ``psr = dmax < threshold`` in ``scripts/ptm3d_stats_to_cog.py``, and in
+    IEEE arithmetic ``NaN < 1.0`` is ``False``. A facet with no value -- never
+    evaluated, or a zero-contribution face in a merged product -- therefore
+    came out ``False``: stamped **not permanently shadowed**. That is the exact
+    inversion of the quantity the layer exists to report, decided silently, for
+    the population least able to contradict it. An unknown may not be forced
+    into either class.
+
+    The NaN leaves here as a NaN and :func:`export_field` turns a non-finite
+    pixel into the raster's declared nodata -- ``DEFAULT_NODATA``
+    (``-3.4028235e+38``) by default, or NaN under the legacy convention.
+    Neither can be confused with ``0.0`` or ``1.0``, so a reader that ignores
+    the nodata declaration still does not silently receive one of the two
+    classes; it receives a number obviously outside a 0/1 mask.
+
+    ⛔ Pass the result to :func:`export_field` as ``unresolved_faces`` as well,
+    or ``--interpolation idw`` puts a class back: the inverse-distance path
+    zeroes the weight of a non-finite neighbor and fills the pixel from the
+    resolved facets around it. Measured on a synthetic polar patch, 100 of 100
+    unresolved facets came back holding ``0.0``.
+
+    ⛔ ``+inf`` and ``-inf`` are no data here too, deliberately. Neither is a
+    flux, so neither licenses a classification: ``+inf < threshold`` would
+    quietly answer "sunlit" for a corrupt facet and ``-inf < threshold``
+    "permanently shadowed", each as confidently as a measurement.
+
+    A facet that HAS a value is classified exactly as before, so a source
+    carrying no non-finite face produces a bit-identical mask.
+
+    This lives here rather than in the converter script so the rule can be
+    imported -- and therefore gated -- with numpy alone, without the raster
+    stack the script refuses to start without.
+    """
+    dmax = np.asarray(direct_solar_max, dtype=np.float64)
+    resolved = np.isfinite(dmax)
+    out = np.full(dmax.shape, np.nan, dtype=np.float64)
+    out[resolved] = dmax[resolved] < threshold
+    return out
+
+
 def _regrid(regridder, face_values, interpolation):
     if interpolation == 'linear':
         return regridder.regrid_linear(face_values)
@@ -504,7 +551,8 @@ def export_field(output_path, face_values, regridder, field_name,
                  software='PTM3D',
                  interpolation='linear',
                  nodata_value=DEFAULT_NODATA,
-                 extra_tags=None):
+                 extra_tags=None,
+                 unresolved_faces=None):
     """Regrid ``face_values`` and write a COG to ``output_path``.
 
     Args:
@@ -517,6 +565,36 @@ def export_field(output_path, face_values, regridder, field_name,
         compress: TIFF compression (default LZW).
         overview_resampling: Resampling for overview levels (default AVERAGE).
         software: ``software`` tag written to the file.
+        unresolved_faces: optional per-face boolean, ``True`` where the facet
+            carries NO value. Same remedy the `+inf` population gets, for a
+            population only the CALLER can recognize -- a derived layer such as
+            the PSR mask encodes its classes as plain 0/1 floats, so nothing
+            here could tell an unresolved facet from a resolved one by looking
+            at the values. ⛔ Without it, `interpolation='idw'` silently
+            reinstates the defect: `MeshRegridder.regrid` zeroes the weight of
+            a non-finite neighbor, so the unresolved facet is DROPPED and its
+            pixel is filled from the resolved facets around it. Measured on a
+            synthetic polar patch, 100 of 100 unresolved facets came back
+            holding a class. ``None`` (the default) leaves every existing
+            caller's raster bit-for-bit as it was.
+
+            ⚠️ On the barycentric path this stamp adds nothing, because a
+            non-finite vertex already NaNs every Delaunay triangle it touches
+            -- which blanks MORE than the unresolved facets cover: measured
+            2.45x (12,674 extra nodata pixels for 100 facets covering 5,171)
+            on the synthetic polar patch in
+            ``src/python/tests/test_psr_mask_nodata.py``. Resolved facets are
+            lost that way, but no unresolved one is ever answered, which is the
+            safe direction. Bounding it needs a regridder that can drop a
+            vertex from the triangulation; that is the open
+            ``PTM-REGRID-SENTINEL-UNSAFE``, not something this function can do.
+
+            ⚠️ Deliberately OPT-IN, not defaulted to ``~isfinite(face_values)``.
+            Defaulting it would close the same hole for every NaN-carrying
+            field (`effective_albedo`, `shadow_depth_*`, `ice_depth`, and any
+            `*_avg` from a merged run) -- but only under `idw`, and only by
+            CHANGING rasters that have already shipped. That is a product
+            decision, not a refactor, and it is not this function's to make.
         extra_tags: extra band metadata, ``{name: str}``. Used for the depth a
             subsurface temperature map holds -- see :func:`depth_band_tags`.
             Written on the BAND, beside the ``STATISTICS_*`` tags, because it
@@ -568,6 +646,27 @@ def export_field(output_path, face_values, regridder, field_name,
     else:
         indicator = None
         grid = _regrid(regridder, face_values, interpolation)
+
+    if unresolved_faces is not None:
+        # Regrid a 0/1 indicator of the caller's unresolved population on the
+        # same grid and stamp the band out wherever those facets outweigh the
+        # resolved ones -- the same rule, and the same threshold, the `+inf`
+        # population gets above. On the barycentric path the non-finite values
+        # have already blanked at least this region, so this is decisive only
+        # for `idw`; it is applied on both so the two paths cannot disagree
+        # about which pixels are answerable.
+        flags = np.asarray(unresolved_faces, dtype=bool)
+        if flags.shape != np.shape(face_values):
+            raise ValueError(
+                f"unresolved_faces has shape {flags.shape}, face_values "
+                f"{np.shape(face_values)}; they must describe the same faces")
+        if flags.any():
+            unresolved_grid = _regrid(regridder, flags.astype(np.float64),
+                                      interpolation)
+            stamp = (np.isfinite(unresolved_grid)
+                     & (unresolved_grid >= UNRESOLVED_STAMP_THRESHOLD))
+            grid = np.where(stamp, np.nan, grid).astype(np.float32, copy=False)
+
     grid_flipped = grid[::-1, :]  # north-up GeoTIFF row order
 
     grid_flipped, stats_tags = _write_raster(

@@ -31,7 +31,7 @@ sys.path.insert(0, str(_HERE.parent / 'src' / 'python'))
 import numpy as np
 
 try:
-    import rasterio  # noqa: F401
+    import rasterio
 except ImportError:
     sys.stderr.write(
         "ERROR: rasterio not importable. Run with the europa_viz Python:\n"
@@ -47,7 +47,8 @@ from ptm_regridder import (
     detect_body_from_mesh, detect_available_statistics,
     read_binary_data, read_ply_mesh_minimal,
 )
-from ptm_cog import depth_band_tags, export_field, unresolved_mask_path
+from ptm_cog import (depth_band_tags, export_field,
+                     psr_mask_values, unresolved_mask_path)
 
 
 def _expected_field_files(stats_dir=None):
@@ -69,6 +70,21 @@ def _expected_field_files(stats_dir=None):
             for stat in STAT_TYPES:
                 out.append((f"{base}_{stat}", f"{base}_{stat}.bin"))
     return out
+
+
+def _declared_nodata_faces(tif_path):
+    """``PTM_FACES_NAN`` from an existing raster's band 1, or -1.
+
+    -1 for "this file does not say" -- it predates the census tags, or it
+    cannot be opened. -1 never equals a face count, so the caller re-exports,
+    which is the safe direction: a mask that does not declare its unresolved
+    population may well be one that stamped it "not permanently shadowed".
+    """
+    try:
+        with rasterio.open(tif_path) as ds:
+            return int(ds.tags(1)['PTM_FACES_NAN'])
+    except Exception:                                        # noqa: BLE001
+        return -1
 
 
 def main():
@@ -126,7 +142,12 @@ def main():
     parser.add_argument('--psr-threshold', type=float, default=1.0,
                         help="Derived PSR mask: a face is permanently shadowed "
                              "(value 1) when its direct_solar_max is below this "
-                             "many W/m^2 over the integration. Default 1.0.")
+                             "many W/m^2 over the integration, and not "
+                             "permanently shadowed (value 0) when it is at or "
+                             "above it. A face whose direct_solar_max is NOT "
+                             "FINITE is written as the raster's nodata "
+                             "instead: it has no value, so it is neither "
+                             "class. Default 1.0.")
     parser.add_argument('--psr-clip-radius-km', type=float, default=None,
                         help="If set, drop PSR faces beyond this radius (km) "
                              "from the mesh centroid. Excludes the mesh-edge "
@@ -146,6 +167,21 @@ def main():
                              "ice_depth 0 = spurious surface ice in the corners "
                              "outside the circular mesh).")
     args = parser.parse_args()
+
+    if not np.isfinite(args.psr_threshold):
+        # Every comparison against a non-finite threshold is False, so this
+        # would have produced a silent "nothing here is permanently shadowed"
+        # map from a perfectly good run.
+        sys.exit(f"ERROR: --psr-threshold must be finite, not "
+                 f"{args.psr_threshold!r}")
+    if args.psr_clip_radius_km is not None and not (
+            np.isfinite(args.psr_clip_radius_km)
+            and args.psr_clip_radius_km > 0.0):
+        # The same hazard one flag over: `hypot(...) < nan` is False for every
+        # face, and so is `< 0`, so the clip would have emptied the mask and
+        # reported "nothing here is permanently shadowed" just as quietly.
+        sys.exit(f"ERROR: --psr-clip-radius-km must be a positive finite "
+                 f"number, not {args.psr_clip_radius_km!r}")
 
     nv = args.nodata_value
     if isinstance(nv, str) and nv.strip().lower() == 'nan':
@@ -342,17 +378,39 @@ def main():
     # derived layer). Disable with --no-psr-mask.
     if not args.no_psr_mask and 'direct_solar_max' in have_names:
         out_path = output_dir / "psr_mask.tif"
-        if args.resume and out_path.is_file():
+        dmax = read_binary_data(stats_dir / "direct_solar_max.bin", n_faces)
+        # ⛔ Read BEFORE the resume check. A psr_mask.tif written by the old
+        # rule has its unresolved facets stamped 0 = "not permanently
+        # shadowed", and resuming past it would keep that answer forever in
+        # every already-converted output directory. Re-export when the source
+        # carries a facet with no value; skip, exactly as before, when it does
+        # not -- which is every product on disk today.
+        n_nonfinite_src = (0 if dmax is None else
+                           int((~np.isfinite(np.asarray(
+                               dmax, dtype=np.float64))).sum()))
+        # ...but only once. An existing raster that already declares the same
+        # unresolved population in its PTM_FACES_NAN band tag was written by
+        # this rule and is correct, so `--resume` still skips it -- otherwise
+        # the campaign watcher, which resumes on every pass, would re-export a
+        # multi-million-face mask forever.
+        stale_rule = bool(n_nonfinite_src) and (
+            _declared_nodata_faces(out_path) != n_nonfinite_src)
+        if args.resume and out_path.is_file() and not stale_rule:
             print(f"      skip  {'psr_mask':30s} (exists)", flush=True)
             skipped += 1
         else:
-            dmax = read_binary_data(stats_dir / "direct_solar_max.bin", n_faces)
+            if args.resume and out_path.is_file():
+                print(f"      redo  {'psr_mask':30s} (the source has "
+                      f"{n_nonfinite_src} face(s) with no direct_solar_max "
+                      f"value and the existing mask does not declare them as "
+                      f"no data)", flush=True)
             if dmax is None:
                 print(f"      FAIL  {'psr_mask':30s} "
                       f"(could not read direct_solar_max.bin)", flush=True)
                 failed.append('psr_mask')
             else:
-                psr = dmax < args.psr_threshold
+                psr = psr_mask_values(dmax, args.psr_threshold)
+                unresolved = np.isnan(psr)
                 clip_note = ""
                 if args.psr_clip_radius_km is not None:
                     flat = np.asarray(mesh['face_latitudes'], dtype=np.float64)
@@ -362,8 +420,30 @@ def main():
                     ee = (np.radians(flon - lon0) * body_radius
                           * np.cos(np.radians(lat0)) / 1000.0)
                     nn = np.radians(flat - lat0) * body_radius / 1000.0
-                    psr = psr & (np.hypot(ee, nn) < args.psr_clip_radius_km)
+                    inside = np.hypot(ee, nn) < args.psr_clip_radius_km
+                    # Unchanged for a facet that HAS a value: beyond the clip
+                    # radius it reports "not permanently shadowed". A facet
+                    # with NO value stays no data -- the clip is a statement
+                    # about where the mesh edge is, not a measurement that
+                    # could resolve a facet the run never resolved.
+                    psr = np.where(inside | unresolved, psr, 0.0)
                     clip_note = f", r<{args.psr_clip_radius_km:g} km"
+                n_psr = int(np.count_nonzero(psr == 1.0))
+                n_unresolved = int(np.count_nonzero(unresolved))
+                if n_unresolved:
+                    # Never silent: this population is written as nodata, which
+                    # is invisible in a viewer that hides nodata, and it is
+                    # exactly the population a PSR map is read for. The three
+                    # sentinels are counted separately here because the raster
+                    # cannot keep them apart -- a 0/1 mask has one spare state.
+                    d64 = np.asarray(dmax, dtype=np.float64)
+                    print(f"      WARNING: {n_unresolved} of {n_faces} faces "
+                          f"carry a non-finite direct_solar_max "
+                          f"({int(np.isnan(d64).sum())} NaN, "
+                          f"{int(np.isposinf(d64).sum())} +inf, "
+                          f"{int(np.isneginf(d64).sum())} -inf) and were NOT "
+                          f"classified; they are nodata in psr_mask.tif, "
+                          f"neither permanently shadowed nor lit", flush=True)
                 t0 = time.time()
                 try:
                     _grid, stats = export_field(
@@ -372,13 +452,15 @@ def main():
                         overview_resampling=args.overview_resampling,
                         interpolation=args.interpolation,
                         nodata_value=nodata_value,
+                        unresolved_faces=unresolved,
                     )
                     dt = time.time() - t0
                     size_mb = out_path.stat().st_size / (1 << 20)
                     print(f"      ok    {'psr_mask':30s} "
-                          f"{size_mb:7.1f} MB  {int(psr.sum())} PSR faces "
-                          f"(<{args.psr_threshold:g} W/m^2{clip_note})  "
-                          f"({dt:.1f}s)", flush=True)
+                          f"{size_mb:7.1f} MB  {n_psr} PSR faces "
+                          f"(<{args.psr_threshold:g} W/m^2{clip_note})"
+                          + (f"  {n_unresolved} no data" if n_unresolved else "")
+                          + f"  ({dt:.1f}s)", flush=True)
                     written += 1
                 except Exception as exc:
                     print(f"      FAIL  {'psr_mask':30s} "

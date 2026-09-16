@@ -184,6 +184,16 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python3 src/python/tests/test_gui_cog_export.py
 
+      # The derived permanent-shadow layer. The classification rule itself
+      # (section 5) runs here on numpy alone, and FAILS rather than skips if it
+      # cannot; the five raster arms need scipy, rasterio and a system GDAL and
+      # skip out loud. The rule that runs everywhere: a facet with NO
+      # direct_solar_max value is neither permanently shadowed nor lit. It used
+      # to be stamped "not permanently shadowed", because `NaN < 1.0` is False
+      # -- the exact inversion of what the layer exists to report.
+      - name: PSR mask no-data invariants (raster arms skip here)
+        run: python3 src/python/tests/test_psr_mask_nodata.py
+
       - name: The GUI still imports
         env:
           QT_QPA_PLATFORM: offscreen
