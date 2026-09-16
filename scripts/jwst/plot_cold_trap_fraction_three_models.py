@@ -92,6 +92,41 @@ def flat_surface_T_max(T_arr, top_pct=10.0):
     return float(np.mean(T_arr[T_arr >= threshold]))
 
 
+# (population size, excluded count) pairs already warned about
+_WARNED = set()
+
+
+def _frac_below(T_arr, threshold):
+    """Fraction of faces below `threshold`, over the RESOLVED faces only.
+
+    Paul's ruling, 2026-09-15: "If a facet has no value, then it should leave
+    the denominator and the numerator." A facet whose value is not finite --
+    NaN, +inf or -inf -- is unresolved and leaves the population entirely. A
+    bare ``np.mean(T_arr < threshold)`` instead counts a NaN facet as
+    not-qualifying and a -inf facet AS qualifying, both silently.
+    """
+    T_arr = np.asarray(T_arr)
+    resolved = np.isfinite(T_arr)
+    n_resolved = int(np.count_nonzero(resolved))
+    n_unresolved = int(resolved.size) - n_resolved
+    if n_unresolved and (resolved.size, n_unresolved) not in _WARNED:
+        # Deduplicated on purpose: this helper is called once per
+        # (latitude x terrain x species x timescale) and, in the animation, per
+        # frame -- warning on every call would emit tens of thousands of
+        # identical lines and stall the run. The first occurrence of each
+        # distinct (population size, excluded count) still warns.
+        _WARNED.add((resolved.size, n_unresolved))
+        print(f"  WARNING: cold-trap fraction: {n_unresolved} of {resolved.size} "
+              "facets have no value (non-finite) and leave BOTH the numerator "
+              f"and the denominator; fraction is over {n_resolved} facets.",
+              file=sys.stderr)
+    if not np.isfinite(threshold) or T_arr.size == 0:
+        return 0.0
+    if n_resolved == 0:
+        return float("nan")
+    return float(np.count_nonzero(resolved & (T_arr < threshold)) / n_resolved)
+
+
 def fractions_three_models(species, A_2d, lat_centers,
                            loss_rate_mm_per_Gyr=1.0,
                            n_samples_per_face=10, lat_half_width=5.0):
@@ -132,9 +167,9 @@ def fractions_three_models(species, A_2d, lat_centers,
                 raw[("no_topo",     sp, lat)].append(
                     100.0 if (np.isfinite(T_flat) and T_flat < Ts) else 0.0)
                 raw[("topo",        sp, lat)].append(
-                    100.0 * float(np.mean(T_topo < Ts)))
+                    100.0 * _frac_below(T_topo, Ts))
                 raw[("topo_albedo", sp, lat)].append(
-                    100.0 * float(np.mean(T_topo_albedo < Ts)))
+                    100.0 * _frac_below(T_topo_albedo, Ts))
 
     summary = {(m, sp): {} for m in LINESTYLE for sp in species}
     for (m, sp, lat), vals in raw.items():

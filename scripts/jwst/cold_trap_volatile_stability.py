@@ -167,15 +167,43 @@ def load_run_temperatures(lat, terrain):
 # ------------------------------------------------------------------
 # Stability fractions
 # ------------------------------------------------------------------
+# (population size, excluded count) pairs already warned about
+_WARNED = set()
+
+
 def fraction_below(T_arr, threshold):
     """Fraction of faces with temperature below threshold (face-equal-weight).
 
     Each face in a regional run represents a roughly equal area patch on
     the DEM, so unweighted face fraction is a reasonable area proxy.
+
+    Paul's ruling, 2026-09-15: "If a facet has no value, then it should leave
+    the denominator and the numerator." A facet whose value is not finite --
+    NaN, +inf or -inf -- is unresolved and leaves the population entirely, so
+    this fraction reads "of the facets we could actually evaluate". A bare
+    ``np.mean(T_arr < threshold)`` instead counts a NaN facet as not-qualifying
+    and a -inf facet AS qualifying, both silently.
     """
+    T_arr = np.asarray(T_arr)
+    resolved = np.isfinite(T_arr)
+    n_resolved = int(np.count_nonzero(resolved))
+    n_unresolved = int(resolved.size) - n_resolved
+    if n_unresolved and (resolved.size, n_unresolved) not in _WARNED:
+        # Deduplicated on purpose: this helper is called once per
+        # (latitude x terrain x species x timescale) and, in the animation, per
+        # frame -- warning on every call would emit tens of thousands of
+        # identical lines and stall the run. The first occurrence of each
+        # distinct (population size, excluded count) still warns.
+        _WARNED.add((resolved.size, n_unresolved))
+        print(f"  WARNING: cold-trap fraction: {n_unresolved} of {resolved.size} "
+              "facets have no value (non-finite) and leave BOTH the numerator "
+              f"and the denominator; fraction is over {n_resolved} facets.",
+              file=sys.stderr)
     if not np.isfinite(threshold):
         return 0.0
-    return float(np.mean(T_arr < threshold))
+    if n_resolved == 0:
+        return 0.0 if resolved.size == 0 else float("nan")
+    return float(np.count_nonzero(resolved & (T_arr < threshold)) / n_resolved)
 
 
 # ------------------------------------------------------------------
@@ -370,7 +398,15 @@ def plot_stability_grid(by_run, stability_table, out_path):
                         continue
                     Tmax = by_run[(lat, terrain)]["Tmax"]
                     vals.append(fraction_below(Tmax, T_stab))
-                fracs.append(np.mean(vals) if vals else np.nan)
+                # a terrain with no resolved face leaves the average rather
+                # than turning the whole latitude's point into NaN
+                usable = [v for v in vals if np.isfinite(v)]
+                if len(usable) != len(vals):
+                    print(f"  WARNING: {sp_name} {tau_label} lat {lat}: "
+                          f"{len(vals) - len(usable)} of {len(vals)} terrains "
+                          "had no resolved face and leave the terrain average.",
+                          file=sys.stderr)
+                fracs.append(np.mean(usable) if usable else np.nan)
             fracs = np.array(fracs)
             ax.plot(LATITUDES, 100.0 * fracs,
                     ls=ls, lw=2.4, color=SPECIES[sp_name]["color"],
@@ -404,7 +440,10 @@ def plot_stability_grid(by_run, stability_table, out_path):
 # ------------------------------------------------------------------
 def write_csv_per_run(by_run, stability_table, out_csv):
     """Per-(lat, terrain) fractional-stability table."""
-    cols = ["lat_deg", "terrain", "n_faces"]
+    # n_resolved_faces is the population every fraction below was computed
+    # over (Paul's ruling, 2026-09-15) -- n_faces stays the mesh total, so a
+    # reader can see exactly how many facets left the denominator.
+    cols = ["lat_deg", "terrain", "n_faces", "n_resolved_faces"]
     species_cols = []
     for sp_name in SPECIES_ORDER:
         for ti, tau_label in enumerate(TIMESCALE_LABELS):
@@ -418,7 +457,8 @@ def write_csv_per_run(by_run, stability_table, out_csv):
             if (lat, terrain) not in by_run:
                 continue
             Tmax = by_run[(lat, terrain)]["Tmax"]
-            row = {"lat_deg": lat, "terrain": terrain, "n_faces": Tmax.size}
+            row = {"lat_deg": lat, "terrain": terrain, "n_faces": Tmax.size,
+                   "n_resolved_faces": int(np.count_nonzero(np.isfinite(Tmax)))}
             for sp_name, ti, cn in species_cols:
                 T_stab = stability_table[(sp_name, ti)]
                 row[cn] = round(100.0 * fraction_below(Tmax, T_stab), 4)
@@ -453,7 +493,16 @@ def write_csv_terrain_avg(by_run, stability_table, out_csv):
                     continue
                 Tmax = by_run[(lat, terrain)]["Tmax"]
                 vals.append(fraction_below(Tmax, T_stab))
-            row[cn] = round(100.0 * np.mean(vals), 4) if vals else float("nan")
+            # The ruling applies at this level too: a terrain whose faces
+            # have no value contributes no number, so it leaves the average
+            # rather than poisoning the other four terrains with a NaN.
+            usable = [v for v in vals if np.isfinite(v)]
+            if len(usable) != len(vals):
+                print(f"  WARNING: lat {lat} {cn}: {len(vals) - len(usable)} of "
+                      f"{len(vals)} terrains had no resolved face and leave the "
+                      "terrain average.", file=sys.stderr)
+            row[cn] = (round(100.0 * np.mean(usable), 4) if usable
+                       else float("nan"))
         rows.append(row)
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)

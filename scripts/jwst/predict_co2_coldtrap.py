@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -87,14 +88,32 @@ def main() -> int:
     lat, lon = npz["lat"], npz["lon"]
     T_max = npz["T_max"]
 
+    # Paul's ruling, 2026-09-15: a facet whose temperature is not finite has no
+    # value, so it leaves BOTH the numerator and the denominator of every
+    # stable-fraction below. A bare `T_max < T_stab` would instead report a NaN
+    # facet as unstable and a -inf facet AS stable, silently.
+    resolved = np.isfinite(T_max)
+    n_resolved = int(np.count_nonzero(resolved))
+    n_unresolved = int(T_max.size) - n_resolved
+    if n_unresolved:
+        print(f"[predict_co2_coldtrap]  WARNING: {n_unresolved} of {T_max.size} "
+              "faces have no value (non-finite); they leave both the numerator "
+              f"and the denominator. Fractions are over {n_resolved} faces.",
+              file=sys.stderr)
+    if n_resolved == 0:
+        print("[predict_co2_coldtrap]  ERROR: no face has a value -- a stable "
+              "fraction over an empty population is undefined, not zero.",
+              file=sys.stderr)
+        return 1
+
     # Stability temperature thresholds for several timescales
     thresholds_K = {}
     for tau_yr in TARGET_STABILITY_TIMESCALES_YR:
         T_stab = stability_temperature_for_timescale(tau_yr * 365.25 * 86400.0)
         thresholds_K[f"T_stab_{tau_yr:g}yr"] = T_stab
-        n_stable = int(np.sum(T_max < T_stab))
+        n_stable = int(np.count_nonzero(resolved & (T_max < T_stab)))
         print(f"[predict_co2_coldtrap]  τ = {tau_yr:6g} yr ⇒ T_stab = {T_stab:5.1f} K  "
-              f"({n_stable:6d} faces / {T_max.size}  = {n_stable/T_max.size:.1%} stable)")
+              f"({n_stable:6d} faces / {n_resolved}  = {n_stable/n_resolved:.1%} stable)")
 
     # Per-face cumulative sublimation depth over 1 yr (proxy for "how much CO2 lost")
     flux_at_Tmax = co2_sublimation_flux_kg_m2_s(T_max)
@@ -103,15 +122,22 @@ def main() -> int:
 
     # Stability mask: T_max below 10-yr threshold
     T_stab_10 = stability_temperature_for_timescale(10.0 * 365.25 * 86400.0)
-    co2_stable_10yr = (T_max < T_stab_10)
+    co2_stable_10yr = resolved & (T_max < T_stab_10)
 
-    print(f"[predict_co2_coldtrap]  Stable on {co2_stable_10yr.sum()} of {T_max.size} faces "
-          f"({co2_stable_10yr.mean():.1%}) at the 10-yr observation timescale")
+    print(f"[predict_co2_coldtrap]  Stable on {co2_stable_10yr.sum()} of {n_resolved} "
+          f"resolved faces ({co2_stable_10yr.sum()/n_resolved:.1%}) at the 10-yr "
+          f"observation timescale  [{T_max.size} faces total, "
+          f"{n_unresolved} with no value]")
 
     out = dict(lat=lat, lon=lon, T_max=T_max,
                co2_flux_at_Tmax_kg_m2_s=flux_at_Tmax,
                co2_log10_loss_kg_m2_per_yr=log10_loss_yr,
                co2_stable_10yr=co2_stable_10yr.astype(np.uint8),
+               # co2_stable_10yr is two-state (0/1) and cannot express "no
+               # value"; this companion says which faces were in the
+               # population at all, so a consumer never reads an unresolved
+               # face's 0 as "CO2 is not stable here".
+               co2_resolved=resolved.astype(np.uint8),
                **thresholds_K)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

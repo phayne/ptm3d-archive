@@ -1,6 +1,11 @@
 """
 Thermal Analysis Panel: PSR detection, cold-trap identification,
 diurnal temperature curves, and export.
+
+PSR and cold-trap fractions here follow Paul's ruling of 2026-09-15: "If a
+facet has no value, then it should leave the denominator and the numerator."
+A facet whose value is not finite is excluded from the population entirely --
+see resolved_population() / classify_at_or_below().
 """
 
 import struct
@@ -45,6 +50,45 @@ def _read_binary_field(filepath, expected_count=None):
 
         data = np.frombuffer(f.read(count * 4), dtype=np.float32)
         return data
+
+
+def resolved_population(data):
+    """Boolean mask of the facets that actually have a value.
+
+    Paul's ruling, 2026-09-15: "If a facet has no value, then it should leave
+    the denominator and the numerator." A non-finite value -- NaN, +inf or
+    -inf -- means no value, so the facet leaves the population entirely: it is
+    never counted as qualifying and never as not-qualifying.
+
+    This is a finiteness test, not an isnan test, and that matters: with a
+    bare comparison ``-inf <= threshold`` is True (a corrupt facet is reported
+    as a PSR) while ``NaN <= threshold`` and ``+inf <= threshold`` are False
+    (a facet with no value is reported as sunlit). Both are silent.
+    """
+    return np.isfinite(np.asarray(data))
+
+
+def classify_at_or_below(data, threshold):
+    """Classify a per-face field at or below `threshold`, over the resolved facets.
+
+    Returns ``(mask, n_qualifying, n_resolved, n_total)``. The fraction the
+    caller reports is ``n_qualifying / n_resolved`` -- the unresolved facets
+    leave BOTH the numerator and the denominator, so the reported number reads
+    "of the facets we could actually evaluate, what fraction qualifies".
+    """
+    resolved = resolved_population(data)
+    mask = resolved & (np.asarray(data) <= threshold)
+    return (mask, int(np.count_nonzero(mask)), int(np.count_nonzero(resolved)),
+            int(resolved.size))
+
+
+def _excluded_note(n_resolved, n_total):
+    """One line naming the facets that left the population, or '' if none did."""
+    n_unresolved = n_total - n_resolved
+    if not n_unresolved:
+        return ""
+    return (f"\nExcluded: {n_unresolved:,} facet(s) with no value (non-finite); "
+            "they leave both the count and the total.")
 
 
 class ThermalAnalysisPanel(QWidget):
@@ -234,14 +278,25 @@ class ThermalAnalysisPanel(QWidget):
             return
 
         threshold = self._psr_threshold.value()
-        psr_mask = data <= threshold
-        psr_count = np.sum(psr_mask)
-        psr_fraction = psr_count / len(data) * 100
+        psr_mask, psr_count, n_resolved, n_total = classify_at_or_below(data, threshold)
+        if n_resolved == 0:
+            # Clear and re-emit: leaving the previous run's highlight up while
+            # the text says nothing could be evaluated is a silent lie in the
+            # 3D view.
+            self._psr_faces = []
+            self._psr_result.setText(
+                f"None of the {n_total:,} facets has a value (all non-finite).\n"
+                "A PSR fraction over an empty population is undefined, not zero."
+            )
+            self.faces_highlighted.emit(self._psr_faces, "PSR")
+            return
+        psr_fraction = psr_count / n_resolved * 100
 
         self._psr_faces = np.where(psr_mask)[0].tolist()
         self._psr_result.setText(
-            f"PSR faces: {psr_count:,} / {len(data):,} ({psr_fraction:.2f}%)\n"
+            f"PSR faces: {psr_count:,} / {n_resolved:,} resolved ({psr_fraction:.2f}%)\n"
             f"Threshold: avg illumination <= {threshold} W/m^2"
+            + _excluded_note(n_resolved, n_total)
         )
 
         self.faces_highlighted.emit(self._psr_faces, "PSR")
@@ -268,9 +323,16 @@ class ThermalAnalysisPanel(QWidget):
             return
 
         threshold = self._ct_threshold.value()
-        ct_mask = data <= threshold
-        ct_count = np.sum(ct_mask)
-        ct_fraction = ct_count / len(data) * 100
+        ct_mask, ct_count, n_resolved, n_total = classify_at_or_below(data, threshold)
+        if n_resolved == 0:
+            self._ct_faces = []
+            self._ct_result.setText(
+                f"None of the {n_total:,} facets has a value (all non-finite).\n"
+                "A cold-trap fraction over an empty population is undefined, not zero."
+            )
+            self.faces_highlighted.emit(self._ct_faces, "ColdTrap")
+            return
+        ct_fraction = ct_count / n_resolved * 100
 
         self._ct_faces = np.where(ct_mask)[0].tolist()
 
@@ -282,8 +344,9 @@ class ThermalAnalysisPanel(QWidget):
             extra = ""
 
         self._ct_result.setText(
-            f"Cold-trap faces: {ct_count:,} / {len(data):,} ({ct_fraction:.2f}%)\n"
+            f"Cold-trap faces: {ct_count:,} / {n_resolved:,} resolved ({ct_fraction:.2f}%)\n"
             f"Threshold: Tmax <= {threshold} K{extra}"
+            + _excluded_note(n_resolved, n_total)
         )
 
         self.faces_highlighted.emit(self._ct_faces, "ColdTrap")

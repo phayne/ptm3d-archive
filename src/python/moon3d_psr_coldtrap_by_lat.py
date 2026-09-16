@@ -14,8 +14,13 @@ AREA-WEIGHTED fractions per latitude:
                        radiatively-coupled run (statistics/temperature_max.bin).
   * coldtrap_radoff  : same threshold in the no-coupling run.
 
-"Area-weighted" means sum(area of qualifying faces) / sum(all face areas), with
-face areas from the double-precision PLY vertices. This reproduces the surviving
+"Area-weighted" means sum(area of qualifying faces) / sum(resolved face areas),
+with face areas from the double-precision PLY vertices. A facet whose value is
+not finite (NaN, +inf, -inf) has no value: per Paul's ruling (2026-09-15) it
+leaves BOTH the numerator and the denominator, so its area is removed from the
+total too. The resolved population is printed per latitude and stored in the
+JSON as n_resolved_* / n_faces_*, because a fraction over a shrinking
+denominator is not interpretable without its N. This reproduces the surviving
 docs/figures/moon3d_500k/psr_coldtrap_vs_latitude.json to full float precision
 (verified against the native-latitude gray baseline). NOTE: Figure 16's per-panel
 "% < 110 K" is a face-COUNT fraction; this figure's cold-trap "area fraction" is
@@ -51,6 +56,7 @@ import pyvista as pv
 
 sys.path.insert(0, str(Path(__file__).parent))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
+import ptm_population as pop
 
 PSR_THRESH = 1.0      # W m^-2  (direct-solar max below this = permanent shadow)
 COLD_THRESH = 110.0   # K       (cold-trap water-ice stability threshold)
@@ -90,15 +96,31 @@ def load_stat(run: Path, name: str) -> np.ndarray:
     return np.fromfile(run / "statistics" / f"{name}.bin", dtype=np.float32)[1:]
 
 
-def area_fraction(field: np.ndarray, area: np.ndarray, mask: np.ndarray) -> float:
+def area_fraction(field: np.ndarray, area: np.ndarray, threshold: float,
+                  label: str):
+    """AREA-weighted fraction below `threshold`, over the RESOLVED facets only.
+
+    Paul's ruling, 2026-09-15: a facet whose value is not finite has no value,
+    so it leaves BOTH the numerator and the denominator -- its area is removed
+    from the total as well. A bare `field < threshold` would instead call a
+    -inf facet a cold trap and a NaN facet not-a-cold-trap.
+
+    Returns (fraction, n_resolved, n_total, resolved_area).
+    """
     if len(field) != len(area):
         raise ValueError(f"field/area length mismatch: {len(field)} vs {len(area)}")
-    return float(area[mask].sum() / area.sum())
+    resolved = pop.resolved_mask(field, area)
+    pop.warn_if_unresolved(label, resolved)
+    frac = pop.area_fraction(field < threshold, resolved, area, label)
+    return (frac, int(resolved.sum()), int(resolved.size),
+            float(np.asarray(area)[resolved].sum()))
 
 
 def compute(runs):
     """Return dict with lat, psr_frac, coldtrap_coupled, coldtrap_radoff lists."""
     lat, psr, ctc, cto = [], [], [], []
+    n_res_psr, n_res_ctc, n_res_cto = [], [], []
+    n_faces_c, n_faces_r = [], []
     for latv, cdir, rdir in runs:
         cdir, rdir = Path(cdir), Path(rdir)
         need = [cdir / "statistics/direct_solar_max.bin",
@@ -118,13 +140,27 @@ def compute(runs):
             print(f"  WARNING: lat {latv:+.1f} face/stat count mismatch -- skipping",
                   file=sys.stderr)
             continue
-        p = area_fraction(dsm, area_c, dsm < PSR_THRESH)
-        c = area_fraction(tmc, area_c, tmc < COLD_THRESH)
-        o = area_fraction(tmr, area_r, tmr < COLD_THRESH)
+        p, np_res, nc_tot, ap_res = area_fraction(
+            dsm, area_c, PSR_THRESH, f"lat {latv:+.1f} PSR (direct_solar_max)")
+        c, nc_res, _, ac_res = area_fraction(
+            tmc, area_c, COLD_THRESH, f"lat {latv:+.1f} cold-trap coupled (temperature_max)")
+        o, no_res, nr_tot, ao_res = area_fraction(
+            tmr, area_r, COLD_THRESH, f"lat {latv:+.1f} cold-trap radoff (temperature_max)")
         lat.append(float(latv)); psr.append(p); ctc.append(c); cto.append(o)
+        n_res_psr.append(np_res); n_res_ctc.append(nc_res); n_res_cto.append(no_res)
+        n_faces_c.append(nc_tot); n_faces_r.append(nr_tot)
         print(f"  lat {latv:+6.1f}:  PSR {100*p:5.1f}%   cold-trap coupled "
               f"{100*c:5.1f}%   radoff {100*o:5.1f}%   (lost {100*(o-c):+.2f} pp)")
-    return dict(lat=lat, psr_frac=psr, coldtrap_coupled=ctc, coldtrap_radoff=cto)
+        # Population disclosure (Paul's ruling 2026-09-15): these fractions are
+        # "of the facets we could actually evaluate", so they are not
+        # interpretable without the N and resolved area they were taken over.
+        print(f"                 population: PSR/coupled {np_res}/{nc_tot} faces "
+              f"(area {ap_res:.6g} m^2), radoff {no_res}/{nr_tot} faces "
+              f"(area {ao_res:.6g} m^2)")
+    return dict(lat=lat, psr_frac=psr, coldtrap_coupled=ctc, coldtrap_radoff=cto,
+                n_resolved_psr=n_res_psr, n_resolved_coldtrap_coupled=n_res_ctc,
+                n_resolved_coldtrap_radoff=n_res_cto,
+                n_faces_coupled=n_faces_c, n_faces_radoff=n_faces_r)
 
 
 def make_figure(d, out_base: Path, dpi: int) -> None:

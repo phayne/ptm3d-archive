@@ -19,7 +19,9 @@ colorbar extend arrow.
 
 Per the crew figure-style convention, the psr_area / psr_count / median-Tmax
 contrast between the two cases is printed to stdout for the MANUSCRIPT CAPTION,
-NOT drawn on the figure.
+NOT drawn on the figure. A facet whose value is not finite has no value and
+leaves BOTH the numerator and the denominator of every fraction (Paul's ruling,
+2026-09-15); the resolved population is printed beneath the caption numbers.
 
     python3 moon3d_tilt_effect.py \
         --tilted   .../lat85_coupled --detilted .../dt85_coupled --lat -85 \
@@ -43,6 +45,7 @@ import pyvista as pv
 sys.path.insert(0, str(Path(__file__).parent))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
 from ptm_pubstyle import apply_style, DOUBLE_W
+import ptm_population as pop
 
 HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
 PSR_THRESH = 1.0     # W/m^2
@@ -74,12 +77,27 @@ def load_panel(run: Path, zexag: float):
     if not (len(tmax) == len(f) == len(dsm)):
         raise ValueError(f"{run}: face/stat mismatch {len(f)}/{len(tmax)}/{len(dsm)}")
     area = face_areas(v, f)
-    psr = dsm < PSR_THRESH
+    # Paul's ruling 2026-09-15: a facet whose value is not finite has no value
+    # and leaves BOTH the numerator and the denominator -- its area leaves the
+    # total too. A bare comparison would put a -inf facet in the PSR numerator
+    # and drop a NaN facet into the "not a PSR" side of the same denominator.
+    res_psr = pop.resolved_mask(dsm, area)
+    res_cold = pop.resolved_mask(tmax, area)
+    pop.warn_if_unresolved(f"{run} PSR (direct_solar_max)", res_psr)
+    pop.warn_if_unresolved(f"{run} cold trap (temperature_max)", res_cold)
+    psr = (dsm < PSR_THRESH) & res_psr
+    res_tmax = pop.resolved_mask(tmax)
     stats = dict(
-        psr_area=float(area[psr].sum() / area.sum()),
-        psr_count=float(psr.mean()),
-        median_tmax=float(np.median(tmax)),
-        coldtrap_area=float(area[tmax < COLD_THRESH].sum() / area.sum()),
+        psr_area=pop.area_fraction(psr, res_psr, area, "psr_area"),
+        psr_count=pop.count_fraction(psr, res_psr, "psr_count"),
+        # the caption median leaves the unresolved facets behind as well, or a
+        # single NaN facet puts "nan" into a manuscript caption
+        median_tmax=float(np.median(pop.resolved_values(tmax, res_tmax))),
+        coldtrap_area=pop.area_fraction(tmax < COLD_THRESH, res_cold, area,
+                                        "coldtrap_area"),
+        n_resolved_psr=int(res_psr.sum()),
+        n_resolved_cold=int(res_cold.sum()),
+        n_faces=int(res_psr.size),
     )
     c = v.mean(0)
     ve = (enu_frame(c) @ (v - c).T).T
@@ -156,6 +174,12 @@ def main() -> int:
     print(f"  de-tilted(dt85):   psr_area {sD['psr_area']:.3f}  "
           f"psr_count {sD['psr_count']:.3f}  median_Tmax {sD['median_tmax']:.2f} K  "
           f"coldtrap_area {sD['coldtrap_area']:.3f}")
+    # Population disclosure (Paul's ruling 2026-09-15): the caption fractions
+    # are "of the facets we could actually evaluate", so the caption needs N.
+    print(f"  population: tilted   PSR {sT['n_resolved_psr']}/{sT['n_faces']} faces, "
+          f"cold trap {sT['n_resolved_cold']}/{sT['n_faces']} faces")
+    print(f"  population: de-tilted PSR {sD['n_resolved_psr']}/{sD['n_faces']} faces, "
+          f"cold trap {sD['n_resolved_cold']}/{sD['n_faces']} faces")
     return 0
 
 

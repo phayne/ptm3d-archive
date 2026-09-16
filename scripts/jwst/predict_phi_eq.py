@@ -18,6 +18,12 @@ Three modes (mutually exclusive):
 Output: NPZ with face-aligned arrays {lat, lon, T_max, T_mean, phi_eq_tmax,
 phi_C_integrated (if --integrate or --cpp-output), phi_eq_tmean, dose_rate}.
 
+Every crystalline/amorphous face fraction printed below is over the RESOLVED
+faces only: a face whose value is not finite has no value and leaves BOTH the
+numerator and the denominator (Paul's ruling, 2026-09-15). phi derives from
+T_max / T_mean, so a blank temperature propagates straight into it. The
+resolved population is printed beside each fraction.
+
 Usage:
   python predict_phi_eq.py --run output/europa_ico6_albedo-map \
                            --out data/jwst/cartwright2025/phi_eq_albedo_map.npz \
@@ -49,6 +55,48 @@ def _find_last_cpp_epoch(run_dir: Path) -> int:
             f"No crystalline_fraction_*.bin files in {run_dir/'crystalline_fraction'}. "
             "Did the C++ run enable --crystallization and --multiscale?")
     return int(files[-1].stem.split("_")[-1])
+
+
+# (label, population size, excluded count) triples already warned about
+_WARNED = set()
+
+
+def _population(field, label):
+    """Faces that have a value, plus how many -- Paul's ruling, 2026-09-15.
+
+    "If a facet has no value, then it should leave the denominator and the
+    numerator." phi derives from T_max / T_mean, so a face whose temperature
+    was never resolved carries a non-finite phi straight through; it is
+    excluded from the population entirely rather than counted as amorphous.
+    A finiteness test, not an isnan test: `NaN > 0.5` is False (silently
+    "not crystalline") and `-inf < 0.1` is True (silently "amorphous").
+    """
+    field = np.asarray(field)
+    resolved = np.isfinite(field)
+    n_resolved = int(np.count_nonzero(resolved))
+    n_unresolved = int(resolved.size) - n_resolved
+    key = (label, int(resolved.size), n_unresolved)
+    if n_unresolved and key not in _WARNED:
+        _WARNED.add(key)
+        print(f"[predict_phi_eq]  WARNING: {label}: {n_unresolved} of "
+              f"{resolved.size} faces have no value (non-finite) and leave BOTH "
+              f"the numerator and the denominator; fractions are over "
+              f"{n_resolved} faces.", file=sys.stderr)
+    return resolved, n_resolved
+
+
+def _frac(qualifying, resolved, n_resolved):
+    """COUNT fraction over the resolved faces (NaN if none are resolved)."""
+    if n_resolved == 0:
+        return float("nan")
+    return float(np.count_nonzero(np.asarray(qualifying) & resolved) / n_resolved)
+
+
+def _stat(fn, field, resolved, n_resolved):
+    """An order statistic over the resolved faces (NaN if none are resolved)."""
+    if n_resolved == 0:
+        return float("nan")
+    return float(fn(np.asarray(field)[resolved]))
 
 
 def main() -> int:
@@ -108,11 +156,13 @@ def main() -> int:
     phi_eq_tmean = cr.phi_eq(T_mean, lat, lon)
 
     print("[predict_phi_eq] Computed phi_eq from T_max:")
-    crystal_frac = float(np.mean(phi_eq_tmax > 0.5))
-    amorphous_frac = float(np.mean(phi_eq_tmax < 0.1))
+    res_eq, n_eq = _population(phi_eq_tmax, "phi_eq(T_max)")
+    crystal_frac = _frac(phi_eq_tmax > 0.5, res_eq, n_eq)
+    amorphous_frac = _frac(phi_eq_tmax < 0.1, res_eq, n_eq)
     print(f"  faces with phi_eq(T_max) > 0.5: {crystal_frac:.1%}")
     print(f"  faces with phi_eq(T_max) < 0.1: {amorphous_frac:.1%}")
-    print(f"  median phi_eq(T_max): {float(np.median(phi_eq_tmax)):.3f}")
+    print(f"  median phi_eq(T_max): {_stat(np.median, phi_eq_tmax, res_eq, n_eq):.3f}")
+    print(f"  population: {n_eq} of {phi_eq_tmax.size} faces resolved")
 
     out = dict(
         lat=lat, lon=lon, T_max=T_max, T_mean=T_mean, T_min=T_min,
@@ -131,12 +181,14 @@ def main() -> int:
         phi_C = cr.integrate_diurnal(Tt.astype(np.float64), times_s, lat, lon,
                                      n_orbits=args.n_orbits, phi0=0.0)
         print(f"[predict_phi_eq]   integrated in {time.time()-t0:.1f}s")
-        crystal_int = float(np.mean(phi_C > 0.5))
-        amorph_int = float(np.mean(phi_C < 0.1))
+        res_int, n_int = _population(phi_C, "integrated phi_C")
+        crystal_int = _frac(phi_C > 0.5, res_int, n_int)
+        amorph_int = _frac(phi_C < 0.1, res_int, n_int)
         print(f"[predict_phi_eq] Integrated phi_C statistics:")
         print(f"  faces with phi_C > 0.5: {crystal_int:.1%}")
         print(f"  faces with phi_C < 0.1: {amorph_int:.1%}")
-        print(f"  median phi_C: {float(np.median(phi_C)):.3f}")
+        print(f"  median phi_C: {_stat(np.median, phi_C, res_int, n_int):.3f}")
+        print(f"  population: {n_int} of {phi_C.size} faces resolved")
         out["phi_C_integrated"] = phi_C
         out["n_orbits_integrated"] = args.n_orbits
 
@@ -145,13 +197,15 @@ def main() -> int:
         print(f"[predict_phi_eq] Loading C++ phi_C from epoch {ep}")
         rel = f"crystalline_fraction/crystalline_fraction_{ep:04d}.bin"
         phi_C = loaders.load_per_face_field(run, rel, nf)
-        crystal_cpp = float(np.mean(phi_C > 0.5))
-        amorph_cpp  = float(np.mean(phi_C < 0.1))
+        res_cpp, n_cpp = _population(phi_C, "C++ crystalline_fraction")
+        crystal_cpp = _frac(phi_C > 0.5, res_cpp, n_cpp)
+        amorph_cpp  = _frac(phi_C < 0.1, res_cpp, n_cpp)
         print(f"[predict_phi_eq] C++ phi_C statistics:")
         print(f"  faces with phi_C > 0.5: {crystal_cpp:.1%}")
         print(f"  faces with phi_C < 0.1: {amorph_cpp:.1%}")
-        print(f"  mean phi_C:   {float(np.mean(phi_C)):.4f}")
-        print(f"  median phi_C: {float(np.median(phi_C)):.4f}")
+        print(f"  mean phi_C:   {_stat(np.mean, phi_C, res_cpp, n_cpp):.4f}")
+        print(f"  median phi_C: {_stat(np.median, phi_C, res_cpp, n_cpp):.4f}")
+        print(f"  population: {n_cpp} of {phi_C.size} faces resolved")
         out["phi_C_integrated"] = phi_C
         out["cpp_epoch"] = ep
         out["source"] = "cpp_runtime"
