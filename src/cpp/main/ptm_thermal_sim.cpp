@@ -1255,6 +1255,259 @@ static std::vector<double> referenceDepthGrid(const thermal::Config& config) {
     return std::vector<double>(z.begin(), z.end());
 }
 
+// ---------------------------------------------------------------------------
+// PRE-FLIGHT DEPTH-GRID AND DISCLOSURE BANNER.  REPORT-ONLY.
+//
+// Everything printed here was already computed at setup and then never shown.
+// A run's depth grid decided which physics it could represent -- and the log
+// said nothing about it: not the number of layers, not how deep the column
+// went, not the skin depth the grid was built on, and not that an ice-stability
+// depth can be the bottom of the domain rather than a measurement.
+//
+// A number chosen silently is worse than one chosen by hand, because nobody can
+// check it. So this prints the value AND where it came from, and every line is
+// written for a reader who does not already know what a skin depth is.
+//
+// It builds one reference column (the same Profile every solver and every
+// checkpoint derives) and writes to stdout. It changes nothing.
+// ---------------------------------------------------------------------------
+// The reference body every driver rebuilds for itself: Planet(config's
+// `planet`) with the config's thermophysical overrides applied. Four sites in
+// this file need only its periods or its name and were each open-coding the
+// same two lines; the pairing matters, because a Planet WITHOUT
+// applyConfiguredThermo carries body defaults and is the PTM-53 trap.
+static thermal::Planet referenceBody(const thermal::Config& config) {
+    thermal::Planet p(config.getProperty("planet", "Moon"));
+    applyConfiguredThermo(p, config);
+    return p;
+}
+
+static void printDepthGridPreflight(const thermal::Config& config,
+                                    double window_days,
+                                    bool ice_stability_on,
+                                    bool ice_product_reachable) {
+    const thermal::Planet ref_planet = referenceBody(config);
+    thermal::Profile ref_profile(ref_planet, 0.0, config, false,
+                                 refGridHOverride(config));
+    const auto& z = ref_profile.z();
+    const int n_layers = static_cast<int>(ref_profile.nlayers);
+    if (n_layers < 2) return;
+    const double z_max   = z[n_layers - 1];
+    const double delta_0 = thermal::eqGridSkinDepth(z.data(), n_layers, config.b);
+    if (!(delta_0 > 0.0)) return;
+
+    // A LOCAL stream: std::cout arrives here carrying whatever fixed/precision
+    // state an earlier banner left on it, which is how a log comes to report
+    // numbers that are not the numbers the run used (PTM-05 / PTM-55).
+    std::ostringstream o;
+    o << std::defaultfloat << std::setprecision(6);
+
+    // "Built in" vs "from the config": the three grid knobs carry struct
+    // defaults, and a config that never mentions them still gets a column of a
+    // definite depth. Saying which is which is the whole point of the banner.
+    // Equality with the default is the only signal available without adding a
+    // config key, so the wording claims exactly what it can prove.
+    auto provenance = [](int value, int builtin) {
+        return (value == builtin)
+            ? " [built-in default; the config either omits this key or sets the "
+              "same value]"
+            : " [from the config / CLI]";
+    };
+
+    o << "\n=== Depth grid and disclosure (pre-flight; nothing here is changed by it) ===\n"
+      << "  The model solves a one-dimensional heat equation in a column of\n"
+      << "  ground beneath every facet. These are that column's dimensions.\n\n"
+      << "  Body                       : " << ref_planet.name << "\n"
+      << "  thermal.thermal_m          : " << config.m
+      << provenance(config.m, 10) << "\n"
+      << "  thermal.thermal_n          : " << config.n
+      << provenance(config.n, 15)
+      // thermal_n is read ONLY by generateStableGrid. Under the shipped
+      // ADAPTIVE_GRID it is inert, and a user who tunes it and sees nothing
+      // move has no way to find that out -- which is the silence this banner
+      // exists to break, reproduced inside the banner itself.
+      << (config.ADAPTIVE_GRID
+              ? "\n                               (INERT: thermal_n is read only "
+                "by the legacy non-adaptive grid;\n"
+                "                                thermal.ADAPTIVE_GRID is ON, so "
+                "nothing below depends on it)"
+              : "")
+      << "\n"
+      << "  thermal.thermal_b          : " << config.b
+      << provenance(config.b, 15) << "\n"
+      << "  Layers actually solved     : " << n_layers
+      << (config.ADAPTIVE_GRID
+              ? "   [derived from thermal_m and thermal_b; ADAPTIVE_GRID on]"
+              : "   [derived from thermal_m/n/b; ADAPTIVE_GRID off]")
+      << "\n"
+      << "  Top layer thickness        : " << (z[1] - z[0]) << " m\n"
+      << "  Column bottom z_max        : " << z_max << " m\n"
+      << "  Grid skin depth delta_0    : " << delta_0
+      << " m   (= z_max / thermal_b)\n";
+    if (!config.ADAPTIVE_GRID) {
+        // generateStableGrid grows layers until z exceeds b*delta and then adds
+        // one more, so z_max OVERSHOOTS b*delta by that last layer. z_max/b is
+        // then an upper bound on the true skin depth, not the skin depth -- and
+        // every meter figure derived from it below inherits the overshoot.
+        o << "                               (thermal.ADAPTIVE_GRID is OFF: the "
+             "legacy grid overshoots\n"
+             "                                z_max = b*delta_0 by its last "
+             "layer, so delta_0 printed here is\n"
+             "                                an UPPER BOUND on the true skin "
+             "depth, by up to that layer's\n"
+             "                                thickness / thermal_b)\n";
+    }
+    o << "\n";
+
+    o << "  WHAT A SKIN DEPTH IS, because the numbers below are counted in them:\n"
+      << "  a temperature wave of a given period (a day, a year) is damped to\n"
+      << "  1/e of its surface amplitude after one skin depth, and to about 1%\n"
+      << "  after 4.6. A column shorter than one skin depth of some period\n"
+      << "  cannot represent that period's wave at all; a few skin depths is\n"
+      << "  the usual working minimum. delta_0 above is the DIURNAL skin depth\n"
+      << "  this grid was built on, and it scales with period as sqrt(P).\n\n"
+      << "  Column depth, counted in skin depths of:\n";
+
+    const double day_s  = ref_planet.day;
+    const double year_s = ref_planet.year;
+    o << "    the diurnal cycle          : " << std::fixed << std::setprecision(2)
+      << (z_max / delta_0) << "   (" << std::setprecision(4)
+      << (day_s / 86400.0) << " d) -- this IS thermal_b, by construction\n"
+      << std::defaultfloat << std::setprecision(6);
+
+    // The run's own window, when it is long enough for a seasonal wave to be
+    // the thing the user is asking about. A quarter of the body's orbital year
+    // is the threshold, and it is named rather than left implicit.
+    //
+    // ⛔ BOTH rows are printed, and that is deliberate. A skin depth is defined
+    // by the PERIOD of a wave, not by how long you looked at it, so the window
+    // row alone would flatter a run whose window is shorter than the seasonal
+    // wave it is trying to resolve (a 120-day lunar window reports ~1.7x more
+    // skin depths against `sqrt(120/29.5)` than against `sqrt(365/29.5)`, in
+    // the non-conservative direction). The window row answers "what is the
+    // longest period this window can contain"; the orbital-year row answers
+    // "how deep is this column against the seasonal wave itself". Neither
+    // alone is the whole answer, so neither is printed alone.
+    const double window_s = window_days * 86400.0;
+    const bool   has_season = (year_s > 1.5 * day_s);
+    if (has_season && window_s >= 0.25 * year_s && day_s > 0.0) {
+        const double delta_win  = delta_0 * std::sqrt(window_s / day_s);
+        const double delta_year = delta_0 * std::sqrt(year_s / day_s);
+        o << std::fixed << std::setprecision(2)
+          << "    this run's own window      : " << (z_max / delta_win)
+          << "   (" << std::setprecision(4) << window_days
+          << " d; the longest period this window can contain at all)\n"
+          << std::setprecision(2)
+          << "    the body's orbital year    : " << (z_max / delta_year)
+          << "   (" << std::setprecision(4) << (year_s / 86400.0)
+          << " d; the seasonal wave itself, whatever the window)\n"
+          << std::defaultfloat << std::setprecision(6)
+          << "    Skin depths: " << delta_win << " m (window), "
+          << delta_year << " m (year). The window spans a season or more, so\n"
+             "    these two rows -- not the diurnal one -- are what say whether "
+             "the column is deep\n"
+             "    enough for what you are asking.\n";
+    } else if (!(day_s > 0.0) || !(year_s > 0.0)) {
+        // No usable period at all. Say so; the alternative is a branch that
+        // prints nothing and reads as "there is no seasonal issue here".
+        o << "    (no seasonal row: this body's periods resolve to day = "
+          << day_s << " s, year = " << year_s
+          << " s, so no second period can be formed)\n";
+    } else if (!has_season) {
+        // A synchronous satellite: Planet::year is its orbital period about its
+        // PRIMARY and equals its day, so the heliocentric seasonal cycle this
+        // engine would need is not in the property table at all. Printing
+        // nothing here would be indistinguishable from "this body has no
+        // season", which for an outer-planet moon is false.
+        o << "    (no seasonal row: this body's `year` (" << std::fixed
+          << std::setprecision(4) << (year_s / 86400.0)
+          << " d) is not longer than its day (" << (day_s / 86400.0)
+          << " d).\n"
+             "     On a synchronously rotating satellite that field is the "
+             "orbital period about its PRIMARY,\n"
+             "     not the heliocentric year, so this engine holds no seasonal "
+             "period for it and cannot\n"
+             "     count skin depths against one. Scale by hand: skin depth "
+             "scales as sqrt(P).)\n"
+          << std::defaultfloat << std::setprecision(6);
+    } else {
+        o << "    (no seasonal row: the output window is " << std::fixed
+          << std::setprecision(4) << window_days
+          << " d, under a quarter of this body's "
+          << std::setprecision(2) << (year_s / 86400.0)
+          << "-day orbital year.\n"
+             "     A window shorter than a season does not develop the seasonal "
+             "wave whose depth would be at issue.)\n"
+          << std::defaultfloat << std::setprecision(6);
+    }
+
+    if (ice_stability_on) {
+        o << "\n  ICE STABILITY IS ON (thermal.compute_ice_stability), and the "
+             "product it writes is CENSORED:\n"
+          << "    statistics/ice_depth.bin gives, per facet, the shallowest "
+             "depth at which water ice\n"
+          << "    would be stable. That search cannot look below this column, "
+             "so every facet whose ice\n"
+          << "    table lies deeper than z_max is written AT z_max = "
+          << z_max << " m.\n"
+          << "    Such a value is a RIGHT-CENSORED LOWER BOUND -- it means "
+             "'no stable ice anywhere within\n"
+          << "    " << z_max << " m of the surface' -- and it is NOT a measured "
+             "depth.\n"
+          << "      * Counting those facets as 'no stable ice' in an AREA "
+             "FRACTION is correct: the model\n"
+             "        knows something real about them, and they belong in the "
+             "population.\n"
+          << "      * Using z_max as a DEPTH is not. Any mean, median, "
+             "histogram or map of ice depth must\n"
+             "        be computed over the facets that resolve a depth strictly "
+             "above 0 and below z_max,\n"
+             "        and must say what fraction was censored.\n"
+          << "    The file carries NO sentinel value: the only way to tell a "
+             "censored facet from a measured\n"
+             "    one is to test whether it equals the ceiling. COMPARE IN "
+             "float32: ice_depth.bin stores\n"
+             "    float32, so a float64 test against the z_max printed above "
+             "matches NOTHING. The exact\n"
+             "    stored ceiling is " << std::setprecision(9)
+          << static_cast<double>(static_cast<float>(z_max))
+          << std::setprecision(6) << " (z_max cast to float32).\n"
+          << "    COUNT the censored fraction for YOUR run and put it in the "
+             "caption. No figure is printed\n"
+             "    here on purpose: the published one for a lunar polar site was "
+             "later shown to be driven\n"
+             "    substantially by its SPIN-UP, not by its grid, so any number "
+             "quoted from another run is\n"
+             "    a different run's answer to a different question.\n"
+          << "    IT DEPENDS ON TWO KNOBS, NOT ONE. A deeper column (larger "
+             "thermal_b) MOVES the ceiling\n"
+             "    but does not remove it; and an UNDER-EQUILIBRATED column has "
+             "not yet developed the deep\n"
+             "    gradient that makes ice stable, so it censors MORE. Read the "
+             "spin-up estimate below\n"
+             "    before you read the censored fraction -- relaxation time goes "
+             "as the column depth\n"
+             "    squared, so deepening the grid without lengthening the "
+             "spin-up makes this worse first.\n";
+        if (!ice_product_reachable) {
+            // Said HERE and not only at the end of the run. The existing
+            // "[Ice stability] WARNING: requested but accumulator not ready"
+            // fires after the whole solve; a user who asked for the product
+            // deserves to learn it will not arrive before paying for the run.
+            o << "    ⚠ BUT NOT ON THIS SOLVER PATH: the ice-stability "
+                 "accumulator is filled by the GPU\n"
+                 "      persistent solver only in this engine version. This run "
+                 "selected a CPU solver, so NO\n"
+                 "      ice_depth.bin will be written. Set thermal.use_gpu: true, "
+                 "or drop\n"
+                 "      thermal.compute_ice_stability so the request is not "
+                 "silently unmet.\n";
+        }
+    }
+    o << "=== end pre-flight ===\n";
+    std::cout << o.str();
+}
+
 static bool depthCsvValidateDepths(const thermal::Config& config,
                                    const std::vector<double>& z,
                                    const std::vector<double>& depths_m,
@@ -3992,6 +4245,269 @@ struct CpuStateCheckpoint {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Spin-up census, scored from ONE materialized column. REPORT-ONLY.
+//
+// thermal::EqSpinupCensus / eqEstimateSpinup shipped wired into exactly one
+// driver -- runThermalModelsForAllFacesBatchSoA -- so the warning that names
+// how many equilibration cycles a run needs against how many it configured was
+// printed by the CPU SIMD-batch solver and by nothing else. Every GPU run, and
+// every `--no-simd-batch` run, integrated its spin-up and said nothing about
+// whether that spin-up was long enough. (BUGS.md PTM-EQ-SPINUP-ESTIMATOR-CPU-ONLY.)
+//
+// This is the shared scorer the other drivers call. It READS z/T/kc/rho and
+// writes only the census, so a run with the census on must be byte-identical to
+// the same run with PTM_EQ_CERTIFICATE=0. That is the acceptance test.
+//
+// k(T) and cp(T) are materialized here from the same two laws the solvers
+// integrate -- thermal::conductivityK() and the cp0 + sum(c_j T^j) polynomial --
+// rather than read out of a solver buffer, because the two paths that call this
+// have their columns at different moments: the CPU SIMD-batch driver scores one
+// substep into the integration (its k/cp arrays are memset to zero until
+// advanceTimestep fills them), while these paths score the SEED, before any
+// step. Deriving both from the same laws is what makes the numbers comparable
+// across paths at all; the residual difference between them is one substep of
+// column evolution and nothing else.
+static void scoreSpinupCensusColumn(thermal::EqSpinupCensus& census,
+                                    const double* z, const double* T,
+                                    const double* kc, const double* rho,
+                                    int n,
+                                    const thermal::Planet& planet,
+                                    thermal::ConductivityModel cond,
+                                    double R350, double Qb, double emissivity,
+                                    double P, double target_K,
+                                    double precision_floor_K,
+                                    bool zero_forcing,
+                                    std::vector<double>& k_scratch,
+                                    std::vector<double>& cp_scratch) {
+    if (n < 3) { census.add(thermal::EqSpinupResult(), zero_forcing); return; }
+    k_scratch.resize(static_cast<size_t>(n));
+    cp_scratch.resize(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const double Ti = T[i];
+        k_scratch[i] = thermal::conductivityK(cond, Ti, kc[i], rho[i], R350);
+        double cp = planet.cp0, Tp = Ti;
+        for (size_t j = 0; j < planet.cpCoeff.size(); ++j) {
+            cp += planet.cpCoeff[j] * Tp;
+            Tp *= Ti;
+        }
+        cp_scratch[i] = cp;
+    }
+    thermal::EqSpinupInput ein;
+    ein.z = z; ein.T = T;
+    ein.k = k_scratch.data(); ein.rho = rho; ein.cp = cp_scratch.data();
+    ein.n = n;
+    ein.Qb = Qb;
+    ein.eps = emissivity;
+    ein.sigma = thermal::SIGMA_SB;
+    ein.P = P;
+    ein.target_K = target_K;
+    // Deliberately 0 unless a caller has MEASURED its path's arithmetic floor.
+    // Inventing one here would let the banner report "target unreachable" on a
+    // number nobody measured, which is the class of silent substitution this
+    // whole object exists to end.
+    ein.precision_floor_K = precision_floor_K;
+    census.add(thermal::eqEstimateSpinup(ein), zero_forcing);
+}
+
+// The census object itself, built the way every driver builds its reference
+// body: from the config, not from whatever Planet the caller happened to have.
+// Returns null when PTM_EQ_CERTIFICATE=0, which is the documented opt-out and
+// the arm the byte-identity acceptance test runs against.
+static std::unique_ptr<thermal::EqSpinupCensus>
+makeSpinupCensus(const thermal::Config& config) {
+    if (!thermal::eqCertificateEnabled()) return nullptr;
+    const thermal::Planet ref_planet = referenceBody(config);
+    if (!(ref_planet.day > 0.0)) {
+        // Every other suppression in this feature is disclosed; this one is
+        // too. A body with no rotation period has no diurnal cycle to count
+        // spin-up in, and n_req is quoted in cycles.
+        std::cerr << "[eq-spinup] estimate UNAVAILABLE: this body's diurnal "
+                     "period resolves to " << ref_planet.day
+                  << " s, and the spin-up requirement is counted in diurnal "
+                     "cycles.\n";
+        return nullptr;
+    }
+    return std::unique_ptr<thermal::EqSpinupCensus>(
+        new thermal::EqSpinupCensus(
+            ref_planet.day,
+            config.getPropertyDouble("eq_target_K", 0.1),
+            /*precision_floor_K=*/0.0,
+            /*seconds_per_cycle=*/0.0));   // nothing measures it; banner says so
+}
+
+// The census, or the reason there is not one. A WARM-STARTED window restores a
+// column that was spun up in an earlier chunk, so it has no spin-up of its own
+// to score and the census is not built at all -- and the refusal is stated,
+// once, instead of leaving an empty banner. All three drivers take this route,
+// so the rule and its wording cannot drift between them.
+static std::unique_ptr<thermal::EqSpinupCensus>
+makeSpinupCensusUnlessWarmStart(const thermal::Config& config,
+                                const std::string& initial_state_file) {
+    if (initial_state_file.empty()) return makeSpinupCensus(config);
+    if (thermal::eqCertificateEnabled()) {
+        std::cerr << "[eq-spinup] estimate SUPPRESSED on this window: it is a "
+                     "WARM START (thermal.initial_state_file is set), so the "
+                     "restored T(z) did its spin-up in an earlier chunk and "
+                     "this one has none to score.\n";
+    }
+    return nullptr;
+}
+
+// Diurnal cycles of REAL-EPHEMERIS equilibration the run integrates before the
+// output window opens. The same quantity runThermalModelsForAllFacesBatchSoA
+// reports, computed from the same array, so the two banners are commensurate.
+//
+// ⛔ The GPU driver does NOT use this: it replays the equilibration array
+// `eq_passes` times, which this expression cannot see. It derives its own count
+// beside the cycling knob -- see `gpu_spinup_cycles`.
+static double spinupCyclesIntegrated(const std::vector<double>& times,
+                                     int equilibration_steps, double day_s) {
+    if (!(day_s > 0.0) || equilibration_steps <= 0) return 0.0;
+    if (static_cast<size_t>(equilibration_steps) >= times.size()) return 0.0;
+    return (times[equilibration_steps] - times[0]) / day_s;
+}
+
+// Print the census and say WHERE it was scored. The CPU SIMD-batch driver
+// scores one substep into the integration; these paths score the seed. Both are
+// "as early as the column is well defined on that path", and the difference is
+// one substep -- but a reader comparing two logs has to be told which, or the
+// residual looks like a disagreement between the solvers rather than a
+// difference in when the snapshot was taken.
+static void reportSpinupCensusAtSeed(thermal::EqSpinupCensus* census,
+                                     const char* path_label,
+                                     double cycles_integrated) {
+    if (!census) return;
+    // A LOCAL stream. EqSpinupCensus::line() sets std::fixed and
+    // setprecision() on whatever stream it is handed and does not restore it,
+    // so reporting straight to std::cout leaves every later line in main()
+    // formatted fixed-point at one decimal -- the PTM-05/PTM-55 archetype,
+    // where a run prints numbers that are not the numbers it used. Buffering
+    // confines that to this string.
+    std::ostringstream o;
+    const bool scored = census->report(o, cycles_integrated);
+    if (scored) {
+        // ⛔ NO MEASURED NUMBERS IN THIS BANNER, deliberately. The mechanism is
+        // permanent; a figure is not, and a stale figure printed by the engine
+        // is the PTM-EQDT-DOC-STALE defect (docs quoting 0.99/2.2/11.9 K for a
+        // solver that now measures 0.549/1.238/5.325). For the record, measured
+        // 2026-09-17 on the shipped 12,800-face lunar 80N crater
+        // (examples/tutorial04_crater80N_radoff.yaml, 1 equilibration cycle):
+        // lit E0 9.209 K at the seed against 71.336 K one substep in, p95
+        // cycles needed 55.1 against 66.5, dark population identical to the
+        // last digit. Not pinned by any gate -- re-measure before quoting.
+        o << "  SCORED AT: the spin-up SEED, before the first step ["
+          << path_label << "].\n"
+             "    The CPU SIMD-batch driver scores its census ONE SUBSTEP "
+             "LATER instead, and on a LIT face\n"
+             "    that is not a small difference: the massless surface node "
+             "jumps to the instantaneous\n"
+             "    radiative balance of epoch 0 in that substep, so E0 there "
+             "also carries the diurnal surface\n"
+             "    excursion -- a swing spin-up does not have to remove, because "
+             "its cycle mean is zero. The\n"
+             "    SIMD-batch driver therefore reports a LARGER E0 and a LARGER "
+             "cycle requirement than this\n"
+             "    one on the same mesh and config, on the lit population only; "
+             "the dark population agrees.\n"
+             "    Do not read that gap as a disagreement between solvers -- "
+             "compare like with like.\n";
+    } else {
+        o << "\n[eq-spinup] estimate NOT SCORED on this window [" << path_label
+          << "]: no face contributed a column.\n";
+    }
+    std::cout << o.str();
+}
+
+// The CPU scalar drivers' report, in one place: both of them need the same
+// reference body, the same cycle count and the same call, and they had two
+// verbatim copies of it.
+static void reportSpinupCensusCpuDriver(thermal::EqSpinupCensus* census,
+                                        const char* path_label,
+                                        const thermal::Config& config,
+                                        const std::vector<double>& times,
+                                        int equilibration_steps) {
+    if (!census) return;
+    reportSpinupCensusAtSeed(
+        census, path_label,
+        spinupCyclesIntegrated(times, equilibration_steps,
+                               referenceBody(config).day));
+}
+
+// One GPU batch's worth of spin-up scoring. REPORT-ONLY.
+//
+// FACTORED, not inlined, because runThermalModelsForAllFaces_GPU_Persistent has
+// TWO batch loops that duplicate each other: a `run_batch_on_solver` lambda used
+// only by the multi-GPU device pool, and a separate serial body for the
+// single-device default (thermal.gpu_devices == 1). Putting the scorer in only
+// one of them would leave the estimate missing on exactly the configuration
+// production runs -- the defect this change exists to remove, moved one branch
+// sideways. Caught by code-review, not by any gate.
+//
+// Deliberately SERIAL. The multi-GPU pool calls this from a device worker
+// thread, so an OpenMP region here would open one team per device, and
+// EqSpinupCensus::add() serializes on a mutex in any case. Cost is a few
+// seconds on a multi-million-face mesh against a many-minute solve.
+static void scoreSpinupCensusGpuBatch(thermal::EqSpinupCensus* census,
+                                      const std::vector<uint8_t>& face_dark,
+                                      const double* z_grid, size_t n_layers,
+                                      const std::vector<float>& T_initial,
+                                      size_t batch_start, size_t batch_n,
+                                      const thermal::Planet& planet,
+                                      const std::vector<double>* face_H_overrides,
+                                      const std::vector<double>* face_Qb,
+                                      const double* kc_ref, const double* rho_ref,
+                                      thermal::ConductivityModel cond,
+                                      double R350, double target_K) {
+    if (!census || n_layers < 3) return;
+    const bool use_per_face_H = (face_H_overrides != nullptr) &&
+                                !face_H_overrides->empty();
+    std::vector<double> zc(n_layers), Tc(n_layers), kcc(n_layers), rhoc(n_layers),
+                        k_scratch, cp_scratch;
+    for (size_t i = 0; i < n_layers; ++i) zc[i] = z_grid[i];
+    for (size_t f = 0; f < batch_n; ++f) {
+        const size_t global_f = batch_start + f;
+        // The same two expressions the float32 upload loop uses, in DOUBLE.
+        // Reading back the uploaded float32 copies would make this disagree
+        // with the CPU census by the rounding of the material arrays and by
+        // nothing physical -- the reasoning GpuSharedSeedContext already gives
+        // for taking kc/rho from the reference profile rather than the buffers.
+        if (use_per_face_H) {
+            const double H_face = (global_f < face_H_overrides->size())
+                                ? (*face_H_overrides)[global_f] : planet.H;
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                const double df = std::exp(-zc[layer] / H_face);
+                rhoc[layer] = planet.rhod + (planet.rhos - planet.rhod) * df;
+                kcc[layer]  = planet.kd   + (planet.ks   - planet.kd  ) * df;
+            }
+        } else {
+            for (size_t layer = 0; layer < n_layers; ++layer) {
+                kcc[layer]  = kc_ref[layer];
+                rhoc[layer] = rho_ref[layer];
+            }
+        }
+        for (size_t layer = 0; layer < n_layers; ++layer)
+            Tc[layer] = T_initial[layer * batch_n + f];
+        // Qb and emissivity in DOUBLE for the same reason: the batch arrays the
+        // kernel receives are float32 casts of exactly these values.
+        const double qb_f = (face_Qb && global_f < face_Qb->size())
+                          ? (*face_Qb)[global_f] : planet.Qb;
+        const bool dark = (global_f < face_dark.size()) && face_dark[global_f] != 0;
+        scoreSpinupCensusColumn(*census, zc.data(), Tc.data(), kcc.data(),
+                                rhoc.data(), static_cast<int>(n_layers),
+                                planet, cond, R350, qb_f, planet.emissivity,
+                                planet.day, target_K,
+                                // The GPU integrates in float32 and this path's
+                                // arithmetic floor has never been MEASURED.
+                                // Inventing one would print "target
+                                // unreachable" from a number nobody measured;
+                                // 0.0 declares no floor and keeps the GPU and
+                                // CPU estimates directly comparable.
+                                /*precision_floor_K=*/0.0,
+                                dark, k_scratch, cp_scratch);
+    }
+}
+
 std::vector<double> runThermalModelWithMatchedTimes(
     const std::vector<double>& flux_values,
     const std::vector<double>& times,
@@ -4039,7 +4555,15 @@ std::vector<double> runThermalModelWithMatchedTimes(
     //
     // ORDER: `fold_depth_map` stays where phase 2D put it so 2D's existing
     // call sites keep their positional meaning; 2H's is appended after it.
-    long long loc_column_face = -1) {
+    long long loc_column_face = -1,
+    // Equilibration spin-up estimate (report-only). Non-null ONLY from the two
+    // whole-mesh CPU SCALAR drivers -- the same lock `fold_depth_map` carries
+    // and for the same reason: the radiation-coupling re-thermal calls this for
+    // a SELECTED subset of faces, and scoring those into a mesh-wide census
+    // would print a whole-mesh-looking banner over whichever faces the coupling
+    // loop happened to reselect. It defaults to null so every existing call
+    // site is unchanged and the object is unreachable from them.
+    thermal::EqSpinupCensus* spinup_census = nullptr) {
 
     // Validate inputs
     std::vector<double> temps_out;
@@ -4150,6 +4674,34 @@ std::vector<double> runThermalModelWithMatchedTimes(
                 thermal::EqSeedRecorder::instance().record(
                     static_cast<size_t>(seed_record_face), rec, model.seed_result);
             }
+        }
+
+        // Equilibration spin-up estimate (report-only). Scored on the seeded
+        // column, before the first step -- the earliest moment at which the
+        // question "is this spin-up long enough?" has an answer.
+        //
+        // SUPPRESSED on a warm-started face, and that is not a convenience: the
+        // checkpoint overwrote the seed a few lines above, so this column was
+        // never integrated from. Scoring it would put a complete, plausible,
+        // entirely fictional spin-up requirement in the banner for a chunk that
+        // did no spin-up at all (the same defect PTM-76 removed from the anchor
+        // census). The driver discloses the suppression by count.
+        if (spinup_census && !warm_started_face) {
+            const auto& prof = model.profile;
+            const int   nz   = model.N_z;
+            double fmax = 0.0;
+            for (double v : flux_values) if (v > fmax) fmax = v;
+            std::vector<double> k_scratch, cp_scratch;
+            scoreSpinupCensusColumn(
+                *spinup_census,
+                prof.z().data(), prof.T().data(),
+                prof.kc().data(), prof.rho().data(), nz,
+                planet, config.conductivity_model, prof.R350_val,
+                planet.Qb, planet.emissivity, planet.day,
+                config.getPropertyDouble("eq_target_K", 0.1),
+                /*precision_floor_K=*/0.0,      // float64 path, no measured floor
+                /*zero_forcing=*/!(fmax > 0.0),
+                k_scratch, cp_scratch);
         }
 
         // CRITICAL: Don't use internal equilibration - it messes up time alignment
@@ -5123,6 +5675,17 @@ bool runThermalModelsForAllFacesStreamed(
     // runThermalModelWithMatchedTimes.
     std::atomic<size_t> seed_floor_faces{0};
     SeedAnchorCensus anchor_census;
+    // Equilibration spin-up estimate (report-only). This driver had none: the
+    // census was wired into the CPU SIMD-batch solver and nowhere else, so a
+    // `--no-simd-batch` streamed run reported nothing about its own spin-up.
+    // NOT CONSTRUCTED on a warm start (see makeSpinupCensusUnlessWarmStart);
+    // `initial_state_file` is a RUN-scope input, so on such a window every face
+    // is restored and there is nothing to score. It is read directly rather
+    // than through `ckpt.want_in` so this does not depend on where the
+    // checkpoint object happens to be declared -- CpuStateCheckpoint::begin
+    // sets want_in from exactly this string.
+    std::unique_ptr<thermal::EqSpinupCensus> spinup_census =
+        makeSpinupCensusUnlessWarmStart(config, initial_state_file);
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
@@ -5235,7 +5798,8 @@ bool runThermalModelsForAllFacesStreamed(
                 face_qb, face_H, static_cast<long long>(f),
                 &seed_floor_faces, &anchor_census, st_ptr,
                 /*fold_depth_map=*/true,
-                /*loc_column_face=*/static_cast<long long>(f));
+                /*loc_column_face=*/static_cast<long long>(f),
+                spinup_census.get());
 
             if (ckpt.want_out && st.out_column) ckpt.scatterOut(f, st_out.data());
 
@@ -5263,6 +5827,8 @@ bool runThermalModelsForAllFacesStreamed(
                   << " K CMB floor (Qb <= 0 AND zero mean absorbed flux).\n";
     }
     anchor_census.report("cpu-streamed", ckpt.want_in);
+    reportSpinupCensusCpuDriver(spinup_census.get(), "CPU scalar, streamed",
+                                config, times, equilibration_steps);
     thermal::EqSeedRecorder::instance().write("cpu-streamed");
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -5412,6 +5978,16 @@ bool runThermalModelsForAllFaces(
     // forcing on top. Both are gone under spinup_seed: physical.
     std::atomic<size_t> seed_floor_faces{0};
     SeedAnchorCensus anchor_census;
+    // Equilibration spin-up estimate (report-only). Same gap as the streamed
+    // driver above: the census existed only on the CPU SIMD-batch path.
+    // NOT CONSTRUCTED on a warm start (see makeSpinupCensusUnlessWarmStart);
+    // `initial_state_file` is a RUN-scope input, so on such a window every face
+    // is restored and there is nothing to score. It is read directly rather
+    // than through `ckpt.want_in` so this does not depend on where the
+    // checkpoint object happens to be declared -- CpuStateCheckpoint::begin
+    // sets want_in from exactly this string.
+    std::unique_ptr<thermal::EqSpinupCensus> spinup_census =
+        makeSpinupCensusUnlessWarmStart(config, initial_state_file);
     if (config.spinup_seed == thermal::EqSeedMode::Physical) {
         thermal::EqSeedRecorder::instance().reserve(n_faces);
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
@@ -5544,7 +6120,8 @@ bool runThermalModelsForAllFaces(
                     &anchor_census,
                     st_ptr,
                     /*fold_depth_map=*/true,
-                    /*loc_column_face=*/static_cast<long long>(f)
+                    /*loc_column_face=*/static_cast<long long>(f),
+                    spinup_census.get()
                 );
 
                 if (ckpt.want_out && st.out_column)
@@ -5648,6 +6225,8 @@ bool runThermalModelsForAllFaces(
                   << std::endl;
     }
     anchor_census.report("cpu-scalar", ckpt.want_in);
+    reportSpinupCensusCpuDriver(spinup_census.get(), "CPU scalar", config,
+                                times, equilibration_steps);
     thermal::EqSeedRecorder::instance().write("cpu-scalar");
 
     // Print timing information using cerr to match illumination code
@@ -8856,6 +9435,22 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // Shared-seed guards, reported after the batch loop (never silent).
     size_t gpu_seed_floor_faces = 0;
     SeedAnchorCensus gpu_anchor_census;
+    // ---- Equilibration spin-up estimate (report-only) --------------------
+    // The same thermal::EqSpinupCensus the CPU SIMD-batch driver prints, on the
+    // path production actually runs. It shipped wired into
+    // runThermalModelsForAllFacesBatchSoA ONLY, so every GPU window -- every
+    // A3GT window -- integrated its spin-up and said nothing about whether that
+    // spin-up was long enough (BUGS.md PTM-EQ-SPINUP-ESTIMATOR-CPU-ONLY).
+    //
+    // Report-only: it reads the seed column, kc/rho and Qb, and writes only
+    // itself. A run with it on must be byte-identical to the same run with
+    // PTM_EQ_CERTIFICATE=0.
+    //
+    // DECLARED HERE, above the `goto post_batch_loop` in the multi-GPU pool
+    // branch below: a goto may not jump over an initialization.
+    const double gpu_eq_target_K = config.getPropertyDouble("eq_target_K", 0.1);
+    std::unique_ptr<thermal::EqSpinupCensus> gpu_spinup_census;
+    std::vector<uint8_t> gpu_face_dark;      // 1 = never forced, at any step
     const double gpu_seed_dt_s =
         (total_time_steps > 1 && times.size() > 1) ? (times[1] - times[0])
                                                    : planet.day;
@@ -8960,6 +9555,63 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // is set"), so it ALWAYS lands on the single-phase solver branch below.
     const bool warm_start_run = !initial_state_file.empty();
 
+    // Spin-up census setup. SUPPRESSED on a warm-started chunk: the checkpoint
+    // overwrites T_initial a few lines below, so the seed this would score
+    // never reaches the answer, and a full plausible banner over it would be
+    // fiction (the same rule gpuFillSharedSeed already applies to the anchor
+    // census). The helper states the suppression; it is not silent.
+    gpu_spinup_census = makeSpinupCensusUnlessWarmStart(config,
+                                                        initial_state_file);
+    if (gpu_spinup_census) {
+        // The dark/forced split, on the same criterion the CPU SIMD-batch
+        // census uses: a face is DARK iff its absorbed flux is zero at every
+        // step of the forcing THIS RUN INTEGRATES. Absorbed flux is
+        //     (1-A)*direct + (1-A)*reflected + eps_ir*IR   [+ eq_indirect]
+        // with A < 1 (both the Hayne and Hapke laws are bounded below 1) and
+        // eps_ir > 0, so "absorbed > 0 at some step" is exactly "one of those
+        // terms > 0 at some step". Testing the raw arrays costs one comparison
+        // per element instead of an applyIncidenceAlbedo() call per element,
+        // which on a multi-million-face window is the difference between
+        // seconds and hours -- and it is the same predicate, not an
+        // approximation of it.
+        //
+        // ⛔ eq_indirect_flux IS part of it. prepare_flux adds that per-face
+        // constant to every equilibration step, and the CPU censuses see it
+        // because they score the composed flux array. Omitting it here would
+        // bin a radiation-coupled PSR face as `dark` on the GPU and as `lit` on
+        // the CPU -- the two banners would then not be comparable on exactly
+        // the population the split exists to expose.
+        //
+        // COST, since this is report-only: a LIT face breaks on its first lit
+        // step, so the full row is scanned only for genuinely dark faces. The
+        // bound is (dark faces x steps), not (all faces x steps).
+        gpu_face_dark.assign(n_faces, 1);
+        const size_t n_steps_dark = static_cast<size_t>(total_time_steps);
+        #pragma omp parallel for schedule(static)
+        for (long long fi = 0; fi < static_cast<long long>(n_faces); ++fi) {
+            const size_t gf = static_cast<size_t>(fi);
+            if (equilibration_steps > 0 && gf < eq_indirect_flux.size()
+                    && eq_indirect_flux[gf] > 0.0) {
+                gpu_face_dark[gf] = 0;
+                continue;
+            }
+            const size_t f0 = gf * n_steps_dark;
+            for (size_t t = 0; t < n_steps_dark; ++t) {
+                const size_t idx = f0 + t;
+                const double d = (idx < direct_solar_values.size())
+                               ? direct_solar_values[idx] : 0.0;
+                const double r = (idx < primary_reflected_values.size())
+                               ? primary_reflected_values[idx] : 0.0;
+                const double ir = (idx < primary_ir_values.size())
+                               ? primary_ir_values[idx] : 0.0;
+                if (d > 0.0 || r > 0.0 || ir > 0.0) {
+                    gpu_face_dark[gf] = 0;
+                    break;
+                }
+            }
+        }
+    }
+
     // Whole-mesh buffer to receive the final T(z) profile, if requested.
     // Filled per-batch and dumped at the end.
     std::vector<float> assembled_final_T;
@@ -9037,6 +9689,26 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         std::cout.flags(bf);
         std::cout.precision(bp);
     }
+    // Diurnal cycles of spin-up this window ACTUALLY integrates, for the
+    // spin-up banner. Derived HERE, beside the cycling knob it depends on, and
+    // above the `goto post_batch_loop` below.
+    //
+    // ⛔ It is NOT (times[eq_steps] - times[0]) / day. That is one pass, and
+    // solvePersistentMultipleCycles runs `eq_passes` of them. Quoting one pass
+    // against a p95 requirement would fire the "BELOW the requirement" warning
+    // on a run that is in fact adequately equilibrated -- a false alarm is the
+    // same defect as silence, pointed the other way.
+    //   two-phase : eq_passes x equilibration_steps x eq_dt.
+    //   single    : the array IS the whole window, so the first (eq_passes - 1)
+    //               passes are spin-up in their entirety and the last pass
+    //               contributes only its equilibration prefix.
+    const double gpu_spinup_cycles =
+        (planet.day > 0.0)
+            ? (two_phase
+                   ? static_cast<double>(eq_passes) * equilibration_steps * eq_dt
+                   : (static_cast<double>(eq_passes - 1) * total_time_steps
+                      + equilibration_steps) * dt) / planet.day
+            : 0.0;
     // Paths that do NOT honor the knob must say so — a silently ignored
     // equilibration request is exactly the class of failure that makes a run
     // unreproducible.
@@ -9626,6 +10298,21 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         }
         solver.uploadInitialTemperature(T_initial);
 
+        // ---- Equilibration spin-up estimate (report-only) ----------------
+        // Scored on the column the kernel is about to start from, for every
+        // seed mode (physical, generic-body reference profile, legacy), which
+        // is why it sits here rather than inside gpuFillSharedSeed: that helper
+        // runs only under `spinup_seed: physical`.
+        //
+        // READ-ONLY. T_initial, kc_ref/rho_ref and the per-face Qb are read;
+        // nothing is written but the census, which reaches stdout and no output
+        // file. THE SAME CALL IS MADE FROM THE SINGLE-DEVICE SERIAL BATCH LOOP
+        // BELOW -- see scoreSpinupCensusGpuBatch for why there are two.
+        scoreSpinupCensusGpuBatch(
+            gpu_spinup_census.get(), gpu_face_dark, z_grid.data(), n_layers,
+            T_initial, batch_start, batch_n, planet, face_H_overrides, face_Qb,
+            kc_ref.data(), rho_ref.data(), config.conductivity_model, R350_val,
+            gpu_eq_target_K);
         if (!loaded_initial_T.empty()) {
             std::vector<float> T_chunked(batch_n * n_layers);
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -10403,6 +11090,19 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         }
         solver.uploadInitialTemperature(T_initial);
 
+        // ---- Equilibration spin-up estimate (report-only) ----------------
+        // THE SINGLE-DEVICE (thermal.gpu_devices == 1) BATCH LOOP. This body is
+        // a duplicate of the `run_batch_on_solver` lambda the multi-GPU pool
+        // uses, so the estimate has to be scored in BOTH or it is missing on
+        // the default configuration -- which is the configuration every A3GT
+        // production window runs. Same call, same helper, no second copy of the
+        // arithmetic.
+        scoreSpinupCensusGpuBatch(
+            gpu_spinup_census.get(), gpu_face_dark, z_grid.data(), n_layers,
+            T_initial, batch_start, batch_n, planet, face_H_overrides, face_Qb,
+            kc_ref.data(), rho_ref.data(), config.conductivity_model, R350_val,
+            gpu_eq_target_K);
+
         // If a chunked-run initial-state file was loaded, overwrite the
         // (computed-from-flux) initial T with the saved per-face profile
         // from the previous chunk. Slice the global layer-major buffer
@@ -10955,6 +11655,8 @@ post_batch_loop:
                      "the steady-state balance has no positive root.\n";
     }
     gpu_anchor_census.report("gpu-persistent", warm_start_run);
+    reportSpinupCensusAtSeed(gpu_spinup_census.get(),
+                             "GPU persistent kernel", gpu_spinup_cycles);
     thermal::EqSeedRecorder::instance().write("gpu-persistent");
 
     return true;
@@ -12451,7 +13153,8 @@ std::vector<double> runThermalModelWithMatchedTimes(
     SeedAnchorCensus*    anchor_census,
     FaceStateIO* state,
     bool fold_depth_map,
-    long long loc_column_face);
+    long long loc_column_face,
+    thermal::EqSpinupCensus* spinup_census);
 
 // Write a complete VTK file with both illumination and thermal data
 bool writeCompleteVTK(
@@ -19728,6 +20431,23 @@ int main(int argc, char** argv) {
         // it is a claim about this file's control flow, and moving a write
         // below it silently makes the claim false.
         thermal_config_populated = true;
+
+        // ---- Pre-flight depth-grid + disclosure banner (report-only) -------
+        // Here, and not earlier, for the same reason the depth-map stage-B
+        // resolve is here: `thermal_config` is only complete now. Printed once,
+        // above the solve, on every solver path -- a radiation-coupled run
+        // enters the whole-mesh driver more than once, and this is outside that
+        // loop so it cannot print twice.
+        // ⛔ READ `config`, NOT `thermal_config`, for the solver-path flag --
+        // the same trap the depth-map stage-B resolve documents above: both
+        // flags are set on the CLI/parse config early and only copied onto
+        // thermal_config later, so reading thermal_config here would report the
+        // DEFAULT path on every run.
+        printDepthGridPreflight(
+            thermal_config, output_days,
+            sim_config.thermal.compute_ice_stability,
+            /*ice_product_reachable=*/config.getPropertyBool("use_gpu_thermal",
+                                                            false));
 
         // ---- Subsurface depth maps, STAGE B: resolve against the REAL grid ----
         // Here, and not at the early validation site, because `thermal_config`
