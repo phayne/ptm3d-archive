@@ -52,6 +52,12 @@ from gui_core._ptm_bootstrap import ensure_ptm_importable  # noqa: E402
 ensure_ptm_importable()
 from ptm.results import describe_mesh_frame  # noqa: E402
 
+# The pointer record. OFF unless `PTM_GUI_TRACE=1` -- the SAME switch the flux
+# cube record uses, deliberately not a second one. It exists because the
+# automated checks for this panel cannot see a real canvas, so when the readout
+# fails on someone's screen the only instrument is that screen.
+from gui_core import pointer_trace  # noqa: E402
+
 # PyVista for 3D visualization
 try:
     import pyvista as pv
@@ -460,15 +466,29 @@ class PyVistaWidget(QWidget):
 
     face_selected = pyqtSignal(int, dict)  # face_id, data dict
 
-    #: What the coordinate readout says with the pointer off the mesh, and what
-    #: it says when the mesh's frame does not support a coordinate at all. The
-    #: second one is not a failure message -- it is the correct answer for a
-    #: local tangent-plane patch, and it has to be distinguishable from a
-    #: coordinate that merely has not been computed yet.
+    #: The readout's four distinct states, and they MUST stay four.
+    #:
+    #: ⛔⛔ Two of these used to be one string. `COORD_READOUT_OFF_MESH` was
+    #: both the resting text after a mesh loads AND the answer to a pick that
+    #: returned nothing, so "the pointer handler has never run" and "the ray
+    #: missed the mesh" were indistinguishable on screen. That is exactly how
+    #: the 2026-09-15 HiDPI defect was reported -- "it just says the pointer is
+    #: off the mesh even when it is directly on the mesh" -- and the report
+    #: could not say which of the two was happening, because the window could
+    #: not say either. A user must be able to tell "not over the mesh" from
+    #: "I have not looked yet" from "I cannot compute this".
     COORD_READOUT_IDLE = "lat / lon: move the pointer over the mesh"
+    COORD_READOUT_WAITING = (
+        "lat / lon: \u2014 (waiting for the pointer)")
     COORD_READOUT_OFF_MESH = "lat / lon: \u2014 (pointer is off the mesh)"
     COORD_READOUT_NO_FRAME = (
         "lat / lon: unavailable \u2014 this mesh has no georeferenced frame")
+    #: The pointer handler raised. NOT the same state as a missed pick, and it
+    #: says where to look, because a silent failure here reads as "off the
+    #: mesh" forever.
+    COORD_READOUT_FAILED = (
+        "lat / lon: unavailable \u2014 the pointer handler failed "
+        "(see the terminal)")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -491,6 +511,10 @@ class PyVistaWidget(QWidget):
         self.hover_face_id = None
         self.hover_highlight_actor = None
         self.selected_face_id = None
+        # Has a pointer event reached this widget since the mesh loaded? The
+        # readout's resting text depends on it, because "off the mesh" must
+        # not be said about a pointer that has never been seen.
+        self._pointer_seen = False
 
         # -- coordinate readout ------------------------------------------
         # What `ptm.results.describe_mesh_frame` decided about THIS mesh's
@@ -767,6 +791,7 @@ class PyVistaWidget(QWidget):
         self._hover_picker = None
         self._hover_locator = None
         self.hover_face_id = None
+        self._pointer_seen = False
         # ⛔ `load_mesh` -- and with it `_reset_coordinate_readout` -- only runs
         # when a mesh.ply is there. Without this, opening a results directory
         # that has none leaves the PREVIOUS run's coordinate on screen.
@@ -842,9 +867,16 @@ class PyVistaWidget(QWidget):
             # Bind (or re-bind) the hover observers now that there is something
             # to hover over.
             self._bind_interactor_observers()
+            self._pointer_seen = False
+            # A new mesh gets a new chance to report a failure. Left latched
+            # from a transient error on an earlier load, a handler that dies
+            # for good on THIS one would print nothing and never mark the
+            # readout as failed.
+            self._hover_error_reported = False
             self._reset_coordinate_readout()
 
             self.update_display()
+            self.trace_pointer_environment("at-mesh-load")
 
         except Exception as e:
             print(f"Error loading mesh: {e}")
@@ -1330,8 +1362,14 @@ class PyVistaWidget(QWidget):
             print(f"[Readout] could not attach the pointer observers: {e}")
             self._interactor_observers = []
 
-    def _reset_coordinate_readout(self):
-        """Put the readout back to its resting text for the current mesh."""
+    def _reset_coordinate_readout(self, seen_pointer=False):
+        """Put the readout back to its resting text for the current mesh.
+
+        `seen_pointer` is True only when a pointer event actually arrived and
+        the pick found nothing. With it False the text says the pointer has
+        not been seen yet, which is a DIFFERENT statement from "off the mesh"
+        and has to read differently -- see `COORD_READOUT_OFF_MESH`.
+        """
         label = getattr(self, 'coord_readout_label', None)
         if label is None:
             return
@@ -1343,7 +1381,11 @@ class PyVistaWidget(QWidget):
             label.setText(self.COORD_READOUT_IDLE)
             label.setToolTip("")
         else:
-            label.setText(self.COORD_READOUT_OFF_MESH)
+            # ⛔ "Off the mesh" is said ONLY about a pointer that was seen and
+            # missed. Saying it about a pointer that has never arrived is how
+            # a dead handler hid behind a plausible message for a release.
+            label.setText(self.COORD_READOUT_OFF_MESH if seen_pointer
+                          else self.COORD_READOUT_WAITING)
             label.setToolTip(frame.label if frame is not None else "")
 
     def face_coordinate_text(self, face_id):
@@ -1382,8 +1424,175 @@ class PyVistaWidget(QWidget):
                 f"lon {lon % 360.0:8.4f}\u00b0 E   "
                 f"\u00b7 {frame.label}  \u00b7 facet {face_id}")
 
-    def _pick_face_at(self, x, y):
-        """Cell id of the results mesh under screen position (x, y), or None.
+    def _canvas_widget(self):
+        """The Qt widget whose mouse events reach this plotter's interactor.
+
+        Identified by the property that matters and not by a class name: it
+        must own THIS plotter's render window, which is what
+        `QVTKRenderWindowInteractor` (and so `pyvistaqt.QtInteractor`) exposes
+        through `GetRenderWindow`. A plain `QWidget` parked in a plotter's
+        `interactor` attribute -- which is what an offscreen stand-in has --
+        does not own one, gets no correction below, and should not: nothing
+        translates Qt positions into VTK display positions for it, so its
+        event positions are already whatever the caller set.
+        """
+        if not getattr(self, 'plotter', None):
+            return None
+        try:
+            ren_win = self.plotter.ren_win
+        except Exception:                                       # noqa: BLE001
+            return None
+        if ren_win is None:
+            return None
+        for candidate in (self.plotter,
+                          getattr(self.plotter, 'interactor', None)):
+            if candidate is None:
+                continue
+            getter = getattr(candidate, 'GetRenderWindow', None)
+            if not callable(getter):
+                continue
+            if not all(callable(getattr(candidate, name, None))
+                       for name in ('width', 'height', 'devicePixelRatioF')):
+                continue
+            try:
+                owned = getter()
+            except Exception:                                   # noqa: BLE001
+                continue
+            if owned is ren_win or owned == ren_win:
+                return candidate
+        return None
+
+    def _display_position(self, x, y):
+        """Convert an interactor event position into a VTK DISPLAY position.
+
+        ⛔⛔ THIS IS THE FIX FOR THE HiDPI PICK. On macOS the two are not the
+        same number, and every pick landed at twice the intended place.
+
+        MEASURED on a Retina canvas (device pixel ratio 2.0, Qt logical size
+        900x619):
+
+        * `ren_win.GetSize()` is **(900, 619)** -- VTK's display coordinate
+          space on the Cocoa backend is Qt's LOGICAL size, because the backing
+          scale is handled inside the render window. `vtkCoordinate` puts the
+          world origin at display (450, 309), and the picker's hit region is
+          centered there.
+        * `pyvistaqt`'s `QVTKRenderWindowInteractor._setEventInformation`
+          multiplies the Qt position by the screen's device pixel ratio before
+          handing it to VTK, which is right on backends whose render window is
+          sized in device pixels and wrong here. A real Qt mouse move at the
+          canvas center delivered `GetEventPosition() == (900, 618)`.
+        * Picking (900, 618) returns cell **-1**; picking (450, 309) returns a
+          real facet. That is the whole defect: "the pointer is off the mesh
+          even when it is directly on the mesh".
+
+        Rotation and zoom never showed it because they consume DIFFERENCES
+        between successive positions, where a uniform factor only changes the
+        gain.
+
+        The correction is MEASURED, not assumed, and carries no platform test:
+        the event positions span the canvas's logical size times the device
+        pixel ratio, VTK's display space spans `ren_win.GetSize()`, and the
+        ratio of the two is the factor. On a backend whose render window is
+        already in device pixels that ratio is exactly 1 and the position is
+        returned unchanged.
+
+        MEASURED cost: `_event_position_scale` is 9.9 us of a 196 us pointer
+        move on the real canvas -- 5% -- so it is recomputed every move rather
+        than cached behind a state flag that would have to be invalidated when
+        the canvas is replaced or resized.
+        """
+        sx, sy = self._event_position_scale()
+        return int(round(x * sx)), int(round(y * sy))
+
+    def _event_pixel_ratio(self, canvas):
+        """The factor the Qt-to-VTK adapter ALREADY applied to the pointer
+        position -- not the screen's device pixel ratio.
+
+        ⛔⛔ These are not always the same number, and using the screen's would
+        turn this correction into a regression on half the installations on
+        this machine. `QVTKRenderWindowInteractor._setEventInformation` scales
+        by its own `_getPixelRatio()`, and the copies of `pyvistaqt` disagree
+        about what that returns under PyQt6:
+
+        * the copy this GUI runs on returns the screen ratio for every binding
+          except PyQt4/PySide -- MEASURED 2.0 on a ratio-2.0 canvas, which is
+          the defect this whole method exists to undo;
+        * other installed copies gate on `PyQtImpl in ["PyQt5", "PySide2",
+          "PySide6"]` and so return **1.0** under PyQt6 -- there the event
+          position is already a VTK display position, and a correction derived
+          from `devicePixelRatioF()` would halve a position that was right,
+          breaking a working viewer with no warning.
+
+        Reading `_getPixelRatio` is reading the quantity itself, so both cases
+        come out correct: 2.0 gives a 0.5 correction, 1.0 gives none. It is a
+        private name, which is why a disagreement with the public
+        `devicePixelRatioF()` is REPORTED rather than passed over -- that
+        difference is the signature of a `pyvistaqt` whose behavior changed.
+
+        ⛔ NOT `plotter.iren.interactor.GetSize()`. `rwi.resizeEvent` does call
+        `_Iren.SetSize(scale*w, scale*h)`, so it looks like the invariant, but
+        MEASURED on the live canvas it reports (900, 619) against a render
+        window of (900, 619) -- a ratio of exactly 1.0, which leaves the bug
+        in place. The Cocoa render window owns its size and VTK writes the
+        interactor's back from it.
+        """
+        public = float(canvas.devicePixelRatioF())
+        getter = getattr(canvas, '_getPixelRatio', None)
+        if not callable(getter):
+            return public
+        try:
+            applied = float(getter())
+        except Exception:                                       # noqa: BLE001
+            return public
+        if applied <= 0.0:
+            return public
+        if abs(applied - public) > 1e-6 and not getattr(
+                self, '_pixel_ratio_mismatch_warned', False):
+            self._pixel_ratio_mismatch_warned = True
+            print(f"[Readout] the pointer adapter scales positions by "
+                  f"{applied} while this screen reports {public}; the pick "
+                  f"follows the adapter, which is the number actually "
+                  f"applied to the pointer position.")
+        return applied
+
+    def _event_position_scale(self):
+        """VTK display pixels per interactor event pixel, as `(sx, sy)`.
+
+        `(1.0, 1.0)` whenever it cannot be measured, so an environment this
+        does not understand behaves exactly as it did before -- but a ratio
+        that is measurable and absurd is reported rather than used.
+        """
+        canvas = self._canvas_widget()
+        if canvas is None:
+            return 1.0, 1.0
+        try:
+            rw_w, rw_h = self.plotter.ren_win.GetSize()
+            ratio = self._event_pixel_ratio(canvas)
+            event_w = canvas.width() * ratio
+            event_h = canvas.height() * ratio
+        except Exception:                                       # noqa: BLE001
+            return 1.0, 1.0
+        if not (event_w > 0 and event_h > 0 and rw_w > 0 and rw_h > 0):
+            return 1.0, 1.0
+        sx, sy = rw_w / event_w, rw_h / event_h
+        if not (0.1 <= sx <= 10.0 and 0.1 <= sy <= 10.0):
+            # Announced, not swallowed. A factor this far out means the two
+            # sizes describe different things and the guess would be worse
+            # than leaving the position alone.
+            if not getattr(self, '_pick_scale_warned', False):
+                self._pick_scale_warned = True
+                print(f"[Readout] the canvas is {canvas.width()}x"
+                      f"{canvas.height()} at device pixel ratio {ratio} while "
+                      f"the render window reports {rw_w}x{rw_h}; that implies "
+                      f"a pick scale of ({sx:.3f}, {sy:.3f}), which is not "
+                      f"credible, so pointer positions are used unchanged and "
+                      f"picking may be offset.")
+            return 1.0, 1.0
+        return sx, sy
+
+    def _pick_cell_at_display(self, dx, dy):
+        """Cell id of the results mesh at VTK DISPLAY position (dx, dy), or
+        None.
 
         ⛔ `picker.GetCellId()` is an index into whatever dataset the ray hit,
         which is not necessarily the results mesh: the Sun label and any other
@@ -1396,7 +1605,7 @@ class PyVistaWidget(QWidget):
             return None
         if not getattr(self, 'plotter', None):
             return None
-        picker.Pick(x, y, 0, self.plotter.renderer)
+        picker.Pick(dx, dy, 0, self.plotter.renderer)
         cell_id = picker.GetCellId()
         if cell_id is None or not (0 <= cell_id < self.mesh.n_cells):
             return None
@@ -1409,6 +1618,14 @@ class PyVistaWidget(QWidget):
         except Exception:                                       # noqa: BLE001
             return None
         return int(cell_id)
+
+    def _pick_face_at(self, x, y):
+        """Cell id of the results mesh under the interactor's event position
+        (x, y), or None. Both the hover readout and click selection go through
+        here, so the HiDPI correction applies to both.
+        """
+        dx, dy = self._display_position(x, y)
+        return self._pick_cell_at_display(dx, dy)
 
     def enable_hover_picking(self):
         """Enable hover-based face picking with highlighting"""
@@ -1466,7 +1683,30 @@ class PyVistaWidget(QWidget):
         try:
             iren = self.plotter.iren.interactor
             x, y = iren.GetEventPosition()
-            cell_id = self._pick_face_at(x, y)
+            dx, dy = self._display_position(x, y)
+            cell_id = self._pick_cell_at_display(dx, dy)
+            if getattr(self, '_hover_error_reported', False):
+                # The handler reached this line, so it is working again. Drop
+                # the latch -- a later failure must be reported too -- and
+                # force the label to be rewritten, because the branches below
+                # only touch it when the facet CHANGES and the "handler
+                # failed" text would otherwise stay on screen over a readout
+                # that is fine.
+                self._hover_error_reported = False
+                self.hover_face_id = None
+                recovered = True
+                pointer_trace.note("pointer-recovered")
+            else:
+                recovered = False
+            first_pointer_event = not self._pointer_seen
+            self._pointer_seen = True
+            if first_pointer_event:
+                self.trace_pointer_environment("at-first-pointer-event")
+            # A pass that must rewrite the label even though the facet under
+            # the pointer did not change: the first event on this canvas, and
+            # the first success after a failure.
+            refresh = first_pointer_event or recovered
+            changed = cell_id != self.hover_face_id or refresh
 
             if cell_id is not None and cell_id != self.hover_face_id:
                 self.hover_face_id = cell_id
@@ -1478,24 +1718,122 @@ class PyVistaWidget(QWidget):
                     self.pick_status_label.setText(
                         f"Face {cell_id} - Click to select")
 
-            elif cell_id is None and self.hover_face_id is not None:
+            elif cell_id is None and (self.hover_face_id is not None
+                                      or refresh):
                 self.hover_face_id = None
-                self._reset_coordinate_readout()
+                self._reset_coordinate_readout(seen_pointer=True)
                 if self.picking_active:
                     self.clear_hover_highlight()
                     self.pick_status_label.setText(
                         "Hover to highlight, click to select")
+
+            if (pointer_trace.enabled()
+                    and pointer_trace.should_record_move(changed)):
+                self._trace_pointer_move(x, y, dx, dy, cell_id)
 
         except Exception as e:                                  # noqa: BLE001
             # A mouse-move handler must not raise -- PyQt6 aborts the process on
             # an exception out of a slot -- but it must not be silent either: a
             # dead readout looks exactly like a pointer that is off the mesh.
             # Reported once, then suppressed so a moving pointer cannot flood
-            # the console.
+            # the console. ⛔ The LABEL says so too: reporting only to a
+            # terminal nobody is reading is how this failure mode stayed
+            # invisible, because its on-screen text was indistinguishable from
+            # a pointer that had simply wandered off the mesh.
+            pointer_trace.note("pointer-error", error=repr(e))
             if not getattr(self, '_hover_error_reported', False):
                 self._hover_error_reported = True
                 print(f"[Readout] the pointer handler failed and the "
                       f"coordinate readout is now stale: {e}")
+                label = getattr(self, 'coord_readout_label', None)
+                if label is not None:
+                    label.setText(self.COORD_READOUT_FAILED)
+                    label.setToolTip(repr(e))
+
+    def _trace_pointer_move(self, x, y, dx, dy, cell_id):
+        """One line of ground truth per pointer move, under `PTM_GUI_TRACE=1`.
+
+        Records the pick the code USED and the pick the RAW event position
+        would have given, so a single line settles whether the coordinate
+        correction is what made the difference -- the question that could not
+        be answered from an offscreen harness, because an offscreen plotter's
+        device pixel ratio is 1 and the two are then the same number.
+        """
+        try:
+            # ⛔ Read the dataset the CORRECTED pick hit BEFORE re-picking with
+            # the raw position: a `vtkCellPicker` keeps only its last result,
+            # so doing it the other way round reports the failed pick's empty
+            # dataset and reads as "the ray hit nothing" for a pick that
+            # succeeded.
+            dataset = None
+            try:
+                ds = self._hover_picker.GetDataSet()
+                dataset = None if ds is None else ds.GetNumberOfCells()
+            except Exception:                                   # noqa: BLE001
+                pass
+            raw_cell = self._pick_cell_at_display(int(x), int(y))
+            label = getattr(self, 'coord_readout_label', None)
+            pointer_trace.note(
+                "pointer-move",
+                event_pos=(int(x), int(y)),
+                display_pos=(int(dx), int(dy)),
+                scale=tuple(round(v, 4) for v in self._event_position_scale()),
+                cell=cell_id,
+                cell_if_uncorrected=raw_cell,
+                hit_dataset_cells=dataset,
+                picking_active=bool(getattr(self, 'picking_active', False)),
+                readout=None if label is None else label.text())
+        except Exception as exc:                                # noqa: BLE001
+            pointer_trace.note("pointer-move", trace_error=repr(exc))
+
+    def trace_pointer_environment(self, when):
+        """Everything about the canvas that could explain a dead pick, once.
+
+        This is the measurement the automated checks could not make, because
+        they never ran against a real `QtInteractor` on a real screen. It is
+        written at mesh load and again the first time the pointer is used, so
+        a canvas that is resized or replaced between the two shows up as two
+        different lines rather than one stale one.
+        """
+        if not pointer_trace.enabled():
+            return
+        try:
+            plotter = getattr(self, 'plotter', None)
+            canvas = self._canvas_widget()
+            ren_win = None if plotter is None else plotter.ren_win
+            iren = None
+            try:
+                iren = plotter.iren.interactor
+            except Exception:                                   # noqa: BLE001
+                pass
+            names = [] if self.mesh is None else list(self.mesh.array_names)
+            frame = self._mesh_frame
+            pointer_trace.note(
+                f"environment-{when}",
+                plotter=type(plotter).__name__,
+                canvas=None if canvas is None else type(canvas).__name__,
+                qt_logical_size=None if canvas is None else (canvas.width(),
+                                                             canvas.height()),
+                qt_device_pixel_ratio=(None if canvas is None
+                                       else canvas.devicePixelRatioF()),
+                vtk_display_size=None if ren_win is None else ren_win.GetSize(),
+                pick_scale=tuple(round(v, 4)
+                                 for v in self._event_position_scale()),
+                interactor=(None if iren is None
+                            else f"{type(iren).__name__}@{hex(id(iren))}"),
+                observers=[(hex(id(i)), oid)
+                           for i, oid in self._interactor_observers],
+                mesh_cells=None if self.mesh is None else self.mesh.n_cells,
+                has_latitude='latitude' in names,
+                has_longitude='longitude' in names,
+                picker=self._hover_picker is not None,
+                locator=self._hover_locator is not None,
+                picking_active=bool(getattr(self, 'picking_active', False)),
+                frame_usable=None if frame is None else frame.usable,
+                frame_label=None if frame is None else frame.label,
+                frame_reason=None if frame is None else frame.reason)
+        except Exception as exc:                                # noqa: BLE001
+            pointer_trace.note(f"environment-{when}", error=repr(exc))
 
     def on_left_click(self, obj, event):
         """Handle left click for face selection"""
@@ -2248,7 +2586,17 @@ class PyVistaWidget(QWidget):
         self._bind_interactor_observers()
         self.hover_face_id = None
         self.hover_highlight_actor = None
+        # ⛔ The NEW canvas has not been pointed at yet, whatever the retired
+        # one saw. Left set, a pointer arriving over empty space on the new
+        # canvas changes neither `hover_face_id` (already None) nor the
+        # "first event" branch, and the readout would sit on "waiting for the
+        # pointer" forever -- the same two states running together that this
+        # change exists to separate. It also makes the replacement canvas show
+        # up as its own line in the pointer record, which is the case that
+        # record was added for.
+        self._pointer_seen = False
         self._reset_coordinate_readout()
+        self.trace_pointer_environment("at-plotter-rebuild")
 
     def find_face_by_latlon(self, lat, lon):
         """Find the nearest face to given lat/lon coordinates"""

@@ -121,9 +121,37 @@ It shows nothing rather than a number when a number would be meaningless:
 | A facet of a body-centered mesh of an unrecognized body (a shape model) | the same, labeled `body-fixed model frame` — latitude is real, and longitude is east-positive from whatever the shape model calls zero, which is not an IAU-ratified prime meridian |
 | A local tangent-plane patch, built about its own center | `lat / lon: unavailable — this mesh has no georeferenced frame` |
 | Empty space | `lat / lon: — (pointer is off the mesh)` |
+| A mesh just opened, pointer not yet moved over the canvas | `lat / lon: — (waiting for the pointer)` |
+| The pointer handler itself failed | `lat / lon: unavailable — the pointer handler failed (see the terminal)` |
 
 A plausible wrong coordinate is worse than no coordinate, and nothing here
 falls back to a number.
+
+Those last two used to be one message with "empty space", and that cost a
+release. "It just says the pointer is off the mesh even when it is directly on
+the mesh" was a correct report of a window that could not distinguish a pointer
+that had wandered off the mesh from a pick that never happened. They are
+separate states now and they read differently.
+
+#### If the readout or Select Face Mode is not following the pointer
+
+Run the viewer with the pointer record turned on, open the results as usual,
+move the pointer across the mesh, then quit:
+
+```bash
+PTM_GUI_TRACE=1 python run_gui.py
+```
+
+It writes `~/ptm3d_pointer_trace.log` (and the same lines to the terminal).
+`PTM_GUI_TRACE` is the same switch the flux-cube record uses; off is off, and
+with it unset the pointer path costs one comparison per move. Each `pointer-move`
+line carries the position the interactor delivered, the display position the
+pick used, the facet found, and the facet the uncorrected position would have
+found — which is enough to tell a coordinate-space problem from a picker
+problem without reproducing anything. The `environment-*` lines name the
+interactor the observers are attached to, the render window's size in VTK
+display pixels against the canvas's logical size and device pixel ratio, and
+whether the mesh carries the per-face coordinate arrays.
 
 ### 3. 2D Analysis (Matplotlib)
 - Temperature distribution histograms
