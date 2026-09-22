@@ -1903,10 +1903,18 @@ int main(int argc, char** argv)
             }
         }
         else if ((a == "--ice-albedo" || a == "--nonice-albedo" || a == "--g-ice" ||
-                  a == "--g-nonice" || a == "--grain-ratio") && i+1 < argc) {
+                  a == "--g-nonice" || a == "--grain-ratio" ||
+                  a == "--nonice-albedo-percentile") && i+1 < argc) {
             const double v = std::stod(argv[++i]);
             if (a == "--ice-albedo") hapke_cfg.ice_albedo = v;
-            else if (a == "--nonice-albedo") hapke_cfg.nonice_albedo = v;
+            else if (a == "--nonice-albedo") {
+                if (!(v >= 0.0)) {
+                    std::cerr << "Error: --nonice-albedo must be >= 0" << std::endl;
+                    return 1;
+                }
+                hapke_cfg.nonice_albedo = v;
+            }
+            else if (a == "--nonice-albedo-percentile") hapke_cfg.nonice_percentile = v;
             else if (a == "--g-ice") hapke_cfg.g_ice = v;
             else if (a == "--g-nonice") hapke_cfg.g_nonice = v;
             else hapke_cfg.grain_ratio = v;
@@ -2015,9 +2023,11 @@ int main(int argc, char** argv)
             std::cout << "                      (default: Europa-0.5deg-BondAlbedo.fits next to the .bin;\n";
             std::cout << "                      'none' skips fill detection, with a warning). Fill faces\n";
             std::cout << "                      get exposed ice fraction 1 - --dust-fraction\n";
-            std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80)\n";
-            std::cout << "  --nonice-albedo A  non-ice endmember Bond albedo (default: 0.012, a JFC\n";
-            std::cout << "                     nucleus; 9P/Tempel 1, Li et al. 2007, Icarus 187, 41)\n";
+            std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80, Fermi's base case)\n";
+            std::cout << "  --nonice-albedo A  non-ice endmember Bond albedo; overrides the default,\n";
+            std::cout << "                     which is the map's area-weighted percentile below\n";
+            std::cout << "  --nonice-albedo-percentile P  percentile of the map (area-weighted, fill\n";
+            std::cout << "                     faces excluded) used as the non-ice endmember (default: 10)\n";
             std::cout << "  --g-ice G          ice asymmetry parameter (default: 0)\n";
             std::cout << "  --g-nonice G       non-ice asymmetry parameter (default: 0)\n";
             std::cout << "  --grain-ratio R    D_ice / D_nonice (default: 10)\n\n";

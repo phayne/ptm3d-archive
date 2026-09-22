@@ -263,12 +263,89 @@ int main(int argc, char** argv) {
               in_range ? 0.0 : 1.0, 0.0);
         check(err_rk_phi < 1e-7, "exposed-area ODE r in {0.3, 0.5, 10}: phi_end vs RK4", err_rk_phi, 1e-7);
         check(err_rk_f < 1e-7, "exposed-area ODE r in {0.3, 0.5, 10}: time-mean f vs RK4", err_rk_f, 1e-7);
+        // Conditioning: a 1e-14 relative change in deposition (transport-sum jitter)
+        // must not move the time-mean f by more than 1e-10 (the B t - dphi form alone
+        // gives 6e-10 on this grid, and float32-visible run-to-run jitter in smoke runs).
+        double worst = 0.0;
+        for (double A : {1e-16, 1e-14, 1e-12, 3e-11, 1e-9})
+        for (double bf : {0.01, 0.2, 0.9, 1.0, 1.5, 1e2, 1e4}) for (double phi0 : phis) for (double dt : dts)
+            for (double r : {0.5, 10.0}) {
+                const double B = bf * A;
+                const auto a = solveExposedAreaStep(phi0, A, B, r, dt);
+                const auto b = solveExposedAreaStep(phi0, A, B * (1.0 + 1e-14), r, dt);
+                worst = std::max(worst, std::abs(a.mean_f - b.mean_f));
+            }
+        check(worst < 1e-10, "exposed-area ODE: mean f well conditioned in deposition (dB/B = 1e-14)", worst, 1e-10);
         // Reviewer's case: r = 0.5, B = 3A (D < 0) must GAIN ice, not wipe it.
         const auto sr = solveExposedAreaStep(0.5, 1e-12, 3e-12, 0.5, 1e6);
         double pr, fr;
         rk4(0.5, 1e-12, 3e-12, 0.5, 1e6, 20000, pr, fr);
         check(std::abs(sr.phi_end - pr) < 1e-12, "r = 0.5, B = 3A, D < 0: phi_end matches RK4 (was -1.25)",
               std::abs(sr.phi_end - pr), 1e-12);
+    }
+
+    // 10. Owed row 1: the initial ice availability governs the first-epoch rate.
+    //     Diurnal averages are scaled by availability before caching; the cache
+    //     keeps the pure-ice potential. First-epoch sublimation must be
+    //     availability x pure (was: the pure-ice rate for any composition).
+    {
+        const double P = 2.0e-9, area = 1.0e6, dt = 3.07e3;   // A dt ~ 1e-7: no depletion within the step
+        for (double r : {0.0, 10.0}) {
+            IceLayerModel model(2);
+            IceLayerState st(2);
+            model.initializeFromConcentrations(st, {0.05, 0.40});
+            model.setExposedAreaGrainRatio(r);
+            MultiTimescaleEvolution evo(2);
+            auto& d = evo.getMutableDiurnalAverages();
+            std::vector<double> pure = {P, P}, sput = {0.0, 0.0}, areas = {area, area};
+            double expect = 0.0;
+            for (int i = 0; i < 2; ++i) {
+                const double av = model.getIceAvailabilityFactor(st, i);
+                d.avg_sublimation_flux[i] = P * av;
+                d.avg_deposition_flux[i] = 0.0;
+                expect += P * av * area;
+            }
+            evo.cacheBaseFluxesUnscaled(model, st, pure, sput, areas, 0);
+            evo.evolveEpoch(model, st, areas, dt);
+            const double got = evo.getStatistics().sublimation_rate;
+            check(std::abs(got / expect - 1.0) < 1e-6,
+                  std::string("first-epoch sublimation = availability x pure-ice potential (") +
+                  (r > 0 ? "exposed-area" : "volume") + " mode)", std::abs(got / expect - 1.0), 1e-6);
+        }
+    }
+
+    // 11. Owed row 7: a face that starts with NO ice (c = 1, f = 0) keeps its
+    //     pure-ice potential in the cache and, once deposition gives it ice,
+    //     develops nonzero sublimation.
+    {
+        const double P = 2.0e-9, dep = 1.0e-10, area = 1.0e6, epoch = 3.07e7;
+        for (double r : {0.0, 10.0}) {
+            IceLayerModel model(1);
+            IceLayerState st(1);
+            model.initializeFromConcentrations(st, {1.0});
+            model.setExposedAreaGrainRatio(r);
+            MultiTimescaleEvolution evo(1);
+            auto& d = evo.getMutableDiurnalAverages();
+            std::vector<double> pure = {P}, sput = {0.0}, areas = {area};
+            d.avg_sublimation_flux[0] = P * model.getIceAvailabilityFactor(st, 0);   // = 0
+            d.avg_deposition_flux[0] = dep;
+            evo.cacheBaseFluxesUnscaled(model, st, pure, sput, areas, 0);
+            evo.evolveEpoch(model, st, areas, epoch);
+            const double c1 = st.nonice_concentration[0];
+            const double sub1 = evo.getStatistics().sublimation_rate;
+            evo.evolveEpoch(model, st, areas, epoch);
+            const double sub2 = evo.getStatistics().sublimation_rate;
+            const std::string m = (r > 0 ? "exposed-area" : "volume");
+            check(c1 < 1.0 && sub1 > 0.0 && sub2 > sub1,
+                  "f = 0 face with deposition gains ice and starts sublimating (" + m + " mode)",
+                  sub2, 0.0);
+            // It relaxes toward the equilibrium where exposed-ice sublimation balances deposition.
+            // relaxation time ~ M/P ~ 2e10 s; step well past it
+            for (int k = 0; k < 50; ++k) evo.evolveEpoch(model, st, areas, 1.0e12);
+            const double bal = evo.getStatistics().sublimation_rate / (dep * area);
+            check(std::abs(bal - 1.0) < 1e-3, "... and reaches sublimation = deposition (" + m + " mode)",
+                  std::abs(bal - 1.0), 1e-3);
+        }
     }
 
     std::printf("\n%d / %d checks passed\n", g_total - g_fail, g_total);

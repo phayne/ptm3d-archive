@@ -9,6 +9,8 @@
 #include "maps/albedo_manager.h"
 #include "maps/spatial_map.h"
 #include "hapke_mixing.h"
+#include <algorithm>
+#include <utility>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -1370,22 +1372,6 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         }
         const size_t n = static_cast<size_t>(num_faces_);
 
-        // --- 1. Endmembers -------------------------------------------------
-        hapke::IntimateMixture mix;
-        try {
-            mix = hapke::makeIntimateMixture(cfg.ice_albedo, cfg.g_ice,
-                                             cfg.nonice_albedo, cfg.g_nonice);
-        } catch (const std::exception& e) {
-            std::cerr << tag << "cannot invert an endmember Bond albedo: " << e.what() << std::endl;
-            return false;
-        }
-        const double A_lo = mix.bond(0.0), A_hi = mix.bond(1.0);
-        if (!(A_hi > A_lo)) {
-            std::cerr << tag << "ice endmember must be brighter than the non-ice endmember (A_B(f=1) = "
-                      << A_hi << ", A_B(f=0) = " << A_lo << ")" << std::endl;
-            return false;
-        }
-
         // --- 2. Per-face Bond albedo map (exactly what the thermal run used) --
         std::vector<double> A_map;
         {
@@ -1505,6 +1491,55 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             }
         }
 
+        // --- 4a. Endmembers ------------------------------------------------
+        // Non-ice endmember: explicit --nonice-albedo, or the area-weighted
+        // nonice_percentile of the map over NON-FILL faces.
+        double A_non = cfg.nonice_albedo;
+        size_t n_pct_faces = 0;
+        const bool derived_nonice = !(A_non >= 0.0);
+        if (derived_nonice) {
+            if (!(cfg.nonice_percentile > 0.0 && cfg.nonice_percentile < 100.0)) {
+                std::cerr << tag << "--nonice-albedo-percentile must be in (0, 100)" << std::endl;
+                return false;
+            }
+            std::vector<std::pair<double, double>> av;   // (albedo, area)
+            av.reserve(n);
+            double a_tot = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (fill[i]) continue;
+                const double a = (i < face_areas_.size()) ? face_areas_[i] : 1.0;
+                av.emplace_back(A_map[i], a);
+                a_tot += a;
+            }
+            n_pct_faces = av.size();
+            if (av.empty() || !(a_tot > 0.0)) {
+                std::cerr << tag << "no non-fill faces to derive the non-ice endmember from" << std::endl;
+                return false;
+            }
+            std::sort(av.begin(), av.end());
+            // Smallest albedo whose cumulative area fraction reaches the percentile.
+            const double target = cfg.nonice_percentile / 100.0 * a_tot;
+            double cum = 0.0;
+            A_non = av.back().first;
+            for (const auto& e : av) {
+                cum += e.second;
+                if (cum >= target) { A_non = e.first; break; }
+            }
+        }
+        hapke::IntimateMixture mix;
+        try {
+            mix = hapke::makeIntimateMixture(cfg.ice_albedo, cfg.g_ice, A_non, cfg.g_nonice);
+        } catch (const std::exception& e) {
+            std::cerr << tag << "cannot invert an endmember Bond albedo: " << e.what() << std::endl;
+            return false;
+        }
+        const double A_lo = mix.bond(0.0), A_hi = mix.bond(1.0);
+        if (!(A_hi > A_lo)) {
+            std::cerr << tag << "ice endmember must be brighter than the non-ice endmember (A_B(f=1) = "
+                      << A_hi << ", A_B(f=0) = " << A_lo << ")" << std::endl;
+            return false;
+        }
+
         // --- 4. Invert, convert to volume, seed the ice layer ----------------
         const double r = cfg.grain_ratio;
         const double f_fill = std::clamp(cfg.fill_exposed_ice_fraction, 0.0, 1.0);
@@ -1557,15 +1592,29 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::cout << "  Map (Bond albedo, per face): " << cfg.albedo_map_path << std::endl;
         std::cout << "  Mixing: intimate; w by extinction, g by scattering cross section" << std::endl;
         std::cout << "  Ice endmember:     A_B = " << cfg.ice_albedo << ", g = " << cfg.g_ice
-                  << "  ->  w_ice = " << std::setprecision(10) << mix.w_ice << std::endl;
-        std::cout << std::setprecision(6) << "  Non-ice endmember: A_B = " << cfg.nonice_albedo
-                  << ", g = " << cfg.g_nonice << "  ->  w_nonice = " << std::setprecision(10)
+                  << "  ->  w_ice = " << std::setprecision(10) << mix.w_ice
+                  << std::setprecision(6) << "   (0.80 default = Fermi's base case, not a ruling)" << std::endl;
+        std::cout << "  Non-ice endmember: A_B = " << std::setprecision(10) << A_non << std::setprecision(6);
+        if (derived_nonice) {
+            std::cout << " = area-weighted P" << cfg.nonice_percentile << " of the map over "
+                      << n_pct_faces << " non-fill faces";
+        } else {
+            std::cout << " (explicit --nonice-albedo)";
+        }
+        std::cout << ", g = " << cfg.g_nonice << "  ->  w_nonice = " << std::setprecision(10)
                   << mix.w_non << std::endl;
         std::cout << std::setprecision(6) << "  Grain-size ratio D_ice/D_nonice r = " << r
                   << "  (phi_ice = f r / (f r + 1 - f); sublimation scales with exposed area f)" << std::endl;
+        double a_clamp0 = 0.0, a_all = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double a = (i < face_areas_.size()) ? face_areas_[i] : 1.0;
+            a_all += a;
+            if (ice_fraction_init_class_[i] == 2.0) a_clamp0 += a;
+        }
         std::cout << "  Faces: " << n << " total; " << (n - n_fill - n_clamp0 - n_clamp1)
-                  << " inverted; clamped at f = 0: " << n_clamp0 << "; clamped at f = 1: "
-                  << n_clamp1 << std::endl;
+                  << " inverted; clamped at f = 0: " << n_clamp0 << " (" << std::setprecision(4)
+                  << (100.0 * a_clamp0 / a_all) << std::setprecision(6)
+                  << "% of area); clamped at f = 1: " << n_clamp1 << std::endl;
         std::cout << "  Fill faces (uniform, exposed ice fraction " << f_fill << "): " << n_fill
                   << "  [invalid value " << n_invalid_value << ", fill mixed by bilinear sampling "
                   << n_fill_mixed << ", registration mismatch " << n_registration << "]" << std::endl;
@@ -1579,10 +1628,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         }
         std::cout << "  Area-weighted mean exposed ice fraction: " << (f_area / area_sum) << std::endl;
         if (n_clamp0 > 0) {
-            std::cout << "  WARNING: " << n_clamp0 << " faces clamped at f = 0 hold no ice mass. The "
-                      << "emission model gates on ice mass > 0, so their cached pure-ice flux is 0 "
-                      << "and they cannot resume sublimation if deposition later refills them "
-                      << "(until the next full diurnal refresh)" << std::endl;
+            std::cout << "  Faces clamped at f = 0 start with no ice; they keep their pure-ice "
+                      << "potential flux in the cache and sublimate again once deposition gives "
+                      << "them ice" << std::endl;
         }
         std::cout << "  Forward/initialization gate: max |A_forward(c_init) - A_map| = "
                   << std::scientific << gate_max << " on inverted faces (limit 1e-6); clamped-face "
@@ -1809,13 +1857,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     break;
                 }
                 // Cache the computed base fluxes for future epochs
-                if (exposed_area_mode_) {
-                    multiscale_evolution_->cacheBaseFluxesUnscaled(
-                        *ice_layer_model_, *ice_layer_state_, unscaled_sublimation_,
-                        unscaled_sputtering_, face_areas_, epoch);
-                } else {
-                    multiscale_evolution_->cacheBaseFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_, epoch);
-                }
+                multiscale_evolution_->cacheBaseFluxesUnscaled(
+                    *ice_layer_model_, *ice_layer_state_, unscaled_sublimation_,
+                    unscaled_sputtering_, face_areas_, epoch);
                 full_diurnal_count++;
             } else {
                 // Use cached fluxes with ice availability scaling (fast, milliseconds)
@@ -2012,6 +2056,18 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             porosity_per_face = &crystallization_model_->getPorosity();
         }
 
+        // The emission model gates emission on ice mass > 0. For the cache we need
+        // the PURE-ICE POTENTIAL of every face (the ice availability is applied as a
+        // factor below and dynamically in later epochs), so a face that holds no ice
+        // now can still sublimate once deposition brings it ice. Lift the mass gate
+        // for the accumulation and restore the true masses afterwards.
+        std::vector<double> saved_mass;
+        if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+            auto& st = exosphere_model_->getMutableState();
+            saved_mass = st.accumulated_mass;
+            std::fill(st.accumulated_mass.begin(), st.accumulated_mass.end(), 1.0);
+        }
+
         // Run through one diurnal cycle, accumulating fluxes.
         // Deposition will be computed after finalization from the escape fraction.
         int accumulated_count = 0;
@@ -2060,6 +2116,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Finalize emission/sputtering/escape/temperature averages
         multiscale_evolution_->finalizeDiurnalAverages(accumulated_count);
+        if (!saved_mass.empty()) {
+            exosphere_model_->getMutableState().accumulated_mass = std::move(saved_mass);
+        }
 
         auto t_diurnal_end = std::chrono::steady_clock::now();
         double diurnal_sec = std::chrono::duration<double>(t_diurnal_end - t_diurnal_start).count();
@@ -2070,13 +2129,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // full sparse matrix (~17 GB for 1.3M faces). Uses ~90 MB instead.
         auto& diurnal_avg = multiscale_evolution_->getMutableDiurnalAverages();
 
-        // hapke-intimate (exposed-area) mode: the per-timestep emission above is
-        // pure-ice emission (gated only by ice mass > 0). Scale it by the exposed ice
-        // fraction BEFORE transport so deposition comes from the emission that
-        // actually leaves the surface, and keep the unscaled fluxes as the cache
-        // base (cacheBaseFluxesUnscaled). The legacy modes are left as they were.
-        if (exposed_area_mode_) {
-            if (spatialSmoothingRadiusRad() > 0.0) {
+        // The per-timestep emission above is the pure-ice POTENTIAL. Scale it by the
+        // ice availability (1 - c, or the exposed ice area fraction f in
+        // hapke-intimate mode) BEFORE transport, so deposition comes from the
+        // emission that actually leaves the surface, and keep the unscaled fluxes as
+        // the cache base (cacheBaseFluxesUnscaled).
+        if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+            if (exposed_area_mode_ && spatialSmoothingRadiusRad() > 0.0) {
                 throw std::invalid_argument(
                     "--ice-fraction-from-albedo=hapke-intimate does not support "
                     "EXO_DEP_SMOOTH_DEG spatial smoothing (the smoothed field could not be "
@@ -2093,9 +2152,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 diurnal_avg.avg_escape_flux[i] *= fa;
                 exposed_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
             }
-            std::cout << "\n  [ice-fraction] diurnal sublimation scaled by exposed ice fraction: "
+            std::cout << "\n  [ice-fraction] diurnal sublimation scaled by ice availability: "
                       << std::scientific << std::setprecision(6) << pure_total
-                      << " kg/s (pure ice) -> " << exposed_total << " kg/s (exposed ice)"
+                      << " kg/s (pure-ice potential) -> " << exposed_total << " kg/s (available ice)"
                       << std::fixed << std::endl;
         }
 
@@ -2167,8 +2226,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         };
         if (smooth_radius > 0.0) {
             smoothPreservingTotal(diurnal_avg.avg_sublimation_flux);
+            if (!unscaled_sublimation_.empty()) smoothPreservingTotal(unscaled_sublimation_);
             if (sputtering_enabled_) {
                 smoothPreservingTotal(diurnal_avg.avg_sputtering_flux);
+                if (!unscaled_sputtering_.empty()) smoothPreservingTotal(unscaled_sputtering_);
             }
         }
 

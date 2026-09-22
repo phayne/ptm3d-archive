@@ -383,9 +383,18 @@ initial composition relates to the albedo map that drove the thermal run:
   the initial composition reproduces the map (the startup gate fails the run if the
   mismatch exceeds $10^{-6}$ on inverted faces). Faces whose baked map value mixed in FITS
   fill pixels (the map's $-1$ fill is not its `MISSING` value) are flagged against
-  `--albedo-fill-fits` and assigned $f = 1 - f_{\mathrm{dust}}$. Defaults: ice $A_B = 0.80$;
-  non-ice $A_B = 0.012$ (a Jupiter-family comet nucleus); $g = 0$ for both; $r = 10$.
+  `--albedo-fill-fits` and assigned $f = 1 - f_{\mathrm{dust}}$. Defaults: ice $A_B = 0.80$ (Fermi's base
+  case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (Paul,
+  2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
+  $g = 0$ for both; $r = 10$.
   Requires `--multiscale`.
+
+**Multi-timescale availability (all modes).** Each full diurnal cycle accumulates the
+pure-ice *potential* emission of every face (the ice-mass gate is lifted for the
+accumulation), scales it by the face's ice availability ($1-c$, or $f$ in `hapke-intimate`)
+before transport, and caches the unscaled potential as the base flux. So the initial
+composition sets the first-epoch sublimation, and a face that starts with no ice sublimates
+again once deposition gives it ice.
 
 **Assumptions:**
 - Well-mixed layer (uniform concentration within skin depth)
@@ -745,7 +754,8 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `--ice-fraction-albedo-map` $F$ | (required for `hapke-intimate`) | Per-face Bond albedo `.bin` used by the thermal run |
 | `--albedo-fill-fits` $F$ | `Europa-0.5deg-BondAlbedo.fits` beside the `.bin` | FITS map for fill flagging; `none` skips it, with a warning |
 | `--ice-albedo` $A$ | 0.80 | Ice endmember Bond albedo (`hapke-intimate`) |
-| `--nonice-albedo` $A$ | 0.012 | Non-ice endmember Bond albedo, a JFC nucleus (`hapke-intimate`) |
+| `--nonice-albedo` $A$ | map P10 | Non-ice endmember Bond albedo, explicit override (`hapke-intimate`) |
+| `--nonice-albedo-percentile` $P$ | 10 | Area-weighted map percentile (fill excluded) used as the non-ice endmember |
 | `--g-ice`, `--g-nonice` $g$ | 0, 0 | Endmember asymmetry parameters (`hapke-intimate`) |
 | `--grain-ratio` $r$ | 10 | $D_{\mathrm{ice}}/D_{\mathrm{nonice}}$ (`hapke-intimate`) |
 

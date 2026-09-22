@@ -31,7 +31,8 @@ namespace ptm {
 
         /**
          * Parameters of --ice-fraction-from-albedo=hapke-intimate.
-         * Endmember Bond albedos and asymmetry parameters, the grain-size ratio
+         * Endmember Bond albedos (the non-ice one derived from a map percentile
+         * unless given explicitly) and asymmetry parameters, the grain-size ratio
          * r = D_ice / D_nonice, the per-face Bond albedo map (the thermal run's
          * own <Body>_Albedo_res<N>.bin), the FITS map used to flag faces whose
          * baked value mixed in fill pixels, and the exposed ice fraction given
@@ -39,7 +40,11 @@ namespace ptm {
          */
         struct HapkeIceFractionConfig {
             double ice_albedo = 0.80;
-            double nonice_albedo = 0.012;
+            // < 0 (default): derive the non-ice endmember as the area-weighted
+            // nonice_percentile of the map over non-fill faces (Paul: the 100%
+            // non-ice albedo is the map's 10th-percentile Bond albedo).
+            double nonice_albedo = -1.0;
+            double nonice_percentile = 10.0;
             double g_ice = 0.0;
             double g_nonice = 0.0;
             double grain_ratio = 10.0;
@@ -162,13 +167,12 @@ namespace ptm {
             // Per-face initial albedos from PTM3D (for temperature scaling reference)
             std::vector<double> initial_face_albedos_;
 
-            // hapke-intimate mode: availability is the exposed ice AREA fraction and
-            // the diurnal averages are scaled by it before transport and caching.
+            // hapke-intimate mode: availability is the exposed ice AREA fraction.
             bool exposed_area_mode_ = false;
             // Per-face initialization class: 0 = inverted, 1 = fill (uniform),
             // 2 = clamped at f = 0, 3 = clamped at f = 1.
             std::vector<double> ice_fraction_init_class_;
-            // Unscaled (pure-ice) diurnal fluxes, the cache base in this mode.
+            // Unscaled (pure-ice potential) diurnal fluxes, the cache base (all modes).
             std::vector<double> unscaled_sublimation_;
             std::vector<double> unscaled_sputtering_;
 

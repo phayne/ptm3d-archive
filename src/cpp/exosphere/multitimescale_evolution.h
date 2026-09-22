@@ -79,9 +79,9 @@ namespace timescale_constants {
  * as in the legacy model).
  *
  * mean_f is the time-mean exposed fraction, so that base_emission * mean_f is
- * the mean emission over the step. It comes from the exact balance
- * int A f dt = B t - (phi(t) - phi0), or from the trapezoid rule when A dt < 1e-8
- * (too small for that difference to be resolved).
+ * the mean emission over the step: int f dt, from whichever of the exact balance
+ * (B t - dphi)/A or the closed-form int phi/(E - D phi) dphi is well conditioned
+ * (the trapezoid rule when phi moves by < 1e-8).
  */
 struct ExposedAreaStep {
     double phi_end = 0.0;
@@ -118,10 +118,9 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
     const double g0 = E - D * phi0;
     const double n0 = r - (r - 1.0) * phi0;
     const double eps = D / g0;
-    auto t_of = [&](double p) {
-        const double sd = p - phi0;
+    // L(s) = int_0^s du/(1 - eps u), M(s) = int_0^s u du/(1 - eps u).
+    auto LM = [&](double sd, double& L, double& M) {
         const double y = eps * sd;             // < 1 along the trajectory
-        double L, M;
         if (std::abs(y) < 1e-3) {
             L = sd * (1.0 + y / 2.0 + y * y / 3.0 + y * y * y / 4.0);
             M = sd * sd * (0.5 + y / 3.0 + y * y / 4.0 + y * y * y / 5.0);
@@ -129,7 +128,18 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
             L = -std::log1p(-y) / eps;
             M = (L - sd) / eps;
         }
+    };
+    auto t_of = [&](double p) {
+        double L, M;
+        LM(p - phi0, L, M);
         return (n0 * L - (r - 1.0) * M) / g0;
+    };
+    // Exposure integral: f dt = f (dt/dphi) dphi = phi / (E - D phi) dphi, so
+    //   int_0^t f dt' = (phi0 L(s) + M(s)) / g0.
+    auto f_integral = [&](double p) {
+        double L, M;
+        LM(p - phi0, L, M);
+        return (phi0 * L + M) / g0;
     };
     // Interior equilibrium phi_eq = E / D (A f(phi_eq) = B) exists only for D > E.
     const bool interior_eq = (D > 0.0) && (E < D);
@@ -154,11 +164,23 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
         lo = std::max(0.0, E / D); hi = phi0;
     }
 
+    // int f dt over [0, t] to phi: two exact, complementary forms.
+    //   balance: (B t - (phi - phi0)) / A   -- cancels when A f << B (deposition-
+    //            dominated growth, far from equilibrium);
+    //   direct:  f_integral(phi)            -- log-singular at phi_eq.
+    // Use the balance unless it loses more than 3 digits to cancellation; in that
+    // regime phi is far from phi_eq and the direct form is well conditioned.
+    auto exposure = [&](double p, double t) {
+        const double dphi = p - phi0;
+        const double bal = B * t - dphi;
+        if (std::abs(bal) > 1e-3 * std::max(std::abs(B * t), std::abs(dphi))) return bal / A;
+        return f_integral(p);
+    };
+
     if (clamped_at_one) {
         out.phi_end = 1.0;
-        // Interior segment [0, t_one] from the exact balance, then f = 1 for the rest.
-        const double sub = (B * t_one - (1.0 - phi0)) + A * (dt - t_one);
-        out.mean_f = std::clamp(sub / (A * dt), f0, 1.0);
+        // Interior segment [0, t_one], then f = 1 for the rest of the step.
+        out.mean_f = std::clamp((exposure(1.0, t_one) + (dt - t_one)) / dt, f0, 1.0);
         return out;
     }
 
@@ -172,15 +194,13 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
 
     const double f1 = f_of(out.phi_end);
     const double f_lo = std::min(f0, f1), f_hi = std::max(f0, f1);
-    // The exact balance divides a bisection-resolved (~1e-16) phi change by A dt;
-    // below A dt = 1e-8 phi moves by < 1e-8 and the trapezoid rule is exact to
-    // O(f'' dphi^2). (f is strongly curved near phi = 1, so the trapezoid is NOT
-    // adequate at larger A dt.)
-    if (A * dt < 1e-8) {
+    // When phi barely moves, its bisection-resolved change (~1e-16) cannot carry
+    // the integral; f is then constant to < r * 1e-8 and the trapezoid is exact
+    // to that order.
+    if (std::abs(out.phi_end - phi0) < 1e-8) {
         out.mean_f = 0.5 * (f0 + f1);
     } else {
-        const double sub = B * dt - (out.phi_end - phi0);
-        out.mean_f = std::clamp(sub / (A * dt), f_lo, f_hi);
+        out.mean_f = std::clamp(exposure(out.phi_end, dt) / dt, f_lo, f_hi);
     }
     return out;
 }
@@ -348,36 +368,19 @@ struct DiurnalAverages {
         emission_weighted_fallback_count = fallback;
     }
 
-    // Store current averages as base (cache) values
-    // ice_availability: continuous ice fraction [0, 1] per face
-    // face_areas: per-face areas [m²] for proper area-weighted global emission
-    void cacheBaseFluxes(const std::vector<double>& ice_availability,
-                         const std::vector<double>& face_areas) {
-        total_base_emission = 0.0;
-        for (size_t i = 0; i < avg_sublimation_flux.size(); ++i) {
-            // Store current fluxes as base values, normalized by ice fraction.
-            // Floor at 1e-3 to avoid extreme amplification when ice fraction
-            // is very small (base flux would be at most 1000× raw flux).
-            double avail = std::max(ice_availability[i], 1e-3);
-
-            base_sublimation_flux[i] = avg_sublimation_flux[i] / avail;
-            base_sputtering_flux[i] = avg_sputtering_flux[i] / avail;
-            base_deposition_flux[i] = avg_deposition_flux[i];
-
-            // Area-weighted total base emission [kg/s]
-            total_base_emission += (base_sublimation_flux[i] + base_sputtering_flux[i]) * face_areas[i];
-
-            cached_ice_availability[i] = ice_availability[i];
-        }
-        cache_valid = true;
-    }
-
-    // Exposed-area mode (hapke-intimate): the avg_* fields have ALREADY been
-    // scaled by the exposed ice fraction, and base_deposition_flux comes from that
-    // scaled emission. The unscaled (pure-ice) fluxes are passed in and stored
-    // directly as base_*, with no 1e-3 availability floor, so a face with zero
-    // exposed ice keeps its pure-ice potential. total_base_emission is the emission
-    // that produced base_deposition_flux, so the deposition scale is 1 at cache time.
+    // Cache base (pure-ice potential) fluxes. On entry the avg_* fields have
+    // ALREADY been scaled by the per-face ice availability, and
+    // avg_deposition_flux comes from that scaled emission. The unscaled pure-ice
+    // potential fluxes are stored directly as base_* (no availability floor), so
+    // the exposure factor is applied dynamically and a face that holds no ice
+    // today resumes sublimating once deposition gives it ice. total_base_emission
+    // is the emission that produced base_deposition_flux, so the deposition scale
+    // is 1 at cache time.
+    //
+    // (This replaced cacheBaseFluxes(), which divided the pure-ice diurnal
+    // emission by the availability as though it were already scaled. That made
+    // the first-epoch rate the pure-ice rate for any initial composition and left
+    // deposition and sublimation out of step by the availability factor.)
     void cacheBaseFluxesUnscaled(const std::vector<double>& unscaled_sublimation,
                                  const std::vector<double>& unscaled_sputtering,
                                  const std::vector<double>& ice_availability,
@@ -654,25 +657,8 @@ public:
     }
 
     /**
-     * Cache current base fluxes for future scaling
-     * Call this after first diurnal computation
-     */
-    void cacheBaseFluxes(const IceLayerModel& ice_model,
-                         const IceLayerState& ice_state,
-                         const std::vector<double>& face_areas,
-                         int epoch) {
-        // Compute ice fraction per face (continuous, 0 = depleted, 1 = pure ice)
-        for (size_t i = 0; i < num_faces_; ++i) {
-            ice_availability_buf_[i] = ice_model.getIceAvailabilityFactor(ice_state, i);
-        }
-
-        diurnal_avg_->cacheBaseFluxes(ice_availability_buf_, face_areas);
-        diurnal_avg_->cache_epoch = epoch;
-    }
-
-    /**
-     * Exposed-area mode: cache unscaled (pure-ice) base fluxes. The diurnal
-     * averages must already be scaled by the exposed ice fraction.
+     * Cache the pure-ice potential base fluxes (all modes). The diurnal averages
+     * must already be scaled by the ice availability factor.
      */
     void cacheBaseFluxesUnscaled(const IceLayerModel& ice_model,
                                  const IceLayerState& ice_state,
