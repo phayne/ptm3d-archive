@@ -16,6 +16,14 @@
  * where c = nonice_concentration [0, 1]
  *
  * Endmember values are configurable at runtime via --albedo-ice and --albedo-nonice.
+ *
+ * Hapke intimate mode (--ice-fraction-from-albedo=hapke-intimate): the forward
+ * model is instead the SAME intimate Hapke mixture used to initialize the
+ * concentrations (hapke_mixing.h), so the albedo computed from the initial
+ * composition reproduces the observed map:
+ *   phi = 1 - c,  f = phi / (phi + r (1 - phi)),  A = A_B(mixture(f))
+ * The linear rule above cannot do that, and would jump the albedo on the first
+ * coupling step with no change in composition.
  */
 
 #ifndef COMPOSITION_ALBEDO_H
@@ -25,6 +33,8 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <iomanip>
+#include "hapke_mixing.h"
 
 namespace ptm {
 namespace exosphere {
@@ -42,6 +52,12 @@ struct CompositionAlbedoConfig {
     // Minimum albedo change to trigger temperature update
     double albedo_update_threshold = 0.01;
 
+    // Hapke intimate forward model (hapke-intimate mode only; off by default).
+    // When true, albedo_ice / albedo_nonice are ignored in favor of the mixture.
+    bool hapke_intimate = false;
+    hapke::IntimateMixture hapke_mixture;   // endmember w, g
+    double grain_ratio = 10.0;              // r = D_ice / D_nonice
+
     CompositionAlbedoConfig() = default;
 
     CompositionAlbedoConfig(double a_ice, double a_nonice, double threshold = 0.01)
@@ -49,8 +65,15 @@ struct CompositionAlbedoConfig {
 
     void print() const {
         std::cout << "\n=== Composition-Albedo Coupling Configuration ===" << std::endl;
-        std::cout << "  Ice albedo (endmember): " << albedo_ice << std::endl;
-        std::cout << "  Non-ice albedo (endmember): " << albedo_nonice << std::endl;
+        if (hapke_intimate) {
+            std::cout << "  Forward model: Hapke intimate mixture (same as initialization)" << std::endl;
+            std::cout << "  w_ice = " << hapke_mixture.w_ice << ", g_ice = " << hapke_mixture.g_ice
+                      << "; w_nonice = " << hapke_mixture.w_non << ", g_nonice = " << hapke_mixture.g_non
+                      << "; grain ratio r = " << grain_ratio << std::endl;
+        } else {
+            std::cout << "  Ice albedo (endmember): " << albedo_ice << std::endl;
+            std::cout << "  Non-ice albedo (endmember): " << albedo_nonice << std::endl;
+        }
         std::cout << "  Update threshold: " << albedo_update_threshold << std::endl;
     }
 };
@@ -89,6 +112,10 @@ public:
      */
     double computeAlbedo(double nonice_concentration, size_t face_idx = 0) const {
         double c = std::clamp(nonice_concentration, 0.0, 1.0);
+        if (config_.hapke_intimate) {
+            const double f = hapke::exposedAreaFromVolume(1.0 - c, config_.grain_ratio);
+            return config_.hapke_mixture.bond(f);
+        }
         double a_nonice = (!nonice_endmember_map_.empty() && face_idx < nonice_endmember_map_.size())
             ? nonice_endmember_map_[face_idx]
             : config_.albedo_nonice;

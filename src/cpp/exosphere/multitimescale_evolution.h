@@ -10,7 +10,9 @@
  * 3. Repeat for desired number of epochs
  *
  * Key physics:
- * - Ice availability is continuous: sublimation scales with ice fraction (1 - nonice_concentration)
+ * - Ice availability is continuous: sublimation scales with ice fraction (1 - nonice_concentration),
+ *   or, in the exposed-area mode (--ice-fraction-from-albedo=hapke-intimate), with the exposed
+ *   ice area fraction f(1 - nonice_concentration); see solveExposedAreaStep()
  * - Self-limiting depletion: as ice is consumed, sublimation rate decreases proportionally
  * - Analytical exponential evolution: d(nonice)/dt = A*(1-nonice) - B is solved exactly,
  *   enabling accurate super-stepping over many epochs without numerical error
@@ -58,6 +60,129 @@ namespace timescale_constants {
 
     // Flux imbalance threshold for mass balance convergence
     constexpr double FLUX_CONVERGENCE_THRESHOLD = 0.01;  // 1% imbalance
+}
+
+/**
+ * One closed-form step of the exposed-area ice ODE
+ * (--ice-fraction-from-albedo=hapke-intimate).
+ *
+ * With ice volume fraction phi = 1 - nonice_concentration and exposed ice area
+ * fraction f(phi) = phi / (phi + r (1 - phi)), r = D_ice / D_nonice:
+ *   dphi/dt = B - A f(phi)
+ * A = base emission / max ice mass, B = deposition / max ice mass [1/s].
+ * Separable: dt = (r - (r-1) phi) dphi / (E - D phi), D = B (r - 1) + A, E = B r,
+ * integrated in closed form (see t_of below; finite for any sign of D, so r < 1
+ * is covered). The interior equilibrium is phi_eq = E / D (A f(phi_eq) = B) when
+ * D > E; otherwise phi rises to 1. phi_end is found by bisection on the
+ * monotone t(phi). For r = 1 this reduces to the legacy
+ * exponential solution. phi is clamped at 1 (deposition overflow is ignored,
+ * as in the legacy model).
+ *
+ * mean_f is the time-mean exposed fraction, so that base_emission * mean_f is
+ * the mean emission over the step. It comes from the exact balance
+ * int A f dt = B t - (phi(t) - phi0), or from the trapezoid rule when A dt < 1e-8
+ * (too small for that difference to be resolved).
+ */
+struct ExposedAreaStep {
+    double phi_end = 0.0;
+    double mean_f = 0.0;
+};
+
+inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
+                                            double r, double dt) {
+    ExposedAreaStep out;
+    phi0 = std::clamp(phi0, 0.0, 1.0);
+    auto f_of = [r](double p) {
+        const double den = p + r * (1.0 - p);
+        return (den > 0.0) ? p / den : 0.0;
+    };
+    const double f0 = f_of(phi0);
+    if (dt <= 0.0) { out.phi_end = phi0; out.mean_f = f0; return out; }
+    if (A <= 1e-30) {
+        // No emission: pure deposition (linear), as in the legacy branch.
+        out.phi_end = std::min(1.0, phi0 + B * dt);
+        out.mean_f = 0.5 * (f0 + f_of(out.phi_end));
+        return out;
+    }
+
+    const double rate0 = B - A * f0;           // dphi/dt at phi0
+    if (rate0 == 0.0) { out.phi_end = phi0; out.mean_f = f0; return out; }
+
+    // t(phi) = int_{phi0}^{phi} (r - (r-1)p) / (E - D p) dp,  D = B (r-1) + A,  E = B r.
+    // Written with s = p - phi0, eps = D / g0 (g0 = E - D phi0, same sign as rate0) as
+    //   t = [n0 L(s) - (r-1) M(s)] / g0,   n0 = r - (r-1) phi0,
+    //   L = int ds/(1 - eps s),  M = int s ds/(1 - eps s),
+    // which stays finite and accurate for any sign of D, including D -> 0 (r < 1).
+    const double D = B * (r - 1.0) + A;
+    const double E = B * r;
+    const double g0 = E - D * phi0;
+    const double n0 = r - (r - 1.0) * phi0;
+    const double eps = D / g0;
+    auto t_of = [&](double p) {
+        const double sd = p - phi0;
+        const double y = eps * sd;             // < 1 along the trajectory
+        double L, M;
+        if (std::abs(y) < 1e-3) {
+            L = sd * (1.0 + y / 2.0 + y * y / 3.0 + y * y * y / 4.0);
+            M = sd * sd * (0.5 + y / 3.0 + y * y / 4.0 + y * y * y / 5.0);
+        } else {
+            L = -std::log1p(-y) / eps;
+            M = (L - sd) / eps;
+        }
+        return (n0 * L - (r - 1.0) * M) / g0;
+    };
+    // Interior equilibrium phi_eq = E / D (A f(phi_eq) = B) exists only for D > E.
+    const bool interior_eq = (D > 0.0) && (E < D);
+
+    double lo, hi;
+    bool clamped_at_one = false;
+    double t_one = 0.0;
+    if (rate0 > 0.0) {
+        // phi increases toward phi_eq, or toward 1 when there is no interior equilibrium.
+        lo = phi0;
+        if (interior_eq) {
+            hi = E / D;
+        } else {
+            hi = 1.0;
+            if (E - D > 0.0) {                 // dphi/dt > 0 at phi = 1: reached in finite time
+                t_one = t_of(1.0);
+                if (dt >= t_one) clamped_at_one = true;
+            }
+        }
+    } else {
+        // phi decreases toward phi_eq (rate0 < 0 implies D > E / phi0 > 0).
+        lo = std::max(0.0, E / D); hi = phi0;
+    }
+
+    if (clamped_at_one) {
+        out.phi_end = 1.0;
+        // Interior segment [0, t_one] from the exact balance, then f = 1 for the rest.
+        const double sub = (B * t_one - (1.0 - phi0)) + A * (dt - t_one);
+        out.mean_f = std::clamp(sub / (A * dt), f0, 1.0);
+        return out;
+    }
+
+    for (int it = 0; it < 200 && hi - lo > 1e-16; ++it) {
+        const double m = 0.5 * (lo + hi);
+        const bool before = t_of(m) < dt;      // m is reached before dt
+        if (rate0 > 0.0) { if (before) lo = m; else hi = m; }
+        else             { if (before) hi = m; else lo = m; }
+    }
+    out.phi_end = 0.5 * (lo + hi);
+
+    const double f1 = f_of(out.phi_end);
+    const double f_lo = std::min(f0, f1), f_hi = std::max(f0, f1);
+    // The exact balance divides a bisection-resolved (~1e-16) phi change by A dt;
+    // below A dt = 1e-8 phi moves by < 1e-8 and the trapezoid rule is exact to
+    // O(f'' dphi^2). (f is strongly curved near phi = 1, so the trapezoid is NOT
+    // adequate at larger A dt.)
+    if (A * dt < 1e-8) {
+        out.mean_f = 0.5 * (f0 + f1);
+    } else {
+        const double sub = B * dt - (out.phi_end - phi0);
+        out.mean_f = std::clamp(sub / (A * dt), f_lo, f_hi);
+    }
+    return out;
 }
 
 /**
@@ -242,6 +367,28 @@ struct DiurnalAverages {
             // Area-weighted total base emission [kg/s]
             total_base_emission += (base_sublimation_flux[i] + base_sputtering_flux[i]) * face_areas[i];
 
+            cached_ice_availability[i] = ice_availability[i];
+        }
+        cache_valid = true;
+    }
+
+    // Exposed-area mode (hapke-intimate): the avg_* fields have ALREADY been
+    // scaled by the exposed ice fraction, and base_deposition_flux comes from that
+    // scaled emission. The unscaled (pure-ice) fluxes are passed in and stored
+    // directly as base_*, with no 1e-3 availability floor, so a face with zero
+    // exposed ice keeps its pure-ice potential. total_base_emission is the emission
+    // that produced base_deposition_flux, so the deposition scale is 1 at cache time.
+    void cacheBaseFluxesUnscaled(const std::vector<double>& unscaled_sublimation,
+                                 const std::vector<double>& unscaled_sputtering,
+                                 const std::vector<double>& ice_availability,
+                                 const std::vector<double>& face_areas) {
+        total_base_emission = 0.0;
+        for (size_t i = 0; i < avg_sublimation_flux.size(); ++i) {
+            base_sublimation_flux[i] = unscaled_sublimation[i];
+            base_sputtering_flux[i] = unscaled_sputtering.empty() ? 0.0 : unscaled_sputtering[i];
+            base_deposition_flux[i] = avg_deposition_flux[i];
+            total_base_emission += (base_sublimation_flux[i] + base_sputtering_flux[i])
+                                   * ice_availability[i] * face_areas[i];
             cached_ice_availability[i] = ice_availability[i];
         }
         cache_valid = true;
@@ -524,6 +671,24 @@ public:
     }
 
     /**
+     * Exposed-area mode: cache unscaled (pure-ice) base fluxes. The diurnal
+     * averages must already be scaled by the exposed ice fraction.
+     */
+    void cacheBaseFluxesUnscaled(const IceLayerModel& ice_model,
+                                 const IceLayerState& ice_state,
+                                 const std::vector<double>& unscaled_sublimation,
+                                 const std::vector<double>& unscaled_sputtering,
+                                 const std::vector<double>& face_areas,
+                                 int epoch) {
+        for (size_t i = 0; i < num_faces_; ++i) {
+            ice_availability_buf_[i] = ice_model.getIceAvailabilityFactor(ice_state, i);
+        }
+        diurnal_avg_->cacheBaseFluxesUnscaled(unscaled_sublimation, unscaled_sputtering,
+                                              ice_availability_buf_, face_areas);
+        diurnal_avg_->cache_epoch = epoch;
+    }
+
+    /**
      * Apply scaled fluxes using cached base values
      * Much faster than recomputing diurnal cycle
      */
@@ -702,6 +867,8 @@ public:
                      const std::vector<double>& face_areas,
                      double epoch_duration) {
         double max_ice_mass = ice_model.getMaxIceMassPerArea();
+        const bool area_mode = ice_model.usesExposedAreaFraction();
+        const double grain_ratio = ice_model.getExposedAreaGrainRatio();
         double max_change = 0.0;
         double epoch_sublimated = 0.0, epoch_deposited = 0.0, epoch_sputtered = 0.0;
 
@@ -727,21 +894,34 @@ public:
             double B = deposition / max_ice_mass;
 
             double nonice_new;
-            if (A > 1e-30) {
-                double nonice_eq = 1.0 - B / A;
-                double decay = std::exp(-A * epoch_duration);
-                nonice_new = nonice_eq - (nonice_eq - conc_before) * decay;
+            double eff_sublimation, eff_sputtering, net_rate;
+            if (area_mode) {
+                // Exposed-area mode: d(phi)/dt = B - A f(phi), solved in closed form.
+                const double phi0 = 1.0 - conc_before;
+                const ExposedAreaStep st =
+                    solveExposedAreaStep(phi0, A, B, grain_ratio, epoch_duration);
+                nonice_new = 1.0 - st.phi_end;
+                eff_sublimation = base_sublim * st.mean_f;
+                eff_sputtering = base_sput * st.mean_f;
+                net_rate = A * ice_model.exposedAreaFraction(phi0) - B;
             } else {
-                // No emission: pure deposition (linear)
-                nonice_new = conc_before - B * epoch_duration;
-            }
+                if (A > 1e-30) {
+                    double nonice_eq = 1.0 - B / A;
+                    double decay = std::exp(-A * epoch_duration);
+                    nonice_new = nonice_eq - (nonice_eq - conc_before) * decay;
+                } else {
+                    // No emission: pure deposition (linear)
+                    nonice_new = conc_before - B * epoch_duration;
+                }
 
-            // Effective rates for mass balance tracking (time-averaged over epoch)
-            double ice_frac_before = 1.0 - conc_before;
-            double ice_frac_after = 1.0 - std::clamp(nonice_new, 0.0, 1.0);
-            double avg_ice_frac = 0.5 * (ice_frac_before + ice_frac_after);
-            double eff_sublimation = base_sublim * avg_ice_frac;
-            double eff_sputtering = base_sput * avg_ice_frac;
+                // Effective rates for mass balance tracking (time-averaged over epoch)
+                double ice_frac_before = 1.0 - conc_before;
+                double ice_frac_after = 1.0 - std::clamp(nonice_new, 0.0, 1.0);
+                double avg_ice_frac = 0.5 * (ice_frac_before + ice_frac_after);
+                eff_sublimation = base_sublim * avg_ice_frac;
+                eff_sputtering = base_sput * avg_ice_frac;
+                net_rate = A * (1.0 - conc_before) - B;
+            }
 
             // Accumulate area-weighted mass balance
             epoch_sublimated += eff_sublimation * face_areas[i];
@@ -749,7 +929,6 @@ public:
             epoch_sputtered += eff_sputtering * face_areas[i];
 
             // Store concentration change rate (instantaneous, for super-step estimation)
-            double net_rate = A * (1.0 - conc_before) - B;
             concentration_change_rate_[i] = net_rate;
 
             // Clamp to valid range [0, 1]

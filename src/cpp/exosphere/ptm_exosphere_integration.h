@@ -30,6 +30,25 @@ namespace ptm {
         struct CompositionAlbedoConfig;
 
         /**
+         * Parameters of --ice-fraction-from-albedo=hapke-intimate.
+         * Endmember Bond albedos and asymmetry parameters, the grain-size ratio
+         * r = D_ice / D_nonice, the per-face Bond albedo map (the thermal run's
+         * own <Body>_Albedo_res<N>.bin), the FITS map used to flag faces whose
+         * baked value mixed in fill pixels, and the exposed ice fraction given
+         * to those faces.
+         */
+        struct HapkeIceFractionConfig {
+            double ice_albedo = 0.80;
+            double nonice_albedo = 0.012;
+            double g_ice = 0.0;
+            double g_nonice = 0.0;
+            double grain_ratio = 10.0;
+            std::string albedo_map_path;     // per-face .bin (size_t count + double[count])
+            std::string fill_fits_path;      // "" = sibling FITS next to the .bin; "none" = skip
+            double fill_exposed_ice_fraction = 0.95;
+        };
+
+        /**
          * Face centers [m, on the sphere of radius R_Europa] and areas [m^2] from
          * a mesh in any length unit (EXO-02). Returns false with a message in
          * `error` if the geometry is unusable, including when the total area
@@ -142,6 +161,16 @@ namespace ptm {
 
             // Per-face initial albedos from PTM3D (for temperature scaling reference)
             std::vector<double> initial_face_albedos_;
+
+            // hapke-intimate mode: availability is the exposed ice AREA fraction and
+            // the diurnal averages are scaled by it before transport and caching.
+            bool exposed_area_mode_ = false;
+            // Per-face initialization class: 0 = inverted, 1 = fill (uniform),
+            // 2 = clamped at f = 0, 3 = clamped at f = 1.
+            std::vector<double> ice_fraction_init_class_;
+            // Unscaled (pure-ice) diurnal fluxes, the cache base in this mode.
+            std::vector<double> unscaled_sublimation_;
+            std::vector<double> unscaled_sputtering_;
 
             // Albedo coupling internal methods
             double updateAlbedoFromComposition();
@@ -493,6 +522,21 @@ namespace ptm {
              */
             void initializeConcentrationsFromAlbedoMap(double percentile_low,
                                                        double percentile_high);
+
+            /**
+             * --ice-fraction-from-albedo=hapke-intimate. Invert the per-face Bond
+             * albedo map for the ice extinction (exposed-area) fraction f with the
+             * intimate Hapke mixture, convert to volume (phi = f r / (f r + 1 - f)),
+             * seed the ice layer (c = 1 - phi), and switch the ice layer to
+             * exposed-area availability. Faces whose map value mixed in fill pixels
+             * get fill_exposed_ice_fraction. Fills albedo_config with the matching
+             * Hapke forward model and enforces the forward/initialization gate
+             * (max |A_forward(c_init) - A_map| < 1e-6 on inverted faces).
+             * Requires enableIceLayerModel first.
+             * @return false (with a message on stderr) on any failure
+             */
+            bool initializeConcentrationsFromHapkeIntimate(const HapkeIceFractionConfig& cfg,
+                                                           CompositionAlbedoConfig& albedo_config);
 
             // =========================================================
             // Multi-Timescale Evolution Interface
