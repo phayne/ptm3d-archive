@@ -384,6 +384,45 @@ set_target_properties(test_equilibrium_bias
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# EXO-01 / EXO-02 regression test (always build; self-contained, exit code 0 = pass)
+add_executable(test_bessel_k0_and_areas
+    test_bessel_k0_and_areas.cpp
+)
+target_include_directories(test_bessel_k0_and_areas PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/constants
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_bessel_k0_and_areas
+    PRIVATE
+    exosphere_core
+    constants
+    mesh_utils
+    Eigen3::Eigen
+)
+if(OpenMP_CXX_FOUND)
+    if(APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang"))
+        if(OpenMP_CXX_FLAGS)
+            string(REPLACE " " ";" OMP_FLAGS_LIST "${OpenMP_CXX_FLAGS}")
+            target_compile_options(test_bessel_k0_and_areas PRIVATE ${OMP_FLAGS_LIST})
+        else()
+            target_compile_options(test_bessel_k0_and_areas PRIVATE -Xpreprocessor -fopenmp)
+        endif()
+        if(OpenMP_omp_LIBRARY)
+            target_link_libraries(test_bessel_k0_and_areas PRIVATE ${OpenMP_omp_LIBRARY})
+        elseif(LIBOMP_LIB)
+            target_link_libraries(test_bessel_k0_and_areas PRIVATE ${LIBOMP_LIB})
+        endif()
+    else()
+        target_link_libraries(test_bessel_k0_and_areas PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
+set_target_properties(test_bessel_k0_and_areas
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # =====================================================================================
 # Install and summary
 # =====================================================================================

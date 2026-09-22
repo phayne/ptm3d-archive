@@ -11,6 +11,10 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <limits>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -54,19 +58,74 @@ namespace constants {
     constexpr double MIN_ICE_THICKNESS = 1e-9;            // 1 nm minimum thickness
 }
 
-// Modified Bessel function K0 - scalar version only for simplicity
+// Modified Bessel function of the second kind, order zero, K0(x) for x > 0.
+// This is the ONLY implementation in the exosphere module; every transport
+// kernel (and the CLI in ptm_exosphere_main.cpp) must call this one.
+//
+// x <= 2: exact power series (A&S 9.6.13 with n = 0),
+//     K0(x) = -(ln(x/2) + gamma) I0(x) + sum_{k>=1} H_k (x^2/4)^k / (k!)^2,
+//     I0(x) = sum_{k>=0} (x^2/4)^k / (k!)^2,  H_k = 1 + 1/2 + ... + 1/k.
+//   With x^2/4 <= 1 the k = 13 term is < 1e-19 relative, so 12 terms are
+//   exact to double precision.
+// x > 2: A&S 9.8.6 polynomial in 2/x (|error| < 1.9e-7 on sqrt(x) e^x K0).
+//
+// History: the previous x <= 2 branch dropped the -gamma constant and used a
+// series that is not I0(x); it overestimated K0 by +104% at x = 1 and +507%
+// just below x = 2, with a 6x jump at x = 2 (EXO-01). test_bessel_k0_and_areas
+// pins both branches and the continuity at x = 2.
 inline double besselK0(double x) {
+    if (x <= 0.0) {
+        return std::numeric_limits<double>::infinity();  // log singularity at 0
+    }
     if (x <= 2.0) {
-        double x2 = x * x / 4.0;
-        double ak = -std::log(x / 2.0) * (1.0 + x2 * (0.25 + x2 * (1.0/32.0 + x2 * (1.0/576.0))));
-        double bk = x2 * (0.42278433 + x2 * (0.23069756 + x2 * (0.03488590 + x2 * 0.00262698)));
-        return ak + bk;
+        constexpr double EULER_GAMMA = 0.57721566490153286061;
+        const double q = 0.25 * x * x;   // (x/2)^2, in (0, 1]
+        double term = 1.0;               // (x^2/4)^k / (k!)^2
+        double harmonic = 0.0;           // H_k
+        double i0 = 1.0;
+        double tail = 0.0;
+        for (int k = 1; k <= 12; ++k) {
+            term *= q / (static_cast<double>(k) * static_cast<double>(k));
+            harmonic += 1.0 / static_cast<double>(k);
+            i0 += term;
+            tail += harmonic * term;
+        }
+        return -(std::log(0.5 * x) + EULER_GAMMA) * i0 + tail;
     } else {
         double y = 2.0 / x;
         double ak = 1.25331414 + y * (-0.07832358 + y * (0.02189568 + y * (-0.01062446 + 
                     y * (0.00587872 + y * (-0.00251540 + y * 0.00053208)))));
         return std::exp(-x) / std::sqrt(x) * ak;
     }
+}
+
+// Spatial post-smoothing radius [rad] shared by the deposition field
+// (BallisticTransport::computeTransportProduct) and the sublimation and
+// sputtering fields (PTMExosphereIntegration::computeDiurnalAverages).
+//
+// OFF (0, a true no-op) by default (Paul, 2026-09-22). The smoothing existed to
+// suppress mesh-topology (pentagon) artifacts. Its default of 20x the mean
+// face angular radius never took effect before the EXO-02 area fix (km^2 areas
+// made it ~0.008 deg); after that fix it silently became ~8 deg on ico6. The
+// EXO-01 K0 fix already removed most of the topology bias it targeted.
+// Measured 2026-09-22 (ico6, uniform 130 K, zonal cos^4 source; departure of
+// deposition from zonal symmetry): pre-fix kernel rms 1.5e-3; fixed kernel
+// with smoothing off rms 3.6e-5, at the estimator floor (2.6e-5); an 8 deg
+// top-hat smoothing ADDS rms 4.3e-2 (max 0.14) of its own cap-edge artifact.
+//
+// Opt in with EXO_DEP_SMOOTH_DEG=<degrees>, 0 < degrees < 30; "0" means off.
+// Any other value (unparsable, negative, >= 30) throws instead of being
+// silently ignored. The same radius applies to all three fields.
+inline double spatialSmoothingRadiusRad() {
+    const char* envp = std::getenv("EXO_DEP_SMOOTH_DEG");
+    if (envp == nullptr || *envp == '\0') return 0.0;
+    char* end = nullptr;
+    const double deg = std::strtod(envp, &end);
+    if (end == envp || *end != '\0' || !std::isfinite(deg) || deg < 0.0 || deg >= 30.0) {
+        throw std::invalid_argument(std::string("EXO_DEP_SMOOTH_DEG='") + envp +
+                                    "' is invalid: expected degrees in [0, 30) (0 = off)");
+    }
+    return deg * M_PI / 180.0;
 }
 
 // Vapor pressure physics
@@ -217,6 +276,9 @@ private:
     // Spatial index for O(N log N) neighbor queries
     mutable SphericalSpatialIndex spatial_index_;
     mutable bool spatial_index_built_;
+    // Largest angular query radius [rad] the spatial index was built for;
+    // queries beyond it are silently truncated, so smoothing checks it.
+    mutable double spatial_index_query_radius_ = 0.0;
 
     // Sinkhorn scaling factor cache for warm-start optimization
     mutable Eigen::VectorXd sinkhorn_row_scale_cache_;
@@ -340,17 +402,16 @@ public:
         double threshold = 1e-10) const;
 
     // Area-weighted smoothing of a per-face scalar over the spatial-index
-    // neighborhood within `smooth_radius_rad` (or, if <=0, a default of
-    // ~20× the mean face angular width). Used to match the per-face
-    // sublimation field to the transport's effective spatial resolution
-    // so that sharp albedo-map pixel boundaries do not create artifacts in
-    // the net-flux map. Falls back to copying input → output when the
-    // spatial index has not yet been built.
+    // neighborhood within `smooth_radius_rad`. A radius <= 0 is a no-op
+    // (output = input); callers pass spatialSmoothingRadiusRad(), which is 0
+    // unless EXO_DEP_SMOOTH_DEG opts in. Throws if the radius exceeds the
+    // spatial index's query radius. Copies input -> output when the spatial
+    // index has not yet been built.
     void smoothField(
         const std::vector<double>& face_areas,
         const std::vector<double>& input,
         std::vector<double>& output,
-        double smooth_radius_rad = -1.0) const;
+        double smooth_radius_rad = 0.0) const;
 
     // NEW: Check if spatial index is built
     bool isSpatialIndexBuilt() const { return spatial_index_built_; }
@@ -502,11 +563,12 @@ public:
 
     // Area-weighted smoothing of a per-face scalar field. Forwards to
     // BallisticTransport::smoothField using face_areas_ and the transport's
-    // spatial index. If transport is not initialized, copies input → output.
+    // spatial index (radius <= 0 is a no-op). If transport is not
+    // initialized, copies input -> output.
     void smoothField(
         const std::vector<double>& input,
         std::vector<double>& output,
-        double smooth_radius_rad = -1.0);
+        double smooth_radius_rad = 0.0);
 
     // Optional: Method to check ice availability at each face
     std::vector<bool> getIcePresenceMask() const {

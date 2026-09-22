@@ -498,9 +498,9 @@ $$\bar{\Phi}_{\mathrm{dep}}^{(\mathrm{scaled})} = \bar{\Phi}_{\mathrm{dep}}^{(\m
 
 where $\Phi_{\mathrm{em},i}^{(\mathrm{base})}$ is the emission flux computed with the initial (undepleted) state and $\Phi_{\mathrm{em},i}^{(\mathrm{current})}$ reflects the current ice availability.
 
-**Analytical acceleration:** For faces where the evolution is slow (time constants $\gg \Delta t_{\mathrm{epoch}}$), the model uses the analytical ODE solution directly rather than time-stepping. Enabled by default; disable with `--no-analytical`.
+**Analytical acceleration:** For faces where the evolution is slow (time constants $\gg \Delta t_{\mathrm{epoch}}$), the model uses the analytical ODE solution directly rather than time-stepping. Always on; it cannot be disabled (`--no-analytical` is refused).
 
-**Adaptive cache refresh:** The diurnal cycle is only recomputed when surface conditions change significantly. The model monitors changes in non-ice concentration and triggers a recomputation when the maximum change exceeds a threshold. Override with `--cache-refresh N` to force recomputation every $N$ epochs.
+**Diurnal-cycle cache:** The diurnal cycle is computed at the first epoch and recomputed only when `--albedo-coupling` changes temperatures by more than `--albedo-update-threshold`. There is no concentration-based or periodic refresh; `--cache-refresh N` is refused.
 
 **Default parameters:**
 
@@ -721,8 +721,8 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `--epochs` $N_e$ | 1000 | Number of geological epochs |
 | `--cycles-per-epoch` $N_c$ | 100 | Diurnal cycles per epoch (~100 = 1 Earth year) |
 | `--export-interval` $N$ | 100 | Export data every $N$ epochs (0 = final only) |
-| `--no-analytical` | analytical on | Disable analytical acceleration |
-| `--cache-refresh` $N$ | 0 (adaptive) | Force diurnal recomputation every $N$ epochs |
+| `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
+| `--cache-refresh` $N$ | (refused) | Not implemented; the CLI exits with an error |
 
 ### Ice Crystallization Options
 

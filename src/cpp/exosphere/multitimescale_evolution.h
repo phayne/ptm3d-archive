@@ -128,6 +128,19 @@ struct DiurnalAverages {
     // when the crystallization model is active; left at zero otherwise.
     std::vector<double> avg_crystallization_rate;
 
+    // Emission-weighted temperature T_w,i = sum_t Phi_i(t) T_i(t) / sum_t Phi_i(t) [K]
+    // (M1). The ballistic kernel's hop length scales with the temperature of
+    // the molecules actually launched (d_char = 2 k T / (m g)), and sublimation
+    // is exponential in T, so the launch-weighted temperature is far above the
+    // diurnal mean (146 K vs 117 K on the delivered ico6 product). Using
+    // avg_temperature for transport shortened every hop by ~1.25x. Same
+    // Jensen's-inequality correction as avg_crystallization_rate above.
+    // Faces with zero emission over the whole cycle launch nothing; for them
+    // the diurnal mean is used and counted in emission_weighted_fallback_count.
+    std::vector<double> emission_weighted_temperature;
+    std::vector<double> emission_weight_sum;        // accumulator: sum_t Phi_i(t)
+    size_t emission_weighted_fallback_count = 0;
+
     // Cached base fluxes (theoretical full-rate, normalized by ice fraction at cache time)
     // evolveEpoch() uses these directly with analytical exponential evolution
     std::vector<double> base_sublimation_flux;  // Full-rate sublimation [kg/(m²·s)]
@@ -156,6 +169,8 @@ struct DiurnalAverages {
         avg_escape_flux.resize(num_faces, 0.0);
         avg_temperature.resize(num_faces, 0.0);
         avg_crystallization_rate.resize(num_faces, 0.0);
+        emission_weighted_temperature.resize(num_faces, 0.0);
+        emission_weight_sum.resize(num_faces, 0.0);
 
         base_sublimation_flux.resize(num_faces, 0.0);
         base_sputtering_flux.resize(num_faces, 0.0);
@@ -175,6 +190,9 @@ struct DiurnalAverages {
         std::fill(avg_escape_flux.begin(), avg_escape_flux.end(), 0.0);
         std::fill(avg_temperature.begin(), avg_temperature.end(), 0.0);
         std::fill(avg_crystallization_rate.begin(), avg_crystallization_rate.end(), 0.0);
+        std::fill(emission_weighted_temperature.begin(), emission_weighted_temperature.end(), 0.0);
+        std::fill(emission_weight_sum.begin(), emission_weight_sum.end(), 0.0);
+        emission_weighted_fallback_count = 0;
         std::fill(max_temperature.begin(), max_temperature.end(), 0.0);
         std::fill(min_temperature.begin(), min_temperature.end(), 1000.0);
         // Note: base_* and cached_* are NOT reset - they persist across epochs
@@ -192,6 +210,17 @@ struct DiurnalAverages {
             avg_temperature[i] *= inv_n;
             avg_crystallization_rate[i] *= inv_n;
         }
+        // Emission-weighted temperature (ratio of sums; no 1/n needed).
+        size_t fallback = 0;
+        for (size_t i = 0; i < emission_weighted_temperature.size(); ++i) {
+            if (emission_weight_sum[i] > 0.0) {
+                emission_weighted_temperature[i] /= emission_weight_sum[i];
+            } else {
+                emission_weighted_temperature[i] = avg_temperature[i];
+                ++fallback;
+            }
+        }
+        emission_weighted_fallback_count = fallback;
     }
 
     // Store current averages as base (cache) values
@@ -429,6 +458,8 @@ public:
             double sput = (!sputtering_flux.empty()) ? sputtering_flux[i] : 0.0;
             diurnal_avg_->avg_net_flux[i] += (deposition_flux[i] - emission_flux[i] - sput);
             diurnal_avg_->avg_temperature[i] += temperatures[i];
+            diurnal_avg_->emission_weighted_temperature[i] += emission_flux[i] * temperatures[i];
+            diurnal_avg_->emission_weight_sum[i] += emission_flux[i];
 
             diurnal_avg_->max_temperature[i] = std::max(diurnal_avg_->max_temperature[i], temperatures[i]);
             diurnal_avg_->min_temperature[i] = std::min(diurnal_avg_->min_temperature[i], temperatures[i]);
@@ -519,6 +550,11 @@ public:
      *       in the caller)
      *
      * Ice availability changes do NOT require transport recomputation.
+     *
+     * NOTE (M3): this returns true only while the cache is empty. There is no
+     * periodic or concentration-threshold refresh; the CLI refuses
+     * --cache-refresh and --no-analytical. Appendix D.7.4/D.7.6 describing an
+     * "adaptive cache refresh" is inaccurate (doc fix owed).
      */
     bool needsCacheRefresh(const IceLayerModel& ice_model,
                            const IceLayerState& ice_state,
