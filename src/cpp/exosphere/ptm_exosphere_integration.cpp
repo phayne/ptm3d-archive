@@ -17,6 +17,7 @@
 #include <sstream>
 #include <cmath>  // For M_PI and other math functions
 #include <chrono>
+#include <stdexcept>
 
 namespace ptm {
 namespace exosphere {
@@ -33,6 +34,109 @@ PTMExosphereIntegration::~PTMExosphereIntegration() {
     // Destructor defined here where ExosphereModel is complete
 }
 
+// Compute exosphere face geometry in SI units (m, m^2) from a mesh in any
+// length unit (EXO-02). The production ico6 mesh stores vertices in km; face
+// centers were already projected to meters but areas were taken from the raw
+// vertices, so every absolute mass/rate was 1e6 too small and every
+// area-derived angle (smoothing radius, self-cap, shell width) 1000x too
+// small. Both mesh-loading paths now go through this one routine.
+//
+// Units: a single uniform scale s = R_Europa / <|v|> converts the native
+// length unit to meters (s = 1000 for a km mesh); areas scale by s^2. Face
+// centers are projected onto the sphere of radius R_Europa.
+//
+// Hard gate: |sum(A) - 4 pi R^2| / (4 pi R^2) must be < 1e-3. The exosphere is
+// a closed-sphere model; a mesh that fails this is either in unexpected units
+// or not a global sphere, and must not run silently.
+bool computeExosphereFaceGeometry(const Mesh& mesh,
+                                  std::vector<std::array<double,3>>& centers,
+                                  std::vector<double>& areas,
+                                  std::vector<std::array<double,3>>* normals,
+                                  std::string& error) {
+    const double R = constants::EUROPA_RADIUS;
+    const size_t n_faces = mesh.faces.size();
+    centers.assign(n_faces, {0.0, 0.0, 0.0});
+    areas.assign(n_faces, 0.0);
+    if (normals) normals->assign(n_faces, {0.0, 0.0, 0.0});
+    if (n_faces == 0) { error = "mesh has no faces"; return false; }
+
+    auto projectToSphere = [R](std::array<double,3> c, bool& ok) {
+        const double r = std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
+        ok = (r > 0.0 && std::isfinite(r));
+        if (ok) { const double k = R / r; c[0] *= k; c[1] *= k; c[2] *= k; }
+        return c;
+    };
+    const bool have_centers = (mesh.face_centers.size() == n_faces);
+
+    if (!mesh.vertices.empty()) {
+        double r_sum = 0.0;
+        for (const auto& v : mesh.vertices) {
+            r_sum += std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        }
+        const double r_mean = r_sum / static_cast<double>(mesh.vertices.size());
+        if (!(r_mean > 0.0) || !std::isfinite(r_mean)) {
+            error = "mean vertex radius is not positive and finite";
+            return false;
+        }
+        const double s = R / r_mean;   // native length unit -> m
+        std::cout << "[exosphere] mesh units: mean vertex radius " << std::setprecision(8)
+                  << r_mean << " (native) -> scale " << s << " to meters" << std::endl;
+
+        for (size_t i = 0; i < n_faces; ++i) {
+            const auto& f = mesh.faces[i];
+            const auto& v0 = mesh.vertices[f[0]];
+            const auto& v1 = mesh.vertices[f[1]];
+            const auto& v2 = mesh.vertices[f[2]];
+            const std::array<double,3> e1{ v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2] };
+            const std::array<double,3> e2{ v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2] };
+            const std::array<double,3> cr{
+                e1[1]*e2[2] - e1[2]*e2[1],
+                e1[2]*e2[0] - e1[0]*e2[2],
+                e1[0]*e2[1] - e1[1]*e2[0]
+            };
+            areas[i] = 0.5 * std::sqrt(cr[0]*cr[0] + cr[1]*cr[1] + cr[2]*cr[2]) * s * s;
+            if (normals) (*normals)[i] = cr;   // unnormalized, diagnostics only
+
+            const std::array<double,3> c = have_centers ? mesh.face_centers[i]
+                : std::array<double,3>{ (v0[0]+v1[0]+v2[0]) / 3.0,
+                                        (v0[1]+v1[1]+v2[1]) / 3.0,
+                                        (v0[2]+v1[2]+v2[2]) / 3.0 };
+            bool ok = false;
+            centers[i] = projectToSphere(c, ok);
+            if (!ok) { error = "face " + std::to_string(i) + " has a zero-radius center"; return false; }
+        }
+    } else {
+        // No vertices: equal-area faces on the sphere (already m^2).
+        if (!have_centers) { error = "mesh has neither vertices nor face centers"; return false; }
+        const double equal_area = 4.0 * M_PI * R * R / static_cast<double>(n_faces);
+        std::cout << "[exosphere] WARNING: mesh has no vertices; using equal face areas "
+                  << equal_area << " m^2" << std::endl;
+        for (size_t i = 0; i < n_faces; ++i) {
+            areas[i] = equal_area;
+            bool ok = false;
+            centers[i] = projectToSphere(mesh.face_centers[i], ok);
+            if (!ok) { error = "face " + std::to_string(i) + " has a zero-radius center"; return false; }
+        }
+    }
+
+    double total = 0.0;
+    for (double a : areas) total += a;
+    const double sphere = 4.0 * M_PI * R * R;
+    const double rel = (total - sphere) / sphere;
+    std::cout << "[exosphere] total face area " << std::scientific << std::setprecision(6)
+              << total << " m^2 = 4 pi R^2 x (1 " << (rel >= 0 ? "+ " : "- ")
+              << std::abs(rel) << ")" << std::defaultfloat << std::endl;
+    if (!(std::abs(rel) < 1e-3)) {
+        std::ostringstream os;
+        os << "total face area " << total << " m^2 differs from 4 pi R_Europa^2 = " << sphere
+           << " m^2 by a relative " << rel << " (limit 1e-3): mesh is in unexpected units "
+           << "or is not a closed global sphere";
+        error = os.str();
+        return false;
+    }
+    return true;
+}
+
 void PTMExosphereIntegration::setMesh(const std::shared_ptr<Mesh>& mesh) {
     mesh_ = mesh;
 
@@ -42,76 +146,9 @@ void PTMExosphereIntegration::setMesh(const std::shared_ptr<Mesh>& mesh) {
     }
 
     const size_t n_faces = mesh_->faces.size();
-    face_areas_.assign(n_faces, 0.0);
-    face_centers_.assign(n_faces, {0.0, 0.0, 0.0});
-    face_normals_.assign(n_faces, {0.0, 0.0, 0.0});
-
-    const bool have_vertices = !mesh_->vertices.empty();
-
-    // If the mesh already provides face centers, copy and normalize them to Europa's radius
-    if (mesh_->face_centers.size() == n_faces) {
-        for (size_t i = 0; i < n_faces; ++i) {
-            auto fc = mesh_->face_centers[i];
-            const double r = std::sqrt(fc[0]*fc[0] + fc[1]*fc[1] + fc[2]*fc[2]);
-            if (r > 0.0) {
-                const double s = ptm::exosphere::constants::EUROPA_RADIUS / r;
-                fc[0] *= s; fc[1] *= s; fc[2] *= s;
-            }
-            face_centers_[i] = fc;
-        }
-    }
-
-    // Compute face areas (and centers if not provided) from vertex geometry when available
-    if (have_vertices) {
-        for (size_t i = 0; i < n_faces; ++i) {
-            const auto& f = mesh_->faces[i];
-            const auto& v0 = mesh_->vertices[f[0]];
-            const auto& v1 = mesh_->vertices[f[1]];
-            const auto& v2 = mesh_->vertices[f[2]];
-
-            // Area via cross product
-            const std::array<double,3> e1{ v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2] };
-            const std::array<double,3> e2{ v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2] };
-            const std::array<double,3> cr{
-                e1[1]*e2[2] - e1[2]*e2[1],
-                e1[2]*e2[0] - e1[0]*e2[2],
-                e1[0]*e2[1] - e1[1]*e2[0]
-            };
-            face_areas_[i] = 0.5 * std::sqrt(cr[0]*cr[0] + cr[1]*cr[1] + cr[2]*cr[2]);
-
-            // Normal (unnormalized cross) for optional diagnostics
-            face_normals_[i] = cr;
-
-            // If we didn’t copy provided centers above, compute them and normalize to sphere radius
-            if (mesh_->face_centers.size() != n_faces) {
-                std::array<double,3> c{
-                    (v0[0] + v1[0] + v2[0]) / 3.0,
-                    (v0[1] + v1[1] + v2[1]) / 3.0,
-                    (v0[2] + v1[2] + v2[2]) / 3.0
-                };
-                const double r = std::sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]);
-                if (r > 0.0) {
-                    const double s = ptm::exosphere::constants::EUROPA_RADIUS / r;
-                    c[0] *= s; c[1] *= s; c[2] *= s;
-                }
-                face_centers_[i] = c;
-            }
-        }
-    }
-
-    // Fallback area if vertices are missing or degenerate
-    if (!have_vertices) {
-        const double total = 4.0 * M_PI *
-            ptm::exosphere::constants::EUROPA_RADIUS * ptm::exosphere::constants::EUROPA_RADIUS;
-        const double equal_area = total / static_cast<double>(n_faces);
-        std::fill(face_areas_.begin(), face_areas_.end(), equal_area);
-
-        // If centers are still all zero, use any provided mesh centers
-        if (mesh_->face_centers.size() == n_faces) {
-            for (size_t i = 0; i < n_faces; ++i) {
-                face_centers_[i] = mesh_->face_centers[i];
-            }
-        }
+    std::string error;
+    if (!computeExosphereFaceGeometry(*mesh_, face_centers_, face_areas_, &face_normals_, error)) {
+        throw std::runtime_error("FATAL: exosphere mesh geometry: " + error);
     }
 
     // Initialize exosphere model and provide mesh geometry
@@ -156,56 +193,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         
         std::cout << "Loaded mesh with " << mesh_->faces.size() << " faces" << std::endl;
         
-        // Calculate face areas and centers from vertices and faces
-        face_areas_.resize(mesh_->faces.size());
-        face_centers_.resize(mesh_->faces.size());
-        
-        for (size_t i = 0; i < mesh_->faces.size(); ++i) {
-            const auto& face = mesh_->faces[i];
-            const auto& v0 = mesh_->vertices[face[0]];
-            const auto& v1 = mesh_->vertices[face[1]];
-            const auto& v2 = mesh_->vertices[face[2]];
-            
-            // Calculate face center (average of vertices)
-            face_centers_[i][0] = (v0[0] + v1[0] + v2[0]) / 3.0;
-            face_centers_[i][1] = (v0[1] + v1[1] + v2[1]) / 3.0;
-            face_centers_[i][2] = (v0[2] + v1[2] + v2[2]) / 3.0;
-            
-            // Project center to sphere surface (for spherical bodies)
-            double r = std::sqrt(face_centers_[i][0] * face_centers_[i][0] + 
-                                face_centers_[i][1] * face_centers_[i][1] + 
-                                face_centers_[i][2] * face_centers_[i][2]);
-            if (r > 0) {
-                face_centers_[i][0] *= constants::EUROPA_RADIUS / r;
-                face_centers_[i][1] *= constants::EUROPA_RADIUS / r;
-                face_centers_[i][2] *= constants::EUROPA_RADIUS / r;
-            }
-            
-            // Calculate area using cross product
-            std::array<double, 3> edge1 = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
-            std::array<double, 3> edge2 = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
-            
-            std::array<double, 3> cross = {
-                edge1[1] * edge2[2] - edge1[2] * edge2[1],
-                edge1[2] * edge2[0] - edge1[0] * edge2[2],
-                edge1[0] * edge2[1] - edge1[1] * edge2[0]
-            };
-            
-            face_areas_[i] = 0.5 * std::sqrt(cross[0] * cross[0] + 
-                                             cross[1] * cross[1] + 
-                                             cross[2] * cross[2]);
+        // Face geometry in SI units, shared with setMesh() (EXO-02). The model
+        // always receives the meter-scaled centers: the raw mesh_->face_centers
+        // are in the mesh's native unit (km for the production meshes).
+        std::string geometry_error;
+        if (!computeExosphereFaceGeometry(*mesh_, face_centers_, face_areas_, &face_normals_,
+                                          geometry_error)) {
+            std::cerr << "FATAL: exosphere mesh geometry: " << geometry_error << std::endl;
+            return false;
         }
-        
-        // Initialize exosphere model
+
         size_t num_faces = mesh_->faces.size();
         exosphere_model_ = std::make_unique<ExosphereModel>(num_faces);
-
-        // Set mesh geometry - use mesh's face_centers if available, otherwise use calculated
-        if (!mesh_->face_centers.empty()) {
-            exosphere_model_->setMeshGeometry(mesh_->face_centers, face_areas_);
-        } else {
-            exosphere_model_->setMeshGeometry(face_centers_, face_areas_);
-        }
+        exosphere_model_->setMeshGeometry(face_centers_, face_areas_);
 
         // IMPORTANT: Set num_faces_ so sputtering and other methods work correctly
         num_faces_ = static_cast<int>(num_faces);
@@ -612,9 +612,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             for (size_t j = 0; j < num_faces; j += 100) {
                 // Calculate approximate transport
                 double distance = exosphere_model_->getState().thermal_velocity[i] > 0 ? 
-                    std::sqrt(std::pow(mesh_->face_centers[i][0] - mesh_->face_centers[j][0], 2) +
-                             std::pow(mesh_->face_centers[i][1] - mesh_->face_centers[j][1], 2) +
-                             std::pow(mesh_->face_centers[i][2] - mesh_->face_centers[j][2], 2)) : 0.0;
+                    // face_centers_ (meters), not mesh_->face_centers (native
+                    // mesh unit, km for production meshes): EXO-02 unit class.
+                    std::sqrt(std::pow(face_centers_[i][0] - face_centers_[j][0], 2) +
+                             std::pow(face_centers_[i][1] - face_centers_[j][1], 2) +
+                             std::pow(face_centers_[i][2] - face_centers_[j][2], 2)) : 0.0;
                 
                 if (distance > 0 && distance < constants::EUROPA_RADIUS * 0.5) {
                     double transport = std::exp(-distance / (constants::EUROPA_RADIUS * 0.1));
@@ -1460,8 +1462,17 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             config.flux_convergence_threshold = flux_convergence_threshold_;
         }
 
-        // Note: analytical_acceleration and cache_refresh_interval parameters are
-        // kept for API compatibility but no longer used in the new concentration model
+        // analytical_acceleration and cache_refresh_interval are kept in the
+        // signature for API compatibility only (M3). Nothing implements them:
+        // super-stepping is always closed-form, and the diurnal cycle is
+        // recomputed only when the cache is empty (epoch 0) or albedo coupling
+        // forces it. Refuse non-default values instead of ignoring them.
+        if (!analytical_acceleration || cache_refresh_interval != 0) {
+            throw std::invalid_argument(
+                "runMultiTimescaleSimulation: analytical_acceleration=false and "
+                "cache_refresh_interval!=0 are not implemented (they were previously "
+                "accepted and silently ignored)");
+        }
 
         multiscale_evolution_ = std::make_unique<MultiTimescaleEvolution>(num_faces_, config);
         multiscale_enabled_ = true;
@@ -1791,10 +1802,27 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             avg_emission[i] = diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
         }
 
-        // Matrix-free: two-pass source-based scatter
+        // Matrix-free: two-pass source-based scatter. The kernel is evaluated
+        // at each source's EMISSION-WEIGHTED temperature, not its diurnal mean
+        // (M1): hops are launched when the face is warm.
+        {
+            double w_sum = 0.0, tw_sum = 0.0, tm_sum = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                w_sum += avg_emission[i];
+                tw_sum += avg_emission[i] * diurnal_avg.emission_weighted_temperature[i];
+                tm_sum += avg_emission[i] * diurnal_avg.avg_temperature[i];
+            }
+            if (w_sum > 0.0) {
+                std::cout << "\n  [exosphere] transport temperature (emission-weighted over sources): "
+                          << std::fixed << std::setprecision(2) << (tw_sum / w_sum)
+                          << " K vs diurnal-mean " << (tm_sum / w_sum) << " K; "
+                          << diurnal_avg.emission_weighted_fallback_count
+                          << " non-emitting faces use the diurnal mean" << std::endl;
+            }
+        }
         std::vector<double> avg_dep;
         exosphere_model_->computeTransportProduct(
-            diurnal_avg.avg_temperature, avg_emission, avg_dep);
+            diurnal_avg.emission_weighted_temperature, avg_emission, avg_dep);
 
         for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
             diurnal_avg.avg_deposition_flux[i] = avg_dep[i] / face_areas_[i];
@@ -1806,37 +1834,40 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                   << transport_sec << " s)" << std::endl;
 
         // Smooth sublimation (and sputtering) to match the transport's spatial
-        // resolution. The transport kernel + post-smoothing averages deposition
-        // over ~1-2°, but sublimation is computed per-face from temperature.
+        // resolution. The transport post-smoothing averages deposition over
+        // 20 x the mean face angular radius (about 8 deg on ico6; logged by
+        // computeTransportProduct), but sublimation is computed per-face from
+        // temperature. (Before EXO-02 the km^2 areas made that radius ~0.008
+        // deg, i.e., no smoothing at all.)
         // Sharp temperature boundaries from albedo map pixels (~0.5° resolution)
         // create sharp sublimation features that appear as artifacts in net flux.
         // Smoothing both sides ensures consistent spatial resolution.
-        {
-            // Preserve total sublimation rate across smoothing
-            double total_sub_before = 0.0;
+        // Area-weighted smoothing does not conserve sum(flux * area) on its own,
+        // so each smoothed field is rescaled to its pre-smoothing total. Both
+        // sublimation and sputtering go through the same path (EXO-08: the
+        // sputtering field used to be smoothed without this rescale).
+        auto smoothPreservingTotal = [&](std::vector<double>& field) {
+            double total_before = 0.0;
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
-                total_sub_before += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+                total_before += field[i] * face_areas_[i];
             }
-
             std::vector<double> smoothed(num_faces_);
-            exosphere_model_->smoothField(diurnal_avg.avg_sublimation_flux, smoothed);
-
-            double total_sub_after = 0.0;
+            exosphere_model_->smoothField(field, smoothed);
+            double total_after = 0.0;
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
-                total_sub_after += smoothed[i] * face_areas_[i];
+                total_after += smoothed[i] * face_areas_[i];
             }
-            if (total_sub_after > 0.0) {
-                double scale = total_sub_before / total_sub_after;
+            if (total_after > 0.0) {
+                const double scale = total_before / total_after;
                 for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                     smoothed[i] *= scale;
                 }
             }
-            diurnal_avg.avg_sublimation_flux = std::move(smoothed);
-        }
+            field = std::move(smoothed);
+        };
+        smoothPreservingTotal(diurnal_avg.avg_sublimation_flux);
         if (sputtering_enabled_) {
-            std::vector<double> smoothed(num_faces_);
-            exosphere_model_->smoothField(diurnal_avg.avg_sputtering_flux, smoothed);
-            diurnal_avg.avg_sputtering_flux = std::move(smoothed);
+            smoothPreservingTotal(diurnal_avg.avg_sputtering_flux);
         }
 
         // Update net flux consistently

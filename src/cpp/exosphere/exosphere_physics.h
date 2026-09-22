@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <limits>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -54,13 +55,39 @@ namespace constants {
     constexpr double MIN_ICE_THICKNESS = 1e-9;            // 1 nm minimum thickness
 }
 
-// Modified Bessel function K0 - scalar version only for simplicity
+// Modified Bessel function of the second kind, order zero, K0(x) for x > 0.
+// This is the ONLY implementation in the exosphere module; every transport
+// kernel (and the CLI in ptm_exosphere_main.cpp) must call this one.
+//
+// x <= 2: exact power series (A&S 9.6.13 with n = 0),
+//     K0(x) = -(ln(x/2) + gamma) I0(x) + sum_{k>=1} H_k (x^2/4)^k / (k!)^2,
+//     I0(x) = sum_{k>=0} (x^2/4)^k / (k!)^2,  H_k = 1 + 1/2 + ... + 1/k.
+//   With x^2/4 <= 1 the k = 13 term is < 1e-19 relative, so 12 terms are
+//   exact to double precision.
+// x > 2: A&S 9.8.6 polynomial in 2/x (|error| < 1.9e-7 on sqrt(x) e^x K0).
+//
+// History: the previous x <= 2 branch dropped the -gamma constant and used a
+// series that is not I0(x); it overestimated K0 by +104% at x = 1 and +507%
+// just below x = 2, with a 6x jump at x = 2 (EXO-01). test_bessel_k0_and_areas
+// pins both branches and the continuity at x = 2.
 inline double besselK0(double x) {
+    if (x <= 0.0) {
+        return std::numeric_limits<double>::infinity();  // log singularity at 0
+    }
     if (x <= 2.0) {
-        double x2 = x * x / 4.0;
-        double ak = -std::log(x / 2.0) * (1.0 + x2 * (0.25 + x2 * (1.0/32.0 + x2 * (1.0/576.0))));
-        double bk = x2 * (0.42278433 + x2 * (0.23069756 + x2 * (0.03488590 + x2 * 0.00262698)));
-        return ak + bk;
+        constexpr double EULER_GAMMA = 0.57721566490153286061;
+        const double q = 0.25 * x * x;   // (x/2)^2, in (0, 1]
+        double term = 1.0;               // (x^2/4)^k / (k!)^2
+        double harmonic = 0.0;           // H_k
+        double i0 = 1.0;
+        double tail = 0.0;
+        for (int k = 1; k <= 12; ++k) {
+            term *= q / (static_cast<double>(k) * static_cast<double>(k));
+            harmonic += 1.0 / static_cast<double>(k);
+            i0 += term;
+            tail += harmonic * term;
+        }
+        return -(std::log(0.5 * x) + EULER_GAMMA) * i0 + tail;
     } else {
         double y = 2.0 / x;
         double ak = 1.25331414 + y * (-0.07832358 + y * (0.02189568 + y * (-0.01062446 + 

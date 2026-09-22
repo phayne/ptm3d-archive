@@ -3130,6 +3130,7 @@ void BallisticTransport::computeTransportProduct(
               << (conservation_ratio * 100.0) << "%"
               << ", area-bias=" << std::setprecision(1) << (max_bias * 100.0) << "%"
               << (disable_bias_correction ? " (uncorrected)" : " (row-corrected)")
+              << ", smoothing radius=" << std::setprecision(3) << smooth_radius_deg << " deg"
               << std::endl;
 }
 

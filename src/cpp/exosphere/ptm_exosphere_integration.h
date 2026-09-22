@@ -30,6 +30,18 @@ namespace ptm {
         struct CompositionAlbedoConfig;
 
         /**
+         * Face centers [m, on the sphere of radius R_Europa] and areas [m^2] from
+         * a mesh in any length unit (EXO-02). Returns false with a message in
+         * `error` if the geometry is unusable, including when the total area
+         * differs from 4 pi R_Europa^2 by 1e-3 or more (relative).
+         */
+        bool computeExosphereFaceGeometry(const Mesh& mesh,
+                                          std::vector<std::array<double,3>>& centers,
+                                          std::vector<double>& areas,
+                                          std::vector<std::array<double,3>>* normals,
+                                          std::string& error);
+
+        /**
          * PTM Exosphere Integration
          * 
          * This class provides integration between PTM3D thermal output
@@ -140,8 +152,9 @@ namespace ptm {
             double calculateBallisticProbability(double distance, double temperature);
             double calculateEscapeFraction(double temperature);
             void buildTransportMatrix(double avg_temperature);
-            double besselK0(double x);
-            double besselI0(double x);
+            // (Never-defined besselK0/besselI0 member declarations removed:
+            // they shadowed the shared ptm::exosphere::besselK0 inside this
+            // class. Use exosphere_physics.h.)
 
             bool show_progress_ = true;
 

@@ -40,20 +40,10 @@ struct MeshView {
     std::vector<double> face_lon;
 };
 
-// Modified Bessel function K0 
-double besselK0(double x) {
-    if (x <= 2.0) {
-        double x2 = x * x / 4.0;
-        double ak = -std::log(x / 2.0) * (1.0 + x2 * (0.25 + x2 * (1.0/32.0 + x2 * (1.0/576.0))));
-        double bk = x2 * (0.42278433 + x2 * (0.23069756 + x2 * (0.03488590 + x2 * 0.00262698)));
-        return ak + bk;
-    } else {
-        double y = 2.0 / x;
-        double ak = 1.25331414 + y * (-0.07832358 + y * (0.02189568 + y * (-0.01062446 + 
-                    y * (0.00587872 + y * (-0.00251540 + y * 0.00053208)))));
-        return std::exp(-x) / std::sqrt(x) * ak;
-    }
-}
+// Modified Bessel function K0: use the single shared implementation in
+// exosphere_physics.h. (A private duplicate lived here and carried the same
+// x <= 2 defect, EXO-01; do not reintroduce a local copy.)
+using ptm::exosphere::besselK0;
 
 // Load mesh using MeshUtils; return nullptr on error.
 static std::shared_ptr<ptm::Mesh> load_mesh_with_meshutils(const std::string& mesh_path)
@@ -1769,8 +1759,12 @@ int main(int argc, char** argv)
     int multiscale_epochs = 1000;           // Default: ~1000 years
     int multiscale_cycles_per_epoch = 100;  // 100 diurnal cycles ≈ 1 year
     int multiscale_export_interval = 100;   // Export every 100 epochs
-    bool analytical_acceleration = true;    // Use analytical solution for slow regions
-    int cache_refresh_interval = 0;         // 0 = never force refresh (use adaptive)
+    // Not user-settable (M3): runMultiTimescaleSimulation() always super-steps
+    // with the closed-form solution and recomputes the diurnal cycle only on the
+    // first epoch or when albedo coupling changes temperatures. The CLI rejects
+    // --no-analytical and --cache-refresh rather than accept and ignore them.
+    bool analytical_acceleration = true;
+    int cache_refresh_interval = 0;
     double convergence_threshold = -1.0;    // <0 = use default (1e-6)
     double flux_convergence_threshold = -1.0; // <0 = use default (0.01 = 1%)
     int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
@@ -1831,11 +1825,15 @@ int main(int argc, char** argv)
         else if (a == "--export-interval" && i+1 < argc) {
             multiscale_export_interval = std::stoi(argv[++i]);
         }
-        else if (a == "--no-analytical") {
-            analytical_acceleration = false;
-        }
-        else if (a == "--cache-refresh" && i+1 < argc) {
-            cache_refresh_interval = std::stoi(argv[++i]);
+        else if (a == "--no-analytical" || a == "--cache-refresh") {
+            std::cerr << "Error: " << a << " is not implemented and is refused.\n"
+                      << "  The multi-timescale integrator always uses closed-form super-stepping\n"
+                      << "  and recomputes the diurnal cycle only on the first epoch or when\n"
+                      << "  --albedo-coupling changes temperatures by more than\n"
+                      << "  --albedo-update-threshold. There is no periodic or adaptive cache\n"
+                      << "  refresh and no way to disable super-stepping. (Earlier builds accepted\n"
+                      << "  these flags and silently ignored them.)" << std::endl;
+            return 1;
         }
         else if (a == "--diurnal-stride" && i+1 < argc) {
             diurnal_stride = std::stoi(argv[++i]);
@@ -1946,9 +1944,9 @@ int main(int argc, char** argv)
             std::cout << "                         Each epoch = cycles_per_epoch * 3.55 days\n";
             std::cout << "  --cycles-per-epoch N   Diurnal cycles per epoch (default: 100 ~ 1 year)\n";
             std::cout << "  --export-interval N    Export VTU every N epochs (default: 100, 0=final only)\n";
-            std::cout << "  --no-analytical        Disable analytical acceleration for slow regions\n";
-            std::cout << "  --cache-refresh N      Force diurnal recomputation every N epochs\n";
-            std::cout << "                         (default: 0 = adaptive refresh only, fastest)\n";
+            std::cout << "  (--no-analytical and --cache-refresh are not implemented and are refused;\n";
+            std::cout << "   the diurnal cycle is recomputed only on epoch 0 and on albedo-coupling\n";
+            std::cout << "   temperature updates)\n";
             std::cout << "  --convergence-threshold T  Max concentration change per epoch for convergence\n";
             std::cout << "                         (default: 1e-6)\n";
             std::cout << "  --flux-convergence T   Flux imbalance fraction for convergence (default: 0.01 = 1%%)\n";
@@ -2021,8 +2019,13 @@ int main(int argc, char** argv)
             return 1;
         }
     } else {
-        // Use the mesh we already loaded
-        integrator.setMesh(mesh);
+        // Use the mesh we already loaded (throws on unusable geometry, EXO-02)
+        try {
+            integrator.setMesh(mesh);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << std::endl;
+            return 1;
+        }
     }
 
     // Load temperatures from PTM output directory
@@ -2085,7 +2088,9 @@ int main(int argc, char** argv)
         std::cout << "  Epochs: " << multiscale_epochs << std::endl;
         std::cout << "  Cycles per epoch: " << multiscale_cycles_per_epoch << std::endl;
         std::cout << "  Export interval: " << multiscale_export_interval << " epochs" << std::endl;
-        std::cout << "  Analytical acceleration: " << (analytical_acceleration ? "yes" : "no") << std::endl;
+        std::cout << "  Diurnal-cycle refresh: epoch 0"
+                  << (albedo_coupling_enabled ? " + albedo-coupling temperature updates" : " only")
+                  << " (closed-form super-stepping always on)" << std::endl;
 
         // Calculate total simulation time for display
         double diurnal_period = 3.5512 * 24.0 * 3600.0;  // seconds
