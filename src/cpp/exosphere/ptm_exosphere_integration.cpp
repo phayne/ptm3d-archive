@@ -7,6 +7,10 @@
 #include "composition_albedo.h"
 #include "../mesh/mesh_utils.h"
 #include "maps/albedo_manager.h"
+#include "maps/spatial_map.h"
+#include "hapke_mixing.h"
+#include <algorithm>
+#include <utility>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -726,6 +730,17 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             writeBinaryArray("cumulative_sublimated_kg_m2", ice_layer_state_->cumulative_sublimated);
             writeBinaryArray("cumulative_sputtered_kg_m2", ice_layer_state_->cumulative_sputtered);
             writeBinaryArray("cumulative_deposited_kg_m2", ice_layer_state_->cumulative_deposited);
+            if (exposed_area_mode_ && ice_layer_model_) {
+                // Exposed ice AREA fraction (the availability factor in this mode)
+                std::vector<double> exposed(num_faces);
+                for (size_t i = 0; i < num_faces; ++i) {
+                    exposed[i] = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
+                }
+                writeBinaryArray("exposed_ice_fraction", exposed);
+                if (timestep_idx == 0) {
+                    writeBinaryArray("ice_fraction_init_class", ice_fraction_init_class_);
+                }
+            }
         }
 
         // Write composition-dependent albedo if coupling is enabled
@@ -1343,6 +1358,292 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::cout << "Initialized per-face concentrations from albedo map." << std::endl;
     }
 
+    bool PTMExosphereIntegration::initializeConcentrationsFromHapkeIntimate(
+        const HapkeIceFractionConfig& cfg, CompositionAlbedoConfig& albedo_config)
+    {
+        const char* tag = "[ice-fraction hapke-intimate] ";
+        if (!mesh_ || num_faces_ == 0) {
+            std::cerr << tag << "mesh must be loaded first" << std::endl;
+            return false;
+        }
+        if (!ice_layer_model_ || !ice_layer_state_) {
+            std::cerr << tag << "ice layer model not enabled (call enableIceLayerModel first)" << std::endl;
+            return false;
+        }
+        const size_t n = static_cast<size_t>(num_faces_);
+
+        // --- 2. Per-face Bond albedo map (exactly what the thermal run used) --
+        std::vector<double> A_map;
+        {
+            std::ifstream in(cfg.albedo_map_path, std::ios::binary);
+            if (!in) {
+                std::cerr << tag << "cannot open per-face albedo map: " << cfg.albedo_map_path << std::endl;
+                return false;
+            }
+            uint64_t count = 0;
+            in.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (!in || count != n) {
+                std::cerr << tag << "per-face albedo map " << cfg.albedo_map_path << " holds " << count
+                          << " values; the mesh has " << n << " faces" << std::endl;
+                return false;
+            }
+            A_map.resize(n);
+            in.read(reinterpret_cast<char*>(A_map.data()), static_cast<std::streamsize>(n * sizeof(double)));
+            if (!in) {
+                std::cerr << tag << "short read on " << cfg.albedo_map_path << std::endl;
+                return false;
+            }
+        }
+
+        // Face lat/lon (degrees, lon in [0, 360)), the generator's sampling points.
+        std::vector<double> lat(n), lon(n);
+        const bool has_latlon = mesh_->latitudes.size() == n && mesh_->longitudes.size() == n;
+        for (size_t i = 0; i < n; ++i) {
+            if (has_latlon) {
+                lat[i] = mesh_->latitudes[i];
+                lon[i] = mesh_->longitudes[i];
+            } else {
+                const auto& c = face_centers_[i];
+                const double r = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+                lat[i] = (r > 0.0) ? std::asin(c[2] / r) * 180.0 / M_PI : 0.0;
+                lon[i] = std::atan2(c[1], c[0]) * 180.0 / M_PI;
+            }
+            lon[i] = std::fmod(lon[i], 360.0);
+            if (lon[i] < 0.0) lon[i] += 360.0;
+        }
+
+        // --- 3. Fill flagging -----------------------------------------------
+        // A face is "fill" if its value is not a finite albedo in [0, 1], or if the
+        // bilinear sample at its center puts nonzero weight on a FITS pixel that is
+        // not a valid albedo (the -1 south-cap / seam fill is not the header's
+        // MISSING value, so the generator mixed it in), or if the baked value does
+        // not reproduce the FITS sample (registration check).
+        std::vector<char> fill(n, 0);
+        size_t n_invalid_value = 0, n_fill_mixed = 0, n_registration = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(A_map[i]) || A_map[i] < 0.0 || A_map[i] > 1.0) {
+                fill[i] = 1;
+                ++n_invalid_value;
+            }
+        }
+        std::string fits_path = cfg.fill_fits_path;
+        if (fits_path.empty()) {
+            fits_path = (std::filesystem::path(cfg.albedo_map_path).parent_path() /
+                         "Europa-0.5deg-BondAlbedo.fits").string();
+        }
+        double reg_max = 0.0, reg_worst = 0.0;
+        std::string reg_worst_msg;
+        if (fits_path == "none") {
+            std::cout << tag << "WARNING: --albedo-fill-fits none: fill-contaminated faces are NOT "
+                      << "flagged; bilinear fill mixing near the map's -1 fill enters the inversion"
+                      << std::endl;
+        } else {
+            SpatialMap src;
+            if (!src.loadFromFITS(fits_path)) {
+                std::cerr << tag << "cannot load the fill-detection FITS map " << fits_path
+                          << " (" << src.getLastError() << "). Pass --albedo-fill-fits <FITS> or, to "
+                          << "skip fill detection explicitly, --albedo-fill-fits none" << std::endl;
+                return false;
+            }
+            const int W = src.getWidth(), H = src.getHeight();
+            const double miss = src.getMissingValue();
+            const double ind_missing = -12345.0;  // never a valid indicator value
+            SpatialMap indicator(W, H, src.getLonMin(), src.getLonMax(), src.getLatMin(),
+                                 src.getLatMax(), src.getProjection(), ind_missing);
+            size_t n_bad_px = 0;
+            for (int y = 0; y < H; ++y) {
+                for (int x = 0; x < W; ++x) {
+                    const double v = src.getValue(x, y);
+                    const bool ok = std::isfinite(v) && v != miss && v >= 0.0 && v <= 1.0;
+                    indicator.setValue(x, y, ok ? 1.0 : 0.0);
+                    if (!ok) ++n_bad_px;
+                }
+            }
+            for (size_t i = 0; i < n; ++i) {
+                if (fill[i]) continue;
+                if (indicator.getValue(lon[i], lat[i]) < 1.0 - 1e-12) {
+                    fill[i] = 1;
+                    ++n_fill_mixed;
+                    continue;
+                }
+                const double a_fits = src.getValue(lon[i], lat[i]);
+                const double d = std::abs(a_fits - A_map[i]);
+                if (d > 1e-6) {
+                    fill[i] = 1;
+                    ++n_registration;
+                    if (d > reg_worst) {
+                        reg_worst = d;
+                        reg_worst_msg = "face " + std::to_string(i) + " (lat " + std::to_string(lat[i]) +
+                                        ", lon " + std::to_string(lon[i]) + "): bin " +
+                                        std::to_string(A_map[i]) + " vs FITS " + std::to_string(a_fits);
+                    }
+                } else {
+                    reg_max = std::max(reg_max, d);
+                }
+            }
+            std::cout << tag << "fill-detection map " << fits_path << ": " << n_bad_px << " of "
+                      << (static_cast<size_t>(W) * H) << " pixels are not a valid albedo" << std::endl;
+            if (n_registration > n / 100) {
+                std::cerr << tag << n_registration << " faces (> 1%) do not reproduce the FITS sample "
+                          << "to 1e-6: " << cfg.albedo_map_path << " was not baked from " << fits_path
+                          << " on this mesh (registration failure)" << std::endl;
+                return false;
+            }
+        }
+
+        // --- 4a. Endmembers ------------------------------------------------
+        // Non-ice endmember: explicit --nonice-albedo, or the area-weighted
+        // nonice_percentile of the map over NON-FILL faces.
+        double A_non = cfg.nonice_albedo;
+        size_t n_pct_faces = 0;
+        const bool derived_nonice = !(A_non >= 0.0);
+        if (derived_nonice) {
+            if (!(cfg.nonice_percentile > 0.0 && cfg.nonice_percentile < 100.0)) {
+                std::cerr << tag << "--nonice-albedo-percentile must be in (0, 100)" << std::endl;
+                return false;
+            }
+            std::vector<std::pair<double, double>> av;   // (albedo, area)
+            av.reserve(n);
+            double a_tot = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (fill[i]) continue;
+                const double a = (i < face_areas_.size()) ? face_areas_[i] : 1.0;
+                av.emplace_back(A_map[i], a);
+                a_tot += a;
+            }
+            n_pct_faces = av.size();
+            if (av.empty() || !(a_tot > 0.0)) {
+                std::cerr << tag << "no non-fill faces to derive the non-ice endmember from" << std::endl;
+                return false;
+            }
+            std::sort(av.begin(), av.end());
+            // Smallest albedo whose cumulative area fraction reaches the percentile.
+            const double target = cfg.nonice_percentile / 100.0 * a_tot;
+            double cum = 0.0;
+            A_non = av.back().first;
+            for (const auto& e : av) {
+                cum += e.second;
+                if (cum >= target) { A_non = e.first; break; }
+            }
+        }
+        hapke::IntimateMixture mix;
+        try {
+            mix = hapke::makeIntimateMixture(cfg.ice_albedo, cfg.g_ice, A_non, cfg.g_nonice);
+        } catch (const std::exception& e) {
+            std::cerr << tag << "cannot invert an endmember Bond albedo: " << e.what() << std::endl;
+            return false;
+        }
+        const double A_lo = mix.bond(0.0), A_hi = mix.bond(1.0);
+        if (!(A_hi > A_lo)) {
+            std::cerr << tag << "ice endmember must be brighter than the non-ice endmember (A_B(f=1) = "
+                      << A_hi << ", A_B(f=0) = " << A_lo << ")" << std::endl;
+            return false;
+        }
+
+        // --- 4. Invert, convert to volume, seed the ice layer ----------------
+        const double r = cfg.grain_ratio;
+        const double f_fill = std::clamp(cfg.fill_exposed_ice_fraction, 0.0, 1.0);
+        std::vector<double> f(n), conc(n);
+        ice_fraction_init_class_.assign(n, 0.0);
+        size_t n_fill = 0, n_clamp0 = 0, n_clamp1 = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (fill[i]) {
+                f[i] = f_fill;
+                ice_fraction_init_class_[i] = 1.0;
+                ++n_fill;
+            } else {
+                int clamp = 0;
+                f[i] = mix.invert(A_map[i], &clamp);
+                if (clamp < 0) { ice_fraction_init_class_[i] = 2.0; ++n_clamp0; }
+                if (clamp > 0) { ice_fraction_init_class_[i] = 3.0; ++n_clamp1; }
+            }
+            conc[i] = 1.0 - hapke::volumeFromExposedArea(f[i], r);
+        }
+        ice_layer_model_->initializeFromConcentrations(*ice_layer_state_, conc);
+        ice_layer_model_->setExposedAreaGrainRatio(r);
+        exposed_area_mode_ = true;
+        initial_face_albedos_ = A_map;
+
+        if (exosphere_model_) {
+            auto& exo_state = exosphere_model_->getMutableState();
+            for (size_t i = 0; i < n; ++i) {
+                exo_state.accumulated_mass[i] = ice_layer_state_->ice_mass[i];
+            }
+            exo_state.updateIceThickness();
+        }
+
+        // --- 5. Matching forward model + consistency gate ---------------------
+        albedo_config.hapke_intimate = true;
+        albedo_config.hapke_mixture = mix;
+        albedo_config.grain_ratio = r;
+        CompositionAlbedoMapper forward(albedo_config);
+        double gate_max = 0.0, clamp_resid_max = 0.0, f_area = 0.0, area_sum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::abs(forward.computeAlbedo(ice_layer_state_->nonice_concentration[i], i) - A_map[i]);
+            if (ice_fraction_init_class_[i] == 0.0) gate_max = std::max(gate_max, d);
+            else if (ice_fraction_init_class_[i] >= 2.0) clamp_resid_max = std::max(clamp_resid_max, d);
+            const double a = (i < face_areas_.size()) ? face_areas_[i] : 1.0;
+            f_area += ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i) * a;
+            area_sum += a;
+        }
+
+        std::cout << "\n=== Ice fraction from albedo: hapke-intimate ===" << std::endl;
+        std::cout << std::setprecision(6) << std::defaultfloat;
+        std::cout << "  Map (Bond albedo, per face): " << cfg.albedo_map_path << std::endl;
+        std::cout << "  Mixing: intimate; w by extinction, g by scattering cross section" << std::endl;
+        std::cout << "  Ice endmember:     A_B = " << cfg.ice_albedo << ", g = " << cfg.g_ice
+                  << "  ->  w_ice = " << std::setprecision(10) << mix.w_ice
+                  << std::setprecision(6) << "   (0.80 default = Fermi's base case, not a ruling)" << std::endl;
+        std::cout << "  Non-ice endmember: A_B = " << std::setprecision(10) << A_non << std::setprecision(6);
+        if (derived_nonice) {
+            std::cout << " = area-weighted P" << cfg.nonice_percentile << " of the map over "
+                      << n_pct_faces << " non-fill faces";
+        } else {
+            std::cout << " (explicit --nonice-albedo)";
+        }
+        std::cout << ", g = " << cfg.g_nonice << "  ->  w_nonice = " << std::setprecision(10)
+                  << mix.w_non << std::endl;
+        std::cout << std::setprecision(6) << "  Grain-size ratio D_ice/D_nonice r = " << r
+                  << "  (phi_ice = f r / (f r + 1 - f); sublimation scales with exposed area f)" << std::endl;
+        double a_clamp0 = 0.0, a_all = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double a = (i < face_areas_.size()) ? face_areas_[i] : 1.0;
+            a_all += a;
+            if (ice_fraction_init_class_[i] == 2.0) a_clamp0 += a;
+        }
+        std::cout << "  Faces: " << n << " total; " << (n - n_fill - n_clamp0 - n_clamp1)
+                  << " inverted; clamped at f = 0: " << n_clamp0 << " (" << std::setprecision(4)
+                  << (100.0 * a_clamp0 / a_all) << std::setprecision(6)
+                  << "% of area); clamped at f = 1: " << n_clamp1 << std::endl;
+        std::cout << "  Fill faces (uniform, exposed ice fraction " << f_fill << "): " << n_fill
+                  << "  [invalid value " << n_invalid_value << ", fill mixed by bilinear sampling "
+                  << n_fill_mixed << ", registration mismatch " << n_registration << "]" << std::endl;
+        if (fits_path != "none") {
+            std::cout << "  Registration: max |A_bin - A_FITS(face)| on accepted faces = "
+                      << std::scientific << reg_max << std::defaultfloat << std::endl;
+            if (n_registration > 0) {
+                std::cout << "  Registration mismatches (> 1e-6, treated as fill): " << n_registration
+                          << "; worst " << reg_worst_msg << std::endl;
+            }
+        }
+        std::cout << "  Area-weighted mean exposed ice fraction: " << (f_area / area_sum) << std::endl;
+        if (n_clamp0 > 0) {
+            std::cout << "  Faces clamped at f = 0 start with no ice; they keep their pure-ice "
+                      << "potential flux in the cache and sublimate again once deposition gives "
+                      << "them ice" << std::endl;
+        }
+        std::cout << "  Forward/initialization gate: max |A_forward(c_init) - A_map| = "
+                  << std::scientific << gate_max << " on inverted faces (limit 1e-6); clamped-face "
+                  << "residual max " << clamp_resid_max << " (expected: the map lies outside the "
+                  << "endmember range there)" << std::defaultfloat << std::endl;
+        std::cout << std::fixed;
+        if (!(gate_max < 1e-6)) {
+            std::cerr << tag << "forward/initialization gate FAILED: " << gate_max << " >= 1e-6" << std::endl;
+            return false;
+        }
+        return true;
+    }
+
     double PTMExosphereIntegration::getFaceAlbedo(int face_idx) const {
         if (albedo_coupling_enabled_ && face_idx >= 0 &&
             face_idx < static_cast<int>(current_face_albedos_.size())) {
@@ -1556,7 +1857,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     break;
                 }
                 // Cache the computed base fluxes for future epochs
-                multiscale_evolution_->cacheBaseFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_, epoch);
+                multiscale_evolution_->cacheBaseFluxesUnscaled(
+                    *ice_layer_model_, *ice_layer_state_, unscaled_sublimation_,
+                    unscaled_sputtering_, face_areas_, epoch);
                 full_diurnal_count++;
             } else {
                 // Use cached fluxes with ice availability scaling (fast, milliseconds)
@@ -1753,6 +2056,18 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             porosity_per_face = &crystallization_model_->getPorosity();
         }
 
+        // The emission model gates emission on ice mass > 0. For the cache we need
+        // the PURE-ICE POTENTIAL of every face (the ice availability is applied as a
+        // factor below and dynamically in later epochs), so a face that holds no ice
+        // now can still sublimate once deposition brings it ice. Lift the mass gate
+        // for the accumulation and restore the true masses afterwards.
+        std::vector<double> saved_mass;
+        if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+            auto& st = exosphere_model_->getMutableState();
+            saved_mass = st.accumulated_mass;
+            std::fill(st.accumulated_mass.begin(), st.accumulated_mass.end(), 1.0);
+        }
+
         // Run through one diurnal cycle, accumulating fluxes.
         // Deposition will be computed after finalization from the escape fraction.
         int accumulated_count = 0;
@@ -1801,6 +2116,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Finalize emission/sputtering/escape/temperature averages
         multiscale_evolution_->finalizeDiurnalAverages(accumulated_count);
+        if (!saved_mass.empty()) {
+            exosphere_model_->getMutableState().accumulated_mass = std::move(saved_mass);
+        }
 
         auto t_diurnal_end = std::chrono::steady_clock::now();
         double diurnal_sec = std::chrono::duration<double>(t_diurnal_end - t_diurnal_start).count();
@@ -1810,6 +2128,35 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // This evaluates dep = M * emission on-the-fly without forming the
         // full sparse matrix (~17 GB for 1.3M faces). Uses ~90 MB instead.
         auto& diurnal_avg = multiscale_evolution_->getMutableDiurnalAverages();
+
+        // The per-timestep emission above is the pure-ice POTENTIAL. Scale it by the
+        // ice availability (1 - c, or the exposed ice area fraction f in
+        // hapke-intimate mode) BEFORE transport, so deposition comes from the
+        // emission that actually leaves the surface, and keep the unscaled fluxes as
+        // the cache base (cacheBaseFluxesUnscaled).
+        if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+            if (exposed_area_mode_ && spatialSmoothingRadiusRad() > 0.0) {
+                throw std::invalid_argument(
+                    "--ice-fraction-from-albedo=hapke-intimate does not support "
+                    "EXO_DEP_SMOOTH_DEG spatial smoothing (the smoothed field could not be "
+                    "split back into exposed fraction x pure-ice flux)");
+            }
+            unscaled_sublimation_ = diurnal_avg.avg_sublimation_flux;
+            unscaled_sputtering_ = diurnal_avg.avg_sputtering_flux;
+            double pure_total = 0.0, exposed_total = 0.0;
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                const double fa = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
+                pure_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+                diurnal_avg.avg_sublimation_flux[i] *= fa;
+                diurnal_avg.avg_sputtering_flux[i] *= fa;
+                diurnal_avg.avg_escape_flux[i] *= fa;
+                exposed_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+            }
+            std::cout << "\n  [ice-fraction] diurnal sublimation scaled by ice availability: "
+                      << std::scientific << std::setprecision(6) << pure_total
+                      << " kg/s (pure-ice potential) -> " << exposed_total << " kg/s (available ice)"
+                      << std::fixed << std::endl;
+        }
 
         std::cout << "  Computing transport product (matrix-free)..." << std::flush;
         auto t_transport_start = std::chrono::steady_clock::now();
@@ -1879,8 +2226,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         };
         if (smooth_radius > 0.0) {
             smoothPreservingTotal(diurnal_avg.avg_sublimation_flux);
+            if (!unscaled_sublimation_.empty()) smoothPreservingTotal(unscaled_sublimation_);
             if (sputtering_enabled_) {
                 smoothPreservingTotal(diurnal_avg.avg_sputtering_flux);
+                if (!unscaled_sputtering_.empty()) smoothPreservingTotal(unscaled_sputtering_);
             }
         }
 
@@ -1978,8 +2327,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             file << "  Initial albedo: " << std::fixed << std::setprecision(4) << initial_albedo_ << "\n";
             file << "  Final mean albedo: " << mean_a << "\n";
             file << "  Final albedo range: " << min_a << " - " << max_a << "\n";
-            file << "  Ice endmember: " << albedo_mapper_->getConfig().albedo_ice << "\n";
-            file << "  Non-ice endmember: " << albedo_mapper_->getConfig().albedo_nonice << "\n";
+            const auto& acfg = albedo_mapper_->getConfig();
+            if (acfg.hapke_intimate) {
+                file << "  Forward model: Hapke intimate mixture (hapke-intimate)\n";
+                file << "  w_ice: " << std::setprecision(10) << acfg.hapke_mixture.w_ice
+                     << ", g_ice: " << acfg.hapke_mixture.g_ice << "\n";
+                file << "  w_nonice: " << acfg.hapke_mixture.w_non
+                     << ", g_nonice: " << acfg.hapke_mixture.g_non << "\n";
+                file << "  Grain ratio D_ice/D_nonice: " << acfg.grain_ratio << "\n";
+                file << std::setprecision(4);
+            } else {
+                file << "  Ice endmember: " << acfg.albedo_ice << "\n";
+                file << "  Non-ice endmember: " << acfg.albedo_nonice << "\n";
+            }
             file << "  Temperature refreshes: " << stats.albedo_temp_refreshes << "\n\n";
         }
 

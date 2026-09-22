@@ -136,6 +136,12 @@ private:
     // This is the ice mass when concentration = 0 (pure ice)
     double max_ice_mass_per_area_;
 
+    // Exposed-area availability (--ice-fraction-from-albedo=hapke-intimate).
+    // 0 (default) = legacy: availability is the ice VOLUME fraction (1 - c).
+    // r > 0 = availability is the exposed ice AREA fraction
+    //   f = phi / (phi + r (1 - phi)),  phi = 1 - c,  r = D_ice / D_nonice.
+    double exposed_area_grain_ratio_ = 0.0;
+
 public:
     /**
      * Constructor
@@ -276,7 +282,36 @@ public:
     double getIceAvailabilityFactor(const IceLayerState& state, size_t face_idx) const {
         double nonice = state.nonice_concentration[face_idx];
         if (nonice >= layer_constants::MAX_NONICE_CONCENTRATION) return 0.0;
+        if (exposed_area_grain_ratio_ > 0.0) {
+            return exposedAreaFraction(1.0 - nonice);
+        }
         return 1.0 - nonice;
+    }
+
+    /**
+     * Switch availability from ice volume fraction to exposed ice area fraction.
+     * @param grain_ratio r = D_ice / D_nonice (> 0); 0 restores the legacy
+     *        volume-fraction availability.
+     */
+    void setExposedAreaGrainRatio(double grain_ratio) {
+        exposed_area_grain_ratio_ = std::max(0.0, grain_ratio);
+    }
+
+    /** True when availability is the exposed ice area fraction. */
+    bool usesExposedAreaFraction() const { return exposed_area_grain_ratio_ > 0.0; }
+
+    /** Grain-size ratio r = D_ice / D_nonice of the exposed-area mode (0 = off). */
+    double getExposedAreaGrainRatio() const { return exposed_area_grain_ratio_; }
+
+    /**
+     * Exposed ice area fraction for ice volume fraction phi (geometric optics,
+     * equal Q_ext): f = phi / (phi + r (1 - phi)). Requires the exposed-area mode.
+     */
+    double exposedAreaFraction(double phi) const {
+        const double r = exposed_area_grain_ratio_;
+        phi = std::clamp(phi, 0.0, 1.0);
+        const double den = phi + r * (1.0 - phi);
+        return (den > 0.0) ? phi / den : 0.0;
     }
 
     /**

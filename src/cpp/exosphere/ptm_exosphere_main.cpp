@@ -1779,6 +1779,13 @@ int main(int argc, char** argv)
     double albedo_percentile_low = 5.0;  // Lower percentile for concentration scaling
     double albedo_percentile_high = 95.0; // Upper percentile for concentration scaling
 
+    // Ice fraction from albedo (--ice-fraction-from-albedo=uniform|percentile|hapke-intimate).
+    // uniform (default) = the legacy uniform --dust-fraction on every face.
+    std::string ice_fraction_mode;        // empty = not given (uniform)
+    ptm::exosphere::HapkeIceFractionConfig hapke_cfg;
+    std::string hapke_param_given;        // first hapke-only flag seen (for mode checks)
+    std::string legacy_albedo_flag_given; // first legacy albedo-model flag seen
+
     // Ice crystallization model options
     bool crystallization_enabled = false;
     ptm::exosphere::CrystallizationConfig cryst_config;
@@ -1850,11 +1857,13 @@ int main(int argc, char** argv)
             ice_layer_enabled = true;  // Albedo coupling requires ice layer model
         }
         else if (a == "--albedo-ice" && i+1 < argc) {
+            if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
             albedo_coupling_enabled = true;
             ice_layer_enabled = true;
             albedo_config.albedo_ice = std::stod(argv[++i]);
         }
         else if (a == "--albedo-nonice" && i+1 < argc) {
+            if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
             albedo_coupling_enabled = true;
             ice_layer_enabled = true;
             albedo_config.albedo_nonice = std::stod(argv[++i]);
@@ -1866,11 +1875,13 @@ int main(int argc, char** argv)
             initial_albedo = std::stod(argv[++i]);
         }
         else if (a == "--albedo-nonice-map" && i+1 < argc) {
+            if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
             albedo_nonice_map_path = argv[++i];
             albedo_coupling_enabled = true;
             ice_layer_enabled = true;
         }
         else if (a == "--albedo-maps-dir" && i+1 < argc) {
+            if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
             albedo_maps_dir = argv[++i];
             albedo_coupling_enabled = true;
             ice_layer_enabled = true;
@@ -1880,10 +1891,46 @@ int main(int argc, char** argv)
             albedo_coupling_enabled = true;
             ice_layer_enabled = true;
         }
+        else if (a.rfind("--ice-fraction-from-albedo", 0) == 0) {
+            if (a == "--ice-fraction-from-albedo" && i+1 < argc) {
+                ice_fraction_mode = argv[++i];
+            } else if (a.rfind("--ice-fraction-from-albedo=", 0) == 0) {
+                ice_fraction_mode = a.substr(std::string("--ice-fraction-from-albedo=").size());
+            } else {
+                std::cerr << "Error: --ice-fraction-from-albedo needs a value "
+                          << "(uniform|percentile|hapke-intimate)" << std::endl;
+                return 1;
+            }
+        }
+        else if ((a == "--ice-albedo" || a == "--nonice-albedo" || a == "--g-ice" ||
+                  a == "--g-nonice" || a == "--grain-ratio" ||
+                  a == "--nonice-albedo-percentile") && i+1 < argc) {
+            const double v = std::stod(argv[++i]);
+            if (a == "--ice-albedo") hapke_cfg.ice_albedo = v;
+            else if (a == "--nonice-albedo") {
+                if (!(v >= 0.0)) {
+                    std::cerr << "Error: --nonice-albedo must be >= 0" << std::endl;
+                    return 1;
+                }
+                hapke_cfg.nonice_albedo = v;
+            }
+            else if (a == "--nonice-albedo-percentile") hapke_cfg.nonice_percentile = v;
+            else if (a == "--g-ice") hapke_cfg.g_ice = v;
+            else if (a == "--g-nonice") hapke_cfg.g_nonice = v;
+            else hapke_cfg.grain_ratio = v;
+            if (hapke_param_given.empty()) hapke_param_given = a;
+        }
+        else if ((a == "--ice-fraction-albedo-map" || a == "--albedo-fill-fits") && i+1 < argc) {
+            if (a == "--ice-fraction-albedo-map") hapke_cfg.albedo_map_path = argv[++i];
+            else hapke_cfg.fill_fits_path = argv[++i];
+            if (hapke_param_given.empty()) hapke_param_given = a;
+        }
         else if (a == "--albedo-percentile-low" && i+1 < argc) {
+            if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
             albedo_percentile_low = std::stod(argv[++i]);
         }
         else if (a == "--albedo-percentile-high" && i+1 < argc) {
+            if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
             albedo_percentile_high = std::stod(argv[++i]);
         }
         // Ice crystallization model options
@@ -1961,6 +2008,29 @@ int main(int argc, char** argv)
             std::cout << "  --albedo-maps-dir DIR  Auto-discover albedo map in directory\n";
             std::cout << "  --albedo-update-threshold T  Min albedo change for temp update (default: 0.01)\n";
             std::cout << "  --initial-albedo A     Bond albedo used in PTM thermal sim (default: 0.5)\n\n";
+            std::cout << "Ice fraction from albedo (optional coupling of initial ice to the albedo map):\n";
+            std::cout << "  --ice-fraction-from-albedo=MODE\n";
+            std::cout << "      uniform         (default) uniform --dust-fraction on every face\n";
+            std::cout << "      percentile      legacy rank mapping of the map (5th-95th percentile);\n";
+            std::cout << "                      not a physical inversion. Same as --init-from-albedo-map\n";
+            std::cout << "      hapke-intimate  invert the per-face Bond albedo with an intimate Hapke\n";
+            std::cout << "                      mixture (w by extinction, g by scattering cross section);\n";
+            std::cout << "                      sublimation scales with the EXPOSED ice area fraction f,\n";
+            std::cout << "                      phi_ice = f r / (f r + 1 - f). Requires --multiscale.\n";
+            std::cout << "  --ice-fraction-albedo-map F  per-face Bond albedo .bin used by the thermal run\n";
+            std::cout << "                      (required for hapke-intimate)\n";
+            std::cout << "  --albedo-fill-fits F  FITS map used to flag faces that mixed in fill pixels\n";
+            std::cout << "                      (default: Europa-0.5deg-BondAlbedo.fits next to the .bin;\n";
+            std::cout << "                      'none' skips fill detection, with a warning). Fill faces\n";
+            std::cout << "                      get exposed ice fraction 1 - --dust-fraction\n";
+            std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80, Fermi's base case)\n";
+            std::cout << "  --nonice-albedo A  non-ice endmember Bond albedo; overrides the default,\n";
+            std::cout << "                     which is the map's area-weighted percentile below\n";
+            std::cout << "  --nonice-albedo-percentile P  percentile of the map (area-weighted, fill\n";
+            std::cout << "                     faces excluded) used as the non-ice endmember (default: 10)\n";
+            std::cout << "  --g-ice G          ice asymmetry parameter (default: 0)\n";
+            std::cout << "  --g-nonice G       non-ice asymmetry parameter (default: 0)\n";
+            std::cout << "  --grain-ratio R    D_ice / D_nonice (default: 10)\n\n";
             std::cout << "Ice crystallization model options:\n";
             std::cout << "  --crystallization      Enable ice crystallization tracking\n";
             std::cout << "                         (amorphous/crystalline competition)\n";
@@ -1978,6 +2048,64 @@ int main(int argc, char** argv)
             std::cerr << "Unknown arg: " << a << std::endl;
             return 1;
         }
+    }
+
+    // Resolve --ice-fraction-from-albedo. uniform leaves every legacy path untouched.
+    if (init_from_albedo_map) {
+        if (!ice_fraction_mode.empty() && ice_fraction_mode != "percentile") {
+            std::cerr << "Error: --init-from-albedo-map (an alias for "
+                      << "--ice-fraction-from-albedo=percentile) conflicts with "
+                      << "--ice-fraction-from-albedo=" << ice_fraction_mode << std::endl;
+            return 1;
+        }
+        ice_fraction_mode = "percentile";
+    }
+    if (ice_fraction_mode.empty()) ice_fraction_mode = "uniform";
+    if (ice_fraction_mode != "uniform" && ice_fraction_mode != "percentile" &&
+        ice_fraction_mode != "hapke-intimate") {
+        std::cerr << "Error: unknown --ice-fraction-from-albedo mode '" << ice_fraction_mode
+                  << "' (expected uniform|percentile|hapke-intimate)" << std::endl;
+        return 1;
+    }
+    if (ice_fraction_mode != "hapke-intimate" && !hapke_param_given.empty()) {
+        std::cerr << "Error: " << hapke_param_given << " is used only by "
+                  << "--ice-fraction-from-albedo=hapke-intimate (mode is " << ice_fraction_mode
+                  << ")" << std::endl;
+        return 1;
+    }
+    if (ice_fraction_mode == "percentile") {
+        // Identical to the legacy --init-from-albedo-map.
+        init_from_albedo_map = true;
+        albedo_coupling_enabled = true;
+        ice_layer_enabled = true;
+    }
+    if (ice_fraction_mode == "hapke-intimate") {
+        if (!multiscale_enabled) {
+            std::cerr << "Error: --ice-fraction-from-albedo=hapke-intimate requires --multiscale. "
+                      << "The standard diurnal path does not apply the ice availability factor "
+                      << "to the emitted flux, so the exposed ice fraction would have no effect."
+                      << std::endl;
+            return 1;
+        }
+        if (hapke_cfg.albedo_map_path.empty()) {
+            std::cerr << "Error: --ice-fraction-from-albedo=hapke-intimate requires "
+                      << "--ice-fraction-albedo-map <per-face Bond albedo .bin> (the map the "
+                      << "thermal run used, e.g. data/albedo_maps/Europa_Albedo_res6.bin)" << std::endl;
+            return 1;
+        }
+        if (!legacy_albedo_flag_given.empty()) {
+            std::cerr << "Error: " << legacy_albedo_flag_given << " belongs to the legacy linear "
+                      << "albedo model; hapke-intimate uses --ice-albedo/--nonice-albedo/--g-ice/"
+                      << "--g-nonice/--grain-ratio and its own forward model" << std::endl;
+            return 1;
+        }
+        if (!(hapke_cfg.grain_ratio > 0.0)) {
+            std::cerr << "Error: --grain-ratio must be > 0" << std::endl;
+            return 1;
+        }
+        hapke_cfg.fill_exposed_ice_fraction = 1.0 - std::clamp(ice_layer_dust_fraction, 0.0, 1.0);
+        albedo_coupling_enabled = true;
+        ice_layer_enabled = true;
     }
 
     if (ptm_dir.empty()) {
@@ -2056,6 +2184,29 @@ int main(int argc, char** argv)
         integrator.enableIceLayerModel(ice_layer_dust_fraction);
     }
 
+    // Ice fraction from albedo: startup banner (every mode) and the hapke-intimate
+    // initialization (before crystallization, whose state initializeFromConcentrations
+    // would otherwise reset).
+    std::cout << "\nIce fraction from albedo: " << ice_fraction_mode;
+    if (ice_fraction_mode == "uniform") {
+        if (ice_layer_enabled) {
+            std::cout << " (default): non-ice volume fraction " << ice_layer_dust_fraction
+                      << " on every face" << std::endl;
+        } else {
+            std::cout << " (default): ice layer model off" << std::endl;
+        }
+    } else if (ice_fraction_mode == "percentile") {
+        std::cout << " (legacy --init-from-albedo-map): rank mapping between the P"
+                  << albedo_percentile_low << " and P" << albedo_percentile_high
+                  << " albedo percentiles. NOTE: this is not a physical inversion" << std::endl;
+    } else {
+        std::cout << " (intimate Hapke inversion of the Bond albedo map)" << std::endl;
+        if (!integrator.initializeConcentrationsFromHapkeIntimate(hapke_cfg, albedo_config)) {
+            std::cerr << "Error: hapke-intimate ice-fraction initialization failed" << std::endl;
+            return 1;
+        }
+    }
+
     // Enable crystallization model if requested (requires ice layer model)
     if (crystallization_enabled) {
         std::cout << "\nEnabling ice crystallization model:" << std::endl;
@@ -2066,6 +2217,7 @@ int main(int argc, char** argv)
     // Enable albedo-composition coupling if requested (requires ice layer model)
     if (albedo_coupling_enabled) {
         // Load per-face non-ice endmember map before enabling coupling
+        // (legacy linear model; hapke-intimate refuses these flags above)
         if (!albedo_nonice_map_path.empty() || !albedo_maps_dir.empty()) {
             integrator.loadNoniceAlbedoMap(albedo_nonice_map_path, albedo_maps_dir);
         }

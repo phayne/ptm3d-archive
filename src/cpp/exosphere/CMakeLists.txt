@@ -423,13 +423,27 @@ set_target_properties(test_bessel_k0_and_areas
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# --ice-fraction-from-albedo=hapke-intimate unit test (always build; header-only
+# code under test, exit code 0 = pass; optional arg: per-face Bond albedo .bin)
+add_executable(test_ice_fraction_from_albedo
+    test_ice_fraction_from_albedo.cpp
+)
+target_include_directories(test_ice_fraction_from_albedo PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/cpp
+)
+target_compile_features(test_ice_fraction_from_albedo PRIVATE cxx_std_17)
+set_target_properties(test_ice_fraction_from_albedo
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # =====================================================================================
 # Install and summary
 # =====================================================================================
 install(TARGETS ptm_exosphere
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(FILES exosphere_physics.h ptm_exosphere_integration.h distance_cache.h spherical_index.h sputtering_model.h ice_crystallization_model.h ice_layer_model.h multitimescale_evolution.h
+install(FILES exosphere_physics.h ptm_exosphere_integration.h distance_cache.h spherical_index.h sputtering_model.h ice_crystallization_model.h ice_layer_model.h multitimescale_evolution.h hapke_mixing.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ptm/exosphere
 )
 

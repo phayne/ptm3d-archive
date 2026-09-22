@@ -358,6 +358,44 @@ A dust fraction parameter $f_{\mathrm{dust}}$ (default $0.05 = 5\%$ by volume; s
 | $\delta_{\mathrm{th}}$ | 0.05 m | Thermal skin depth (default) |
 | $c_0$ | 0.01 | Initial non-ice concentration (1%) |
 
+**Ice fraction from albedo (optional).** `--ice-fraction-from-albedo=MODE` sets how the
+initial composition relates to the albedo map that drove the thermal run:
+
+- `uniform` (default): $c = f_{\mathrm{dust}}$ on every face; all legacy behavior unchanged.
+- `percentile`: the legacy `--init-from-albedo-map` rank mapping between the 5th and 95th
+  albedo percentiles. It is not a physical inversion.
+- `hapke-intimate`: invert the per-face **Bond** albedo map (`--ice-fraction-albedo-map`,
+  the thermal run's own `<Body>_Albedo_res<N>.bin`) with an intimate Hapke mixture of an
+  ice and a non-ice endmember. Scattering follows the engine's closed form (isotropic
+  scatterers, $H(\mu)=(1+2\mu)/(1+2\mu\gamma)$, $\gamma=\sqrt{1-w^*}$), and the Bond
+  albedo is $A_B(w^*) = 2\int_0^1 \mu\,[1-\gamma H(\mu)]\,d\mu$ (64-point Gauss-Legendre),
+  with $w^* = w(1-g)/(1-wg)$. Each endmember's $w$ is solved from its Bond albedo. The
+  mixture weights $w$ by extinction cross section and $g$ by scattering cross section
+  ($\sigma_{\mathrm{sca}} = w\,\sigma_{\mathrm{ext}}$). Per face, $f$ (the ice share of
+  extinction, which equals the exposed ice area in the geometric-optics limit) is found by
+  bisection and clamped at the endmembers.
+  With grain-size ratio $r = D_{\mathrm{ice}}/D_{\mathrm{nonice}}$ the ice volume fraction is
+  $\phi = f r / (f r + 1 - f)$ (inverse: $f = \phi / (\phi + r(1-\phi))$), and the layer
+  is seeded with $c = 1 - \phi$. **Sublimation and sputtering scale with the exposed area
+  $f$, not with $1-c$**. In multi-timescale mode, $d\phi/dt = B - A f(\phi)$ is solved in
+  closed form (`solveExposedAreaStep`); it reduces to the legacy exponential when $r = 1$.
+  The albedo-coupling forward model uses the same mixture, so the albedo computed from
+  the initial composition reproduces the map (the startup gate fails the run if the
+  mismatch exceeds $10^{-6}$ on inverted faces). Faces whose baked map value mixed in FITS
+  fill pixels (the map's $-1$ fill is not its `MISSING` value) are flagged against
+  `--albedo-fill-fits` and assigned $f = 1 - f_{\mathrm{dust}}$. Defaults: ice $A_B = 0.80$ (Fermi's base
+  case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (Paul,
+  2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
+  $g = 0$ for both; $r = 10$.
+  Requires `--multiscale`.
+
+**Multi-timescale availability (all modes).** Each full diurnal cycle accumulates the
+pure-ice *potential* emission of every face (the ice-mass gate is lifted for the
+accumulation), scales it by the face's ice availability ($1-c$, or $f$ in `hapke-intimate`)
+before transport, and caches the unscaled potential as the base flux. So the initial
+composition sets the first-epoch sublimation, and a face that starts with no ice sublimates
+again once deposition gives it ice.
+
 **Assumptions:**
 - Well-mixed layer (uniform concentration within skin depth)
 - Instantaneous vertical mixing
@@ -712,6 +750,14 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `--ice-layer` | off | Enable ice layer model with lag deposit tracking |
 | `--no-ice-layer` | | Disable ice layer model |
 | `--dust-fraction` $f_{\mathrm{dust}}$ | 0.05 | Dust volume fraction in ice |
+| `--ice-fraction-from-albedo=MODE` | `uniform` | `uniform`, `percentile` (= `--init-from-albedo-map`), or `hapke-intimate` |
+| `--ice-fraction-albedo-map` $F$ | (required for `hapke-intimate`) | Per-face Bond albedo `.bin` used by the thermal run |
+| `--albedo-fill-fits` $F$ | `Europa-0.5deg-BondAlbedo.fits` beside the `.bin` | FITS map for fill flagging; `none` skips it, with a warning |
+| `--ice-albedo` $A$ | 0.80 | Ice endmember Bond albedo (`hapke-intimate`) |
+| `--nonice-albedo` $A$ | map P10 | Non-ice endmember Bond albedo, explicit override (`hapke-intimate`) |
+| `--nonice-albedo-percentile` $P$ | 10 | Area-weighted map percentile (fill excluded) used as the non-ice endmember |
+| `--g-ice`, `--g-nonice` $g$ | 0, 0 | Endmember asymmetry parameters (`hapke-intimate`) |
+| `--grain-ratio` $r$ | 10 | $D_{\mathrm{ice}}/D_{\mathrm{nonice}}$ (`hapke-intimate`) |
 
 ### Multi-Timescale Options
 
@@ -746,6 +792,7 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 - `--dust-fraction` automatically enables `--ice-layer`
 - `--initial-crystallinity` automatically enables `--crystallization` and `--ice-layer`
 - `--epochs` automatically enables `--multiscale` and `--ice-layer`
+- `--ice-fraction-from-albedo=percentile` or `=hapke-intimate` enables `--ice-layer` and albedo coupling; `hapke-intimate` requires `--multiscale` and refuses the legacy linear-model flags (`--albedo-ice`, `--albedo-nonice`, `--albedo-nonice-map`, `--albedo-maps-dir`, `--albedo-percentile-*`); the `hapke-intimate` parameters are refused in the other modes
 
 ---
 
@@ -762,6 +809,8 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `ice_layer_model.h` | ~500 | Ice layer: concentration tracking, sublimation/deposition bookkeeping |
 | `ice_crystallization_model.h` | ~600 | Crystallization: Avrami kinetics, radiation amorphization, dose maps |
 | `multitimescale_evolution.h` | ~650 | Operator splitting: epoch extrapolation, flux caching, analytical accel. |
+| `hapke_mixing.h` | ~220 | Hapke Bond albedo, endmember inversion, intimate mixture (`hapke-intimate`) |
+| `composition_albedo.h` | ~240 | Composition-to-albedo forward model (linear, or Hapke in `hapke-intimate`) |
 | `distance_cache.h` | ~300 | Great-circle distance cache with spatial indexing |
 | `spherical_index.h` | ~400 | Spatial hash grid on sphere for neighbor queries |
 
@@ -781,6 +830,8 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `test_pentagon_bias.cpp` | Icosahedral mesh bias detection in transport |
 | `test_cutoff_benchmark.cpp` | Performance benchmarks for $K_0$ cutoff distance |
 | `test_equilibrium_bias.cpp` | Equilibrium state bias analysis |
+| `test_bessel_k0_and_areas.cpp` | EXO-01/EXO-02 regression: $K_0$ values, m$^2$ areas, smoothing gate |
+| `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 
 ---
