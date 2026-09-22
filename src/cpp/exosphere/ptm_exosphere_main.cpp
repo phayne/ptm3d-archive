@@ -2110,11 +2110,17 @@ int main(int argc, char** argv)
             integrator.setDiurnalStride(diurnal_stride);
             std::cout << "  Diurnal accumulation stride: " << diurnal_stride << std::endl;
         }
-        integrator.runMultiTimescaleSimulation(multiscale_epochs,
-                                                multiscale_cycles_per_epoch,
-                                                multiscale_export_interval,
-                                                analytical_acceleration,
-                                                cache_refresh_interval);
+        try {
+            integrator.runMultiTimescaleSimulation(multiscale_epochs,
+                                                    multiscale_cycles_per_epoch,
+                                                    multiscale_export_interval,
+                                                    analytical_acceleration,
+                                                    cache_refresh_interval);
+        } catch (const std::exception& e) {
+            // e.g., an invalid EXO_DEP_SMOOTH_DEG: fail loudly with the reason.
+            std::cerr << "Error: " << e.what() << std::endl;
+            return 1;
+        }
     } else {
         // Standard diurnal simulation
         std::cout << "\nRunning standard diurnal simulation..." << std::endl;

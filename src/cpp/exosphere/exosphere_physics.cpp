@@ -2137,6 +2137,7 @@ Eigen::SparseMatrix<double> BallisticTransport::buildTransportMatrixIndexed(
         cell_size_deg = std::max(2.0, cell_size_deg);  // But not too small
 
         spatial_index_.build(face_centers, cell_size_deg, theta_max_global * 1.1);
+        spatial_index_query_radius_ = theta_max_global * 1.1;
         spatial_index_built_ = true;
         spatial_index_.printStatistics();
     }
@@ -2399,6 +2400,7 @@ Eigen::SparseMatrix<double> BallisticTransport::buildTransportMatrixSmooth(
         cell_size_deg = std::max(2.0, cell_size_deg);
 
         spatial_index_.build(face_centers, cell_size_deg, theta_max_global * 1.1);
+        spatial_index_query_radius_ = theta_max_global * 1.1;
         spatial_index_built_ = true;
     }
 
@@ -2828,13 +2830,9 @@ void BallisticTransport::computeTransportProduct(
         double cell_size_deg = std::min(10.0, theta_max_global * 180.0 / M_PI / 3.0);
         cell_size_deg = std::max(2.0, cell_size_deg);
         spatial_index_.build(face_centers, cell_size_deg, theta_max_global * 1.1);
+        spatial_index_query_radius_ = theta_max_global * 1.1;
         spatial_index_built_ = true;
     }
-
-    // Mean angular face size (used for spatial smoothing radius)
-    double mean_theta = 0.0;
-    for (double A : face_areas) mean_theta += std::sqrt(std::max(A, 0.0) / M_PI) / R;
-    mean_theta /= std::max<size_t>(1, face_areas.size());
 
     // Kernel probability density with precomputed sigma2 for the source temperature.
     // Avoids redundant kT/m computation for each neighbor pair.
@@ -3060,21 +3058,17 @@ void BallisticTransport::computeTransportProduct(
         max_residual_bias = 0.0;  // Exact correction for calibration case
     }
 
-    // === SPATIAL SMOOTHING ===
-    // Smoothing radius matches smoothField() default: 20 × mean face angular width.
-    // This ensures deposition and sublimation have consistent spatial resolution,
-    // preventing mesh artifacts in net_flux = dep - sub.
-    // Override: EXO_DEP_SMOOTH_DEG=<degrees>
-    double smooth_radius_deg = 0.0;
-    {
-        double smooth_radius = 20.0 * mean_theta;
-        if (const char* envp = std::getenv("EXO_DEP_SMOOTH_DEG")) {
-            double v = std::atof(envp);
-            if (v > 0.0 && v < 30.0) {
-                smooth_radius = v * M_PI / 180.0;
-            }
+    // === SPATIAL SMOOTHING (off by default) ===
+    // Radius from spatialSmoothingRadiusRad(): 0 unless EXO_DEP_SMOOTH_DEG opts
+    // in, and the same radius the sublimation/sputtering fields use, so
+    // net_flux = dep - sub stays at one resolution.
+    const double smooth_radius = spatialSmoothingRadiusRad();
+    const double smooth_radius_deg = smooth_radius * 180.0 / M_PI;
+    if (smooth_radius > 0.0) {
+        if (smooth_radius > spatial_index_query_radius_) {
+            throw std::invalid_argument("EXO_DEP_SMOOTH_DEG exceeds the spatial index query radius ("
+                + std::to_string(spatial_index_query_radius_ * 180.0 / M_PI) + " deg)");
         }
-        smooth_radius_deg = smooth_radius * 180.0 / M_PI;
         float cos_smooth = static_cast<float>(std::cos(smooth_radius));
         std::vector<double> dep_smooth(n);
 
@@ -3130,7 +3124,8 @@ void BallisticTransport::computeTransportProduct(
               << (conservation_ratio * 100.0) << "%"
               << ", area-bias=" << std::setprecision(1) << (max_bias * 100.0) << "%"
               << (disable_bias_correction ? " (uncorrected)" : " (row-corrected)")
-              << ", smoothing radius=" << std::setprecision(3) << smooth_radius_deg << " deg"
+              << ", smoothing="
+              << (smooth_radius > 0.0 ? std::to_string(smooth_radius_deg) + " deg" : std::string("off"))
               << std::endl;
 }
 
@@ -3153,17 +3148,13 @@ void BallisticTransport::smoothField(
     double smooth_radius_rad) const
 {
     size_t n = input.size();
-    if (!spatial_index_built_ || n == 0) {
-        output = input;
+    if (!spatial_index_built_ || n == 0 || smooth_radius_rad <= 0.0) {
+        output = input;  // radius <= 0: smoothing off, exact no-op
         return;
     }
-
-    // Default smoothing radius: 20 × mean face angular width
-    if (smooth_radius_rad <= 0.0) {
-        double mean_theta = 0.0;
-        for (double A : face_areas) mean_theta += std::sqrt(std::max(A, 0.0) / M_PI) / body_radius_;
-        mean_theta /= std::max<size_t>(1, n);
-        smooth_radius_rad = 20.0 * mean_theta;
+    if (smooth_radius_rad > spatial_index_query_radius_) {
+        throw std::invalid_argument("smoothField radius exceeds the spatial index query radius ("
+            + std::to_string(spatial_index_query_radius_ * 180.0 / M_PI) + " deg)");
     }
 
     float cos_smooth = static_cast<float>(std::cos(smooth_radius_rad));

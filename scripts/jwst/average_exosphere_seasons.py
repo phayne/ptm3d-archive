@@ -106,8 +106,10 @@ def face_geometry_m(mesh_path: Path):
     e2 = v[f[:, 2]] - v[f[:, 0]]
     areas = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1) * scale * scale
     rel = areas.sum() / (4.0 * np.pi * EUROPA_RADIUS_M ** 2) - 1.0
-    if not abs(rel) < 1e-3:
-        raise ValueError(f"total face area differs from 4 pi R^2 by {rel:.3e} (limit 1e-3)")
+    # Same gate as the C++ computeExosphereFaceGeometry(): 1e-2 catches unit
+    # errors (off by ~1e6) and non-global meshes but admits coarse icospheres.
+    if not abs(rel) < 1e-2:
+        raise ValueError(f"total face area differs from 4 pi R^2 by {rel:.3e} (limit 1e-2)")
     c = v[f].mean(axis=1)
     lat = np.degrees(np.arcsin(c[:, 2] / np.linalg.norm(c, axis=1)))
     return areas, lat

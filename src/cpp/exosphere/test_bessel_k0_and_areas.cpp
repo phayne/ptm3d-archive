@@ -8,7 +8,11 @@
  *         end to end: a km-unit icosphere with uniform T must report
  *         total_sublimation_rate_kg_s = Phi(T) * sum(A [m^2]) in
  *         atmospheric_mass.csv, through BOTH setMesh() and loadMesh(); and a
- *         mesh that is not a closed sphere must be refused.
+ *         mesh that is not a closed sphere must be refused, while coarse
+ *         flat-faceted icospheres (ico3, ico4) must be accepted (tolerance
+ *         1e-2, Paul 2026-09-22).
+ * Smoothing (Paul 2026-09-22): spatial smoothing is OFF by default (a true
+ *         no-op), EXO_DEP_SMOOTH_DEG opts in, and an invalid value is refused.
  *
  * Uses only public API present before the fix, so the same file builds
  * against the unfixed code (where it fails).
@@ -28,6 +32,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
 #include <unistd.h>
 
 #include "exosphere_physics.h"
@@ -275,6 +281,98 @@ static void test_open_mesh_refused() {
     check(refused, "setMesh refuses an open hemisphere (sum A = 0.5 x 4 pi R^2)");
 }
 
+static void test_coarse_icospheres_accepted() {
+    const double R_km = exo::constants::EUROPA_RADIUS / 1000.0;
+    for (int levels : {3, 4}) {
+        bool accepted = true;
+        std::string msg;
+        try {
+            exo::PTMExosphereIntegration integ(
+                (fs::temp_directory_path() / ("ptm_exo_coarse_" + std::to_string(::getpid()))).string());
+            integ.setMesh(std::make_shared<ptm::Mesh>(make_icosphere(levels, R_km)));
+        } catch (const std::exception& e) {
+            accepted = false;
+            msg = e.what();
+        }
+        fs::remove_all(fs::temp_directory_path() / ("ptm_exo_coarse_" + std::to_string(::getpid())));
+        check(accepted, "setMesh accepts km-unit ico" + std::to_string(levels) +
+                        " (flat-facet area deficit is inside the 1e-2 tolerance)" +
+                        (msg.empty() ? "" : " [" + msg + "]"));
+    }
+}
+
+// Transport + smoothing on a meter-unit ico5 with one emitting face.
+struct SmoothCase {
+    std::vector<std::array<double, 3>> centers;
+    std::vector<double> areas, temps, emission;
+};
+
+static SmoothCase make_smooth_case() {
+    const ptm::Mesh m = make_icosphere(5, exo::constants::EUROPA_RADIUS);  // meters
+    SmoothCase c;
+    for (const auto& tri : m.faces) {
+        std::array<double, 3> ctr{0, 0, 0};
+        for (int k = 0; k < 3; ++k)
+            for (int d = 0; d < 3; ++d) ctr[d] += m.vertices[tri[k]][d] / 3.0;
+        const double r = std::sqrt(ctr[0] * ctr[0] + ctr[1] * ctr[1] + ctr[2] * ctr[2]);
+        for (int d = 0; d < 3; ++d) ctr[d] *= exo::constants::EUROPA_RADIUS / r;
+        c.centers.push_back(ctr);
+        ptm::Mesh one;
+        one.vertices = m.vertices;
+        one.faces = {tri};
+        c.areas.push_back(total_area_m2(one, 1.0));
+    }
+    c.temps.assign(c.centers.size(), 130.0);
+    c.emission.assign(c.centers.size(), 0.0);
+    c.emission[777] = 1.0;
+    return c;
+}
+
+static void test_smoothing_default_off() {
+    std::cout << "\n[smoothing] OFF by default, opt-in via EXO_DEP_SMOOTH_DEG, invalid refused\n";
+    ::unsetenv("EXO_DEP_SMOOTH_DEG");
+    const SmoothCase c = make_smooth_case();
+    exo::BallisticTransport bt;
+    std::vector<double> dep_off;
+    bt.computeTransportProduct(c.centers, c.areas, c.temps, c.emission, dep_off);
+
+    // smoothField with its default radius must be an exact no-op.
+    std::vector<double> spike(c.centers.size(), 0.0), out;
+    spike[777] = 1.0;
+    bt.smoothField(c.areas, spike, out);
+    check(out == spike, "smoothField(default radius) returns its input unchanged (bitwise)");
+
+    // An explicit opt-in must actually smooth the deposition field.
+    ::setenv("EXO_DEP_SMOOTH_DEG", "5", 1);
+    std::vector<double> dep_on;
+    bool threw_on = false;
+    try {
+        bt.computeTransportProduct(c.centers, c.areas, c.temps, c.emission, dep_on);
+    } catch (const std::exception&) {
+        threw_on = true;
+    }
+    double peak_off = 0.0, peak_on = 0.0;
+    for (double v : dep_off) peak_off = std::max(peak_off, v);
+    for (double v : dep_on) peak_on = std::max(peak_on, v);
+    std::ostringstream os;
+    os << "EXO_DEP_SMOOTH_DEG=5 smooths deposition (peak " << std::scientific << std::setprecision(3)
+       << peak_off << " off -> " << peak_on << " on)";
+    check(!threw_on && peak_on < 0.9 * peak_off, os.str());
+
+    // An invalid value must be refused, not ignored.
+    ::setenv("EXO_DEP_SMOOTH_DEG", "eight", 1);
+    bool refused = false;
+    try {
+        std::vector<double> dep_bad;
+        bt.computeTransportProduct(c.centers, c.areas, c.temps, c.emission, dep_bad);
+    } catch (const std::exception& e) {
+        refused = true;
+        std::cout << "        (refusal message: " << e.what() << ")" << std::endl;
+    }
+    ::unsetenv("EXO_DEP_SMOOTH_DEG");
+    check(refused, "EXO_DEP_SMOOTH_DEG=eight is refused");
+}
+
 int main() {
     std::cout << "Exosphere EXO-01 / EXO-02 regression tests\n";
     test_k0_values();
@@ -284,6 +382,8 @@ int main() {
     test_reported_rate("setMesh", false);
     test_reported_rate("loadMesh", true);
     test_open_mesh_refused();
+    test_coarse_icospheres_accepted();
+    test_smoothing_default_off();
     std::cout << "\n" << (g_failures == 0 ? "ALL PASS" : "FAILURES: " + std::to_string(g_failures))
               << std::endl;
     return g_failures == 0 ? 0 : 1;

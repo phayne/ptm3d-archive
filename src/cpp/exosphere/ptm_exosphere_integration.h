@@ -33,7 +33,8 @@ namespace ptm {
          * Face centers [m, on the sphere of radius R_Europa] and areas [m^2] from
          * a mesh in any length unit (EXO-02). Returns false with a message in
          * `error` if the geometry is unusable, including when the total area
-         * differs from 4 pi R_Europa^2 by 1e-3 or more (relative).
+         * differs from 4 pi R_Europa^2 by 1e-2 or more (relative; catches unit
+         * errors and non-global meshes, admits coarse flat-faceted icospheres).
          */
         bool computeExosphereFaceGeometry(const Mesh& mesh,
                                           std::vector<std::array<double,3>>& centers,

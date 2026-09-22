@@ -45,9 +45,13 @@ PTMExosphereIntegration::~PTMExosphereIntegration() {
 // length unit to meters (s = 1000 for a km mesh); areas scale by s^2. Face
 // centers are projected onto the sphere of radius R_Europa.
 //
-// Hard gate: |sum(A) - 4 pi R^2| / (4 pi R^2) must be < 1e-3. The exosphere is
-// a closed-sphere model; a mesh that fails this is either in unexpected units
-// or not a global sphere, and must not run silently.
+// Hard gate: |sum(A) - 4 pi R^2| / (4 pi R^2) must be < 1e-2. The gate exists
+// to catch unit errors, which are off by factors like 1e6 (km vs m) and are
+// caught by any modest tolerance, and meshes that are not a closed global
+// sphere (a hemisphere is off by 0.5). It is deliberately NOT tighter:
+// flat-faceted icospheres cover less area than their sphere (ico3 -4.8e-3,
+// ico4 -1.2e-3, ico6 -7.5e-5), and 1e-3 rejected valid ico<=4 meshes,
+// including the loadMesh("") default icosphere.
 bool computeExosphereFaceGeometry(const Mesh& mesh,
                                   std::vector<std::array<double,3>>& centers,
                                   std::vector<double>& areas,
@@ -126,10 +130,10 @@ bool computeExosphereFaceGeometry(const Mesh& mesh,
     std::cout << "[exosphere] total face area " << std::scientific << std::setprecision(6)
               << total << " m^2 = 4 pi R^2 x (1 " << (rel >= 0 ? "+ " : "- ")
               << std::abs(rel) << ")" << std::defaultfloat << std::endl;
-    if (!(std::abs(rel) < 1e-3)) {
+    if (!(std::abs(rel) < 1e-2)) {
         std::ostringstream os;
         os << "total face area " << total << " m^2 differs from 4 pi R_Europa^2 = " << sphere
-           << " m^2 by a relative " << rel << " (limit 1e-3): mesh is in unexpected units "
+           << " m^2 by a relative " << rel << " (limit 1e-2): mesh is in unexpected units "
            << "or is not a closed global sphere";
         error = os.str();
         return false;
@@ -1479,6 +1483,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         config.print();
 
+        // Spatial smoothing banner (validates EXO_DEP_SMOOTH_DEG up front).
+        {
+            const double r = spatialSmoothingRadiusRad();
+            if (r > 0.0) {
+                std::cout << "[exosphere] spatial smoothing ON: " << std::fixed << std::setprecision(3)
+                          << (r * 180.0 / M_PI) << " deg radius (EXO_DEP_SMOOTH_DEG), applied to "
+                          << "deposition, sublimation and sputtering" << std::endl;
+            } else {
+                std::cout << "[exosphere] spatial smoothing OFF (default). It existed to suppress "
+                          << "mesh-topology (pentagon) artifacts; the K0 fix (EXO-01) removed most "
+                          << "of that bias. Opt in with EXO_DEP_SMOOTH_DEG=<degrees>." << std::endl;
+            }
+        }
+
         // Calculate epoch duration
         double diurnal_period = timescale_constants::EUROPA_DIURNAL_PERIOD;
         double epoch_duration = cycles_per_epoch * diurnal_period;
@@ -1833,26 +1851,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::cout << "  Transport complete (" << std::fixed << std::setprecision(1)
                   << transport_sec << " s)" << std::endl;
 
-        // Smooth sublimation (and sputtering) to match the transport's spatial
-        // resolution. The transport post-smoothing averages deposition over
-        // 20 x the mean face angular radius (about 8 deg on ico6; logged by
-        // computeTransportProduct), but sublimation is computed per-face from
-        // temperature. (Before EXO-02 the km^2 areas made that radius ~0.008
-        // deg, i.e., no smoothing at all.)
-        // Sharp temperature boundaries from albedo map pixels (~0.5° resolution)
-        // create sharp sublimation features that appear as artifacts in net flux.
-        // Smoothing both sides ensures consistent spatial resolution.
+        // Optional spatial smoothing of sublimation and sputtering, at the same
+        // radius as the deposition smoothing inside computeTransportProduct()
+        // (spatialSmoothingRadiusRad(): OFF unless EXO_DEP_SMOOTH_DEG opts in).
         // Area-weighted smoothing does not conserve sum(flux * area) on its own,
-        // so each smoothed field is rescaled to its pre-smoothing total. Both
-        // sublimation and sputtering go through the same path (EXO-08: the
-        // sputtering field used to be smoothed without this rescale).
+        // so each smoothed field is rescaled to its pre-smoothing total (EXO-08:
+        // the sputtering field used to be smoothed without this rescale).
+        const double smooth_radius = spatialSmoothingRadiusRad();
         auto smoothPreservingTotal = [&](std::vector<double>& field) {
             double total_before = 0.0;
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 total_before += field[i] * face_areas_[i];
             }
             std::vector<double> smoothed(num_faces_);
-            exosphere_model_->smoothField(field, smoothed);
+            exosphere_model_->smoothField(field, smoothed, smooth_radius);
             double total_after = 0.0;
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 total_after += smoothed[i] * face_areas_[i];
@@ -1865,9 +1877,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             }
             field = std::move(smoothed);
         };
-        smoothPreservingTotal(diurnal_avg.avg_sublimation_flux);
-        if (sputtering_enabled_) {
-            smoothPreservingTotal(diurnal_avg.avg_sputtering_flux);
+        if (smooth_radius > 0.0) {
+            smoothPreservingTotal(diurnal_avg.avg_sublimation_flux);
+            if (sputtering_enabled_) {
+                smoothPreservingTotal(diurnal_avg.avg_sputtering_flux);
+            }
         }
 
         // Update net flux consistently

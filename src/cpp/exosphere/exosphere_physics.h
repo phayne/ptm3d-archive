@@ -12,6 +12,9 @@
 #include <cmath>
 #include <memory>
 #include <limits>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -94,6 +97,35 @@ inline double besselK0(double x) {
                     y * (0.00587872 + y * (-0.00251540 + y * 0.00053208)))));
         return std::exp(-x) / std::sqrt(x) * ak;
     }
+}
+
+// Spatial post-smoothing radius [rad] shared by the deposition field
+// (BallisticTransport::computeTransportProduct) and the sublimation and
+// sputtering fields (PTMExosphereIntegration::computeDiurnalAverages).
+//
+// OFF (0, a true no-op) by default (Paul, 2026-09-22). The smoothing existed to
+// suppress mesh-topology (pentagon) artifacts. Its default of 20x the mean
+// face angular radius never took effect before the EXO-02 area fix (km^2 areas
+// made it ~0.008 deg); after that fix it silently became ~8 deg on ico6. The
+// EXO-01 K0 fix already removed most of the topology bias it targeted.
+// Measured 2026-09-22 (ico6, uniform 130 K, zonal cos^4 source; departure of
+// deposition from zonal symmetry): pre-fix kernel rms 1.5e-3; fixed kernel
+// with smoothing off rms 3.6e-5, at the estimator floor (2.6e-5); an 8 deg
+// top-hat smoothing ADDS rms 4.3e-2 (max 0.14) of its own cap-edge artifact.
+//
+// Opt in with EXO_DEP_SMOOTH_DEG=<degrees>, 0 < degrees < 30; "0" means off.
+// Any other value (unparsable, negative, >= 30) throws instead of being
+// silently ignored. The same radius applies to all three fields.
+inline double spatialSmoothingRadiusRad() {
+    const char* envp = std::getenv("EXO_DEP_SMOOTH_DEG");
+    if (envp == nullptr || *envp == '\0') return 0.0;
+    char* end = nullptr;
+    const double deg = std::strtod(envp, &end);
+    if (end == envp || *end != '\0' || !std::isfinite(deg) || deg < 0.0 || deg >= 30.0) {
+        throw std::invalid_argument(std::string("EXO_DEP_SMOOTH_DEG='") + envp +
+                                    "' is invalid: expected degrees in [0, 30) (0 = off)");
+    }
+    return deg * M_PI / 180.0;
 }
 
 // Vapor pressure physics
@@ -244,6 +276,9 @@ private:
     // Spatial index for O(N log N) neighbor queries
     mutable SphericalSpatialIndex spatial_index_;
     mutable bool spatial_index_built_;
+    // Largest angular query radius [rad] the spatial index was built for;
+    // queries beyond it are silently truncated, so smoothing checks it.
+    mutable double spatial_index_query_radius_ = 0.0;
 
     // Sinkhorn scaling factor cache for warm-start optimization
     mutable Eigen::VectorXd sinkhorn_row_scale_cache_;
@@ -367,17 +402,16 @@ public:
         double threshold = 1e-10) const;
 
     // Area-weighted smoothing of a per-face scalar over the spatial-index
-    // neighborhood within `smooth_radius_rad` (or, if <=0, a default of
-    // ~20× the mean face angular width). Used to match the per-face
-    // sublimation field to the transport's effective spatial resolution
-    // so that sharp albedo-map pixel boundaries do not create artifacts in
-    // the net-flux map. Falls back to copying input → output when the
-    // spatial index has not yet been built.
+    // neighborhood within `smooth_radius_rad`. A radius <= 0 is a no-op
+    // (output = input); callers pass spatialSmoothingRadiusRad(), which is 0
+    // unless EXO_DEP_SMOOTH_DEG opts in. Throws if the radius exceeds the
+    // spatial index's query radius. Copies input -> output when the spatial
+    // index has not yet been built.
     void smoothField(
         const std::vector<double>& face_areas,
         const std::vector<double>& input,
         std::vector<double>& output,
-        double smooth_radius_rad = -1.0) const;
+        double smooth_radius_rad = 0.0) const;
 
     // NEW: Check if spatial index is built
     bool isSpatialIndexBuilt() const { return spatial_index_built_; }
@@ -529,11 +563,12 @@ public:
 
     // Area-weighted smoothing of a per-face scalar field. Forwards to
     // BallisticTransport::smoothField using face_areas_ and the transport's
-    // spatial index. If transport is not initialized, copies input → output.
+    // spatial index (radius <= 0 is a no-op). If transport is not
+    // initialized, copies input -> output.
     void smoothField(
         const std::vector<double>& input,
         std::vector<double>& output,
-        double smooth_radius_rad = -1.0);
+        double smooth_radius_rad = 0.0);
 
     // Optional: Method to check ice availability at each face
     std::vector<bool> getIcePresenceMask() const {
