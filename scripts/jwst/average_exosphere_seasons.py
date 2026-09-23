@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
-"""Average per-face exosphere outputs between two seasonal C++ runs.
+"""Average per-face exosphere outputs across N seasonal/orbital-phase runs.
 
 Solves the Jensen's-inequality problem with simply averaging temperatures:
   AVERAGING TEMPERATURES BEFORE EXOSPHERE understates sublimation flux
-  because flux ∝ exp(-Q/kT) is convex in T.
-  AVERAGING FLUXES AFTER TWO SEPARATE EXOSPHERE RUNS captures the actual
-  seasonal mean (sub & dep & sput over the full Jovian year).
+  because flux ~ exp(-Q/kT) is convex in T.
+  AVERAGING FLUXES AFTER N SEPARATE EXOSPHERE RUNS captures the actual
+  time-weighted mean over the orbit (sub & dep & sput over the full
+  Jupiter year, or any other cycle sampled at N phases).
 
-For each per-face output dir we average across season1 / season2 at the
-final epoch and write the result to <output>/<field>/<field>_0999.bin.
+For each per-face output field we compute the weighted mean across all N
+runs at each run's final epoch and write the result to
+<output>/<field>/<field>_<epoch>.bin.
 
 evolution_summary.txt is SYNTHESIZED from the averaged per-face fields (M8):
-mass totals are sum(averaged cumulative field [kg/m^2] x face area [m^2]),
-concentration/crystallinity statistics and the latitude table come from the
-averaged fields. (An earlier version copied season 1's summary verbatim and
-appended a note claiming it was an average.) The summary is refused -- not
-written, nonzero exit -- if the two seasons disagree on duration or final
-epoch, or if a season's own summary is inconsistent with its fields.
+mass totals are sum(weighted-averaged cumulative field [kg/m^2] x face area
+[m^2]); concentration/crystallinity statistics and the latitude table come
+from the weighted-averaged fields. The summary is refused -- not written,
+nonzero exit -- if any two runs disagree on duration or final epoch, or if
+a run's own summary is inconsistent with its own fields.
 
-Usage:
+Weights: for N phases evenly spaced in mean anomaly (the Jupiter-year
+sampling design), the time-weighted orbital average is exactly the uniform
+mean 1/N (mean anomaly is linear in time by definition), so the default
+is uniform weights. --weights lets you override this for non-uniform
+sampling or a sensitivity study (e.g. an N=2 two-point quadrature).
+
+Usage (N=8 Jupiter-year phases, uniform weights):
     python average_exosphere_seasons.py \
-        --season1 output/europa_ico6_albedo-map_cryst \
-        --season2 output/europa_ico6_albedo-map_opp-season_cryst \
-        --output  output/europa_ico6_albedo-map_seasonavg_cryst
+        --runs output/.../phase0 output/.../phase1 ... output/.../phase7 \
+        --output output/.../eightphase_avg
+
+Usage (legacy two-season case, explicit for clarity):
+    python average_exosphere_seasons.py \
+        --runs output/europa_ico6_albedo-map_cryst \
+               output/europa_ico6_albedo-map_opp-season_cryst \
+        --output output/europa_ico6_albedo-map_seasonavg_cryst
 """
 from __future__ import annotations
 
@@ -43,10 +55,10 @@ EUROPA_RADIUS_M = 1.5608e6  # matches ptm::exosphere::constants::EUROPA_RADIUS
 
 
 # Per-face field directories that we want to average.
-# Cumulative quantities → straight average is OK (both runs simulated the same
-# duration so the time-averaged rates are comparable).
-# Per-epoch state quantities (concentrations, fractions) → also averaged at the
-# final epoch.
+# Cumulative quantities -> weighted average is OK (all runs simulated the
+# same duration so the time-averaged rates are comparable).
+# Per-epoch state quantities (concentrations, fractions) -> also averaged at
+# each run's final epoch.
 FIELD_DIRS = [
     "cumulative_sublimated_kg_m2",
     "cumulative_deposited_kg_m2",
@@ -72,6 +84,7 @@ FIELD_DIRS = [
     "sputtering_spatial_weight",
     "escape_flux_kg_m2_s",
     "net_flux_kg_m2_s",
+    "bond_albedo",
 ]
 
 
@@ -139,13 +152,14 @@ def parse_summary(path: Path) -> dict:
     return out
 
 
-def synthesize_summary(args, areas, lat, fields, epochs_used) -> str:
-    """Build evolution_summary.txt text from the averaged fields.
+def synthesize_summary(runs, weights, areas, lat, fields, epochs_used) -> str:
+    """Build evolution_summary.txt text from the N weighted-averaged fields.
 
-    `fields` maps field name -> (season1, season2, average) arrays at the final
-    epoch. Raises ValueError (the caller refuses to write a summary) on any
-    inconsistency.
+    `fields` maps field name -> (list of N per-run arrays, weighted average)
+    at each run's own final epoch. Raises ValueError (the caller refuses to
+    write a summary) on any inconsistency.
     """
+    n = len(runs)
     needed = ["cumulative_sublimated_kg_m2", "cumulative_deposited_kg_m2",
               "cumulative_sputtered_kg_m2", "nonice_concentration"]
     missing = [k for k in needed if k not in fields]
@@ -155,52 +169,57 @@ def synthesize_summary(args, areas, lat, fields, epochs_used) -> str:
     if len(used) != 1:
         raise ValueError(f"fields come from different final epochs: {epochs_used}")
 
-    sums = [parse_summary(args.season1 / "evolution_summary.txt"),
-            parse_summary(args.season2 / "evolution_summary.txt")]
+    sums = [parse_summary(r / "evolution_summary.txt") for r in runs]
     for key in ("total_years", "elapsed_years", "epochs", "cycles_per_epoch"):
-        a, b = sums[0][key], sums[1][key]
-        if abs(a - b) > 1e-6 * max(abs(a), abs(b), 1.0):
-            raise ValueError(f"seasons disagree on {key}: {a} vs {b}")
+        vals = [s[key] for s in sums]
+        spread = max(vals) - min(vals)
+        if spread > 1e-6 * max(max(abs(v) for v in vals), 1.0):
+            raise ValueError(f"runs disagree on {key}: {vals}")
 
-    # Per-season cross-check: each season's field totals must reproduce its own
+    # Per-run cross-check: each run's own field totals must reproduce its own
     # summary. Ratio 1 = summary in true units; ratio 1e6 = summary written
     # before the EXO-02 fix (km^2 areas). Anything else is refused.
     unit_factor = []
-    for idx, (label, summ) in enumerate(zip(("season1", "season2"), sums)):
-        total = float(np.sum(fields["cumulative_sublimated_kg_m2"][idx] * areas))
+    for idx, (run, summ) in enumerate(zip(runs, sums)):
+        total = float(np.sum(fields["cumulative_sublimated_kg_m2"][0][idx] * areas))
         ratio = total / summ["sublimated"] if summ["sublimated"] > 0 else float("nan")
         if abs(ratio - 1.0) < 0.01:
             unit_factor.append(1.0)
         elif abs(ratio / 1e6 - 1.0) < 0.01:
-            print(f"WARNING: {label} evolution_summary.txt predates the EXO-02 area fix: its "
+            print(f"WARNING: {run} evolution_summary.txt predates the EXO-02 area fix: its "
                   f"mass totals are 1e6 too small (field total / summary = {ratio:.4e}). "
                   f"The synthesized totals below use true m^2 areas.", file=sys.stderr)
             unit_factor.append(1e6)
         else:
-            raise ValueError(f"{label}: field total {total:.4e} kg does not match its summary "
-                             f"{summ['sublimated']:.4e} kg (ratio {ratio:.4e}, expected 1 or 1e6)")
+            raise ValueError(f"{run}: field total {total:.4e} kg does not match its summary "
+                              f"{summ['sublimated']:.4e} kg (ratio {ratio:.4e}, expected 1 or 1e6)")
 
     def total(name):
-        return float(np.sum(fields[name][2] * areas))
+        return float(np.sum(fields[name][1] * areas))
 
-    escaped = 0.5 * (sums[0]["escaped"] * unit_factor[0] + sums[1]["escaped"] * unit_factor[1])
-    conc = fields["nonice_concentration"][2]
-    # Depleted = no ice left (concentration at 1) in BOTH seasons, i.e. the
-    # averaged concentration is 1 to float32 precision.
-    depleted_both = int((conc >= 1.0 - 1e-6).sum())
+    escaped = sum(w * s["escaped"] * uf for w, s, uf in zip(weights, sums, unit_factor))
+    conc = fields["nonice_concentration"][1]
+    # Depleted = no ice left (concentration at 1) in EVERY run, i.e. the
+    # weighted-averaged concentration is 1 to float32 precision (only
+    # possible if every input was already 1, since weights sum to 1 and
+    # concentration is bounded in [0,1]).
+    depleted_all = int((conc >= 1.0 - 1e-6).sum())
+    per_run_depleted = [int(s["faces_depleted"]) for s in sums]
     L = []
     L.append("Europa Ice Evolution Summary")
     L.append("==============================")
     L.append("")
-    L.append("SYNTHESIZED: average of two seasonal runs (not a single simulation).")
-    L.append(f"  season1: {args.season1}")
-    L.append(f"  season2: {args.season2}")
-    L.append(f"  Every number below is computed from the season-averaged per-face fields at")
-    L.append(f"  epoch {used.pop()}, except 'Total escaped' (mean of the two seasons' summaries;")
-    L.append(f"  no per-face escape field exists). This is a 2-point seasonal quadrature, not")
-    L.append(f"  an average over the Jovian orbit.")
+    L.append(f"SYNTHESIZED: weighted average of {n} runs (not a single simulation).")
+    for r, w in zip(runs, weights):
+        L.append(f"  run (weight {w:.4f}): {r}")
+    L.append(f"  Every number below is computed from the weighted-averaged per-face fields at")
+    L.append(f"  epoch {used.pop()}, except 'Total escaped' (weighted mean of the {n} runs'")
+    L.append(f"  summaries; no per-face escape field exists). For N phases evenly spaced in")
+    L.append(f"  mean anomaly with uniform weights, this is the time-weighted orbital mean")
+    L.append(f"  exactly (mean anomaly is linear in time); for N=2 or non-uniform weights it")
+    L.append(f"  is a quadrature approximation, not a full-orbit integral.")
     if any(u != 1.0 for u in unit_factor):
-        L.append("  PRE-FIX INPUTS: at least one season's summary predates the EXO-02 area fix")
+        L.append("  PRE-FIX INPUTS: at least one run's summary predates the EXO-02 area fix")
         L.append("  (its mass totals were 1e6 too small); the totals below use true m^2 areas.")
         L.append("  The per-face fields of such a run were also computed with the pre-fix K0")
         L.append("  transport kernel (EXO-01) and diurnal-mean transport temperature (M1),")
@@ -211,31 +230,30 @@ def synthesize_summary(args, areas, lat, fields, epochs_used) -> str:
     L.append(f"  Cycles per epoch: {int(sums[0]['cycles_per_epoch'])}")
     L.append(f"  Total time: {sums[0]['total_years']:.3e} years")
     L.append("")
-    L.append("Final State (season-averaged fields):")
+    L.append("Final State (weighted-averaged fields):")
     L.append(f"  Elapsed time: {sums[0]['elapsed_years']:.3e} years")
     L.append(f"  Max non-ice concentration: {conc.max() * 100:.2f} %")
     L.append(f"  Mean non-ice concentration: {conc.mean() * 100:.2f} %")
-    L.append(f"  Faces depleted (no ice): {depleted_both} / {conc.size}")
-    L.append(f"    (depleted in both seasons; per season: {int(sums[0]['faces_depleted'])} / "
-             f"{int(sums[1]['faces_depleted'])})")
-    L.append("  Converged: not applicable (average of two runs)")
+    L.append(f"  Faces depleted (no ice): {depleted_all} / {conc.size}")
+    L.append(f"    (depleted in ALL {n} runs; per-run: {per_run_depleted})")
+    L.append("  Converged: not applicable (average of N runs)")
     L.append("")
-    L.append("Mass Balance (season-averaged fields x face area [m^2]):")
+    L.append("Mass Balance (weighted-averaged fields x face area [m^2]):")
     L.append(f"  Total sublimated: {total('cumulative_sublimated_kg_m2'):.3e} kg")
     L.append(f"  Total deposited: {total('cumulative_deposited_kg_m2'):.3e} kg")
     L.append(f"  Total sputtered: {total('cumulative_sputtered_kg_m2'):.3e} kg")
     L.append(f"  Total escaped: {escaped:.3e} kg")
     L.append("")
-    L.append("Latitude Distribution (final non-ice concentration, season-averaged):")
+    L.append("Latitude Distribution (final non-ice concentration, weighted-averaged):")
     bins = np.clip(((lat + 90.0) // 10.0).astype(int), 0, 17)
     for b in range(18):
         sel = bins == b
         v = conc[sel].mean() * 100 if sel.any() else 0.0
         L.append(f"  {-85.0 + 10.0 * b:6.2f}°: {v:.2f} %")
     if "crystalline_fraction" in fields:
-        phi = fields["crystalline_fraction"][2]
+        phi = fields["crystalline_fraction"][1]
         L.append("")
-        L.append("Crystallization State (season-averaged fields):")
+        L.append("Crystallization State (weighted-averaged fields):")
         L.append(f"  Mean crystalline fraction: {phi.mean() * 100:.2f} %")
         L.append(f"  Range: {phi.min() * 100:.2f} % - {phi.max() * 100:.2f} %")
         L.append(f"  Mostly crystalline (>90%): {int((phi > 0.9).sum())} faces")
@@ -251,43 +269,65 @@ def synthesize_summary(args, areas, lat, fields, epochs_used) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--season1", required=True, type=Path)
-    p.add_argument("--season2", required=True, type=Path)
-    p.add_argument("--output",  required=True, type=Path)
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--runs", required=True, type=Path, nargs="+",
+                   help="N run output directories to average (N >= 2)")
+    p.add_argument("--weights", type=float, nargs="+", default=None,
+                   help="N weights, one per --runs entry (default: uniform 1/N; "
+                        "renormalized to sum to 1 if they do not already)")
+    p.add_argument("--output", required=True, type=Path)
     args = p.parse_args()
 
-    src_mesh = (args.season1 / "mesh.ply").resolve()
+    runs = args.runs
+    n = len(runs)
+    if n < 2:
+        print("ERROR: need at least 2 --runs", file=sys.stderr)
+        return 1
+    if args.weights is None:
+        weights = [1.0 / n] * n
+    else:
+        if len(args.weights) != n:
+            print(f"ERROR: --weights has {len(args.weights)} entries, need {n}", file=sys.stderr)
+            return 1
+        s = sum(args.weights)
+        weights = [w / s for w in args.weights]
 
-    print(f"Averaging fields between\n  s1 = {args.season1}\n  s2 = {args.season2}")
+    src_mesh = (runs[0] / "mesh.ply").resolve()
+
+    print(f"Averaging fields across {n} runs (weights {['%.4f' % w for w in weights]}):")
+    for r in runs:
+        print(f"  {r}")
+
     # Read and average everything in memory first; validate and synthesize the
     # summary BEFORE writing anything, so a refusal leaves no half-built product.
-    fields = {}        # name -> (season1, season2, average) at the final epoch
+    fields = {}        # name -> (list of N per-run arrays, weighted average) at final epoch
     epochs_used = {}
-    epoch0 = {}        # name -> averaged epoch-0 field
+    epoch0 = {}        # name -> weighted-averaged epoch-0 field
     for fdir in FIELD_DIRS:
-        s1 = args.season1 / fdir
-        s2 = args.season2 / fdir
-        if not (s1.is_dir() and s2.is_dir()):
+        dirs = [r / fdir for r in runs]
+        if not all(d.is_dir() for d in dirs):
             continue
-        ep1 = find_last_epoch(args.season1, fdir)
-        ep2 = find_last_epoch(args.season2, fdir)
-        if ep1 < 0 or ep2 < 0:
+        eps = [find_last_epoch(r, fdir) for r in runs]
+        if any(e < 0 for e in eps):
             continue
-        ep = min(ep1, ep2)
-        f1 = s1 / f"{fdir}_{ep:04d}.bin"
-        f2 = s2 / f"{fdir}_{ep:04d}.bin"
-        if not (f1.exists() and f2.exists()):
+        ep = min(eps)
+        files = [r / fdir / f"{fdir}_{ep:04d}.bin" for r in runs]
+        if not all(f.exists() for f in files):
             continue
-        d1 = read_bin(f1); d2 = read_bin(f2)
-        fields[fdir] = (d1, d2, 0.5 * (d1 + d2))
+        arrs = [read_bin(f) for f in files]
+        if len({a.size for a in arrs}) != 1:
+            print(f"WARNING: size mismatch for {fdir} across runs: "
+                  f"{[a.size for a in arrs]}", file=sys.stderr)
+            continue
+        avg = sum(w * a for w, a in zip(weights, arrs))
+        fields[fdir] = (arrs, avg)
         epochs_used[fdir] = ep
         # Also average epoch 0 (used by mass_balance loader for stats)
         if ep > 0:
-            f1_0 = s1 / f"{fdir}_0000.bin"
-            f2_0 = s2 / f"{fdir}_0000.bin"
-            if f1_0.exists() and f2_0.exists():
-                epoch0[fdir] = 0.5 * (read_bin(f1_0) + read_bin(f2_0))
+            files0 = [r / fdir / f"{fdir}_0000.bin" for r in runs]
+            if all(f.exists() for f in files0):
+                arrs0 = [read_bin(f) for f in files0]
+                epoch0[fdir] = sum(w * a for w, a in zip(weights, arrs0))
 
     # Synthesize evolution_summary.txt from the averaged fields (M8); it keeps
     # the "Total time: ... years" line that mass_balance.load_evolution_total_years
@@ -295,7 +335,7 @@ def main() -> int:
     summary_path = args.output / "evolution_summary.txt"
     try:
         areas, lat = face_geometry_m(src_mesh)
-        text = synthesize_summary(args, areas, lat, fields, epochs_used)
+        text = synthesize_summary(runs, weights, areas, lat, fields, epochs_used)
     except (ValueError, FileNotFoundError) as exc:
         print(f"ERROR: refusing to write {args.output}: {exc}", file=sys.stderr)
         if summary_path.exists():
@@ -309,7 +349,7 @@ def main() -> int:
         dst_mesh.unlink()
     dst_mesh.symlink_to(src_mesh)
     written = 0
-    for fdir, (d1, d2, avg) in fields.items():
+    for fdir, (arrs, avg) in fields.items():
         ep = epochs_used[fdir]
         out_dir = args.output / fdir
         out_dir.mkdir(exist_ok=True)
@@ -317,16 +357,14 @@ def main() -> int:
         if fdir in epoch0:
             write_bin(out_dir / f"{fdir}_0000.bin", epoch0[fdir])
         written += 1
-        print(f"  {fdir} (epoch {ep}): "
-              f"s1=[{d1.min():.3g},{d1.max():.3g}] "
-              f"s2=[{d2.min():.3g},{d2.max():.3g}] "
-              f"avg=[{avg.min():.3g},{avg.max():.3g}]")
+        ranges = ", ".join(f"[{a.min():.3g},{a.max():.3g}]" for a in arrs)
+        print(f"  {fdir} (epoch {ep}): per-run={ranges} avg=[{avg.min():.3g},{avg.max():.3g}]")
     summary_path.write_text(text)
     print(f"Wrote synthesized {summary_path}")
 
-    # Also copy time_steps and metadata
+    # Also copy time_steps and metadata from the first run
     for fname in ("time_steps.txt", "metadata.txt"):
-        src = args.season1 / fname
+        src = runs[0] / fname
         if src.exists():
             shutil.copy(src, args.output / fname)
 
