@@ -1087,6 +1087,20 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                                          std::string(config.ion_map_absolute ? "absolute map " : "weight map ") +
                                          config.ion_map_path);
         }
+        if (!config.o2_map_path.empty()) {
+            std::ifstream in(config.o2_map_path, std::ios::binary);
+            uint64_t count = 0;
+            if (in) in.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (!in || count != static_cast<uint64_t>(num_faces_)) {
+                throw std::invalid_argument("sputtering: O2 map " + config.o2_map_path + " holds " +
+                                            std::to_string(count) + " values; the mesh has " +
+                                            std::to_string(num_faces_) + " faces");
+            }
+            std::vector<double> v(num_faces_);
+            in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(num_faces_ * sizeof(double)));
+            if (!in) throw std::invalid_argument("sputtering: short read on O2 map " + config.o2_map_path);
+            sputtering_model_->setO2Map(v, "O2 map " + config.o2_map_path);
+        }
         sputtering_model_->initializeSpatialDistribution(face_centers_, latitudes, longitudes, face_areas_);
 
         // Only enable if initialization succeeded
@@ -1166,7 +1180,7 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                       << std::setprecision(6) << target << " kg/s (pure ice at T_ref "
                       << std::fixed << std::setprecision(1) << sc.radiolysis_reference_K
                       << " K); O2 production " << std::setprecision(3) << a.reservoir
-                      << " kg/s (JADE 12 +/- 6 kg/s, Szalay et al. 2024, UNVERIFIED)" << std::endl;
+                      << " kg/s (JADE 12 +/- 6 kg/s, Szalay et al. 2024)" << std::endl;
         }
         if (a.closure_rel > 1e-6 || a.transport_rel > 1e-6) {
             throw std::runtime_error("sputter mass audit failed at " + std::string(when) +
@@ -1972,6 +1986,7 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         const AlbedoRefreshResult r = albedo_refresh_.update(current_face_albedos_,
                                                              surface_temperatures_, threshold);
         if (!r.fired) return false;
+        max_refresh_deviation_ = std::max(max_refresh_deviation_, r.max_deviation);
 
         if (show_progress_) {
             std::cout << "  Albedo coupling: max |A - A_at_last_refresh| = " << std::scientific
@@ -2293,6 +2308,45 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     if (max_superstep_epochs_ > 0) {
                         safe_extra = std::min(safe_extra, max_superstep_epochs_ - 1);
                     }
+                    // PTM-640 / PTM-634: the temperatures are refreshed only at iteration
+                    // boundaries, so a super-step may not carry any face's albedo past the
+                    // refresh threshold (measured from the albedo the temperatures
+                    // correspond to). End the step at the first epoch count whose predicted
+                    // albedo deviation exceeds the threshold, so the refresh fires at the
+                    // next boundary; the temperatures are then never stale by more than
+                    // the threshold plus one epoch's drift.
+                    if (safe_extra > 0 && albedo_coupling_enabled_ && albedo_mapper_ &&
+                        albedo_refresh_.seeded() && albedo_step_limit_) {
+                        const auto t_lim0 = std::chrono::steady_clock::now();
+                        const double thr = albedo_mapper_->getConfig().albedo_update_threshold;
+                        std::vector<double> c_pred, a_pred;
+                        auto exceeds = [&](int n) {
+                            multiscale_evolution_->predictConcentrations(
+                                *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration * n, c_pred);
+                            albedo_mapper_->computeAlbedos(c_pred, a_pred);
+                            return albedo_refresh_.maxDeviation(a_pred) > thr;
+                        };
+                        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration, a_pred);
+                        if (albedo_refresh_.maxDeviation(a_pred) > thr) {
+                            // The one-epoch step already passed the threshold: refresh next.
+                            safe_extra = 0;
+                            auto& st = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
+                            ++st.steps_albedo_limited;
+                        } else if (exceeds(safe_extra)) {
+                            // Smallest n in [1, safe_extra] with exceeds(n) (bisection; the
+                            // deviation grows with n over one step).
+                            int lo = 0, hi = safe_extra;   // exceeds(hi) true; lo = no-extra
+                            while (hi - lo > 1) {
+                                const int mid = lo + (hi - lo) / 2;
+                                if (exceeds(mid)) hi = mid; else lo = mid;
+                            }
+                            safe_extra = hi;
+                            auto& st = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
+                            ++st.steps_albedo_limited;
+                        }
+                        albedo_limit_seconds_ += std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_lim0).count();
+                    }
 
                     if (safe_extra > 0) {
                         // Save per-epoch stats before super-step overwrites them
@@ -2343,6 +2397,18 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         if (total_super_stepped > 0) {
             std::cout << "    Super-stepped epochs: " << total_super_stepped
                       << " (max step: " << max_super_step << ")" << std::endl;
+        }
+        {
+            const auto& st = multiscale_evolution_->getStatistics();
+            if (albedo_coupling_enabled_) {
+                std::cout << "    Albedo step limiter (PTM-640): " << (albedo_step_limit_ ? "on" : "OFF (legacy)")
+                          << ", " << st.steps_albedo_limited << " steps limited, " << st.predictions
+                          << " predictions (" << st.prediction_evaluations << " solver evaluations), "
+                          << std::fixed << std::setprecision(1) << albedo_limit_seconds_ << " s; max albedo "
+                          << "deviation at a refresh " << std::scientific << std::setprecision(4)
+                          << max_refresh_deviation_ << " (threshold " << albedo_mapper_->getConfig().albedo_update_threshold
+                          << ")" << std::fixed << std::endl;
+            }
         }
         if (full_diurnal_count > 0) {
             double speedup = static_cast<double>(full_diurnal_count + cached_epoch_count) / full_diurnal_count;
@@ -2872,6 +2938,18 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                  << stats.total_layer_overflow_mass << " kg\n";
             file << "    Ice inventory vs booked fluxes: " << stats.total_inventory_error_mass
                  << " kg; max per step " << stats.max_inventory_error_rel << " relative\n";
+            if (albedo_coupling_enabled_) {
+                file << "    Albedo step limiter (PTM-640): " << (albedo_step_limit_ ? "on" : "OFF (legacy)")
+                     << "; steps limited " << stats.steps_albedo_limited << ", predictions " << stats.predictions
+                     << ", " << std::fixed << std::setprecision(1) << albedo_limit_seconds_ << " s\n";
+                file << "    Max albedo deviation at a refresh: " << std::scientific << std::setprecision(6)
+                     << max_refresh_deviation_ << " (threshold " << albedo_mapper_->getConfig().albedo_update_threshold
+                     << ")\n" << std::setprecision(3);
+            }
+            if (stats.step_solver_slope_fallbacks > 0 || stats.step_solver_loose > 0) {
+                file << "    Deposition solve: " << stats.step_solver_slope_fallbacks << " slope fallbacks, "
+                     << stats.step_solver_loose << " steps accepted at residual <= 1e-8 (stagnation)\n";
+            }
             file << "    Steps: " << stats.steps_evolved << "; solver evaluations "
                  << stats.step_solver_evaluations << ", max Newton iterations "
                  << stats.step_solver_max_iterations << "\n";

@@ -1818,6 +1818,7 @@ int main(int argc, char** argv)
     double flux_convergence_threshold = -1.0; // <0 = use default (0.01 = 1%)
     int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
     bool superstep_legacy_deposition = false;  // PTM-644: reproduce the pre-fix super-step
+    bool no_albedo_step_limit = false;         // PTM-640: reproduce the unlimited super-step
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
 
@@ -1876,10 +1877,15 @@ int main(int argc, char** argv)
                   a == "--sputter-escape-o2" || a == "--sputter-escape-h2" ||
                   a == "--sputter-launch-temperature" || a == "--sputter-binding-energy" ||
                   a == "--sputter-radiolysis-ea" || a == "--sputter-radiolysis-tref" ||
+                  a == "--sputter-radiolysis-q0" ||
                   a == "--sputter-polar-enhancement") && i+1 < argc) {
             if (sputter_physics_flag.empty()) sputter_physics_flag = a;
             // Applied after parsing, once the parameter set is known (PTM-649).
             sputter_overrides.emplace_back(a, std::stod(argv[++i]));
+        }
+        else if (a == "--sputter-o2-map-absolute" && i+1 < argc) {
+            if (sputter_physics_flag.empty()) sputter_physics_flag = a;
+            sputter_cfg.o2_map_path = argv[++i];
         }
         else if ((a == "--sputter-ion-map" || a == "--sputter-ion-map-absolute") && i+1 < argc) {
             if (sputter_physics_flag.empty()) sputter_physics_flag = a;
@@ -1934,6 +1940,10 @@ int main(int argc, char** argv)
         }
         else if (a == "--flux-convergence" && i+1 < argc) {
             flux_convergence_threshold = std::stod(argv[++i]);
+        }
+        else if (a == "--no-albedo-step-limit") {
+            no_albedo_step_limit = true;
+            if (superstep_flag.empty()) superstep_flag = a;
         }
         else if (a == "--superstep-legacy-deposition") {
             superstep_legacy_deposition = true;
@@ -2108,13 +2118,18 @@ int main(int argc, char** argv)
             std::cout << "  --sputter-h2o-fraction F  Mass fraction of gross sputtered mass leaving as H2O at\n";
             std::cout << "                         T_ref (default 0.90, Cassidy et al. 2013; legacy 0.85); the\n";
             std::cout << "                         rest is radiolytic O2 + H2 (2 H2O -> 2 H2 + O2)\n";
-            std::cout << "  --sputter-binding-energy U  Sigmund-Thompson binding energy [eV] (default 0.055);\n";
-            std::cout << "                         sets the H2O escape fraction (0.235) AND the launch\n";
-            std::cout << "                         temperature (683 K) of the redepositing H2O\n";
-            std::cout << "  --sputter-radiolysis-ea E / --sputter-radiolysis-tref T  tau(T) on the radiolytic\n";
-            std::cout << "                         part: exp[-(E/k)(1/T - 1/Tref)] (default 0.06 eV, 100 K)\n";
+            std::cout << "  --sputter-binding-energy U  Effective binding energy [eV] of the Sigmund energy\n";
+            std::cout << "                         distribution (default 0.054, Plainaki et al. 2010); sets the\n";
+            std::cout << "                         H2O escape fraction (0.232) AND launch temperature (673 K)\n";
+            std::cout << "  --sputter-radiolysis-ea E / --sputter-radiolysis-q0 Q / --sputter-radiolysis-tref T\n";
+            std::cout << "                         tau(T) on the radiolytic part: [1 + Q e^(-E/kT)] /\n";
+            std::cout << "                         [1 + Q e^(-E/kTref)] (default 0.06 eV, 1000, 100 K;\n";
+            std::cout << "                         Cassidy et al. 2013 p. 71)\n";
+            std::cout << "  --sputter-o2-map-absolute FILE  Per-face O2 production (O2 cm^-2 s^-1, e.g.\n";
+            std::cout << "                         Addison et al. 2022); H2 stoichiometric, H2O = gross - O2 - H2,\n";
+            std::cout << "                         no tau(T) (the map carries its own)\n";
             std::cout << "  --sputter-polar-enhancement E  Linear polar factor of the default cosine pattern\n";
-            std::cout << "                         (default 1.2; not from Cassidy; 1 = none)\n";
+            std::cout << "                         (default 1 = none; 1.2 in the legacy set; not from Cassidy)\n";
             std::cout << "  --sputter-ion-map FILE  Per-face ion weights (uint64 count + float64), normalized\n";
             std::cout << "                         to an area-weighted mean of 1 at Cassidy's 2e27 H2O/s\n";
             std::cout << "  --sputter-ion-map-absolute FILE  Per-face H2O-equivalent molecules cm^-2 s^-1 at\n";
@@ -2147,6 +2162,8 @@ int main(int argc, char** argv)
             std::cout << "  --flux-convergence T   Flux imbalance fraction for convergence (default: 0.01 = 1%%)\n";
             std::cout << "  --max-superstep-epochs N  Cap one super-step at N epochs (default: none; for\n";
             std::cout << "                         step-size refinement checks)\n";
+            std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
+            std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
             std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
             std::cout << "                         each super-step (pre-PTM-644; not mass-conserving;\n";
             std::cout << "                         reproduces earlier products only)\n";
@@ -2359,7 +2376,7 @@ int main(int argc, char** argv)
         const bool legacy_only = (flag == "--sputter-escape-h2o" || flag == "--sputter-escape-o2" ||
                                   flag == "--sputter-escape-h2" || flag == "--sputter-launch-temperature");
         const bool current_only = (flag == "--sputter-binding-energy" || flag == "--sputter-radiolysis-ea" ||
-                                   flag == "--sputter-radiolysis-tref");
+                                   flag == "--sputter-radiolysis-tref" || flag == "--sputter-radiolysis-q0");
         if (legacy_only && !sputter_cfg.legacyParams()) {
             std::cerr << "Error: " << flag << " applies to the legacy sputter parameters only. The current set "
                       << "derives the H2O escape fraction and launch temperature from the binding energy "
@@ -2382,7 +2399,12 @@ int main(int argc, char** argv)
         else if (flag == "--sputter-binding-energy") sputter_cfg.binding_energy_eV = v;
         else if (flag == "--sputter-radiolysis-ea") sputter_cfg.radiolysis_activation_eV = v;
         else if (flag == "--sputter-radiolysis-tref") sputter_cfg.radiolysis_reference_K = v;
+        else if (flag == "--sputter-radiolysis-q0") sputter_cfg.radiolysis_q0 = v;
         else if (flag == "--sputter-polar-enhancement") sputter_cfg.polar_enhancement = v;
+    }
+    if (!sputter_cfg.o2_map_path.empty() && sputter_cfg.legacyParams()) {
+        std::cerr << "Error: --sputter-o2-map-absolute needs the current sputter parameters" << std::endl;
+        return 1;
     }
     if (!sputter_cfg.ion_map_path.empty() && sputter_cfg.legacyParams()) {
         std::cerr << "Error: --sputter-ion-map / --sputter-ion-map-absolute need the current sputter "
@@ -2542,6 +2564,17 @@ int main(int argc, char** argv)
             integrator.setFluxConvergenceThreshold(flux_convergence_threshold);
         }
         integrator.setSuperstepConsistentDeposition(!superstep_legacy_deposition);
+        if (sputtering_enabled && sputter_cfg.legacy_escape_only && !no_albedo_step_limit) {
+            no_albedo_step_limit = true;
+            std::cerr << "WARNING [PTM-640]: --sputter-legacy-escape-only implies --no-albedo-step-limit "
+                      << "(reproduces pre-fix products)" << std::endl;
+        }
+        if (no_albedo_step_limit && albedo_coupling_enabled) {
+            std::cerr << "WARNING [PTM-640]: --no-albedo-step-limit: super-steps are not limited by the albedo "
+                      << "change, so the temperature refresh can lag by a whole step (the answer then depends "
+                      << "on the step size). Reproduces earlier products only." << std::endl;
+        }
+        integrator.setAlbedoStepLimit(!no_albedo_step_limit);
         integrator.setMaxSuperstepEpochs(max_superstep_epochs);
         if (diurnal_stride > 1) {
             integrator.setDiurnalStride(diurnal_stride);

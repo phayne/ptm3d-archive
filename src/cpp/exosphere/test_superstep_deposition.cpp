@@ -28,6 +28,7 @@
 
 #include "multitimescale_evolution.h"
 #include "ice_layer_model.h"
+#include "composition_albedo.h"
 #include "ptm_exosphere_integration.h"
 #include "sputtering_model.h"
 #include "../mesh/mesh_utils.h"
@@ -399,7 +400,7 @@ static ptm::Mesh make_icosphere(int levels, double radius) {
 }
 
 static const int kNt = 8;
-static void writeThermal(const fs::path& dir, const ptm::Mesh& mesh) {
+static void writeThermal(const fs::path& dir, const ptm::Mesh& mesh, double dT = 0.0) {
     fs::create_directories(dir / "temperature");
     const size_t n = mesh.faces.size();
     for (int t = 0; t < kNt; ++t) {
@@ -410,7 +411,7 @@ static void writeThermal(const fs::path& dir, const ptm::Mesh& mesh) {
             for (int k = 0; k < 3; ++k)
                 for (int j = 0; j < 3; ++j) c[j] += mesh.vertices[fc[k]][j] / 3.0;
             const double mu = std::abs(c[2]) / std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
-            T[f] = static_cast<float>(150.0 - 70.0 * mu + 8.0 * std::cos(2.0 * M_PI * t / kNt + 0.37 * f));
+            T[f] = static_cast<float>(150.0 + dT - 70.0 * mu + 8.0 * std::cos(2.0 * M_PI * t / kNt + 0.37 * f));
         }
         std::ostringstream fn;
         fn << (dir / "temperature").string() << "/temperature_" << std::setfill('0') << std::setw(4) << t << ".bin";
@@ -489,6 +490,77 @@ static void test_end_to_end() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// (9) PTM-640: with albedo coupling, a super-step ends when a face's albedo would
+// pass the refresh threshold, so the refresh is never late by more than one epoch's
+// drift, and the answer no longer depends on the super-step size.
+static double kLimiterDT = -22.0;  // cooler body: one epoch moves the albedo by << threshold
+struct LimRun { bool ok = false; std::string err; double max_dev = NAN, max_c = NAN, sub = NAN; };
+static LimRun runLimiter(bool limit, int cap, int epochs) {
+    LimRun r;
+    char tmpl[] = "/tmp/test_superstep_limiter_XXXXXX";
+    const char* dd = mkdtemp(tmpl);
+    if (!dd) { r.err = "mkdtemp"; return r; }
+    const fs::path root(dd);
+    const ptm::Mesh mesh = make_icosphere(3, 1560.8);
+    writeThermal(root / "thermal", mesh, kLimiterDT);
+    auto integ = std::make_unique<exo::PTMExosphereIntegration>((root / "out").string());
+    integ->setShowProgress(false);
+    integ->setMesh(std::make_shared<ptm::Mesh>(mesh));
+    integ->setAlbedoStepLimit(limit);
+    if (cap > 0) integ->setMaxSuperstepEpochs(cap);
+    std::streambuf* old = std::cout.rdbuf();
+    std::streambuf* olde = std::cerr.rdbuf();
+    std::ostringstream sink;
+    std::cout.rdbuf(sink.rdbuf());
+    std::cerr.rdbuf(sink.rdbuf());
+    bool ok = integ->loadTemperatureData((root / "thermal").string(), kNt);
+    integ->enableIceLayerModel(0.05);
+    try {
+        // Linear composition albedo 0.65 (ice) .. 0.10; c = 0.05 -> 0.6225 = thermal albedo.
+        ok = ok && integ->setThermalAlbedoUniform(0.6225, "uniform 0.6225 (test)") &&
+             integ->enableAlbedoCoupling(exo::CompositionAlbedoConfig());
+        if (ok) integ->runMultiTimescaleSimulation(epochs, 100, 0);
+    } catch (const std::exception& e) {
+        r.err = e.what();
+    }
+    std::cout.rdbuf(old);
+    std::cerr.rdbuf(olde);
+    r.ok = ok && r.err.empty();
+    std::ifstream in(root / "out" / "evolution_summary.txt");
+    std::stringstream ss;
+    ss << in.rdbuf();
+    r.max_dev = summaryValue(ss.str(), "Max albedo deviation at a refresh: ");
+    r.sub = summaryValue(ss.str(), "Total sublimated: ");
+    double c = 0.0;
+    for (size_t i = 0; i < mesh.faces.size(); ++i) c = std::max(c, 1.0 - integ->getIceAvailabilityFactor(static_cast<int>(i)));
+    r.max_c = c;
+    fs::remove_all(root);
+    return r;
+}
+
+static void test_albedo_step_limiter() {
+    std::printf("\n(9) albedo step limiter (PTM-640): refresh never late, step-size independent\n");
+    const int E = 3000;
+    const double thr = exo::CompositionAlbedoConfig().albedo_update_threshold;
+    LimRun on0 = runLimiter(true, 0, E), on1 = runLimiter(true, 100, E), on2 = runLimiter(true, 25, E);
+    LimRun off0 = runLimiter(false, 0, E), off2 = runLimiter(false, 25, E);
+    for (const auto* r : {&on0, &on1, &on2, &off0, &off2}) {
+        check(r->ok, "run completes" + (r->err.empty() ? "" : ": " + r->err));
+    }
+    std::printf("    limiter on:  max step none/100/25: max non-ice %.6f %.6f %.6f, max dev at refresh %.4e %.4e %.4e\n",
+                on0.max_c, on1.max_c, on2.max_c, on0.max_dev, on1.max_dev, on2.max_dev);
+    std::printf("    limiter off: max step none/25:     max non-ice %.6f %.6f, max dev at refresh %.4e %.4e\n",
+                off0.max_c, off2.max_c, off0.max_dev, off2.max_dev);
+    check(off0.max_dev > 2.0 * thr, "limiter off (control): a refresh fires far past the threshold", off0.max_dev / thr, 2.0);
+    check(on0.max_dev < 1.5 * thr, "limiter on: every refresh fires within 1.5 x threshold", on0.max_dev / thr, 1.5);
+    const double d_on = std::abs(on0.max_c - on2.max_c), d_off = std::abs(off0.max_c - off2.max_c);
+    check(d_off > 1e-3, "limiter off (control): max non-ice depends on the super-step cap", d_off, 1e-3);
+    check(d_on < 0.25 * d_off, "limiter on: cap dependence of max non-ice cut by > 4x", d_on / d_off, 0.25);
+    check(std::abs(on0.sub / on2.sub - 1.0) < 0.01, "limiter on: cumulative sublimated agrees within 1% across caps",
+          std::abs(on0.sub / on2.sub - 1.0), 0.01);
+}
+
 int main() {
     std::printf("=== test_superstep_deposition ===\n");
     test_exact_linear_mean();
@@ -501,6 +573,7 @@ int main() {
     test_refinement();
     test_inventory();
     test_end_to_end();
+    test_albedo_step_limiter();
     std::printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail == 0 ? 0 : 1;
 }
