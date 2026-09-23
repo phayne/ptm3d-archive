@@ -22,6 +22,7 @@
 #include <cmath>  // For M_PI and other math functions
 #include <chrono>
 #include <stdexcept>
+#include <limits>
 
 namespace ptm {
 namespace exosphere {
@@ -1239,15 +1240,76 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
     // Albedo-Composition Coupling Implementation
     // =========================================================================
 
-    void PTMExosphereIntegration::enableAlbedoCoupling(const CompositionAlbedoConfig& config) {
+    // Mean over finite values (a hapke-intimate fill face may hold a non-finite value).
+    static double finiteMean(const std::vector<double>& v) {
+        double sum = 0.0;
+        size_t k = 0;
+        for (double x : v) if (std::isfinite(x)) { sum += x; ++k; }
+        return k ? sum / static_cast<double>(k) : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    bool PTMExosphereIntegration::setThermalAlbedoUniform(double albedo, const std::string& source) {
+        if (num_faces_ == 0) {
+            std::cerr << "setThermalAlbedoUniform: no faces loaded yet" << std::endl;
+            return false;
+        }
+        if (!std::isfinite(albedo) || albedo < 0.0 || albedo >= 1.0) {
+            std::cerr << "Error: thermal-run albedo " << albedo << " (" << source
+                      << ") must be finite and in [0, 1)" << std::endl;
+            return false;
+        }
+        thermal_face_albedos_.assign(static_cast<size_t>(num_faces_), albedo);
+        thermal_albedo_source_ = source;
+        initial_albedo_ = albedo;
+        return true;
+    }
+
+    bool PTMExosphereIntegration::loadThermalAlbedoMap(const std::string& path) {
+        if (num_faces_ == 0) {
+            std::cerr << "loadThermalAlbedoMap: no faces loaded yet" << std::endl;
+            return false;
+        }
+        const size_t n = static_cast<size_t>(num_faces_);
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            std::cerr << "Error: cannot open the thermal-run albedo map " << path << std::endl;
+            return false;
+        }
+        uint64_t count = 0;
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!in || count != n) {
+            std::cerr << "Error: thermal-run albedo map " << path << " holds " << count
+                      << " values; the mesh has " << n << " faces" << std::endl;
+            return false;
+        }
+        std::vector<double> a(n);
+        in.read(reinterpret_cast<char*>(a.data()), static_cast<std::streamsize>(n * sizeof(double)));
+        if (!in) {
+            std::cerr << "Error: short read on the thermal-run albedo map " << path << std::endl;
+            return false;
+        }
+        // Values outside [0, 1) are checked in enableAlbedoCoupling: they are allowed
+        // only on hapke-intimate fill faces, which are anchored and never use them.
+        thermal_face_albedos_ = std::move(a);
+        thermal_albedo_source_ = "per-face map " + path;
+        return true;
+    }
+
+    bool PTMExosphereIntegration::enableAlbedoCoupling(const CompositionAlbedoConfig& config) {
         if (num_faces_ == 0) {
             std::cerr << "PTMExosphereIntegration::enableAlbedoCoupling: no faces loaded yet!" << std::endl;
-            return;
+            return false;
         }
         if (!ice_layer_enabled_ || !ice_layer_state_) {
             std::cerr << "PTMExosphereIntegration::enableAlbedoCoupling: "
                       << "ice layer model must be enabled first!" << std::endl;
-            return;
+            return false;
+        }
+        if (thermal_face_albedos_.size() != static_cast<size_t>(num_faces_)) {
+            std::cerr << "Error: albedo coupling needs the albedo the thermal run used (the albedo "
+                      << "the loaded temperatures correspond to). Pass --thermal-albedo A or "
+                      << "--thermal-albedo-map F; the exosphere will not guess it." << std::endl;
+            return false;
         }
 
         albedo_mapper_ = std::make_unique<CompositionAlbedoMapper>(config);
@@ -1265,14 +1327,105 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                                        current_face_albedos_);
         previous_face_albedos_ = current_face_albedos_;
 
+        // The temperature reference is the THERMAL run's albedo, not the t = 0
+        // composition albedo. Exception: hapke-intimate faces whose map albedo the
+        // forward model cannot reproduce (fill, clamped at f = 0 or 1) are anchored at
+        // (an in-range fill face seeded from its map value, the PTM-637 default, has
+        // composition albedo == thermal albedo, so its anchor is the thermal albedo)
+        // their t = 0 composition albedo, so their thermal temperatures are kept at
+        // t = 0 and only later composition changes rescale them. Rescaling them to the
+        // endmember albedo would move a face clamped at f = 1 (map 0.98, model 0.80)
+        // by ((1 - 0.80) / (1 - 0.98))^(1/4) = 1.78x.
+        std::vector<char> anchored(static_cast<size_t>(num_faces_), 0);
+        albedo_anchored_faces_ = 0;
+        if (exposed_area_mode_ && ice_fraction_init_class_.size() == static_cast<size_t>(num_faces_)) {
+            for (size_t i = 0; i < anchored.size(); ++i) {
+                if (ice_fraction_init_class_[i] != 0.0) { anchored[i] = 1; ++albedo_anchored_faces_; }
+            }
+        }
+        if (exposed_area_mode_ && initial_face_albedos_.size() == thermal_face_albedos_.size()) {
+            const AlbedoMismatchReport rm = compareThermalAndCompositionAlbedo(
+                thermal_face_albedos_, initial_face_albedos_, 1e-3);
+            warnThermalCompositionMismatch(rm, 1e-3,
+                "hapke-intimate inverted map vs thermal-run albedo",
+                "  The ice fraction was inverted from a map the thermal run did not use. The\n"
+                "  temperatures stay referenced to the thermal-run albedo.\n",
+                std::cout, "inverted-map");
+        }
+        // Every face whose temperature is referenced to the thermal albedo needs a
+        // value the rescale is defined for.
+        {
+            size_t n_bad = 0, first_bad = 0;
+            for (size_t i = 0; i < thermal_face_albedos_.size(); ++i) {
+                const double a = thermal_face_albedos_[i];
+                if (!anchored[i] && (!std::isfinite(a) || a < 0.0 || a >= 1.0)) {
+                    if (n_bad == 0) first_bad = i;
+                    ++n_bad;
+                }
+            }
+            if (n_bad > 0) {
+                std::cerr << "Error: the thermal-run albedo (" << thermal_albedo_source_ << ") has "
+                          << n_bad << " non-anchored faces whose value is not finite or not in [0, 1) "
+                          << "(first: face " << first_bad << " = " << thermal_face_albedos_[first_bad]
+                          << "); the temperature rescale is undefined there" << std::endl;
+                return false;
+            }
+        }
+        std::vector<double> baseline = thermal_face_albedos_;
+        for (size_t i = 0; i < baseline.size(); ++i) {
+            if (anchored[i]) baseline[i] = current_face_albedos_[i];
+        }
+        albedo_refresh_.seed(baseline);
+
         albedo_coupling_enabled_ = true;
         config.print();
 
         std::cout << "Albedo-composition coupling enabled." << std::endl;
-        std::cout << "  Initial albedo from thermal sim: " << initial_albedo_ << std::endl;
+        std::cout << "  Thermal-run albedo (temperature reference): " << thermal_albedo_source_
+                  << "; mean " << std::fixed << std::setprecision(4)
+                  << finiteMean(thermal_face_albedos_) << std::endl;
+        if (albedo_anchored_faces_ > 0) {
+            std::cout << "  (" << albedo_anchored_faces_ << " anchored hapke-intimate faces are "
+                      << "referenced to their t = 0 composition albedo instead; see below)" << std::endl;
+        }
         std::cout << "  Current mean composition-albedo: " << std::fixed << std::setprecision(4)
                   << std::accumulate(current_face_albedos_.begin(), current_face_albedos_.end(), 0.0)
                      / num_faces_ << std::endl;
+        std::cout << "  Temperature refresh: when max_f |A_comp - A_at_last_refresh| > "
+                  << config.albedo_update_threshold << "; every face is then rescaled from its own "
+                  << "last-refresh albedo" << std::endl;
+
+        constexpr double kMismatchTol = 1e-3;
+        std::vector<char> not_anchored(anchored.size());
+        for (size_t i = 0; i < anchored.size(); ++i) not_anchored[i] = anchored[i] ? 0 : 1;
+        const AlbedoMismatchReport rep = compareThermalAndCompositionAlbedo(
+            thermal_face_albedos_, current_face_albedos_, kMismatchTol, &anchored);
+        const std::string when = (rep.max_abs > config.albedo_update_threshold)
+            ? "  The first multiscale coupling pass rescales these temperatures from the thermal\n"
+              "  albedo to the composition albedo (the max exceeds --albedo-update-threshold).\n"
+            : "  The max is below --albedo-update-threshold, so the temperatures are rescaled\n"
+              "  only once later drift carries some face past the threshold.\n";
+        if (!warnThermalCompositionMismatch(rep, kMismatchTol, "thermal vs composition",
+                when +
+                "  This is a CONFIGURATION difference, not feedback: the thermal and exosphere\n"
+                "  albedo models disagree before anything has evolved.\n",
+                std::cout)) {
+            std::cout << "  t = 0 check: composition albedo matches the thermal-run albedo to "
+                      << std::scientific << std::setprecision(3) << rep.max_abs << std::fixed
+                      << " (limit " << kMismatchTol << ") on " << rep.n_faces << " faces" << std::endl;
+        }
+        if (albedo_anchored_faces_ > 0) {
+            const AlbedoMismatchReport rep_a = compareThermalAndCompositionAlbedo(
+                thermal_face_albedos_, current_face_albedos_, kMismatchTol, &not_anchored);
+            warnThermalCompositionMismatch(rep_a, kMismatchTol,
+                "hapke-intimate fill/clamped faces, outside the forward model's range",
+                "  These faces are ANCHORED: their temperatures keep the thermal-run values at\n"
+                "  t = 0 and are rescaled only by later changes of the composition albedo.\n",
+                std::cout);
+            std::cout << "  Anchored hapke-intimate faces (fill or clamped): " << albedo_anchored_faces_
+                      << " of " << num_faces_ << std::endl;
+        }
+        return true;
     }
 
     void PTMExosphereIntegration::disableAlbedoCoupling() {
@@ -1546,11 +1699,25 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::vector<double> f(n), conc(n);
         ice_fraction_init_class_.assign(n, 0.0);
         size_t n_fill = 0, n_clamp0 = 0, n_clamp1 = 0;
+        size_t n_fill_value = 0, n_fill_value_c0 = 0, n_fill_value_c1 = 0, n_fill_uniform = 0;
+        std::vector<char> fill_inverted(n, 0);
         for (size_t i = 0; i < n; ++i) {
             if (fill[i]) {
-                f[i] = f_fill;
+                // Class 1 (fill) is kept for reporting either way.
                 ice_fraction_init_class_[i] = 1.0;
                 ++n_fill;
+                const bool usable = std::isfinite(A_map[i]) && A_map[i] >= 0.0 && A_map[i] <= 1.0;
+                if (cfg.fill_from_map_value && usable) {
+                    int clamp = 0;
+                    f[i] = mix.invert(A_map[i], &clamp);
+                    ++n_fill_value;
+                    if (clamp < 0) ++n_fill_value_c0;
+                    else if (clamp > 0) ++n_fill_value_c1;
+                    else fill_inverted[i] = 1;
+                } else {
+                    f[i] = f_fill;
+                    ++n_fill_uniform;
+                }
             } else {
                 int clamp = 0;
                 f[i] = mix.invert(A_map[i], &clamp);
@@ -1578,8 +1745,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         albedo_config.grain_ratio = r;
         CompositionAlbedoMapper forward(albedo_config);
         double gate_max = 0.0, clamp_resid_max = 0.0, f_area = 0.0, area_sum = 0.0;
+        double fill_gate_max = 0.0;
         for (size_t i = 0; i < n; ++i) {
             const double d = std::abs(forward.computeAlbedo(ice_layer_state_->nonice_concentration[i], i) - A_map[i]);
+            if (fill_inverted[i]) fill_gate_max = std::max(fill_gate_max, d);
             if (ice_fraction_init_class_[i] == 0.0) gate_max = std::max(gate_max, d);
             else if (ice_fraction_init_class_[i] >= 2.0) clamp_resid_max = std::max(clamp_resid_max, d);
             const double a = (i < face_areas_.size()) ? face_areas_[i] : 1.0;
@@ -1615,9 +1784,27 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                   << " inverted; clamped at f = 0: " << n_clamp0 << " (" << std::setprecision(4)
                   << (100.0 * a_clamp0 / a_all) << std::setprecision(6)
                   << "% of area); clamped at f = 1: " << n_clamp1 << std::endl;
-        std::cout << "  Fill faces (uniform, exposed ice fraction " << f_fill << "): " << n_fill
-                  << "  [invalid value " << n_invalid_value << ", fill mixed by bilinear sampling "
-                  << n_fill_mixed << ", registration mismatch " << n_registration << "]" << std::endl;
+        std::cout << "  Fill faces: " << n_fill << "  [invalid value " << n_invalid_value
+                  << ", fill mixed by bilinear sampling " << n_fill_mixed << ", registration mismatch "
+                  << n_registration << "]" << std::endl;
+        if (n_fill > 0) {
+            if (cfg.fill_from_map_value) {
+                std::cout << "    seeded from the map value the thermal run used (--fill-ice-fraction="
+                          << "map-value): " << n_fill_value << " (clamped at f = 0: " << n_fill_value_c0
+                          << ", at f = 1: " << n_fill_value_c1 << ")" << std::endl;
+                std::cout << "    That value is fill-contaminated, so it is not a measurement; it is used "
+                          << "so that composition and temperature agree on these faces" << std::endl;
+            }
+            if (n_fill_uniform > 0) {
+                std::cout << "    " << (cfg.fill_from_map_value ? "no usable map value; " : "")
+                          << "uniform exposed ice fraction " << f_fill << ": " << n_fill_uniform << std::endl;
+                std::cout << "  WARNING: " << n_fill_uniform << " fill faces have a composition that does "
+                          << "NOT follow the albedo their temperatures were computed with"
+                          << (cfg.fill_from_map_value ? " (the map has no usable value there)"
+                                                      : " (--fill-ice-fraction=uniform)")
+                          << std::endl;
+            }
+        }
         if (fits_path != "none") {
             std::cout << "  Registration: max |A_bin - A_FITS(face)| on accepted faces = "
                       << std::scientific << reg_max << std::defaultfloat << std::endl;
@@ -1636,9 +1823,16 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                   << std::scientific << gate_max << " on inverted faces (limit 1e-6); clamped-face "
                   << "residual max " << clamp_resid_max << " (expected: the map lies outside the "
                   << "endmember range there)" << std::defaultfloat << std::endl;
+        if (n_fill_value > n_fill_value_c0 + n_fill_value_c1) {
+            std::cout << "  Fill-face gate: max |A_forward(c_init) - A_map| = " << std::scientific
+                      << fill_gate_max << std::defaultfloat << " on "
+                      << (n_fill_value - n_fill_value_c0 - n_fill_value_c1)
+                      << " in-range fill faces (limit 1e-6)" << std::endl;
+        }
         std::cout << std::fixed;
-        if (!(gate_max < 1e-6)) {
-            std::cerr << tag << "forward/initialization gate FAILED: " << gate_max << " >= 1e-6" << std::endl;
+        if (!(gate_max < 1e-6) || !(fill_gate_max < 1e-6)) {
+            std::cerr << tag << "forward/initialization gate FAILED: " << std::max(gate_max, fill_gate_max)
+                      << " >= 1e-6" << std::endl;
             return false;
         }
         return true;
@@ -1671,39 +1865,30 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                                                         current_face_albedos_);
     }
 
-    void PTMExosphereIntegration::updateTemperaturesForAlbedoChange() {
-        if (surface_temperatures_.empty()) return;
+    bool PTMExosphereIntegration::updateTemperaturesForAlbedoChange() {
+        if (surface_temperatures_.empty()) return false;
 
-        size_t num_timesteps = surface_temperatures_[0].size();
-        double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
-        int faces_updated = 0;
+        // Compare against the albedo the temperatures correspond to (the last refresh,
+        // or the thermal run before the first one), not the previous pass. When the
+        // threshold is exceeded, EVERY face is rescaled from its own baseline:
+        // T_new = T_ref * ((1 - A_new) / (1 - A_ref))^(1/4)
+        const double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
+        const AlbedoRefreshResult r = albedo_refresh_.update(current_face_albedos_,
+                                                             surface_temperatures_, threshold);
+        if (!r.fired) return false;
 
-        // Scale temperatures for faces with significant albedo change
-        // T_new = T_old * ((1 - A_new) / (1 - A_old))^(1/4)
-        #pragma omp parallel for reduction(+:faces_updated)
-        for (size_t f = 0; f < static_cast<size_t>(num_faces_); ++f) {
-            double albedo_change = std::abs(current_face_albedos_[f] - previous_face_albedos_[f]);
-            if (albedo_change < threshold) continue;
-
-            double old_absorptivity = 1.0 - previous_face_albedos_[f];
-            double new_absorptivity = 1.0 - current_face_albedos_[f];
-
-            // Avoid division by zero
-            if (old_absorptivity < 1e-10) continue;
-
-            double ratio = new_absorptivity / old_absorptivity;
-            double scale = std::pow(ratio, 0.25);
-
-            for (size_t t = 0; t < num_timesteps; ++t) {
-                surface_temperatures_[f][t] *= scale;
-            }
-            faces_updated++;
+        if (show_progress_) {
+            std::cout << "  Albedo coupling: max |A - A_at_last_refresh| = " << std::scientific
+                      << std::setprecision(3) << r.max_deviation << std::fixed << " (face "
+                      << r.worst_face << ") > " << threshold << "; rescaled temperatures on "
+                      << r.faces_rescaled << " / " << num_faces_ << " faces" << std::endl;
         }
-
-        if (show_progress_ && faces_updated > 0) {
-            std::cout << "  Albedo coupling: updated temperatures for " << faces_updated
-                      << " / " << num_faces_ << " faces" << std::endl;
+        if (r.faces_singular > 0) {
+            std::cerr << "WARNING: albedo coupling could not rescale " << r.faces_singular
+                      << " faces whose last-refresh albedo is ~1 (1 - A < 1e-10); their "
+                      << "temperatures and baseline are unchanged" << std::endl;
         }
+        return true;
     }
 
     // =========================================================================
@@ -1820,8 +2005,37 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // Track albedo coupling statistics
         int albedo_temp_refresh_count = 0;
 
-        // Main epoch loop with flux caching and super-stepping optimization
-        for (int epoch = 0; epoch < num_epochs; ) {
+        // Main epoch loop with flux caching and super-stepping optimization.
+        //
+        // Export timing (PTM-636): a snapshot labeled L is the state after exactly L
+        // epochs, t = L * epoch_duration. It is written at the TOP of the iteration
+        // that starts at epoch L, after the albedo/temperature update (step 0) and the
+        // fluxes for that state (step 1), and BEFORE the state is evolved. Earlier
+        // builds exported after steps 2-3, so every state field (concentration, ice
+        // mass, cumulative fluxes, vapor pressure) had already been super-stepped up to
+        // a whole export interval past the label, while the fluxes, temperatures and
+        // bond_albedo were from the label; one file mixed two times. The last snapshot
+        // is labeled num_epochs, the final state (the only one for an interval of 0).
+        // Super-steps are clamped so every
+        // iteration boundary lands on each export label and on num_epochs.
+        std::vector<int> export_labels;
+        std::vector<double> export_times_s;
+        // Work done at the final state only for its snapshot (no epoch evolved);
+        // reported separately so the cost and refresh counts stay honest.
+        bool final_pass_refresh = false, final_pass_full_diurnal = false;
+        for (int epoch = 0; ; ) {
+            // The loop only ever lands on epochs the super-step clamp allows.
+            if (multiscale_evolution_->getStatistics().current_epoch != epoch) {
+                throw std::logic_error("runMultiTimescaleSimulation: statistics epoch " +
+                    std::to_string(multiscale_evolution_->getStatistics().current_epoch) +
+                    " != loop epoch " + std::to_string(epoch));
+            }
+            const bool final_state = (epoch >= num_epochs);
+            // --export-interval 0 = the final state only (as documented; earlier builds
+            // wrote no snapshot at all).
+            const bool export_now = final_state ||
+                (effective_export_interval > 0 && epoch % effective_export_interval == 0);
+
             // Step 0 (optional): Update albedo from current composition
             bool force_cache_refresh = false;
             if (albedo_coupling_enabled_ && albedo_mapper_) {
@@ -1836,12 +2050,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 }
                 stats.mean_albedo = albedo_sum / num_faces_;
 
-                if (max_albedo_change > albedo_mapper_->getConfig().albedo_update_threshold) {
-                    // Albedo changed significantly - update temperatures and force cache refresh
-                    updateTemperaturesForAlbedoChange();
+                // Refresh when the albedo has moved by more than the threshold since the
+                // temperatures were last computed/rescaled (drift accumulates across passes).
+                if (updateTemperaturesForAlbedoChange()) {
                     force_cache_refresh = true;
                     albedo_temp_refresh_count++;
                     stats.albedo_temp_refreshes = albedo_temp_refresh_count;
+                    if (final_state) final_pass_refresh = true;
                 }
             }
 
@@ -1860,12 +2075,52 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 multiscale_evolution_->cacheBaseFluxesUnscaled(
                     *ice_layer_model_, *ice_layer_state_, unscaled_sublimation_,
                     unscaled_sputtering_, face_areas_, epoch);
-                full_diurnal_count++;
+                if (final_state) final_pass_full_diurnal = true;
+                else full_diurnal_count++;
             } else {
                 // Use cached fluxes with ice availability scaling (fast, milliseconds)
                 multiscale_evolution_->applyScaledFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_);
-                cached_epoch_count++;
+                if (!final_state) cached_epoch_count++;
             }
+
+            // Export the state at t = epoch * epoch_duration (see the note above the loop).
+            if (export_now) {
+                // Sync ice layer state and averaged fluxes to exosphere model before export
+                if (exosphere_model_ && multiscale_evolution_) {
+                    auto& exo_state = exosphere_model_->getMutableState();
+                    const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
+
+                    for (size_t i = 0; i < num_faces_; ++i) {
+                        // Sync ice mass from ice layer state
+                        if (ice_layer_enabled_ && ice_layer_state_) {
+                            exo_state.accumulated_mass[i] = ice_layer_state_->ice_mass[i];
+                        }
+
+                        // Sync averaged fluxes from multi-timescale evolution
+                        exo_state.emission_flux[i] = diurnal_avg.avg_sublimation_flux[i];
+                        exo_state.deposition_flux[i] = diurnal_avg.avg_deposition_flux[i];
+                        exo_state.net_flux[i] = diurnal_avg.avg_net_flux[i];
+                        exo_state.escape_flux[i] = diurnal_avg.avg_escape_flux[i];
+
+                        // Recompute atmospheric properties from diurnal-averaged temperature
+                        double T = std::max(50.0, diurnal_avg.avg_temperature[i]);
+                        double ice_avail = (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
+                            ? ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i)
+                            : 1.0;
+                        exo_state.vapor_pressure[i] = VaporPressure::calculateVaporPressure(T) * ice_avail;
+                        exo_state.vapor_density[i] = VaporPressure::calculateVaporDensity(
+                            exo_state.vapor_pressure[i], T);
+                        exo_state.thermal_velocity[i] = VaporPressure::calculateThermalVelocity(T) * ice_avail;
+                    }
+                    exo_state.updateIceThickness();
+                }
+
+                const double time_value = static_cast<double>(epoch) * epoch_duration;
+                exportTimestepVTU(epoch, time_value);
+                export_labels.push_back(epoch);
+                export_times_s.push_back(time_value);
+            }
+            if (final_state) break;
 
             // Step 2: Evolve one epoch to establish concentration_change_rate_
             evolveEpoch(epoch, epoch_duration);
@@ -1922,46 +2177,6 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 multiscale_evolution_->printProgress();
             }
 
-            // Export at intervals
-            int next_epoch = epoch + step_size;
-            if (effective_export_interval > 0 &&
-                (epoch % effective_export_interval == 0 || next_epoch >= num_epochs)) {
-                // Sync ice layer state and averaged fluxes to exosphere model before export
-                if (exosphere_model_ && multiscale_evolution_) {
-                    auto& exo_state = exosphere_model_->getMutableState();
-                    const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
-
-                    for (size_t i = 0; i < num_faces_; ++i) {
-                        // Sync ice mass from ice layer state
-                        if (ice_layer_enabled_ && ice_layer_state_) {
-                            exo_state.accumulated_mass[i] = ice_layer_state_->ice_mass[i];
-                        }
-
-                        // Sync averaged fluxes from multi-timescale evolution
-                        exo_state.emission_flux[i] = diurnal_avg.avg_sublimation_flux[i];
-                        exo_state.deposition_flux[i] = diurnal_avg.avg_deposition_flux[i];
-                        exo_state.net_flux[i] = diurnal_avg.avg_net_flux[i];
-                        exo_state.escape_flux[i] = diurnal_avg.avg_escape_flux[i];
-
-                        // Recompute atmospheric properties from diurnal-averaged temperature
-                        double T = std::max(50.0, diurnal_avg.avg_temperature[i]);
-                        double ice_avail = (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
-                            ? ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i)
-                            : 1.0;
-                        exo_state.vapor_pressure[i] = VaporPressure::calculateVaporPressure(T) * ice_avail;
-                        exo_state.vapor_density[i] = VaporPressure::calculateVaporDensity(
-                            exo_state.vapor_pressure[i], T);
-                        exo_state.thermal_velocity[i] = VaporPressure::calculateThermalVelocity(T) * ice_avail;
-                    }
-                    exo_state.updateIceThickness();
-                }
-
-                // Export VTU with epoch index
-                double time_value = multiscale_evolution_->getStatistics().elapsed_time_years *
-                                   timescale_constants::SECONDS_PER_YEAR;
-                exportTimestepVTU(epoch, time_value);
-            }
-
             // Advance epoch counter by the super-step size
             epoch += step_size;
         }
@@ -1985,12 +2200,56 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             double speedup = static_cast<double>(full_diurnal_count + cached_epoch_count) / full_diurnal_count;
             std::cout << "    Effective speedup: " << std::setprecision(1) << speedup << "x" << std::endl;
         }
+        if (final_pass_full_diurnal) {
+            std::cout << "    Plus 1 full diurnal computation at the final state for its snapshot "
+                      << "(no epoch evolved; not counted above)" << std::endl;
+        }
         if (albedo_coupling_enabled_) {
             std::cout << "  Albedo coupling:" << std::endl;
-            std::cout << "    Temperature refreshes: " << albedo_temp_refresh_count << std::endl;
+            std::cout << "    Temperature refreshes: " << albedo_temp_refresh_count
+                      << (final_pass_refresh ? " (including 1 at the final state, for its snapshot)" : "")
+                      << std::endl;
             double mean_a = std::accumulate(current_face_albedos_.begin(),
                                             current_face_albedos_.end(), 0.0) / num_faces_;
             std::cout << "    Final mean albedo: " << std::fixed << std::setprecision(4) << mean_a << std::endl;
+        }
+
+        // Fill faces carry no valid map albedo, so their share of the rate is not a
+        // measurement: report it separately with N and area (PTM-637).
+        fill_contribution_report_.clear();
+        if (exposed_area_mode_ && ice_fraction_init_class_.size() == static_cast<size_t>(num_faces_)) {
+            size_t n_fill = 0;
+            double a_fill = 0.0, a_all = 0.0, s_fill = 0.0, s_all = 0.0;
+            const auto& avg = multiscale_evolution_->getDiurnalAverages().avg_sublimation_flux;
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                const double a = face_areas_[i];
+                const double q = avg[i] * a;
+                a_all += a;
+                s_all += q;
+                if (ice_fraction_init_class_[i] == 1.0) { ++n_fill; a_fill += a; s_fill += q; }
+            }
+            if (n_fill > 0) {
+                std::ostringstream r;
+                if (!export_labels.empty() && export_labels.back() == num_epochs) {
+                    r << std::scientific << std::setprecision(4)
+                      << "  Sublimation at the final state (label " << num_epochs << "): " << s_all
+                      << " kg/s over " << num_faces_ << " faces\n"
+                      << "    map-fill faces (no valid map albedo): " << s_fill << " kg/s ("
+                      << std::fixed << std::setprecision(2) << (s_all > 0.0 ? 100.0 * s_fill / s_all : 0.0)
+                      << "%), N = " << n_fill << ", " << std::setprecision(3) << (100.0 * a_fill / a_all)
+                      << "% of area\n"
+                      << "    faces with a map value: " << std::scientific << std::setprecision(4)
+                      << (s_all - s_fill) << " kg/s, N = " << (static_cast<size_t>(num_faces_) - n_fill)
+                      << ", " << std::fixed << std::setprecision(3) << (100.0 * (a_all - a_fill) / a_all)
+                      << "% of area\n";
+                } else {
+                    r << "  Map-fill faces: " << n_fill << " (" << std::fixed << std::setprecision(3)
+                      << (100.0 * a_fill / a_all) << "% of area); their share of the rate is NOT "
+                      << "reported because no final-state snapshot was written\n";
+                }
+                fill_contribution_report_ = r.str();
+                std::cout << fill_contribution_report_;
+            }
         }
 
         // Print final statistics
@@ -1999,17 +2258,15 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // Export summary
         exportEvolutionSummary();
 
-        // Create PVD file for exported epochs (use effective_export_interval)
-        if (effective_export_interval > 0) {
-            int num_exports = (num_epochs + effective_export_interval - 1) / effective_export_interval;
-            std::vector<double> time_values;
-            for (int i = 0; i < num_exports; ++i) {
-                int ep = i * effective_export_interval;
-                if (ep >= num_epochs) ep = num_epochs - 1;
-                double years = (ep + 1) * epoch_duration / timescale_constants::SECONDS_PER_YEAR;
-                time_values.push_back(years * timescale_constants::SECONDS_PER_YEAR);
-            }
-            createPVDFile(num_exports, time_values);
+        // time_steps.txt / metadata.txt: one entry per snapshot actually written, in
+        // label order, holding its state time (label * epoch_duration). Earlier builds
+        // wrote (label + 1) * epoch_duration and omitted the final snapshot.
+        if (!export_labels.empty()) {
+            createPVDFile(static_cast<int>(export_labels.size()), export_times_s);
+            std::cout << "  Snapshots: " << export_labels.size() << " (labels " << export_labels.front()
+                      << " .. " << export_labels.back() << "; label L = state after L epochs, t = L x "
+                      << std::setprecision(6) << (epoch_duration / timescale_constants::SECONDS_PER_YEAR)
+                      << " yr)" << std::endl;
         }
 
         // Reset export mode flag
@@ -2324,7 +2581,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             double max_a = *std::max_element(current_face_albedos_.begin(), current_face_albedos_.end());
             double mean_a = std::accumulate(current_face_albedos_.begin(),
                                             current_face_albedos_.end(), 0.0) / num_faces_;
-            file << "  Initial albedo: " << std::fixed << std::setprecision(4) << initial_albedo_ << "\n";
+            const double mean_thermal = thermal_face_albedos_.empty() ? initial_albedo_ :
+                finiteMean(thermal_face_albedos_);
+            file << "  Thermal-run albedo: " << thermal_albedo_source_ << " (mean " << std::fixed
+                 << std::setprecision(4) << mean_thermal << ")\n";
+            if (albedo_anchored_faces_ > 0) {
+                file << "  Anchored hapke-intimate faces (fill or clamped): " << albedo_anchored_faces_ << "\n";
+            }
             file << "  Final mean albedo: " << mean_a << "\n";
             file << "  Final albedo range: " << min_a << " - " << max_a << "\n";
             const auto& acfg = albedo_mapper_->getConfig();
@@ -2341,6 +2604,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 file << "  Non-ice endmember: " << acfg.albedo_nonice << "\n";
             }
             file << "  Temperature refreshes: " << stats.albedo_temp_refreshes << "\n\n";
+        }
+        if (!fill_contribution_report_.empty()) {
+            file << "Map-fill faces (reported separately; no valid map albedo):\n"
+                 << fill_contribution_report_ << "\n";
         }
 
         file << "Mass Balance:\n";
