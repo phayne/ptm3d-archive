@@ -1,16 +1,70 @@
 /*
  * Europa Magnetospheric Plasma Sputtering Model
  *
- * Physics-based model of ion sputtering at Europa's surface based on:
- * - Cassidy et al. (2013) - Magnetospheric ion sputtering spatial distribution
- * - Famá et al. (2008) - Low-energy ion sputtering yield formulas
- * - Teolis et al. (2017) - Temperature-dependent sputtering yields
+ * Gross sputtering (ice removed) per face, in H2O-equivalent mass:
  *
- * Key features:
- * - Spatially-varying ion flux (trailing hemisphere enhancement)
- * - Temperature-dependent sputtering yields
- * - Separate tracking of H2O, O2, and H2 production
- * - Configurable parameters for sensitivity studies
+ *   gross_i(T) = m_H2O * Phi_i * [ f + (1 - f) * tau(T_i) ]
+ *
+ *   Phi_i   ion-driven H2O-equivalent molecule flux at the reference temperature.
+ *           Default: N_tot * w_i / A, with the geometric (ion-access) weight w_i
+ *           renormalized so that sum_i w_i a_i = A (area-weighted mean 1, A = the
+ *           mesh's total area). The target N_tot is therefore delivered exactly by a
+ *           pure-ice surface at T_ref; ice availability and tau(T) then reduce or
+ *           raise the realized gross. We renormalize the geometric weight, not the
+ *           realized gross: the magnetosphere sets the ion flux, the surface sets the
+ *           yield, and renormalizing the realized value would make a darker or colder
+ *           surface sputter harder to hit a fixed total. Alternatives:
+ *           --sputter-ion-map FILE (per-face weights, renormalized the same way) or
+ *           --sputter-ion-map-absolute FILE (Phi_i itself, molecules cm^-2 s^-1).
+ *   f       H2O mass fraction of the gross at T_ref (--sputter-h2o-fraction).
+ *   tau(T)  radiolytic (O2 + H2) yield relative to T_ref, applied to the radiolytic
+ *           part ONLY; the H2O yield is temperature-independent:
+ *             tau(T) = exp[-(E_a / k) (1/T - 1/T_ref)],
+ *           the temperature-dependent term of Y = Y0 [1 + q0 exp(-E_a / kT)], with its
+ *           magnitude fixed by f at T_ref instead of by q0. Continuous and monotonic,
+ *           no cutoff or step (the legacy factor was 0 below 50 K, 1 from 50-80 K,
+ *           0.599 at 80 K, and applied to the whole yield; PTM-649).
+ *
+ * Products and fates. Radiolytic O2 : H2 is stoichiometric (2 H2O -> 2 H2 + O2).
+ * H2O leaves with the Sigmund-Thompson energy distribution f(E) ~ E / (E + U)^3,
+ * which fixes BOTH the escaping fraction and the launch temperature of the
+ * redepositing part, from the surface binding energy U (--sputter-binding-energy):
+ *   e_H2O  = 1 - [E_esc / (E_esc + U)]^2                (fraction above E_esc)
+ *   T_launch = <E | E < E_esc> / (2 k)                   (kernel mean energy 2kT)
+ * with E_esc = m_H2O v_esc^2 / 2 = 0.3828 eV (v_esc = 2025 m/s). U = 0.055 eV gives
+ * e_H2O = 0.2354 and T_launch = 683 K. The non-escaping H2O redeposits through the
+ * ballistic kernel; H2 escapes (100%); O2 is bound but non-condensable and is lost
+ * from the ice budget by ionization, dissociation and pickup (100% "atmospheric
+ * loss", not escape).
+ *
+ * Citations (checked 2026-09-23; no journal access in this session, so every
+ * PRIMARY source is UNVERIFIED unless stated otherwise):
+ *   N_tot = 2e27 H2O/s   Cassidy et al. 2013, PSS 77, 64            UNVERIFIED (table/eq not checked)
+ *   f = 0.90             Cassidy et al. 2013 (O2 1e26 + H2 2e26 /s  UNVERIFIED; internally consistent:
+ *                        against 2e27 H2O/s, i.e. 10.0% by mass)    5.98 / 59.8 kg/s
+ *   Cosine 3:1 T/L       attributed to Cassidy et al. 2013          UNVERIFIED (functional form not traced)
+ *   Polar 1.2 (linear)   NOT from Cassidy; appendix D calls it a    UNVERIFIED
+ *                        simplification of Nordheim et al. 2022
+ *   E_a = 0.06 eV        Fama et al. 2008 (Surf. Sci.)              UNVERIFIED in the paper; VERIFIED as used by
+ *                                                                   Addison et al. 2022 GENTOo source
+ *                                                                   (H2O/.../src/routines.cpp:521,
+ *                                                                   temp_dep = 1 + 220 exp(-0.06/kT))
+ *   T_ref = 100 K        Addison et al. 2022 fixed surface T        VERIFIED in GENTOo source (surf_temp);
+ *                        (the reference of the absolute maps)       Cassidy's reference T UNVERIFIED
+ *   U = 0.055 eV         Johnson 1990 (Energetic Charged-Particle   UNVERIFIED
+ *                        Interactions with Atmospheres and Surfaces)
+ *   f(E) ~ E/(E+U)^3     Sigmund 1969, Phys. Rev. 184, 383;         UNVERIFIED (standard form)
+ *                        Thompson 1968, Phil. Mag. 18, 377
+ *   O2 bound, lost by    Johnson et al. 2019 (per Fermi review)     UNVERIFIED
+ *   ionization/pickup
+ *   JADE O2 12 +/- 6 kg/s  Szalay et al. 2024                       UNVERIFIED (comparison only)
+ *   Addison 2022 maps    Zenodo 10.5281/zenodo.5708206 (GENTOo)     data VERIFIED (md5 = Zenodo checksum);
+ *                                                                   paper volume/article UNVERIFIED
+ *
+ * --sputter-legacy-params restores the pre-2026-09-23 parameter set (f 0.85,
+ * escape 0.10 / 0.90 / 0.95, launch 683 K, the stepped tau on the whole yield with
+ * a 50 K cutoff, count-normalized weights over a fixed 3.09e13 m^2).
+ * --sputter-legacy-escape-only implies it.
  */
 
 #ifndef SPUTTERING_MODEL_H
@@ -51,8 +105,39 @@ namespace sputtering_constants {
     // Reference temperature for yield normalization
     constexpr double REFERENCE_TEMP = 100.0;  // K (typical Europa dayside)
 
-    // Temperature below which sputtering yield is constant
+    // Temperature below which sputtering yield is constant (legacy parameters only)
     constexpr double LOW_TEMP_THRESHOLD = 80.0;  // K
+
+    // Current parameter set (see the header comment for citations and status).
+    constexpr double EUROPA_ESCAPE_VELOCITY = 2025.0;          // m/s (= constants::EUROPA_ESCAPE_VELOCITY)
+    constexpr double JOULE_PER_EV = 1.602176634e-19;
+    constexpr double BOLTZMANN_J = 1.380649e-23;               // J/K
+    constexpr double DEFAULT_BINDING_ENERGY_EV = 0.055;        // U, Sigmund-Thompson
+    constexpr double DEFAULT_H2O_FRACTION = 0.90;              // f at T_ref (Cassidy split)
+    constexpr double RADIOLYSIS_ACTIVATION_EV = 0.06;          // E_a of tau(T)
+    constexpr double RADIOLYSIS_REFERENCE_T = 100.0;           // K, T_ref of tau(T) and of the maps
+    constexpr double CM2_PER_M2 = 1.0e4;
+}
+
+/**
+ * Sigmund-Thompson H2O ejecta, f(E) ~ E / (E + U)^3 (PTM-649).
+ * escapeFraction: share with E >= E_esc, 1 - [E_esc / (E_esc + U)]^2.
+ * meanBoundEnergy: mean E over [0, E_esc) [same unit as U, E_esc].
+ */
+inline double sigmundThompsonEscapeFraction(double U, double E_esc) {
+    const double x = E_esc / (E_esc + U);
+    return 1.0 - x * x;
+}
+inline double sigmundThompsonMeanBoundEnergy(double U, double E_esc) {
+    // int_0^Ee E^2/(E+U)^3 dE / int_0^Ee E/(E+U)^3 dE, with y = E + U.
+    const double y1 = E_esc + U;
+    const double num = std::log(y1 / U) + 2.0 * U / y1 - 2.0 - U * U / (2.0 * y1 * y1) + 0.5;
+    const double den = (1.0 - sigmundThompsonEscapeFraction(U, E_esc)) / (2.0 * U);
+    return num / den;
+}
+inline double h2oEscapeEnergyEV() {
+    return 0.5 * sputtering_constants::H2O_MASS * sputtering_constants::EUROPA_ESCAPE_VELOCITY *
+           sputtering_constants::EUROPA_ESCAPE_VELOCITY / sputtering_constants::JOULE_PER_EV;
 }
 
 /**
@@ -69,8 +154,9 @@ struct SputteringConfig {
     // Based on Cassidy et al. (2013): trailing apex ~3x leading apex
     double hemisphere_contrast = 3.0;
 
-    // Latitude dependence - polar enhancement factor for energetic ions
-    // Energetic ions preferentially precipitate at higher latitudes
+    // Latitude dependence - linear polar enhancement factor. NOT from Cassidy et
+    // al. 2013; appendix D describes it as a simplification of Nordheim et al.
+    // 2022 (UNVERIFIED). --sputter-polar-enhancement (1 = none).
     double polar_enhancement = 1.2;
 
     // Temperature dependence enable (Teolis et al. 2017)
@@ -109,10 +195,55 @@ struct SputteringConfig {
     double h2_escape_fraction = 0.95;   // 95% escapes
 
     // Mass fraction of the gross sputtered mass that leaves as H2O molecules
-    // (--sputter-h2o-fraction). The remainder is radiolytic O2 + H2 in the
-    // stoichiometric mass ratio of 2 H2O -> 2 H2 + O2, i.e.
+    // (--sputter-h2o-fraction), at T_ref in the current parameter set (away from
+    // T_ref the radiolytic part follows tau(T)). The remainder is radiolytic O2 + H2
+    // in the stoichiometric mass ratio of 2 H2O -> 2 H2 + O2, i.e.
     // m_O2 : 2 m_H2 = 7.94 : 1 with this file's molecular masses (8:1 nominal).
-    double h2o_fraction = 0.85;
+    // 0.90 = Cassidy et al. 2013 (UNVERIFIED); the legacy set uses 0.85.
+    double h2o_fraction = sputtering_constants::DEFAULT_H2O_FRACTION;
+
+    // Parameter set (PTM-649). false = the current set described in the header;
+    // true = the pre-2026-09-23 set (--sputter-legacy-params; implied by
+    // legacy_escape_only). applyLegacyParams() sets the legacy values.
+    bool legacy_params = false;
+    bool legacyParams() const { return legacy_params || legacy_escape_only; }
+
+    // Surface binding energy U [eV] of the Sigmund-Thompson distribution; sets the
+    // H2O escaping fraction AND the launch temperature (current set only).
+    double binding_energy_eV = sputtering_constants::DEFAULT_BINDING_ENERGY_EV;
+    // tau(T) = exp[-(E_a/k)(1/T - 1/T_ref)] on the radiolytic part (current set only).
+    double radiolysis_activation_eV = sputtering_constants::RADIOLYSIS_ACTIVATION_EV;
+    double radiolysis_reference_K = sputtering_constants::RADIOLYSIS_REFERENCE_T;
+
+    // Derived (current set) or stored (legacy set) fate parameters. Use these, not
+    // the raw fields, which hold the legacy values.
+    double h2oEscapeFraction() const {
+        return legacyParams() ? h2o_escape_fraction
+                              : sigmundThompsonEscapeFraction(binding_energy_eV, h2oEscapeEnergyEV());
+    }
+    double o2EscapeFraction() const { return legacyParams() ? o2_escape_fraction : 0.0; }  // O2: atmospheric loss
+    double h2EscapeFraction() const { return legacyParams() ? h2_escape_fraction : 1.0; }  // H2 escapes
+    double launchTemperatureK() const {
+        if (legacyParams()) return launch_temperature_K;
+        return sigmundThompsonMeanBoundEnergy(binding_energy_eV, h2oEscapeEnergyEV()) *
+               sputtering_constants::JOULE_PER_EV / (2.0 * sputtering_constants::BOLTZMANN_J);
+    }
+    // Radiolytic yield relative to T_ref (current set). Continuous, monotonic, > 0.
+    double radiolyticFactor(double T) const {
+        if (!temperature_dependent) return 1.0;
+        const double k_ev = sputtering_constants::BOLTZMANN_EV;
+        return std::exp(-(radiolysis_activation_eV / k_ev) * (1.0 / T - 1.0 / radiolysis_reference_K));
+    }
+
+    // Restore the pre-2026-09-23 parameter values (callers set legacy_params too).
+    void applyLegacyParams() {
+        h2o_fraction = 0.85;
+        h2o_escape_fraction = 0.1;
+        o2_escape_fraction = 0.9;
+        h2_escape_fraction = 0.95;
+        launch_temperature_K = 683.0;
+        min_sputtering_temp = 50.0;
+    }
 
     // Legacy (non-stoichiometric) O2 / H2 mass fractions: O2:H2 = 2:1 by mass
     // against 7.94:1 from radiolysis. Used ONLY when legacy_escape_only is set.
@@ -133,7 +264,16 @@ struct SputteringConfig {
     double launch_temperature_K = 683.0;
     bool launch_temperature_given = false;  // set by the CLI; rejected with legacy (unused there)
 
-    // Minimum temperature for sputtering (below this, surface is "cold trapped")
+    // Optional per-face ion map (current set; read by PTMExosphereIntegration::
+    // enableSputtering): uint64 count + float64 per face, face order.
+    // ion_map_absolute = false: weights (--sputter-ion-map, renormalized to an
+    // area-weighted mean of 1 at the N_tot target); true: H2O-equivalent molecules
+    // cm^-2 s^-1 at T_ref (--sputter-ion-map-absolute), which set the total too.
+    std::string ion_map_path;
+    bool ion_map_absolute = false;
+
+    // Minimum temperature for sputtering (legacy parameter set only; the current
+    // set has no cutoff: sputtering is not thermally activated)
     double min_sputtering_temp = 50.0;  // K
 
     // Product mass fractions of the gross sputtered mass (sum to 1).
@@ -154,13 +294,17 @@ struct SputteringConfig {
     // transport: non-escaping H2O, redeposited through the ballistic kernel.
     // escape:    escaping share of every product, lost to space.
     // reservoir: non-escaping O2 + H2 (non-condensable), never returned as ice.
-    double transportShare() const { return h2o_fraction * (1.0 - h2o_escape_fraction); }
+    // In the current set these are the shares at T_ref; per face the composition
+    // follows tau(T), and the multiscale path uses per-face shares (PTM-649).
+    // "reservoir" is the atmospheric loss of the non-condensable products (current
+    // set: all O2, lost by ionization/dissociation/pickup).
+    double transportShare() const { return h2o_fraction * (1.0 - h2oEscapeFraction()); }
     double escapeShare() const {
-        return h2o_fraction * h2o_escape_fraction + o2Fraction() * o2_escape_fraction
-             + h2Fraction() * h2_escape_fraction;
+        return h2o_fraction * h2oEscapeFraction() + o2Fraction() * o2EscapeFraction()
+             + h2Fraction() * h2EscapeFraction();
     }
     double reservoirShare() const {
-        return o2Fraction() * (1.0 - o2_escape_fraction) + h2Fraction() * (1.0 - h2_escape_fraction);
+        return o2Fraction() * (1.0 - o2EscapeFraction()) + h2Fraction() * (1.0 - h2EscapeFraction());
     }
 
     // Throws std::invalid_argument on an out-of-range parameter.
@@ -239,6 +383,15 @@ private:
     std::vector<double> spatial_weight_;
     bool spatial_initialized_ = false;
 
+    // Current parameter set (PTM-649): H2O-equivalent molecule flux per face at
+    // T_ref [molecules m^-2 s^-1] before rate_scale, and its source.
+    std::vector<double> ion_molecule_flux_;
+    std::vector<double> ion_map_values_;   // optional per-face map (weights or absolute)
+    bool ion_map_absolute_ = false;
+    std::string ion_map_label_;
+    double mesh_area_ = 0.0;               // [m^2]
+    double ion_total_rate_ = 0.0;          // [molecules/s] at T_ref, before rate_scale
+
     // Reference flux for normalization (ions/m²/s at trailing apex)
     double reference_ion_flux_ = 0.0;
 
@@ -269,7 +422,29 @@ public:
     void initializeSpatialDistribution(
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<double>& face_latitudes = {},
-        const std::vector<double>& face_longitudes = {});
+        const std::vector<double>& face_longitudes = {},
+        const std::vector<double>& face_areas = {});
+
+    /**
+     * Optional per-face ion map, set BEFORE initializeSpatialDistribution (current
+     * parameter set only). absolute = false: weights (any scale; renormalized to an
+     * area-weighted mean of 1, total N_tot = 2e27 x rate_scale). absolute = true:
+     * H2O-equivalent molecules cm^-2 s^-1 at T_ref, which set pattern AND total.
+     */
+    void setIonMap(const std::vector<double>& values, bool absolute, const std::string& label) {
+        ion_map_values_ = values;
+        ion_map_absolute_ = absolute;
+        ion_map_label_ = label;
+    }
+    bool hasIonMap() const { return !ion_map_values_.empty(); }
+    bool ionMapAbsolute() const { return ion_map_absolute_; }
+    /** Total H2O-equivalent rate at T_ref over the mesh [molecules/s], before rate_scale. */
+    double ionTotalRate() const { return ion_total_rate_; }
+    double meshArea() const { return mesh_area_; }
+    /** Per-face H2O-equivalent molecule flux at T_ref [m^-2 s^-1], before rate_scale. */
+    double ionMoleculeFlux(size_t i) const {
+        return (i < ion_molecule_flux_.size()) ? ion_molecule_flux_[i] : 0.0;
+    }
 
     /**
      * Compute sputtering rates for current temperatures

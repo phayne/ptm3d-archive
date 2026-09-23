@@ -350,7 +350,7 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 ice_layer_model_->applySputtering(
                     *ice_layer_state_,
                     sputtering_state_->total_mass_loss,
-                    sputtering_model_->getConfig().h2o_escape_fraction,
+                    sputtering_model_->getConfig().h2oEscapeFraction(),
                     dt_seconds
                 );
 
@@ -1070,7 +1070,24 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::cout << "  latitudes.size() = " << latitudes.size() << std::endl;
         std::cout << "  longitudes.size() = " << longitudes.size() << std::endl;
 
-        sputtering_model_->initializeSpatialDistribution(face_centers_, latitudes, longitudes);
+        if (!config.ion_map_path.empty()) {
+            std::ifstream in(config.ion_map_path, std::ios::binary);
+            uint64_t count = 0;
+            if (in) in.read(reinterpret_cast<char*>(&count), sizeof(count));
+            if (!in || count != static_cast<uint64_t>(num_faces_)) {
+                throw std::invalid_argument("sputtering: ion map " + config.ion_map_path + " holds " +
+                                            std::to_string(count) + " values (uint64 count + float64 "
+                                            "per face expected); the mesh has " + std::to_string(num_faces_) +
+                                            " faces");
+            }
+            std::vector<double> v(num_faces_);
+            in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(num_faces_ * sizeof(double)));
+            if (!in) throw std::invalid_argument("sputtering: short read on ion map " + config.ion_map_path);
+            sputtering_model_->setIonMap(v, config.ion_map_absolute,
+                                         std::string(config.ion_map_absolute ? "absolute map " : "weight map ") +
+                                         config.ion_map_path);
+        }
+        sputtering_model_->initializeSpatialDistribution(face_centers_, latitudes, longitudes, face_areas_);
 
         // Only enable if initialization succeeded
         if (sputtering_model_->isSpatialInitialized()) {
@@ -1138,6 +1155,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                   << a.deposition_from_sublimation << "), net surface loss " << surface_loss
                   << " kg/s; deposition - (sublimation + sputter source) = "
                   << std::setprecision(2) << a.dep_excess_rel << " rel" << std::fixed << std::endl;
+        if (!sputtering_model_->getConfig().legacyParams()) {
+            // PTM-649: realized vs target gross, and the O2 production (all O2 is atmospheric loss).
+            const auto& sc = sputtering_model_->getConfig();
+            const double target = sputtering_model_->ionTotalRate() * sc.rate_scale *
+                                  sputtering_constants::H2O_MASS;
+            std::cout << "  [sputter-rates] " << when << std::scientific << std::setprecision(6)
+                      << ": realized gross " << a.gross << " kg/s = " << std::fixed << std::setprecision(4)
+                      << (target > 0.0 ? a.gross / target : 0.0) << " x the target " << std::scientific
+                      << std::setprecision(6) << target << " kg/s (pure ice at T_ref "
+                      << std::fixed << std::setprecision(1) << sc.radiolysis_reference_K
+                      << " K); O2 production " << std::setprecision(3) << a.reservoir
+                      << " kg/s (JADE 12 +/- 6 kg/s, Szalay et al. 2024, UNVERIFIED)" << std::endl;
+        }
         if (a.closure_rel > 1e-6 || a.transport_rel > 1e-6) {
             throw std::runtime_error("sputter mass audit failed at " + std::string(when) +
                                      ": closure " + std::to_string(a.closure_rel) +
@@ -2062,10 +2092,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             std::cout << "[sputter] mass-conserving accounting: gross removal leaves the surface; "
                       << std::fixed << std::setprecision(4) << (100.0 * sc.transportShare())
                       << "% (non-escaping H2O) redeposits through the ballistic kernel at "
-                      << std::setprecision(1) << sc.launch_temperature_K << " K; "
+                      << std::setprecision(1) << sc.launchTemperatureK() << " K; "
                       << std::setprecision(4) << (100.0 * sc.escapeShare()) << "% escapes; "
-                      << (100.0 * sc.reservoirShare()) << "% (non-escaping O2 + H2) goes to the "
-                      << "non-condensing atmospheric reservoir" << std::endl;
+                      << (100.0 * sc.reservoirShare())
+                      << (sc.legacyParams() ? "% (non-escaping O2 + H2) goes to the non-condensing atmospheric "
+                                              "reservoir"
+                                            : "% (O2) is atmospheric loss (ionization/dissociation/pickup). "
+                                              "Shares at T_ref; per face they follow tau(T) (PTM-649)")
+                      << std::endl;
         } else if (sputtering_enabled_ && sputtering_model_) {
             std::cerr << "WARNING [PTM-642]: --sputter-legacy-escape-only: only the "
                       << std::fixed << std::setprecision(4)
@@ -2439,6 +2473,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             std::fill(st.accumulated_mass.begin(), st.accumulated_mass.end(), 1.0);
         }
 
+        // PTM-649: in the current sputter parameter set the composition (and so the
+        // fate split) varies with temperature; accumulate the per-face fates over the
+        // cycle so the multiscale step can use diurnal-mean per-face shares.
+        const bool per_face_sputter = sputterTransportActive() &&
+                                      !sputtering_model_->getConfig().legacyParams();
+        std::vector<double> sp_gross, sp_transport, sp_escape, sp_reservoir;
+        if (per_face_sputter) {
+            sp_gross.assign(nf, 0.0);
+            sp_transport.assign(nf, 0.0);
+            sp_escape.assign(nf, 0.0);
+            sp_reservoir.assign(nf, 0.0);
+        }
+
         // Run through one diurnal cycle, accumulating fluxes.
         // Deposition will be computed after finalization from the escape fraction.
         int accumulated_count = 0;
@@ -2458,6 +2505,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 sputtering_model_->computeSputteringRates(current_temps, face_areas_, *sputtering_state_);
                 sputtering_flux = sputtering_state_->surfaceRemovalFlux(
                     sputtering_model_->getConfig().legacy_escape_only);
+                if (per_face_sputter) {
+                    for (size_t f = 0; f < nf; ++f) {
+                        sp_gross[f] += sputtering_state_->gross_removal_flux[f];
+                        sp_transport[f] += sputtering_state_->redeposition_flux[f];
+                        sp_escape[f] += sputtering_state_->total_mass_loss[f];
+                        sp_reservoir[f] += sputtering_state_->reservoir_flux[f];
+                    }
+                }
             }
 
             // Accumulate emission, sputtering, escape, and temperature.
@@ -2488,6 +2543,25 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Finalize emission/sputtering/escape/temperature averages
         multiscale_evolution_->finalizeDiurnalAverages(accumulated_count);
+        if (per_face_sputter) {
+            auto& da = multiscale_evolution_->getMutableDiurnalAverages();
+            const auto& sc = sputtering_model_->getConfig();
+            da.sputter_face_transport_frac.resize(nf);
+            da.sputter_face_escape_frac.resize(nf);
+            da.sputter_face_reservoir_frac.resize(nf);
+            for (size_t f = 0; f < nf; ++f) {
+                if (sp_gross[f] > 0.0) {
+                    da.sputter_face_transport_frac[f] = sp_transport[f] / sp_gross[f];
+                    da.sputter_face_escape_frac[f] = sp_escape[f] / sp_gross[f];
+                    da.sputter_face_reservoir_frac[f] = 1.0 - da.sputter_face_transport_frac[f]
+                                                        - da.sputter_face_escape_frac[f];
+                } else {
+                    da.sputter_face_transport_frac[f] = sc.transportShare();
+                    da.sputter_face_escape_frac[f] = sc.escapeShare();
+                    da.sputter_face_reservoir_frac[f] = 1.0 - sc.transportShare() - sc.escapeShare();
+                }
+            }
+        }
         if (!saved_mass.empty()) {
             exosphere_model_->getMutableState().accumulated_mass = std::move(saved_mass);
         }
@@ -2570,20 +2644,22 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // Jeans escape (its escaping share was already removed), and redeposits.
         if (sputterTransportActive()) {
             const auto& sc = sputtering_model_->getConfig();
-            const double share = sc.transportShare();
             std::vector<double> sput_source(num_faces_);
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 diurnal_avg.avg_deposition_sublimation_flux[i] = diurnal_avg.avg_deposition_flux[i];
+                // Global share (legacy parameters) or the per-face share (PTM-649).
+                const double share = diurnal_avg.perFaceSputter() ? diurnal_avg.sputter_face_transport_frac[i]
+                                                                  : sc.transportShare();
                 sput_source[i] = share * diurnal_avg.avg_sputtering_flux[i] * face_areas_[i];
             }
-            std::vector<double> launch_T(num_faces_, sc.launch_temperature_K);
+            std::vector<double> launch_T(num_faces_, sc.launchTemperatureK());
             std::vector<double> dep_sput;
             TransportCallOptions opt;
             opt.apply_jeans_escape = false;
             opt.private_index_if_needed = true;
             TransportTotals tt;
             std::cout << "  Computing sputtered-H2O transport (launch " << std::fixed << std::setprecision(1)
-                      << sc.launch_temperature_K << " K, no Jeans escape)..." << std::endl;
+                      << sc.launchTemperatureK() << " K, no Jeans escape)..." << std::endl;
             exosphere_model_->computeTransportProduct(launch_T, sput_source, dep_sput, opt, &tt);
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 diurnal_avg.avg_deposition_sputter_flux[i] = dep_sput[i] / face_areas_[i];
@@ -2767,7 +2843,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             // PTM-642: "Total sputtered" is the GROSS removal; its fates:
             file << "    sputter redeposited (ballistic transport): " << stats.total_sputter_redeposited_mass << " kg\n";
             file << "    sputter escaped (all products): " << stats.total_sputter_escaped_mass << " kg\n";
-            file << "    sputter reservoir (non-escaping O2 + H2): " << stats.total_sputter_reservoir_mass << " kg\n";
+            const bool legacy_params = sputtering_model_ && sputtering_model_->getConfig().legacyParams();
+            file << (legacy_params ? "    sputter reservoir (non-escaping O2 + H2): "
+                                   : "    sputter atmospheric loss (O2: ionization/dissociation/pickup): ")
+                 << stats.total_sputter_reservoir_mass << " kg\n";
             file << "  Sublimation Jeans escape: " << stats.total_sublimation_jeans_mass << " kg\n";
             file << "  Super-step lag (deposition in excess of step-mean sources; PTM-644): "
                  << stats.total_superstep_lag_mass << " kg\n";

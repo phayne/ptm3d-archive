@@ -127,8 +127,16 @@ static void test_stoichiometry() {
     check(std::abs(sum_products - 1.0) < 1e-15, "H2O + O2 + H2 fractions sum to 1", std::abs(sum_products - 1.0), 1e-15);
     const double sum_fates = c.transportShare() + c.escapeShare() + c.reservoirShare();
     check(std::abs(sum_fates - 1.0) < 1e-15, "transport + escape + reservoir shares sum to 1", std::abs(sum_fates - 1.0), 1e-15);
-    check(std::abs(c.escapeShare() + c.reservoirShare() - (1.0 - 0.85 * 0.9)) < 1e-15,
-          "surface loss share = 1 - f_H2O (1 - e_H2O) = 0.235", c.escapeShare() + c.reservoirShare(), 0.235);
+    check(std::abs(c.escapeShare() + c.reservoirShare() - (1.0 - c.h2o_fraction * (1.0 - c.h2oEscapeFraction()))) < 1e-15,
+          "surface loss share = 1 - f_H2O (1 - e_H2O) (current set, at T_ref: 0.3119)",
+          c.escapeShare() + c.reservoirShare(), 0.3119);
+    {
+        exo::SputteringConfig lp;  // PTM-649 legacy parameter set (the pre-2026-09-23 defaults)
+        lp.legacy_params = true;
+        lp.applyLegacyParams();
+        check(std::abs(lp.escapeShare() + lp.reservoirShare() - (1.0 - 0.85 * 0.9)) < 1e-15,
+              "legacy params: surface loss share = 1 - 0.85 x 0.9 = 0.235", lp.escapeShare() + lp.reservoirShare(), 0.235);
+    }
     exo::SputteringConfig h = c;
     h.h2o_fraction = 0.6;  // the H2O fraction is the parameter; O2/H2 follow
     check(std::abs(h.o2Fraction() / h.h2Fraction() / expect - 1.0) < 1e-12,
@@ -136,6 +144,7 @@ static void test_stoichiometry() {
 
     exo::SputteringConfig L;
     L.legacy_escape_only = true;
+    L.applyLegacyParams();  // what the CLI does for --sputter-legacy-escape-only (PTM-649)
     check(L.o2Fraction() == 0.10 && L.h2Fraction() == 0.05, "legacy split is the old 0.10 / 0.05 (ratio 2)",
           L.o2Fraction() / L.h2Fraction(), 2.0);
     check(std::abs(L.escapeShare() - 0.2225) < 1e-15, "legacy escaping share = 22.25% of gross", L.escapeShare(), 0.2225);
@@ -165,9 +174,10 @@ static void test_per_face_fates() {
     for (int legacy = 0; legacy < 2; ++legacy) {
         exo::SputteringConfig c;
         c.legacy_escape_only = (legacy == 1);
+        if (legacy) c.applyLegacyParams();
         exo::SputteringModel sm(n, c);
         std::vector<double> lat, lon;
-        sm.initializeSpatialDistribution(g.centers, lat, lon);
+        sm.initializeSpatialDistribution(g.centers, lat, lon, g.areas);
         exo::SputteringState st(n);
         sm.computeSputteringRates(T, g.areas, st);
         double worst_products = 0.0, worst_fates = 0.0, gross_total = 0.0, removal_total = 0.0;
@@ -353,8 +363,9 @@ static double summaryValue(const std::string& text, const std::string& key) {
     return std::stod(text.substr(p + key.size()));
 }
 
-static void test_end_to_end() {
-    std::printf("\n(5) end to end: --multiscale with sputtering on a synthetic ico3 body\n");
+static void test_end_to_end(bool legacy_params) {
+    std::printf("\n(5) end to end: --multiscale with sputtering on a synthetic ico3 body (%s parameters)\n",
+                legacy_params ? "legacy" : "current");
     char tmpl[] = "/tmp/test_sputter_mass_accounting_XXXXXX";
     const char* dd = mkdtemp(tmpl);
     if (!dd) { check(false, "mkdtemp"); return; }
@@ -372,6 +383,10 @@ static void test_end_to_end() {
     integ->enableIceLayerModel(0.05);
     exo::SputteringConfig sc;
     sc.rate_scale = 50.0;  // make sputtering comparable to sublimation on this small body
+    if (legacy_params) {
+        sc.legacy_params = true;
+        sc.applyLegacyParams();
+    }
     std::string err;
     try {
         integ->enableSputtering(sc);
@@ -403,7 +418,8 @@ static void test_end_to_end() {
     const double sub = summaryValue(s, "Total sublimated: "), dep = summaryValue(s, "Total deposited: ");
     const double spu = summaryValue(s, "Total sputtered: "), red = summaryValue(s, "sputter redeposited (ballistic transport): ");
     const double esc = summaryValue(s, "sputter escaped (all products): ");
-    const double res = summaryValue(s, "sputter reservoir (non-escaping O2 + H2): ");
+    const double res = legacy_params ? summaryValue(s, "sputter reservoir (non-escaping O2 + H2): ")
+                                     : summaryValue(s, "sputter atmospheric loss (O2: ionization/dissociation/pickup): ");
     const double jea = summaryValue(s, "Sublimation Jeans escape: ");
     const double lag = summaryValue(s, "Super-step lag (deposition in excess of step-mean sources; PTM-644): ");
     const bool have = std::isfinite(sub + dep + spu + red + esc + res + jea + lag);
@@ -413,9 +429,19 @@ static void test_end_to_end() {
         // Summary values are printed to 4 significant digits.
         check(std::abs(lhs - rhs) <= 2e-3 * (sub + spu), "cumulative: sublimated + sputtered - deposited = "
               "escaped + reservoir + Jeans - lag", std::abs(lhs - rhs) / (sub + spu), 2e-3);
-        check(std::abs((esc + res) / spu - exo::SputteringConfig().escapeShare() -
-                       exo::SputteringConfig().reservoirShare()) < 2e-3,
-              "cumulative sputter surface loss = 23.5% of gross", (esc + res) / spu, 0.235);
+        if (legacy_params) {
+            exo::SputteringConfig lp;
+            lp.legacy_params = true;
+            lp.applyLegacyParams();
+            check(std::abs((esc + res) / spu - lp.escapeShare() - lp.reservoirShare()) < 2e-3,
+                  "cumulative sputter surface loss = 23.5% of gross", (esc + res) / spu, 0.235);
+        } else {
+            // Current set: the composition follows tau(T) per face, so the realized share
+            // differs from the T_ref share; it must still close (above) and be a share.
+            check((esc + res) / spu > 0.0 && (esc + res) / spu < 1.0 && std::abs(red + esc + res - spu) <= 2e-3 * spu,
+                  "cumulative: redeposited + escaped + atmospheric loss = gross (current set)",
+                  std::abs(red + esc + res - spu) / spu, 2e-3);
+        }
     }
     fs::remove_all(root);
 }
@@ -426,7 +452,8 @@ int main() {
     test_per_face_fates();
     test_kernel_bound_population();
     test_deposition_rescale();
-    test_end_to_end();
+    test_end_to_end(true);
+    test_end_to_end(false);
     std::printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail == 0 ? 0 : 1;
 }
