@@ -1797,6 +1797,7 @@ int main(int argc, char** argv)
     // Sputter mass accounting / products (PTM-642). Defaults live in SputteringConfig.
     ptm::exosphere::SputteringConfig sputter_cfg;
     std::string sputter_physics_flag;   // first sputter-physics flag seen (needs --sputtering)
+    std::vector<std::pair<std::string, double>> sputter_overrides;  // numeric sputter flags, in order
 
     // Ice layer model options (lag deposit tracking)
     bool ice_layer_enabled = false;
@@ -1867,19 +1868,27 @@ int main(int argc, char** argv)
             if (sputter_physics_flag.empty()) sputter_physics_flag = a;
             sputter_cfg.legacy_escape_only = true;
         }
+        else if (a == "--sputter-legacy-params") {
+            if (sputter_physics_flag.empty()) sputter_physics_flag = a;
+            sputter_cfg.legacy_params = true;
+        }
         else if ((a == "--sputter-h2o-fraction" || a == "--sputter-escape-h2o" ||
                   a == "--sputter-escape-o2" || a == "--sputter-escape-h2" ||
-                  a == "--sputter-launch-temperature") && i+1 < argc) {
+                  a == "--sputter-launch-temperature" || a == "--sputter-binding-energy" ||
+                  a == "--sputter-radiolysis-ea" || a == "--sputter-radiolysis-tref" ||
+                  a == "--sputter-polar-enhancement") && i+1 < argc) {
             if (sputter_physics_flag.empty()) sputter_physics_flag = a;
-            const double v = std::stod(argv[++i]);
-            if (a == "--sputter-h2o-fraction") sputter_cfg.h2o_fraction = v;
-            else if (a == "--sputter-escape-h2o") sputter_cfg.h2o_escape_fraction = v;
-            else if (a == "--sputter-escape-o2") sputter_cfg.o2_escape_fraction = v;
-            else if (a == "--sputter-escape-h2") sputter_cfg.h2_escape_fraction = v;
-            else {
-                sputter_cfg.launch_temperature_K = v;
-                sputter_cfg.launch_temperature_given = true;
+            // Applied after parsing, once the parameter set is known (PTM-649).
+            sputter_overrides.emplace_back(a, std::stod(argv[++i]));
+        }
+        else if ((a == "--sputter-ion-map" || a == "--sputter-ion-map-absolute") && i+1 < argc) {
+            if (sputter_physics_flag.empty()) sputter_physics_flag = a;
+            if (!sputter_cfg.ion_map_path.empty()) {
+                std::cerr << "Error: give only one of --sputter-ion-map and --sputter-ion-map-absolute" << std::endl;
+                return 1;
             }
+            sputter_cfg.ion_map_path = argv[++i];
+            sputter_cfg.ion_map_absolute = (a == "--sputter-ion-map-absolute");
         }
         else if (a == "--sputtering-contrast" && i+1 < argc) {
             sputtering_hemisphere_contrast = std::stod(argv[++i]);
@@ -2096,17 +2105,29 @@ int main(int argc, char** argv)
             std::cout << "  --sputtering-rate S    Sputtering rate scale factor (default: 1.0)\n";
             std::cout << "                         1.0 = Cassidy et al. 2013 rates\n";
             std::cout << "  --sputtering-contrast C  Trailing/leading hemisphere ratio (default: 3.0)\n";
-            std::cout << "  --sputter-h2o-fraction F  Mass fraction of gross sputtered mass leaving as H2O\n";
-            std::cout << "                         (default 0.85); the rest is radiolytic O2 + H2 in the\n";
-            std::cout << "                         stoichiometric mass ratio (2 H2O -> 2 H2 + O2)\n";
+            std::cout << "  --sputter-h2o-fraction F  Mass fraction of gross sputtered mass leaving as H2O at\n";
+            std::cout << "                         T_ref (default 0.90, Cassidy et al. 2013; legacy 0.85); the\n";
+            std::cout << "                         rest is radiolytic O2 + H2 (2 H2O -> 2 H2 + O2)\n";
+            std::cout << "  --sputter-binding-energy U  Sigmund-Thompson binding energy [eV] (default 0.055);\n";
+            std::cout << "                         sets the H2O escape fraction (0.235) AND the launch\n";
+            std::cout << "                         temperature (683 K) of the redepositing H2O\n";
+            std::cout << "  --sputter-radiolysis-ea E / --sputter-radiolysis-tref T  tau(T) on the radiolytic\n";
+            std::cout << "                         part: exp[-(E/k)(1/T - 1/Tref)] (default 0.06 eV, 100 K)\n";
+            std::cout << "  --sputter-polar-enhancement E  Linear polar factor of the default cosine pattern\n";
+            std::cout << "                         (default 1.2; not from Cassidy; 1 = none)\n";
+            std::cout << "  --sputter-ion-map FILE  Per-face ion weights (uint64 count + float64), normalized\n";
+            std::cout << "                         to an area-weighted mean of 1 at Cassidy's 2e27 H2O/s\n";
+            std::cout << "  --sputter-ion-map-absolute FILE  Per-face H2O-equivalent molecules cm^-2 s^-1 at\n";
+            std::cout << "                         T_ref (e.g. Addison et al. 2022); sets pattern AND total\n";
+            std::cout << "  --sputter-legacy-params  Pre-2026-09-23 parameters (f 0.85; escape 0.10/0.90/0.95;\n";
+            std::cout << "                         683 K; stepped tau(T) on the whole yield, 50 K cutoff;\n";
+            std::cout << "                         count-normalized weights). Reproduces earlier products\n";
             std::cout << "  --sputter-escape-h2o F / --sputter-escape-o2 F / --sputter-escape-h2 F\n";
-            std::cout << "                         Escaping share of each product (default 0.10 / 0.90 / 0.95)\n";
-            std::cout << "  --sputter-launch-temperature K  Kernel temperature of the non-escaping sputtered\n";
-            std::cout << "                         H2O redeposited by ballistic transport (default 683 K: mean\n";
-            std::cout << "                         energy of the bound Sigmund-Thompson distribution, U=0.055 eV)\n";
+            std::cout << "  --sputter-launch-temperature K  Legacy parameters only (the current set derives them)\n";
             std::cout << "  --sputter-legacy-escape-only  Pre-PTM-642 accounting: remove only the escaping\n";
             std::cout << "                         share, no transport, 0.10/0.05 O2/H2 split (NOT mass-\n";
-            std::cout << "                         conserving; reproduces old products)\n\n";
+            std::cout << "                         conserving; reproduces old products; implies\n";
+            std::cout << "                         --sputter-legacy-params)\n\n";
             std::cout << "Ice layer model options (lag deposit tracking):\n";
             std::cout << "  --ice-layer            Enable multi-layer ice model with lag deposits\n";
             std::cout << "  --no-ice-layer         Disable ice layer model (default)\n";
@@ -2325,6 +2346,53 @@ int main(int argc, char** argv)
     if (!sputter_physics_flag.empty() && !sputtering_enabled) {
         std::cerr << "Error: " << sputter_physics_flag << " requires --sputtering" << std::endl;
         return 1;
+    }
+
+    // Sputter parameter set (PTM-649). The legacy set (--sputter-legacy-params, implied
+    // by --sputter-legacy-escape-only) takes the old values, then the overrides. The
+    // current set DERIVES the H2O escape fraction and launch temperature from the
+    // binding energy U and fixes the O2/H2 fates, so those overrides are refused.
+    if (sputter_cfg.legacyParams()) {
+        sputter_cfg.applyLegacyParams();
+    }
+    for (const auto& [flag, v] : sputter_overrides) {
+        const bool legacy_only = (flag == "--sputter-escape-h2o" || flag == "--sputter-escape-o2" ||
+                                  flag == "--sputter-escape-h2" || flag == "--sputter-launch-temperature");
+        const bool current_only = (flag == "--sputter-binding-energy" || flag == "--sputter-radiolysis-ea" ||
+                                   flag == "--sputter-radiolysis-tref");
+        if (legacy_only && !sputter_cfg.legacyParams()) {
+            std::cerr << "Error: " << flag << " applies to the legacy sputter parameters only. The current set "
+                      << "derives the H2O escape fraction and launch temperature from the binding energy "
+                      << "(--sputter-binding-energy, Sigmund-Thompson) so they cannot disagree; O2 is "
+                      << "atmospheric loss and H2 escapes. Add --sputter-legacy-params to set it." << std::endl;
+            return 1;
+        }
+        if (current_only && sputter_cfg.legacyParams()) {
+            std::cerr << "Error: " << flag << " has no effect with the legacy sputter parameters" << std::endl;
+            return 1;
+        }
+        if (flag == "--sputter-h2o-fraction") sputter_cfg.h2o_fraction = v;
+        else if (flag == "--sputter-escape-h2o") sputter_cfg.h2o_escape_fraction = v;
+        else if (flag == "--sputter-escape-o2") sputter_cfg.o2_escape_fraction = v;
+        else if (flag == "--sputter-escape-h2") sputter_cfg.h2_escape_fraction = v;
+        else if (flag == "--sputter-launch-temperature") {
+            sputter_cfg.launch_temperature_K = v;
+            sputter_cfg.launch_temperature_given = true;
+        }
+        else if (flag == "--sputter-binding-energy") sputter_cfg.binding_energy_eV = v;
+        else if (flag == "--sputter-radiolysis-ea") sputter_cfg.radiolysis_activation_eV = v;
+        else if (flag == "--sputter-radiolysis-tref") sputter_cfg.radiolysis_reference_K = v;
+        else if (flag == "--sputter-polar-enhancement") sputter_cfg.polar_enhancement = v;
+    }
+    if (!sputter_cfg.ion_map_path.empty() && sputter_cfg.legacyParams()) {
+        std::cerr << "Error: --sputter-ion-map / --sputter-ion-map-absolute need the current sputter "
+                  << "parameters (not --sputter-legacy-params / --sputter-legacy-escape-only)" << std::endl;
+        return 1;
+    }
+    if (sputter_cfg.legacyParams() && sputtering_enabled) {
+        std::cerr << "WARNING [PTM-649]: legacy sputter parameters (f_H2O 0.85, escape 0.10/0.90/0.95, "
+                  << "stepped tau(T) on the whole yield with a 50 K cutoff, count-normalized weights). "
+                  << "Reproduces earlier products only." << std::endl;
     }
 
     // Enable sputtering if requested

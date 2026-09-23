@@ -347,6 +347,24 @@ struct DiurnalAverages {
     double total_base_sublimation = 0.0;  // [kg/s] sublimation source at cache time
     double total_base_sputter = 0.0;      // [kg/s] GROSS sputter removal at cache time
 
+    // PTM-649. Per-face fate fractions of the gross sputter flux (diurnal means),
+    // set when the composition varies with temperature (current parameter set:
+    // tau(T) on the radiolytic part only). Empty = the global shares above.
+    std::vector<double> sputter_face_transport_frac;
+    std::vector<double> sputter_face_escape_frac;
+    std::vector<double> sputter_face_reservoir_frac;
+    double total_base_sputter_transport = 0.0;  // [kg/s] sputter transport source at cache time
+    bool perFaceSputter() const { return !sputter_face_transport_frac.empty(); }
+    double sputterTransportFrac(size_t i) const {
+        return perFaceSputter() ? sputter_face_transport_frac[i] : sputter_transport_share;
+    }
+    double sputterEscapeFrac(size_t i) const {
+        return perFaceSputter() ? sputter_face_escape_frac[i] : sputter_escape_share;
+    }
+    double sputterReservoirFrac(size_t i) const {
+        return perFaceSputter() ? sputter_face_reservoir_frac[i] : sputter_reservoir_share;
+    }
+
     // PTM-644. Deposition = base deposition x a global scale per source group
     // (one group, total emission, without sputter transport; sublimation and
     // sputter with it). The scales below are the CURRENT (start-of-step) values
@@ -463,6 +481,13 @@ struct DiurnalAverages {
                 total_base_sputter += base_sputtering_flux[i] * ice_availability[i] * face_areas[i];
             }
         }
+        total_base_sputter_transport = 0.0;
+        if (sputter_transport && perFaceSputter()) {
+            for (size_t i = 0; i < avg_sublimation_flux.size(); ++i) {
+                total_base_sputter_transport += base_sputtering_flux[i] * sputter_face_transport_frac[i]
+                                                * ice_availability[i] * face_areas[i];
+            }
+        }
         deposition_scale_total = deposition_scale_sub = deposition_scale_sput = 1.0;
         total_base_deposition = total_base_deposition_sub = total_base_deposition_sput = 0.0;
         for (size_t i = 0; i < avg_sublimation_flux.size(); ++i) {
@@ -496,7 +521,15 @@ struct DiurnalAverages {
                 p_now += sput_scaled * face_areas[i];
             }
             const double scale_s = (total_base_sublimation > 1e-30) ? s_now / total_base_sublimation : 1.0;
-            const double scale_p = (total_base_sputter > 1e-30) ? p_now / total_base_sputter : 1.0;
+            double scale_p = (total_base_sputter > 1e-30) ? p_now / total_base_sputter : 1.0;
+            if (perFaceSputter()) {
+                // The sputter deposition follows ITS source, the per-face transported share.
+                double c_now = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    c_now += avg_sputtering_flux[i] * sputter_face_transport_frac[i] * face_areas[i];
+                }
+                scale_p = (total_base_sputter_transport > 1e-30) ? c_now / total_base_sputter_transport : 1.0;
+            }
             deposition_scale_sub = scale_s;
             deposition_scale_sput = scale_p;
             #pragma omp parallel for
@@ -741,9 +774,11 @@ private:
     // Per-face scratch for evolveEpoch()'s face-order sums (PTM-644).
     struct StepBuffers {
         std::vector<double> emit_sub, emit_sput, dep_sub, dep_sput, deposition, overflow, inventory_err;
+        std::vector<double> sput_transport, sput_escape, sput_reservoir;
         void resize(size_t n) {
             if (emit_sub.size() == n) return;
-            for (auto* v : {&emit_sub, &emit_sput, &dep_sub, &dep_sput, &deposition, &overflow, &inventory_err}) {
+            for (auto* v : {&emit_sub, &emit_sput, &dep_sub, &dep_sput, &deposition, &overflow, &inventory_err,
+                            &sput_transport, &sput_escape, &sput_reservoir}) {
                 v->assign(n, 0.0);
             }
         }
@@ -1160,8 +1195,12 @@ public:
         step_buffers_.resize(num_faces_);
 
         // Source groups: 0 = sublimation (+ sputtering when it is not transported), 1 = sputter.
+        // Group 1 is the sputter transport source: the gross, or (per-face composition,
+        // PTM-649) the per-face transported share of it.
+        const bool per_face = two && d.perFaceSputter();
         const double S_base[2] = {two ? d.total_base_sublimation : d.total_base_emission,
-                                  two ? d.total_base_sputter : 0.0};
+                                  two ? (per_face ? d.total_base_sputter_transport : d.total_base_sputter) : 0.0};
+        auto w1 = [&](size_t i) { return per_face ? d.sputter_face_transport_frac[i] : 1.0; };
         const double D_base[2] = {two ? d.total_base_deposition_sub : d.total_base_deposition,
                                   two ? d.total_base_deposition_sput : 0.0};
         const bool active[2] = {S_base[0] > 1e-30, two && S_base[1] > 1e-30};
@@ -1181,7 +1220,7 @@ public:
                                              (bs + bp) / max_ice_mass, dep_at(i, sc) / max_ice_mass,
                                              epoch_duration, true);
                 step_buffers_.emit_sub[i] = bs * st.mean_avail * face_areas[i];
-                step_buffers_.emit_sput[i] = bp * st.mean_avail * face_areas[i];
+                step_buffers_.emit_sput[i] = bp * w1(i) * st.mean_avail * face_areas[i];
             }
             G[0] = G[1] = 0.0;
             for (size_t i = 0; i < num_faces_; ++i) G[0] += step_buffers_.emit_sub[i];
@@ -1203,7 +1242,7 @@ public:
         // The kernel cannot retain more than its source: rho_sub <= 1 (Jeans and
         // unscattered losses only), rho_sput <= the non-escaping H2O share.
         if (consistent) {
-            const double rho_max[2] = {1.0, two ? d.sputter_transport_share : 1.0};
+            const double rho_max[2] = {1.0, (two && !per_face) ? d.sputter_transport_share : 1.0};
             for (int k = 0; k < 2; ++k) {
                 if (active[k] && D_base[k] > S_base[k] * rho_max[k] * (1.0 + 1e-6)) {
                     std::ostringstream m;
@@ -1316,6 +1355,11 @@ public:
             step_buffers_.deposition[i] = deposition;
             step_buffers_.emit_sub[i] = eff_sublimation * face_areas[i];
             step_buffers_.emit_sput[i] = eff_sputtering * face_areas[i];
+            if (per_face) {
+                step_buffers_.sput_transport[i] = eff_sputtering * d.sputter_face_transport_frac[i] * face_areas[i];
+                step_buffers_.sput_escape[i] = eff_sputtering * d.sputter_face_escape_frac[i] * face_areas[i];
+                step_buffers_.sput_reservoir[i] = eff_sputtering * d.sputter_face_reservoir_frac[i] * face_areas[i];
+            }
             step_buffers_.dep_sub[i] = (two ? (consistent ? d.base_deposition_sublimation_flux[i] * s[0]
                                                           : d.avg_deposition_sublimation_flux[i])
                                             : deposition) * face_areas[i];
@@ -1333,6 +1377,14 @@ public:
         // Face-order (reproducible) sums of the step.
         // Gs, Gp, Ds, Dp [kg/s]; over, inv_err [kg] over the step.
         double Gs = 0.0, Gp = 0.0, Ds = 0.0, Dp = 0.0, over = 0.0, inv_err = 0.0;
+        double Gc = 0.0, Ge = 0.0, Gr = 0.0;  // per-face sputter fates [kg/s] (PTM-649)
+        if (per_face) {
+            for (size_t i = 0; i < num_faces_; ++i) {
+                Gc += step_buffers_.sput_transport[i];
+                Ge += step_buffers_.sput_escape[i];
+                Gr += step_buffers_.sput_reservoir[i];
+            }
+        }
         for (size_t i = 0; i < num_faces_; ++i) {
             Gs += step_buffers_.emit_sub[i];
             Gp += step_buffers_.emit_sput[i];
@@ -1354,7 +1406,7 @@ public:
         const double rho0 = active[0] ? D_base[0] / S_base[0] : 0.0;
         const double rho1 = active[1] ? D_base[1] / S_base[1] : 0.0;
         const double emitted = Gs + Gp;
-        const double retained = two ? rho0 * Gs + rho1 * Gp : rho0 * emitted;
+        const double retained = two ? rho0 * Gs + rho1 * (per_face ? Gc : Gp) : rho0 * emitted;
         // A group with deposition but no source at cache time (only in synthetic
         // setups: the kernel conserves its source) is an external supply; it is
         // reported separately and excluded from the audit, never silently.
@@ -1421,8 +1473,8 @@ public:
             stats_.total_superstep_lag_mass += step_residual * epoch_duration;
             stats_.sputter_redeposited_rate = Dp;
             stats_.sublimation_deposition_rate = Ds;
-            stats_.sputter_escaped_rate = d.sputter_escape_share * epoch_sputtered;
-            stats_.sputter_reservoir_rate = d.sputter_reservoir_share * epoch_sputtered;
+            stats_.sputter_escaped_rate = per_face ? Ge : d.sputter_escape_share * epoch_sputtered;
+            stats_.sputter_reservoir_rate = per_face ? Gr : d.sputter_reservoir_share * epoch_sputtered;
             stats_.total_sputter_redeposited_mass += Dp * epoch_duration;
             stats_.total_sputter_escaped_mass += stats_.sputter_escaped_rate * epoch_duration;
             stats_.total_sputter_reservoir_mass += stats_.sputter_reservoir_rate * epoch_duration;
@@ -1548,9 +1600,18 @@ public:
             a.deposition += d.avg_deposition_flux[i] * face_areas[i];
             a.deposition_from_sublimation += d.avg_deposition_sublimation_flux[i] * face_areas[i];
         }
-        a.transport_source = d.sputter_transport_share * a.gross;
-        a.escaped = d.sputter_escape_share * a.gross;
-        a.reservoir = d.sputter_reservoir_share * a.gross;
+        if (d.perFaceSputter()) {
+            for (size_t i = 0; i < num_faces_; ++i) {
+                const double g = d.avg_sputtering_flux[i] * face_areas[i];
+                a.transport_source += d.sputter_face_transport_frac[i] * g;
+                a.escaped += d.sputter_face_escape_frac[i] * g;
+                a.reservoir += d.sputter_face_reservoir_frac[i] * g;
+            }
+        } else {
+            a.transport_source = d.sputter_transport_share * a.gross;
+            a.escaped = d.sputter_escape_share * a.gross;
+            a.reservoir = d.sputter_reservoir_share * a.gross;
+        }
         if (a.gross > 0.0) {
             a.closure_rel = std::abs(a.gross - (a.redeposited + a.escaped + a.reservoir)) / a.gross;
         }

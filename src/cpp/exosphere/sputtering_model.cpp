@@ -21,11 +21,27 @@ namespace exosphere {
 void SputteringModel::initializeSpatialDistribution(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<double>& face_latitudes,
-    const std::vector<double>& face_longitudes)
+    const std::vector<double>& face_longitudes,
+    const std::vector<double>& face_areas)
 {
     if (face_centers.size() != num_faces_) {
         std::cerr << "SputteringModel: face_centers size mismatch!" << std::endl;
         return;
+    }
+    const bool legacy = config_.legacyParams();
+    if (legacy && hasIonMap()) {
+        throw std::invalid_argument("sputtering: --sputter-ion-map / --sputter-ion-map-absolute need the "
+                                    "current parameter set (not --sputter-legacy-params)");
+    }
+    if (!legacy && face_areas.size() != num_faces_) {
+        throw std::invalid_argument("sputtering: the area-weighted ion normalization needs the face areas "
+                                    "(initializeSpatialDistribution got " + std::to_string(face_areas.size()) +
+                                    " for " + std::to_string(num_faces_) + " faces)");
+    }
+    if (hasIonMap() && ion_map_values_.size() != num_faces_) {
+        throw std::invalid_argument("sputtering: ion map " + ion_map_label_ + " has " +
+                                    std::to_string(ion_map_values_.size()) + " values; the mesh has " +
+                                    std::to_string(num_faces_) + " faces");
     }
 
     spatial_weight_.resize(num_faces_);
@@ -54,6 +70,67 @@ void SputteringModel::initializeSpatialDistribution(
                 longitudes[i] = 0.0;
             }
         }
+    }
+
+    if (!legacy) {
+        // Current set (PTM-649): area-weighted normalization, exact total.
+        std::vector<double> raw(num_faces_);
+        if (hasIonMap()) {
+            raw = ion_map_values_;
+        } else {
+            for (size_t i = 0; i < num_faces_; ++i) {
+                raw[i] = computeLongitudeFluxFactor(toWestLongitude(longitudes[i])) *
+                         computeLatitudeFluxFactor(latitudes[i]);
+            }
+        }
+        double area = 0.0, weighted = 0.0;
+        for (size_t i = 0; i < num_faces_; ++i) {
+            if (!std::isfinite(raw[i]) || raw[i] < 0.0 || !(face_areas[i] > 0.0)) {
+                throw std::invalid_argument("sputtering: ion weight/area at face " + std::to_string(i) +
+                                            " is not finite and >= 0 (weight " + std::to_string(raw[i]) +
+                                            ", area " + std::to_string(face_areas[i]) + ")");
+            }
+            area += face_areas[i];
+            weighted += raw[i] * face_areas[i];
+        }
+        if (!(weighted > 0.0)) {
+            throw std::invalid_argument("sputtering: the ion map integrates to zero");
+        }
+        mesh_area_ = area;
+        ion_molecule_flux_.resize(num_faces_);
+        if (hasIonMap() && ion_map_absolute_) {
+            // molecules cm^-2 s^-1 -> m^-2 s^-1; the map sets the total.
+            ion_total_rate_ = weighted * sputtering_constants::CM2_PER_M2;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                ion_molecule_flux_[i] = raw[i] * sputtering_constants::CM2_PER_M2;
+            }
+        } else {
+            ion_total_rate_ = sputtering_constants::GLOBAL_H2O_RATE;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                ion_molecule_flux_[i] = ion_total_rate_ * raw[i] / weighted;
+            }
+        }
+        // Diagnostic weight: area-weighted mean 1.
+        for (size_t i = 0; i < num_faces_; ++i) spatial_weight_[i] = raw[i] * area / weighted;
+        reference_ion_flux_ = ion_total_rate_ / area *
+                              *std::max_element(spatial_weight_.begin(), spatial_weight_.end());
+        spatial_initialized_ = true;
+        const double min_w = *std::min_element(spatial_weight_.begin(), spatial_weight_.end());
+        const double max_w = *std::max_element(spatial_weight_.begin(), spatial_weight_.end());
+        std::cout << "Sputtering ion flux (area-weighted normalization, PTM-649):" << std::endl;
+        std::cout << "  Pattern: " << (hasIonMap() ? ion_map_label_ :
+                     "cosine " + std::to_string(config_.hemisphere_contrast) +
+                     ":1 trailing/leading (attributed to Cassidy et al. 2013; UNVERIFIED) x linear polar " +
+                     std::to_string(config_.polar_enhancement) + " (not from Cassidy; UNVERIFIED)") << std::endl;
+        std::cout << "  Total at T_ref " << std::fixed << std::setprecision(1) << config_.radiolysis_reference_K
+                  << " K on pure ice: " << std::scientific << std::setprecision(6) << ion_total_rate_
+                  << " H2O-equivalent/s x rate_scale " << config_.rate_scale << " = "
+                  << ion_total_rate_ * config_.rate_scale * sputtering_constants::H2O_MASS << " kg/s ("
+                  << (hasIonMap() && ion_map_absolute_ ? "set by the absolute map" : "Cassidy et al. 2013 target")
+                  << "; availability and tau(T) change the realized gross)" << std::endl;
+        std::cout << "  Mesh area " << area << " m^2; weight range " << std::fixed << std::setprecision(3)
+                  << min_w << " - " << max_w << std::endl;
+        return;
     }
 
     // Compute spatial weights based on hemisphere and latitude
@@ -120,6 +197,36 @@ void SputteringModel::computeSputteringRates(
     if (temperatures.size() != num_faces_ || face_areas.size() != num_faces_) {
         std::cerr << "SputteringModel: size mismatch in computeSputteringRates!" << std::endl;
         state.reset();
+        return;
+    }
+
+    if (!config_.legacyParams()) {
+        // Current set (PTM-649): H2O part temperature-independent, radiolytic part x tau(T).
+        const double f = config_.h2o_fraction;
+        const double m_o2 = sputtering_constants::O2_MASS, m_2h2 = 2.0 * sputtering_constants::H2_MASS;
+        const double o2_of_rad = m_o2 / (m_o2 + m_2h2);
+        const double e_h2o = config_.h2oEscapeFraction();
+        const double e_o2 = config_.o2EscapeFraction(), e_h2 = config_.h2EscapeFraction();
+        const double scale = sputtering_constants::H2O_MASS * config_.rate_scale;
+        #pragma omp parallel for
+        for (size_t i = 0; i < num_faces_; ++i) {
+            const double base = scale * ion_molecule_flux_[i];            // kg m^-2 s^-1 at T_ref
+            const double tau = config_.radiolyticFactor(temperatures[i]);
+            const double h2o = base * f;
+            const double rad = base * (1.0 - f) * tau;
+            const double o2 = rad * o2_of_rad;
+            const double h2 = rad - o2;
+            const double gross = h2o + rad;
+            state.sputtering_yield[i] = f + (1.0 - f) * tau;             // gross / (gross at T_ref)
+            state.h2o_sputter_flux[i] = h2o;
+            state.o2_production_flux[i] = o2;
+            state.h2_production_flux[i] = h2;
+            state.gross_removal_flux[i] = gross;
+            state.total_mass_loss[i] = h2o * e_h2o + o2 * e_o2 + h2 * e_h2;
+            state.redeposition_flux[i] = h2o * (1.0 - e_h2o);
+            state.reservoir_flux[i] = o2 * (1.0 - e_o2) + h2 * (1.0 - e_h2);
+            state.ion_flux[i] = gross / sputtering_constants::H2O_MASS;  // H2O-equivalent molecules m^-2 s^-1
+        }
         return;
     }
 
@@ -243,20 +350,20 @@ double SputteringModel::applySputteringMassLoss(
         total_sputtered += sputtered_mass * face_areas[i];
 
         // Escaped mass (fraction that doesn't return)
-        double escaped = sputtered_mass * config_.h2o_escape_fraction;
+        double escaped = sputtered_mass * config_.h2oEscapeFraction();
         total_escaped += escaped * face_areas[i];
 
         // Redeposited mass (H2O that returns via ballistic transport)
         // Note: This is handled by the transport matrix, so we just track it
-        double redeposited = sputtered_mass * (1.0 - config_.h2o_escape_fraction);
+        double redeposited = sputtered_mass * (1.0 - config_.h2oEscapeFraction());
         total_redeposited += redeposited * face_areas[i];
     }
 
     // Also add O2 and H2 escape to total escaped
     #pragma omp parallel for reduction(+:total_escaped)
     for (size_t i = 0; i < num_faces_; ++i) {
-        total_escaped += state.o2_production_flux[i] * config_.o2_escape_fraction * dt * face_areas[i];
-        total_escaped += state.h2_production_flux[i] * config_.h2_escape_fraction * dt * face_areas[i];
+        total_escaped += state.o2_production_flux[i] * config_.o2EscapeFraction() * dt * face_areas[i];
+        total_escaped += state.h2_production_flux[i] * config_.h2EscapeFraction() * dt * face_areas[i];
     }
 
     // Update cumulative statistics
@@ -275,15 +382,31 @@ void SputteringModel::printConfig() const {
         std::cout << "  (Sputtering disabled - no further parameters apply)" << std::endl;
         return;
     }
-
+    const bool legacy = config_.legacyParams();
+    std::cout << "  Parameter set: " << (legacy ? "LEGACY (--sputter-legacy-params; pre-2026-09-23)"
+                                                : "current (PTM-649; citations in sputtering_model.h)") << std::endl;
     std::cout << "  Rate scale factor: " << config_.rate_scale << std::endl;
-    std::cout << "  Hemisphere contrast: " << config_.hemisphere_contrast
-              << " (trailing/leading ratio)" << std::endl;
-    std::cout << "  Polar enhancement: " << config_.polar_enhancement << std::endl;
+    if (!legacy && hasIonMap()) {
+        std::cout << "  Ion map: " << ion_map_label_ << (ion_map_absolute_ ? " (absolute)" : " (pattern)") << std::endl;
+    } else {
+        std::cout << "  Hemisphere contrast: " << config_.hemisphere_contrast
+                  << " (trailing/leading ratio)" << std::endl;
+        std::cout << "  Polar enhancement: " << config_.polar_enhancement << std::endl;
+    }
     std::cout << "  Temperature dependent: " << (config_.temperature_dependent ? "yes" : "no") << std::endl;
-    std::cout << "  Min sputtering temp: " << config_.min_sputtering_temp << " K" << std::endl;
+    if (legacy) {
+        std::cout << "  Min sputtering temp: " << config_.min_sputtering_temp << " K" << std::endl;
+    } else {
+        std::cout << "  tau(T) on the radiolytic part only: exp[-(E_a/k)(1/T - 1/T_ref)], E_a "
+                  << config_.radiolysis_activation_eV << " eV, T_ref " << config_.radiolysis_reference_K
+                  << " K (no cutoff)" << std::endl;
+        std::cout << "  Binding energy U: " << config_.binding_energy_eV << " eV -> H2O escaping fraction "
+                  << std::setprecision(4) << config_.h2oEscapeFraction() << " and launch temperature "
+                  << std::setprecision(1) << config_.launchTemperatureK() << " K (Sigmund-Thompson, E_esc "
+                  << std::setprecision(4) << h2oEscapeEnergyEV() << " eV)" << std::endl;
+    }
 
-    std::cout << "\n  Species fractions:" << std::endl;
+    std::cout << "\n  Species fractions" << (legacy ? "" : " (at T_ref)") << ":" << std::endl;
     std::cout << "    H2O: " << (config_.h2o_fraction * 100) << "%" << std::endl;
     std::cout << "    O2:  " << (config_.o2Fraction() * 100) << "%" << std::endl;
     std::cout << "    H2:  " << (config_.h2Fraction() * 100) << "%" << std::endl;
@@ -293,20 +416,28 @@ void SputteringModel::printConfig() const {
               << std::endl;
 
     std::cout << "\n  Escape fractions:" << std::endl;
-    std::cout << "    H2O: " << (config_.h2o_escape_fraction * 100) << "%" << std::endl;
-    std::cout << "    O2:  " << (config_.o2_escape_fraction * 100) << "%" << std::endl;
-    std::cout << "    H2:  " << (config_.h2_escape_fraction * 100) << "%" << std::endl;
+    std::cout << "    H2O: " << (config_.h2oEscapeFraction() * 100) << "%" << std::endl;
+    if (legacy) {
+        std::cout << "    O2:  " << (config_.o2EscapeFraction() * 100) << "%" << std::endl;
+    } else {
+        std::cout << "    O2:  0% escape; 100% atmospheric loss (bound; ionization/dissociation/pickup)" << std::endl;
+    }
+    std::cout << "    H2:  " << (config_.h2EscapeFraction() * 100) << "%" << std::endl;
 
     // Compute expected global rates
-    double h2o_total = sputtering_constants::GLOBAL_H2O_RATE * sputtering_constants::H2O_MASS
-                       * config_.rate_scale;
-    double h2o_escape_rate = h2o_total * config_.h2o_escape_fraction;
-
-    std::cout << "\n  Expected global rates (with current settings):" << std::endl;
-    std::cout << "    Total H2O sputtered: " << std::scientific << std::setprecision(2)
-              << (sputtering_constants::GLOBAL_H2O_RATE * config_.rate_scale) << " molecules/s" << std::endl;
-    std::cout << "    H2O mass loss rate: " << h2o_total << " kg/s" << std::endl;
-    std::cout << "    H2O escape rate: " << h2o_escape_rate << " kg/s" << std::endl;
+    const double rate = legacy ? sputtering_constants::GLOBAL_H2O_RATE : ion_total_rate_;
+    double h2o_total = rate * sputtering_constants::H2O_MASS * config_.rate_scale;
+    std::cout << "\n  Expected global rates (with current settings" << (legacy ? "" : ", pure ice at T_ref") << "):"
+              << std::endl;
+    std::cout << "    Total sputtered (H2O-equivalent): " << std::scientific << std::setprecision(2)
+              << (rate * config_.rate_scale) << " molecules/s" << std::endl;
+    std::cout << "    Gross mass rate: " << h2o_total << " kg/s" << std::endl;
+    std::cout << "    H2O escape rate: " << h2o_total * config_.h2o_fraction * config_.h2oEscapeFraction()
+              << " kg/s" << std::endl;
+    if (!legacy) {
+        std::cout << "    O2 production: " << h2o_total * config_.o2Fraction() << " kg/s (JADE: 12 +/- 6 kg/s, "
+                  << "Szalay et al. 2024, UNVERIFIED)" << std::endl;
+    }
     std::cout << std::fixed << std::setprecision(4);
     if (config_.legacy_escape_only) {
         std::cout << "\n  Mass accounting: LEGACY escape-only (--sputter-legacy-escape-only). Only the "
@@ -314,13 +445,15 @@ void SputteringModel::printConfig() const {
                   << (100.0 * (1.0 - config_.escapeShare())) << "% is neither removed nor transported "
                   << "(NOT mass-conserving; PTM-642)." << std::endl;
     } else {
-        std::cout << "\n  Mass accounting (share of gross sputtered mass):" << std::endl;
+        std::cout << "\n  Mass accounting (share of gross sputtered mass" << (legacy ? "" : ", at T_ref") << "):"
+                  << std::endl;
         std::cout << "    Redeposited via ballistic transport (non-escaping H2O): "
                   << (100.0 * config_.transportShare()) << "%, launch temperature "
-                  << std::setprecision(1) << config_.launch_temperature_K << " K" << std::endl;
+                  << std::setprecision(1) << config_.launchTemperatureK() << " K" << std::endl;
         std::cout << std::setprecision(4);
         std::cout << "    Escaped (all products):                  " << (100.0 * config_.escapeShare()) << "%" << std::endl;
-        std::cout << "    Atmospheric reservoir (non-escaping O2 + H2, non-condensable): "
+        std::cout << (legacy ? "    Atmospheric reservoir (non-escaping O2 + H2, non-condensable): "
+                             : "    Atmospheric loss (O2; ionization/dissociation/pickup): ")
                   << (100.0 * config_.reservoirShare()) << "%" << std::endl;
     }
     std::cout << std::fixed;
@@ -344,6 +477,23 @@ void SputteringConfig::validate() const {
     if (legacy_escape_only && launch_temperature_given) {
         throw std::invalid_argument("sputtering: --sputter-launch-temperature has no effect with "
                                     "--sputter-legacy-escape-only (nothing is transported)");
+    }
+    auto positive = [](double v, const char* name) {
+        if (!(v > 0.0) || !std::isfinite(v)) {
+            throw std::invalid_argument(std::string("sputtering: ") + name + " = " + std::to_string(v) +
+                                        " must be positive and finite");
+        }
+    };
+    positive(binding_energy_eV, "binding_energy_eV (--sputter-binding-energy)");
+    positive(radiolysis_reference_K, "radiolysis_reference_K (--sputter-radiolysis-tref)");
+    if (!(radiolysis_activation_eV >= 0.0) || !std::isfinite(radiolysis_activation_eV)) {
+        throw std::invalid_argument("sputtering: radiolysis_activation_eV (--sputter-radiolysis-ea) = " +
+                                    std::to_string(radiolysis_activation_eV) + " must be >= 0");
+    }
+    positive(polar_enhancement, "polar_enhancement (--sputter-polar-enhancement)");
+    if (!(hemisphere_contrast >= 1.0)) {
+        throw std::invalid_argument("sputtering: hemisphere_contrast (--sputtering-contrast) = " +
+                                    std::to_string(hemisphere_contrast) + " must be >= 1");
     }
     if (legacy_escape_only &&
         std::abs(h2o_fraction + legacy_o2_fraction + legacy_h2_fraction - 1.0) > 1e-12) {
