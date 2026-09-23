@@ -9,7 +9,12 @@
 //  (c) the t = 0 thermal-vs-composition mismatch warning fires (and does not
 //      fire when the two agree), and coupling refuses without a thermal albedo;
 //  (d) hapke-intimate honors a pinned non-ice endmember (--nonice-albedo) on a
-//      uniform map.
+//      uniform map;
+//  (e) optional, given <mesh.ply> <Europa_Albedo_res6.bin> (FITS beside the .bin):
+//      map-fill faces are seeded from the map value the thermal run used, so on
+//      every in-range fill face the t = 0 composition albedo, the temperature
+//      reference and the thermal albedo agree (PTM-637); --fill-ice-fraction=uniform
+//      (the old seed) is shown to disagree there.
 //
 // The legacy rule (compare to the previous pass, skip faces below the threshold)
 // is emulated verbatim from ptm_exosphere_integration.cpp at 323cf11 (:1663 and
@@ -380,7 +385,89 @@ static void test_integration(const std::filesystem::path& root) {
     }
 }
 
-int main() {
+// (e) Real map: fill faces follow the albedo the thermal run used.
+static void test_real_map_fill(const std::filesystem::path& root, const std::string& mesh_path,
+                               const std::string& map_path) {
+    ptm::MeshUtils mu;
+    std::shared_ptr<ptm::Mesh> mesh;
+    captureCout([&] {
+        if (mu.loadMeshFromFile(mesh_path)) {
+            auto pm = mu.getMesh();
+            if (pm && !pm->faces.empty()) mesh = std::make_shared<ptm::Mesh>(*pm);
+        }
+    });
+    check(mesh != nullptr, "(e) load the thermal-run mesh " + mesh_path);
+    if (!mesh) return;
+    const size_t n = mesh->faces.size();
+    std::vector<double> map;
+    {
+        std::ifstream in(map_path, std::ios::binary);
+        uint64_t c = 0;
+        in.read(reinterpret_cast<char*>(&c), sizeof(c));
+        map.resize(c);
+        in.read(reinterpret_cast<char*>(map.data()), static_cast<std::streamsize>(c * sizeof(double)));
+    }
+    check(map.size() == n, "(e) map face count matches the mesh", double(map.size()), double(n));
+    if (map.size() != n) return;
+
+    struct Result { bool ok = false; std::vector<double> cls, comp, base, thermal; std::string out; };
+    auto runMode = [&](bool from_value, const std::string& tag) {
+        Result r;
+        auto integ = std::make_unique<exo::PTMExosphereIntegration>((root / tag).string());
+        integ->setShowProgress(false);
+        r.out = captureCout([&] {
+            integ->setMesh(mesh);
+            integ->enableIceLayerModel(0.05);
+            exo::HapkeIceFractionConfig cfg;
+            cfg.albedo_map_path = map_path;
+            cfg.fill_from_map_value = from_value;
+            exo::CompositionAlbedoConfig acfg;
+            r.ok = integ->initializeConcentrationsFromHapkeIntimate(cfg, acfg) &&
+                   integ->loadThermalAlbedoMap(map_path) && integ->enableAlbedoCoupling(acfg);
+        });
+        if (!r.ok) return r;
+        r.cls = integ->getIceFractionInitClass();
+        r.base = integ->getAlbedoAtLastRefresh();
+        r.thermal = integ->getThermalFaceAlbedos();
+        r.comp.resize(n);
+        for (size_t i = 0; i < n; ++i) r.comp[i] = integ->getFaceAlbedo(static_cast<int>(i));
+        return r;
+    };
+    const Result fix = runMode(true, "real_map_value");
+    const Result old = runMode(false, "real_uniform");
+    check(fix.ok && old.ok, "(e) hapke-intimate init + coupling on the real map (both fill modes)");
+    if (!fix.ok || !old.ok) return;
+
+    // The endmember range of the forward model on this map.
+    double a_lo = 1.0, a_hi = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (fix.cls[i] == 0.0) { a_lo = std::min(a_lo, map[i]); a_hi = std::max(a_hi, map[i]); }
+    }
+    size_t n_fill = 0, n_in = 0;
+    double e_fix = 0.0, e_base = 0.0, e_old = 0.0, e_old_base = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (fix.cls[i] != 1.0) continue;
+        ++n_fill;
+        if (!(map[i] > a_lo + 1e-9 && map[i] < a_hi - 1e-9)) continue;   // clamped fill faces
+        ++n_in;
+        e_fix = std::max(e_fix, std::abs(fix.comp[i] - map[i]));
+        e_base = std::max(e_base, std::abs(fix.base[i] - fix.thermal[i]));
+        e_old = std::max(e_old, std::abs(old.comp[i] - map[i]));
+        e_old_base = std::max(e_old_base, std::abs(old.base[i] - old.thermal[i]));
+    }
+    std::printf("       fill faces %zu, in the endmember range %zu (A in (%.4f, %.4f))\n", n_fill, n_in, a_lo, a_hi);
+    check(n_fill > 0 && n_in > 0, "(e) the real map has in-range fill faces (test is live)", double(n_in), 1.0);
+    check(e_fix < 1e-6, "(e) map-value: t = 0 composition albedo == thermal-run map value on fill faces", e_fix, 1e-6);
+    check(e_base < 1e-6, "(e) map-value: temperature reference == thermal albedo on fill faces", e_base, 1e-6);
+    check(e_old > 0.1 && e_old_base > 0.1,
+          "(e) contrast: the uniform seed disagrees with the thermal albedo on fill faces", e_old, 0.1);
+    check(fix.out.find("seeded from the map value the thermal run used") != std::string::npos &&
+              old.out.find("WARNING: " + std::to_string(n_fill) + " fill faces have a composition that does NOT") !=
+                  std::string::npos,
+          "(e) banners: map-value seeding reported; uniform seeding WARNS with the count");
+}
+
+int main(int argc, char** argv) {
     std::printf("=== test_albedo_refresh ===\n");
     test_tracker();
     char tmpl[] = "/tmp/test_albedo_refresh_XXXXXX";
@@ -388,6 +475,11 @@ int main() {
     if (!d) { std::printf("mkdtemp failed\n"); return 2; }
     const std::filesystem::path root(d);
     test_integration(root);
+    if (argc >= 3) {
+        test_real_map_fill(root, argv[1], argv[2]);
+    } else {
+        std::printf("[SKIP] (e) real-map fill-face checks: pass <mesh.ply> <albedo .bin> to run them\n");
+    }
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     std::printf("\n%d / %d checks passed\n", g_total - g_fail, g_total);

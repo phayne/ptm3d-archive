@@ -1979,6 +1979,26 @@ int main(int argc, char** argv)
             else hapke_cfg.grain_ratio = v;
             if (hapke_param_given.empty()) hapke_param_given = a;
         }
+        else if (a == "--fill-ice-fraction" || a.rfind("--fill-ice-fraction=", 0) == 0) {
+            std::string v;
+            if (a == "--fill-ice-fraction") {
+                if (i + 1 >= argc) {
+                    std::cerr << "Error: --fill-ice-fraction needs a value (map-value|uniform)" << std::endl;
+                    return 1;
+                }
+                v = argv[++i];
+            } else {
+                v = a.substr(std::string("--fill-ice-fraction=").size());
+            }
+            if (v == "map-value") hapke_cfg.fill_from_map_value = true;
+            else if (v == "uniform") hapke_cfg.fill_from_map_value = false;
+            else {
+                std::cerr << "Error: --fill-ice-fraction must be map-value or uniform (got '" << v << "')"
+                          << std::endl;
+                return 1;
+            }
+            if (hapke_param_given.empty()) hapke_param_given = "--fill-ice-fraction";
+        }
         else if ((a == "--ice-fraction-albedo-map" || a == "--albedo-fill-fits") && i+1 < argc) {
             if (a == "--ice-fraction-albedo-map") hapke_cfg.albedo_map_path = argv[++i];
             else hapke_cfg.fill_fits_path = argv[++i];
@@ -2086,8 +2106,13 @@ int main(int argc, char** argv)
             std::cout << "                      (required for hapke-intimate)\n";
             std::cout << "  --albedo-fill-fits F  FITS map used to flag faces that mixed in fill pixels\n";
             std::cout << "                      (default: Europa-0.5deg-BondAlbedo.fits next to the .bin;\n";
-            std::cout << "                      'none' skips fill detection, with a warning). Fill faces\n";
-            std::cout << "                      get exposed ice fraction 1 - --dust-fraction\n";
+            std::cout << "                      'none' skips fill detection, with a warning)\n";
+            std::cout << "  --fill-ice-fraction M  initial composition of fill faces (hapke-intimate):\n";
+            std::cout << "      map-value       (default) invert the face's own map value, the albedo the\n";
+            std::cout << "                      thermal run used there, so composition and temperature\n";
+            std::cout << "                      agree; faces with no usable value get 1 - --dust-fraction\n";
+            std::cout << "      uniform         every fill face gets exposed ice fraction 1 - --dust-fraction\n";
+            std::cout << "                      (pre-PTM-637 behavior; disagrees with the thermal albedo)\n";
             std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80, Fermi's base case)\n";
             std::cout << "  --nonice-albedo A  pin the non-ice endmember Bond albedo (e.g. 0.3814); overrides\n";
             std::cout << "                     the default, which is the map's area-weighted percentile below.\n";

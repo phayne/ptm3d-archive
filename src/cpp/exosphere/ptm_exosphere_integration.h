@@ -52,6 +52,14 @@ namespace ptm {
             double grain_ratio = 10.0;
             std::string albedo_map_path;     // per-face .bin (size_t count + double[count])
             std::string fill_fits_path;      // "" = sibling FITS next to the .bin; "none" = skip
+            // Fill faces (PTM-637). true (default): a fill face whose map value is a
+            // finite albedo in [0, 1] is inverted from THAT value, the one the thermal
+            // run used for it, like any other face (clamped at f = 0 / 1 outside the
+            // endmember range), so its composition and its temperature agree. Only fill
+            // faces without a usable value get fill_exposed_ice_fraction. false (the
+            // pre-PTM-637 behavior, --fill-ice-fraction=uniform): every fill face gets
+            // fill_exposed_ice_fraction, which disagrees with the thermal albedo there.
+            bool fill_from_map_value = true;
             double fill_exposed_ice_fraction = 0.95;
         };
 
@@ -173,6 +181,10 @@ namespace ptm {
             // hapke-intimate faces the forward model cannot reproduce at t = 0 (fill and
             // clamped classes): anchored at their t = 0 composition albedo instead.
             size_t albedo_anchored_faces_ = 0;
+            // Final-snapshot sublimation split into map-fill faces and the rest
+            // (PTM-637; Paul's ruling: a face with no value leaves both the
+            // numerator and the denominator, so report it separately, with N).
+            std::string fill_contribution_report_;
 
             // Per-face non-ice albedo endmembers from spatial map
             std::vector<double> nonice_albedo_map_;
@@ -507,6 +519,8 @@ namespace ptm {
             const std::vector<double>& getThermalFaceAlbedos() const { return thermal_face_albedos_; }
             /** Per-face albedo the current temperature array corresponds to. */
             const std::vector<double>& getAlbedoAtLastRefresh() const { return albedo_refresh_.baseline(); }
+            /** hapke-intimate init class per face: 0 inverted, 1 fill, 2 clamped f = 0, 3 clamped f = 1. */
+            const std::vector<double>& getIceFractionInitClass() const { return ice_fraction_init_class_; }
 
             /**
              * Disable albedo-composition coupling
