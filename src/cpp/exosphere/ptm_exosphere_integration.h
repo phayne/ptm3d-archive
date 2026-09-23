@@ -228,6 +228,9 @@ namespace ptm {
             double convergence_threshold_ = -1.0;       // <0 means use default
             double flux_convergence_threshold_ = -1.0;   // <0 means use default
             bool superstep_consistent_deposition_ = true;  // PTM-644
+            bool albedo_step_limit_ = true;                 // PTM-640
+            double albedo_limit_seconds_ = 0.0;
+            double max_refresh_deviation_ = 0.0;            // max |A - A_ref| when a refresh fired
             int max_superstep_epochs_ = 0;                  // 0 = no cap
 
             // Diurnal accumulation stride: use every Nth timestep for averaging.
@@ -625,6 +628,12 @@ namespace ptm {
 
             /** Upper bound on one multiscale super-step in epochs (0 = none; refinement checks). */
             void setMaxSuperstepEpochs(int n) { max_superstep_epochs_ = std::max(0, n); }
+
+            /**
+             * PTM-640. false = legacy: super-steps are not limited by the albedo
+             * change (the temperature refresh can lag by a whole step).
+             */
+            void setAlbedoStepLimit(bool on) { albedo_step_limit_ = on; }
 
             /**
              * Set diurnal accumulation stride for multi-timescale simulation

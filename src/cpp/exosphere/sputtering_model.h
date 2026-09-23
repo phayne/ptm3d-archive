@@ -5,65 +5,99 @@
  *
  *   gross_i(T) = m_H2O * Phi_i * [ f + (1 - f) * tau(T_i) ]
  *
- *   Phi_i   ion-driven H2O-equivalent molecule flux at the reference temperature.
- *           Default: N_tot * w_i / A, with the geometric (ion-access) weight w_i
- *           renormalized so that sum_i w_i a_i = A (area-weighted mean 1, A = the
- *           mesh's total area). The target N_tot is therefore delivered exactly by a
- *           pure-ice surface at T_ref; ice availability and tau(T) then reduce or
- *           raise the realized gross. We renormalize the geometric weight, not the
- *           realized gross: the magnetosphere sets the ion flux, the surface sets the
- *           yield, and renormalizing the realized value would make a darker or colder
- *           surface sputter harder to hit a fixed total. Alternatives:
- *           --sputter-ion-map FILE (per-face weights, renormalized the same way) or
- *           --sputter-ion-map-absolute FILE (Phi_i itself, molecules cm^-2 s^-1).
+ *   Phi_i   ion-driven H2O-equivalent molecule flux at T_ref. Default:
+ *           N_tot * w_i / A, with the geometric (ion-access) weight w_i renormalized
+ *           so that sum_i w_i a_i = A (area-weighted mean 1, A = the mesh's total
+ *           area). The target N_tot is delivered exactly by a pure-ice surface at
+ *           T_ref; ice availability and tau(T) then reduce or raise the realized
+ *           gross. We renormalize the geometric weight, not the realized gross: the
+ *           magnetosphere sets the ion flux, the surface sets the yield.
+ *           Alternatives: --sputter-ion-map FILE (weights, renormalized the same
+ *           way) or --sputter-ion-map-absolute FILE (Phi_i itself, cm^-2 s^-1).
  *   f       H2O mass fraction of the gross at T_ref (--sputter-h2o-fraction).
- *   tau(T)  radiolytic (O2 + H2) yield relative to T_ref, applied to the radiolytic
- *           part ONLY; the H2O yield is temperature-independent:
- *             tau(T) = exp[-(E_a / k) (1/T - 1/T_ref)],
- *           the temperature-dependent term of Y = Y0 [1 + q0 exp(-E_a / kT)], with its
- *           magnitude fixed by f at T_ref instead of by q0. Continuous and monotonic,
- *           no cutoff or step (the legacy factor was 0 below 50 K, 1 from 50-80 K,
- *           0.599 at 80 K, and applied to the whole yield; PTM-649).
+ *   tau(T)  radiolytic (O2 + H2) yield relative to T_ref, on the radiolytic part
+ *           ONLY (Cassidy et al. 2013 p. 71: the H2O rate is nearly independent of T
+ *           at 80-130 K; the T dependence arises mostly from O2 and H2):
+ *             tau(T) = [1 + q0 exp(-E_a/kT)] / [1 + q0 exp(-E_a/kT_ref)],
+ *           the O2 yield law of Cassidy et al. 2013 p. 71 (q0 = 1000, E_a = 0.06 eV,
+ *           after Teolis et al. 2010). Continuous and monotonic, no cutoff (the
+ *           legacy factor was 0 below 50 K, 1 from 50-80 K, 0.599 at 80 K, and applied
+ *           to the whole yield; PTM-649).
+ *   --sputter-o2-map-absolute FILE: the radiolytic part comes from a per-face O2
+ *           production map instead (O2 molecules cm^-2 s^-1; H2 stoichiometric;
+ *           H2O = gross - O2 - H2). tau(T) is NOT applied to it: the Addison et al.
+ *           2022 O2 map already carries the same law at a diurnal-mean surface
+ *           temperature profile (GENTOo O2 source: parameters.cpp:201-202 o2_q0 =
+ *           1.0e3, o2_Q = 0.06 eV; defines.h:55 TEMPERATUREPROFILE).
  *
- * Products and fates. Radiolytic O2 : H2 is stoichiometric (2 H2O -> 2 H2 + O2).
- * H2O leaves with the Sigmund-Thompson energy distribution f(E) ~ E / (E + U)^3,
- * which fixes BOTH the escaping fraction and the launch temperature of the
- * redepositing part, from the surface binding energy U (--sputter-binding-energy):
+ * Products and fates. Radiolytic O2 : H2 is stoichiometric (2 H2O -> 2 H2 + O2;
+ * Cassidy p. 71: "the H2 production rate is exactly twice that of the O2").
+ * H2O leaves with the Sigmund distribution f(E) ~ E / (E + U)^3 (Plainaki et al.
+ * 2010 Eq. 2 in its T_m -> infinity limit), which fixes BOTH the escaping fraction
+ * and the launch temperature of the redepositing part, from the effective surface
+ * binding energy U (--sputter-binding-energy):
  *   e_H2O  = 1 - [E_esc / (E_esc + U)]^2                (fraction above E_esc)
  *   T_launch = <E | E < E_esc> / (2 k)                   (kernel mean energy 2kT)
- * with E_esc = m_H2O v_esc^2 / 2 = 0.3828 eV (v_esc = 2025 m/s). U = 0.055 eV gives
- * e_H2O = 0.2354 and T_launch = 683 K. The non-escaping H2O redeposits through the
- * ballistic kernel; H2 escapes (100%); O2 is bound but non-condensable and is lost
- * from the ice budget by ionization, dissociation and pickup (100% "atmospheric
- * loss", not escape).
+ * with E_esc = m_H2O v_esc^2 / 2 = 0.3828 eV (v_esc = 2025 m/s; Plainaki: 0.38 eV).
+ * U = 0.054 eV gives e_H2O = 0.2320 and T_launch = 677 K. H2 escapes (100%); O2 is
+ * gravitationally bound (Cassidy p. 71) but non-condensable and is lost from the
+ * ice budget by ionization, dissociation and pickup (100% "atmospheric loss",
+ * not escape).
  *
- * Citations (checked 2026-09-23; no journal access in this session, so every
- * PRIMARY source is UNVERIFIED unless stated otherwise):
- *   N_tot = 2e27 H2O/s   Cassidy et al. 2013, PSS 77, 64            UNVERIFIED (table/eq not checked)
- *   f = 0.90             Cassidy et al. 2013 (O2 1e26 + H2 2e26 /s  UNVERIFIED; internally consistent:
- *                        against 2e27 H2O/s, i.e. 10.0% by mass)    5.98 / 59.8 kg/s
- *   Cosine 3:1 T/L       attributed to Cassidy et al. 2013          UNVERIFIED (functional form not traced)
- *   Polar 1.2 (linear)   NOT from Cassidy; appendix D calls it a    UNVERIFIED
- *                        simplification of Nordheim et al. 2022
- *   E_a = 0.06 eV        Fama et al. 2008 (Surf. Sci.)              UNVERIFIED in the paper; VERIFIED as used by
- *                                                                   Addison et al. 2022 GENTOo source
- *                                                                   (H2O/.../src/routines.cpp:521,
- *                                                                   temp_dep = 1 + 220 exp(-0.06/kT))
- *   T_ref = 100 K        Addison et al. 2022 fixed surface T        VERIFIED in GENTOo source (surf_temp);
- *                        (the reference of the absolute maps)       Cassidy's reference T UNVERIFIED
- *   U = 0.055 eV         Johnson 1990 (Energetic Charged-Particle   UNVERIFIED
- *                        Interactions with Atmospheres and Surfaces)
- *   f(E) ~ E/(E+U)^3     Sigmund 1969, Phys. Rev. 184, 383;         UNVERIFIED (standard form)
- *                        Thompson 1968, Phil. Mag. 18, 377
- *   O2 bound, lost by    Johnson et al. 2019 (per Fermi review)     UNVERIFIED
- *   ionization/pickup
- *   JADE O2 12 +/- 6 kg/s  Szalay et al. 2024                       UNVERIFIED (comparison only)
- *   Addison 2022 maps    Zenodo 10.5281/zenodo.5708206 (GENTOo)     data VERIFIED (md5 = Zenodo checksum);
- *                                                                   paper volume/article UNVERIFIED
+ * Citations, checked 2026-09-23 against the PDFs in Paul's library
+ * (VERIFIED = value found at the locator; DIFFERS = the source gives another value):
+ *   N_tot = 2e27 H2O/s    Cassidy et al. 2013, PSS 77, 64: abstract (p. 64),     VERIFIED
+ *                         Table 2 "Total" (p. 70); H2O-equivalent incl. O2/H2 (p. 66)
+ *   f = 0.90              Cassidy p. 71: O2 + H2 "~10% by mass"; Table 2 O2       VERIFIED
+ *                         1e26/s (p. 70), H2 2e26/s (p. 71)
+ *   Pattern: 3:1          Cassidy abstract (p. 64) "decreases to about 1/3rd of   VERIFIED (amplitude)
+ *     trailing/leading    the peak value at the leading hemisphere apex"; p. 69
+ *                         "about a factor of 3 difference" between the apexes
+ *   Pattern: cosine form  Cassidy gives a computed map (Fig. 7, p. 69), no         DIFFERS (approximation)
+ *                         analytic form; cos(theta) from the trailing apex is the
+ *                         cold-ion flux only (p. 70). The map also rises with
+ *                         latitude on the leading hemisphere (Fig. 7 caption),
+ *                         which the cosine omits (PTM-652).
+ *   Polar 1.2 (linear)    NOT in Cassidy, and no such number in Nordheim 2022      NOT-FOUND; default 1.0
+ *                         (below). Default is now 1 (BASE = Cassidy).              (legacy set keeps 1.2)
+ *   tau(T): q0 = 1000,    Cassidy p. 71 O2-yield equation (after Teolis et al.     VERIFIED (Teolis 2010
+ *     E_a = 0.06 eV       2010); total-yield law q0 = 220, E_a = 0.06 eV: Cassidy   not checked)
+ *                         Eq. 2 (p. 66) = Fama et al. 2008 Sec. 3.1 (p. 158)
+ *   T_ref = 100 K         Addison et al. 2022 fixed surface T (GENTOo source)      VERIFIED (as used)
+ *   U = 0.054 eV          Plainaki et al. 2010, Icarus 210, 385: Table 1 and       VERIFIED (0.055 NOT
+ *                         Sec. 2.2.1.3 (p. 388), after Boring et al. 1984 and      FOUND: not in Johnson
+ *                         Haring et al. 1984                                       & Sittler 1990 GRL)
+ *   e_H2O                 Plainaki p. 388 and abstract: ~22% for 0.054 eV (their   DIFFERS slightly (0.2320
+ *                         Eq. 2 with the T_m cutoff, 100 keV S+); Cassidy p. 69:   here, T_m -> inf);
+ *                         "~1/3 of sputtered H2O" escapes                          Cassidy DIFFERS (1/3)
+ *   f(E) ~ E/(E+U)^3      Plainaki Eq. 2 (p. 388), after Sigmund 1969              VERIFIED (limit form)
+ *   O2 bound, H2 escapes  Cassidy p. 71 (after Smyth & Marconi 2006)              VERIFIED
+ *   O2 loss channels      Teolis et al. 2017, Icarus 284, 18, Sec. 2 (pp. 21-22):   VERIFIED
+ *                         ionization/dissociation/charge exchange rates
+ *   JADE O2 12 +/- 6 kg/s Szalay et al. 2024, Nat. Astron.: abstract and Table 1    VERIFIED
+ *                         (2.2 +/- 1.2e26 /s, inferred from H2 loss x 2:1)
+ *   Addison 2022 maps     Zenodo 10.5281/zenodo.5708206 (GENTOo)               data VERIFIED (md5)
+ *   Addison et al. 2022, JGR Space Phys. 127, e2021JA030136:
+ *     units R [cm^-2 s^-1]   pp. 21, 30 (H2O-equivalent and O2 sputtering rates)    VERIFIED
+ *     H2O total, draped      p. 25: P_T ~ 5.9e27 /s (uniform fields 1.16e28, p. 24)  DIFFERS: the shipped
+ *                            p. 12: yields x 0.3 for regolith sticking; the GENTOo   map is 1.98e28 = 5.9e27
+ *                            source has no such factor                               / 0.3 (PTM-654)
+ *     H2O yield T-indep.     p. 11 (below 140 K, after Baragiola 2003); the GENTOo   DIFFERS (source keeps
+ *                            H2O source still applies 1 + 220 e^(-0.06/kT) at 100 K  1.21 at <= 100 keV)
+ *     O2 total, thin layer   p. 32: 1.5e26 - 4.9e26 /s over five T profiles; map     VERIFIED (in range)
+ *                            (diurnal-mean profile) 2.65e26 /s = 14.1 kg/s
+ *     O2 yield T law         Eqs. 3 and 5 (p. 14): (1 + q0 e^(-E_A/kT)), q0 = 1000,   VERIFIED
+ *                            E_A = 0.06 eV (after Johnson et al. 2009)
+ *     O2 delayed T response  p. 6 (after Teolis et al. 2005): diurnal-mean T         VERIFIED
+ *     energy quadrature      discrete energies (p. 10); the integration rule is      NOT-FOUND
+ *                            not stated
+ *   Nordheim et al. 2022, PSJ 3:5: high-latitude and polar regions receive the   1.2 NOT-FOUND (ion
+ *                            largest ion flux (abstract p. 1; p. 14); no linear     access maps only; no
+ *                            polar sputtering factor is given                       sputtering factor)
  *
  * --sputter-legacy-params restores the pre-2026-09-23 parameter set (f 0.85,
  * escape 0.10 / 0.90 / 0.95, launch 683 K, the stepped tau on the whole yield with
- * a 50 K cutoff, count-normalized weights over a fixed 3.09e13 m^2).
+ * a 50 K cutoff, polar 1.2, count-normalized weights over a fixed 3.09e13 m^2).
  * --sputter-legacy-escape-only implies it.
  */
 
@@ -112,9 +146,10 @@ namespace sputtering_constants {
     constexpr double EUROPA_ESCAPE_VELOCITY = 2025.0;          // m/s (= constants::EUROPA_ESCAPE_VELOCITY)
     constexpr double JOULE_PER_EV = 1.602176634e-19;
     constexpr double BOLTZMANN_J = 1.380649e-23;               // J/K
-    constexpr double DEFAULT_BINDING_ENERGY_EV = 0.055;        // U, Sigmund-Thompson
+    constexpr double DEFAULT_BINDING_ENERGY_EV = 0.054;        // U (Plainaki 2010 Table 1)
     constexpr double DEFAULT_H2O_FRACTION = 0.90;              // f at T_ref (Cassidy split)
-    constexpr double RADIOLYSIS_ACTIVATION_EV = 0.06;          // E_a of tau(T)
+    constexpr double RADIOLYSIS_ACTIVATION_EV = 0.06;          // E_a of tau(T) (Cassidy 2013 p. 71)
+    constexpr double RADIOLYSIS_Q0 = 1000.0;                   // q0 of tau(T) (Cassidy 2013 p. 71)
     constexpr double RADIOLYSIS_REFERENCE_T = 100.0;           // K, T_ref of tau(T) and of the maps
     constexpr double CM2_PER_M2 = 1.0e4;
 }
@@ -154,10 +189,11 @@ struct SputteringConfig {
     // Based on Cassidy et al. (2013): trailing apex ~3x leading apex
     double hemisphere_contrast = 3.0;
 
-    // Latitude dependence - linear polar enhancement factor. NOT from Cassidy et
-    // al. 2013; appendix D describes it as a simplification of Nordheim et al.
-    // 2022 (UNVERIFIED). --sputter-polar-enhancement (1 = none).
-    double polar_enhancement = 1.2;
+    // Latitude dependence - linear polar enhancement factor. NOT in Cassidy et al.
+    // 2013 (checked 2026-09-23); appendix D describes it as a simplification of
+    // Nordheim et al. 2022. Default 1 (none: BASE uses Cassidy's pattern); the
+    // legacy parameter set restores 1.2. --sputter-polar-enhancement.
+    double polar_enhancement = 1.0;
 
     // Temperature dependence enable (Teolis et al. 2017)
     bool temperature_dependent = true;
@@ -211,9 +247,10 @@ struct SputteringConfig {
     // Surface binding energy U [eV] of the Sigmund-Thompson distribution; sets the
     // H2O escaping fraction AND the launch temperature (current set only).
     double binding_energy_eV = sputtering_constants::DEFAULT_BINDING_ENERGY_EV;
-    // tau(T) = exp[-(E_a/k)(1/T - 1/T_ref)] on the radiolytic part (current set only).
+    // tau(T) = [1 + q0 e^(-E_a/kT)] / [1 + q0 e^(-E_a/kT_ref)] on the radiolytic part (current set).
     double radiolysis_activation_eV = sputtering_constants::RADIOLYSIS_ACTIVATION_EV;
     double radiolysis_reference_K = sputtering_constants::RADIOLYSIS_REFERENCE_T;
+    double radiolysis_q0 = sputtering_constants::RADIOLYSIS_Q0;
 
     // Derived (current set) or stored (legacy set) fate parameters. Use these, not
     // the raw fields, which hold the legacy values.
@@ -232,7 +269,10 @@ struct SputteringConfig {
     double radiolyticFactor(double T) const {
         if (!temperature_dependent) return 1.0;
         const double k_ev = sputtering_constants::BOLTZMANN_EV;
-        return std::exp(-(radiolysis_activation_eV / k_ev) * (1.0 / T - 1.0 / radiolysis_reference_K));
+        if (!(T > 0.0)) return 1.0 / (1.0 + radiolysis_q0 * std::exp(-radiolysis_activation_eV /
+                                                                    (k_ev * radiolysis_reference_K)));
+        return (1.0 + radiolysis_q0 * std::exp(-radiolysis_activation_eV / (k_ev * T))) /
+               (1.0 + radiolysis_q0 * std::exp(-radiolysis_activation_eV / (k_ev * radiolysis_reference_K)));
     }
 
     // Restore the pre-2026-09-23 parameter values (callers set legacy_params too).
@@ -243,6 +283,7 @@ struct SputteringConfig {
         h2_escape_fraction = 0.95;
         launch_temperature_K = 683.0;
         min_sputtering_temp = 50.0;
+        polar_enhancement = 1.2;
     }
 
     // Legacy (non-stoichiometric) O2 / H2 mass fractions: O2:H2 = 2:1 by mass
@@ -271,6 +312,11 @@ struct SputteringConfig {
     // cm^-2 s^-1 at T_ref (--sputter-ion-map-absolute), which set the total too.
     std::string ion_map_path;
     bool ion_map_absolute = false;
+    // Optional per-face radiolytic O2 production map (current set;
+    // --sputter-o2-map-absolute): O2 molecules cm^-2 s^-1, same file format. When
+    // given, O2 comes from the map (no tau(T)), H2 is stoichiometric to it, and
+    // H2O = gross - O2 - H2.
+    std::string o2_map_path;
 
     // Minimum temperature for sputtering (legacy parameter set only; the current
     // set has no cutoff: sputtering is not thermally activated)
@@ -391,6 +437,9 @@ private:
     std::string ion_map_label_;
     double mesh_area_ = 0.0;               // [m^2]
     double ion_total_rate_ = 0.0;          // [molecules/s] at T_ref, before rate_scale
+    std::vector<double> o2_map_values_;    // optional O2 map [cm^-2 s^-1]
+    std::string o2_map_label_;
+    double o2_map_total_rate_ = 0.0;       // [O2 molecules/s], before rate_scale
 
     // Reference flux for normalization (ions/m²/s at trailing apex)
     double reference_ion_flux_ = 0.0;
@@ -437,6 +486,14 @@ public:
         ion_map_label_ = label;
     }
     bool hasIonMap() const { return !ion_map_values_.empty(); }
+    /** Optional per-face O2 production map [O2 molecules cm^-2 s^-1] (see o2_map_path). */
+    void setO2Map(const std::vector<double>& values, const std::string& label) {
+        o2_map_values_ = values;
+        o2_map_label_ = label;
+    }
+    bool hasO2Map() const { return !o2_map_values_.empty(); }
+    /** Total O2 production of the map over the mesh [molecules/s], before rate_scale. */
+    double o2MapTotalRate() const { return o2_map_total_rate_; }
     bool ionMapAbsolute() const { return ion_map_absolute_; }
     /** Total H2O-equivalent rate at T_ref over the mesh [molecules/s], before rate_scale. */
     double ionTotalRate() const { return ion_total_rate_; }

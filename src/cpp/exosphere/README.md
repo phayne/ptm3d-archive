@@ -296,29 +296,35 @@ Below $T = 80$ K the yield is constant (temperature-independent regime).
 
 **Current parameter set (PTM-649, default).** The gross (ice removed, H$_2$O-equivalent mass) at face $i$ is
 
-$$\Phi_{\mathrm{gross},i} = m \thinspace S \thinspace \phi_i \left[ f + (1 - f) \thinspace \tau(T_i) \right], \qquad \tau(T) = \exp\left[ -\frac{E_a}{k_B} \left( \frac{1}{T} - \frac{1}{T_{\mathrm{ref}}} \right) \right]$$
+$$\Phi_{\mathrm{gross},i} = m \thinspace S \thinspace \phi_i \left[ f + (1 - f) \thinspace \tau(T_i) \right], \qquad \tau(T) = \frac{1 + q_0 \exp(-E_a / k_B T)}{1 + q_0 \exp(-E_a / k_B T_{\mathrm{ref}})}$$
 
-where $\phi_i$ is the H$_2$O-equivalent molecule flux at $T_{\mathrm{ref}}$. By default $\phi_i = \dot{N}_{\mathrm{tot}} w_i / A$, with the ion-access weight $w_i$ renormalized to an area-weighted mean of 1 over the mesh area $A$, so a pure-ice surface at $T_{\mathrm{ref}}$ delivers exactly $\dot{N}_{\mathrm{tot}} = 2 \times 10^{27}$ s$^{-1}$. The geometric weight is renormalized, not the realized gross: ice availability and $\tau(T)$ then reduce or raise the realized rate (the magnetosphere sets the ion flux; the surface sets the yield). The legacy code normalized by face count over a fixed $3.09 \times 10^{13}$ m$^2$. The H$_2$O part ($f$) is temperature-independent; only the radiolytic O$_2$ + H$_2$ part follows $\tau(T)$, which is continuous and monotonic (no cutoff). Radiolytic O$_2$ : H$_2$ is stoichiometric.
+where $\phi_i$ is the H$_2$O-equivalent molecule flux at $T_{\mathrm{ref}}$. By default $\phi_i = \dot{N}_{\mathrm{tot}} w_i / A$, with the ion-access weight $w_i$ renormalized to an area-weighted mean of 1 over the mesh area $A$, so a pure-ice surface at $T_{\mathrm{ref}}$ delivers exactly $\dot{N}_{\mathrm{tot}} = 2 \times 10^{27}$ s$^{-1}$. The geometric weight is renormalized, not the realized gross: ice availability and $\tau(T)$ then reduce or raise the realized rate (the magnetosphere sets the ion flux; the surface sets the yield). The legacy code normalized by face count over a fixed $3.09 \times 10^{13}$ m$^2$. The H$_2$O part ($f$) is temperature-independent; only the radiolytic O$_2$ + H$_2$ part follows $\tau(T)$, Cassidy et al.'s O$_2$ yield law ($q_0 = 1000$, $E_a = 0.06$ eV), which is continuous and monotonic (no cutoff; $\tau \to 0.514$ as $T \to 0$). Radiolytic O$_2$ : H$_2$ is stoichiometric. The default ion pattern (BASE) is Cassidy's trailing/leading apex ratio of 3 as a cosine in longitude, with no polar term.
 
-The escaping share of sputtered H$_2$O and the launch temperature of the redepositing share both come from the Sigmund-Thompson distribution $f(E) \propto E/(E+U)^3$: $e_{\mathrm{H_2O}} = 1 - [E_{\mathrm{esc}}/(E_{\mathrm{esc}}+U)]^2$ and $T_{\mathrm{launch}} = \langle E \rangle_{E<E_{\mathrm{esc}}} / 2k_B$, with $E_{\mathrm{esc}} = m v_{\mathrm{esc}}^2/2 = 0.3828$ eV. $U = 0.055$ eV gives 0.2354 and 683 K; `--sputter-binding-energy` changes both together. H$_2$ escapes. O$_2$ is bound but non-condensable and is booked as atmospheric loss (ionization, dissociation, pickup), not escape. Shares of the gross at $T_{\mathrm{ref}}$: 68.81% redeposited, 22.31% escaped, 8.88% O$_2$ atmospheric loss. Per face they follow $\tau(T)$, and the multiscale path uses the diurnal-mean per-face shares.
+The escaping share of sputtered H$_2$O and the launch temperature of the redepositing share both come from the Sigmund distribution $f(E) \propto E/(E+U)^3$: $e_{\mathrm{H_2O}} = 1 - [E_{\mathrm{esc}}/(E_{\mathrm{esc}}+U)]^2$ and $T_{\mathrm{launch}} = \langle E \rangle_{E<E_{\mathrm{esc}}} / 2k_B$, with $E_{\mathrm{esc}} = m v_{\mathrm{esc}}^2/2 = 0.3828$ eV. $U = 0.054$ eV gives 0.2320 and 677 K; `--sputter-binding-energy` changes both together. H$_2$ escapes. O$_2$ is gravitationally bound but non-condensable and is booked as atmospheric loss (ionization, dissociation, pickup), not escape. Shares of the gross at $T_{\mathrm{ref}}$: 69.12% redeposited, 22.00% escaped, 8.88% O$_2$ atmospheric loss. Per face they follow $\tau(T)$, and the multiscale path uses the diurnal-mean per-face shares.
 
-Ion maps: `--sputter-ion-map FILE` replaces $w_i$ (per-face weights, renormalized as above); `--sputter-ion-map-absolute FILE` gives $\phi_i$ directly in H$_2$O-equivalent molecules cm$^{-2}$ s$^{-1}$ at $T_{\mathrm{ref}}$ and sets the total (for example the Addison et al. 2022 maps, computed at a fixed 100 K surface, so $\tau$ is not applied twice). Both files are a uint64 count followed by float64 per face.
+Ion maps: `--sputter-ion-map FILE` replaces $w_i$ (per-face weights, renormalized as above); `--sputter-ion-map-absolute FILE` gives $\phi_i$ directly in H$_2$O-equivalent molecules cm$^{-2}$ s$^{-1}$ at $T_{\mathrm{ref}}$ and sets the total. `--sputter-o2-map-absolute FILE` (O$_2$ molecules cm$^{-2}$ s$^{-1}$) sets the radiolytic part per face: H$_2$ is stoichiometric to it, H$_2$O is the gross minus O$_2$ and H$_2$, and $\tau(T)$ is not applied, because the Addison et al. 2022 O$_2$ map already carries the same temperature law at a diurnal-mean temperature profile. All map files are a uint64 count followed by float64 per face. HIGH bracket case: both Addison 2022 absolute maps.
 
-**Citations** (status as of 2026-09-23; no journal access in that session, so primary sources are UNVERIFIED unless stated):
+**Citations** (checked 2026-09-23 against the PDFs; VERIFIED = value found at the locator, DIFFERS = the source gives another value, NOT-FOUND = the source does not contain it):
 
-| Parameter | Value | Source | Status |
+| Parameter | Value used | Source and locator | Status |
 |---|---|---|---|
-| $\dot{N}_{\mathrm{tot}}$ | $2 \times 10^{27}$ H$_2$O s$^{-1}$ | Cassidy et al. 2013, PSS 77, 64 | UNVERIFIED (table not checked) |
-| $f$ (H$_2$O share at $T_{\mathrm{ref}}$) | 0.90 | Cassidy et al. 2013 (O$_2$ $10^{26}$ + H$_2$ $2 \times 10^{26}$ s$^{-1}$ against $2 \times 10^{27}$, i.e. 10.0% by mass) | UNVERIFIED |
-| Cosine 3:1 trailing/leading | 3.0 | attributed to Cassidy et al. 2013 | UNVERIFIED (functional form not traced) |
-| Linear polar factor | 1.2 | not from Cassidy; appendix D: simplification of Nordheim et al. 2022 | UNVERIFIED |
-| $E_a$ of $\tau(T)$ | 0.06 eV | Fama et al. 2008, Surf. Sci. 602, 156 | UNVERIFIED in the paper; VERIFIED as used in the Addison et al. 2022 GENTOo source (`temp_dep = 1 + 220 exp(-0.06/kT)`) |
-| $T_{\mathrm{ref}}$ | 100 K | Addison et al. 2022 fixed surface temperature | VERIFIED in the GENTOo source; Cassidy's reference temperature UNVERIFIED |
-| $U$ | 0.055 eV | Johnson 1990 | UNVERIFIED |
-| $f(E) \propto E/(E+U)^3$ | | Sigmund 1969; Thompson 1968 | UNVERIFIED (standard form) |
-| O$_2$ bound, lost by ionization and pickup | | Johnson et al. 2019 | UNVERIFIED |
-| JADE O$_2$ loss (comparison) | $12 \pm 6$ kg/s | Szalay et al. 2024 | UNVERIFIED |
-| Addison 2022 ion maps | 1.98 $\times 10^{28}$ s$^{-1}$ | Zenodo 10.5281/zenodo.5708206 | data VERIFIED (archive md5 = Zenodo checksum); paper details UNVERIFIED |
+| $\dot{N}_{\mathrm{tot}}$ | $2 \times 10^{27}$ H$_2$O-equivalent s$^{-1}$ | Cassidy et al. 2013, PSS 77, 64: abstract (p. 64); Table 2 (p. 70); yield counts O$_2$/H$_2$ as H$_2$O mass equivalent (p. 66) | VERIFIED |
+| $f$ | 0.90 | Cassidy p. 71: O$_2$ + H$_2$ "~10% by mass"; O$_2$ $10^{26}$ s$^{-1}$ (Table 2), H$_2$ twice that (p. 71) | VERIFIED |
+| Trailing/leading ratio | 3 | Cassidy abstract (p. 64): leading apex "about 1/3rd of the peak"; p. 69: "about a factor of 3" | VERIFIED |
+| Cosine in longitude | | Cassidy gives a computed map (Fig. 7, p. 69), not a formula; $\cos\theta$ is the cold-ion flux only (p. 70). Fig. 7 also rises with latitude on the leading hemisphere, which the cosine omits | DIFFERS (approximation) |
+| Linear polar factor | 1 (legacy 1.2) | not in Cassidy; not in Nordheim et al. 2022, PSJ 3:5 (ion access only: polar and high latitudes get the largest flux, abstract p. 1 and p. 14) | NOT-FOUND |
+| $q_0$, $E_a$ of $\tau(T)$ | 1000, 0.06 eV | Cassidy p. 71 (O$_2$ yield, after Teolis et al. 2010); Addison et al. 2022 Eqs. 3 and 5 (p. 14). Total-yield law $q_0 = 220$: Fama et al. 2008 Sec. 3.1 (p. 158); Cassidy Eq. 2 (p. 66) | VERIFIED |
+| $T_{\mathrm{ref}}$ | 100 K | Addison et al. 2022 yield curves at 100 K (p. 14); GENTOo source | VERIFIED |
+| $U$ | 0.054 eV | Plainaki et al. 2010, Icarus 210, 385: Table 1 and Sec. 2.2.1.3 (p. 388), after Boring et al. 1984 and Haring et al. 1984. The earlier 0.055 eV is not in Johnson and Sittler 1990 (GRL 17, 1629) | VERIFIED (0.055 NOT-FOUND) |
+| $e_{\mathrm{H_2O}}$ | 0.2320 (derived) | Plainaki abstract and p. 388: ~22% at 0.054 eV (with the $T_m$ cutoff, 100 keV S$^+$); Cassidy p. 69: ~1/3 | DIFFERS slightly (Plainaki); DIFFERS (Cassidy) |
+| $f(E) \propto E/(E+U)^3$ | | Plainaki Eq. 2 (p. 388), after Sigmund 1969 ($T_m \to \infty$ limit) | VERIFIED |
+| O$_2$ bound, H$_2$ escapes | | Cassidy p. 71 | VERIFIED |
+| O$_2$ loss channels | | Teolis et al. 2017, Icarus 284, 18, Sec. 2 (pp. 21-22) | VERIFIED |
+| JADE O$_2$ production | $12 \pm 6$ kg/s | Szalay et al. 2024, Nat. Astron.: abstract; Table 1 | VERIFIED |
+| Addison map units | cm$^{-2}$ s$^{-1}$ | Addison et al. 2022, JGR Space Phys. 127, e2021JA030136, pp. 21, 30 | VERIFIED |
+| Addison H$_2$O total | map 1.98 $\times 10^{28}$ s$^{-1}$ | paper p. 25: $\approx 5.9 \times 10^{27}$ s$^{-1}$ (draped fields), after the ×0.3 regolith sticking factor (p. 12) that the shipped GENTOo source does not apply | DIFFERS (×3.3) |
+| Addison O$_2$ total | map 2.65 $\times 10^{26}$ s$^{-1}$ = 14.1 kg/s | paper p. 32: 1.5–4.9 $\times 10^{26}$ s$^{-1}$ (thin layer, five temperature profiles) | VERIFIED (in range) |
+| Addison energy quadrature | | discrete energies (p. 10); the integration rule is not stated | NOT-FOUND |
 
 `--sputter-legacy-params` restores the earlier set below (implied by `--sputter-legacy-escape-only`).
 
@@ -817,6 +823,7 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--cycles-per-epoch` $N_c$ | 100 | Diurnal cycles per epoch (~100 = 1 Earth year) |
 | `--export-interval` $N$ | 100 | Export every $N$ epochs, plus the final state (0 = the final state only; earlier builds wrote nothing for 0). Snapshot $L$ is the state after exactly $L$ epochs ($t = L\,\Delta t_{\mathrm{epoch}}$); the last is labeled `--epochs`. `time_steps.txt` lists one time per snapshot (PTM-636; earlier builds wrote state fields after the epoch's super-step, up to one interval past the label, and omitted the final snapshot from `time_steps.txt`) |
 | `--max-superstep-epochs` $N$ | none | Cap one super-step at $N$ epochs (step-size refinement checks; the physical bound is the emission-weighted availability change) |
+| `--no-albedo-step-limit` | off | Pre-PTM-640 step: super-steps are not ended when a face's albedo would pass `--albedo-update-threshold`, so the temperature refresh can lag by a whole step and the answer depends on the step size. Implied by `--sputter-legacy-escape-only`. By default, with `--albedo-coupling`, each super-step ends at the first epoch count whose predicted albedo deviation (from the albedo the temperatures correspond to) exceeds the threshold (bisection on the closed-form step), so every refresh fires within one epoch of being due |
 | `--superstep-legacy-deposition` | off | Pre-PTM-644 step: deposition held at its start-of-step value while the sources follow the ice availability, and the trapezoid mean availability in the linear mode. Not mass-conserving; reproduces earlier products only. Implied by `--sputter-legacy-escape-only` |
 | `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
 | `--cache-refresh` $N$ | (refused) | Not implemented; the CLI exits with an error |

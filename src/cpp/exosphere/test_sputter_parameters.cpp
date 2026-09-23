@@ -154,8 +154,15 @@ static void test_sigmund_thompson() {
         check(std::abs(mean_c / mean_q - 1.0) < 2e-4, tag, std::abs(mean_c / mean_q - 1.0), 2e-4);
     }
     exo::SputteringConfig c;
-    check(std::abs(c.h2oEscapeFraction() - 0.2354) < 1e-4, "U = 0.055 eV: e_H2O = 0.2354", c.h2oEscapeFraction(), 0.2354);
-    check(std::abs(c.launchTemperatureK() - 683.0) < 1.0, "U = 0.055 eV: T_launch = 683 K", c.launchTemperatureK(), 683.0);
+    check(c.binding_energy_eV == 0.054, "default U = 0.054 eV (Plainaki et al. 2010 Table 1)", c.binding_energy_eV, 0.054);
+    check(std::abs(c.h2oEscapeFraction() - 0.2320) < 1e-4, "U = 0.054 eV: e_H2O = 0.2320", c.h2oEscapeFraction(), 0.2320);
+    check(std::abs(c.launchTemperatureK() - 677.3) < 0.5, "U = 0.054 eV: T_launch = 677 K", c.launchTemperatureK(), 677.3);
+    {
+        exo::SputteringConfig c55;
+        c55.binding_energy_eV = 0.055;
+        check(std::abs(c55.h2oEscapeFraction() - 0.2354) < 1e-4 && std::abs(c55.launchTemperatureK() - 683.0) < 1.0,
+              "U = 0.055 eV (the earlier default): 0.2354 and 683 K", c55.launchTemperatureK(), 683.0);
+    }
     exo::SputteringConfig c2;
     c2.binding_energy_eV = 0.1;
     check(c2.h2oEscapeFraction() > c.h2oEscapeFraction() && c2.launchTemperatureK() > c.launchTemperatureK(),
@@ -173,17 +180,32 @@ static void test_tau() {
     exo::SputteringConfig c;
     check(std::abs(c.radiolyticFactor(c.radiolysis_reference_K) - 1.0) < 1e-15, "tau(T_ref) = 1",
           c.radiolyticFactor(c.radiolysis_reference_K), 1.0);
+    {
+        // Cassidy et al. 2013 p. 71: Y(T) = Y(0) (1 + 1000 exp(-0.06 eV / kT)), independent evaluation.
+        const double k = 8.617333262e-5;
+        auto Y = [&](double T) { return 1.0 + 1000.0 * std::exp(-0.06 / (k * T)); };
+        double worst = 0.0;
+        for (double T : {40.0, 80.0, 100.0, 120.0, 130.0, 140.0}) {
+            worst = std::max(worst, std::abs(c.radiolyticFactor(T) / (Y(T) / Y(100.0)) - 1.0));
+        }
+        check(worst < 1e-6, "tau(T) = Cassidy p. 71 O2 law (q0 1000, E_a 0.06 eV) normalized at 100 K", worst, 1e-6);
+        check(std::abs(c.radiolyticFactor(130.0) - 2.94) < 0.01, "tau(130 K) = 2.94 (the '1 +' term included)",
+              c.radiolyticFactor(130.0), 2.94);
+        check(c.radiolyticFactor(20.0) > 0.51 && c.radiolyticFactor(20.0) < 0.52,
+              "tau(T -> 0) = 1 / (1 + 1000 e^(-E_a/kT_ref)) = 0.514, not 0", c.radiolyticFactor(20.0), 0.514);
+    }
     double prev = c.radiolyticFactor(20.0), worst_jump = 0.0;
     bool mono = prev > 0.0;
     for (double T = 20.01; T <= 300.0; T += 0.01) {
         const double v = c.radiolyticFactor(T);
-        mono = mono && (v > prev);
+        mono = mono && (T < 40.0 ? v >= prev : v > prev);
         // Continuity: relative step bounded by (E_a/k) dT / T^2 (+ rounding).
         const double bound = (c.radiolysis_activation_eV / sc::BOLTZMANN_EV) * 0.01 / (T * T) * 1.01 + 1e-12;
         worst_jump = std::max(worst_jump, std::abs(v / prev - 1.0) / bound);
         prev = v;
     }
-    check(mono, "tau strictly increasing and > 0 from 20 to 300 K (no cutoff)", c.radiolyticFactor(20.0), 0.0);
+    check(mono, "tau > 0, non-decreasing from 20 K and strictly increasing from 40 to 300 K (no cutoff)",
+          c.radiolyticFactor(20.0), 0.0);
     check(worst_jump <= 1.0, "no jump: every 0.01 K step within the analytic derivative bound", worst_jump, 1.0);
 
     // Radiolytic part only: H2O part independent of T; radiolytic part scales with tau.
@@ -370,7 +392,71 @@ static void test_fates() {
     check(w_o2 < 1e-14, "O2 is 100% atmospheric loss; escape = e_H2O x H2O + all H2", w_o2, 1e-14);
     check(w_ratio < 1e-12, "O2 : H2 stays stoichiometric at every temperature", w_ratio, 1e-12);
     check(std::abs(c.transportShare() + c.escapeShare() + c.reservoirShare() - 1.0) < 1e-15,
-          "global shares at T_ref sum to 1 (0.6881 / 0.2231 / 0.0888)", c.transportShare(), 0.6881);
+          "global shares at T_ref sum to 1 (0.6912 / 0.2200 / 0.0888)", c.transportShare(), 0.6912);
+}
+
+static void test_o2_map_and_polar() {
+    std::printf("\n(6b) O2 map (PTM-650) and the BASE pattern (no polar term)\n");
+    const ptm::Mesh m = make_icosphere(3, 1560.8e3);
+    const Geo g = geometry(m);
+    const size_t n = g.areas.size();
+    exo::SputteringConfig c;
+    check(c.polar_enhancement == 1.0, "default polar enhancement = 1 (Cassidy has none)", c.polar_enhancement, 1.0);
+    {
+        exo::SputteringModel sm(n, c);
+        sm.initializeSpatialDistribution(g.centers, g.lat, g.lon, g.areas);
+        // Weight depends on longitude only: compare faces mirrored in latitude... use the
+        // closed form: w ~ f_lon(lon) exactly.
+        double worst = 0.0;
+        const double wmin = 1.0 / c.hemisphere_contrast;
+        double ratio0 = -1.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double west = std::fmod(-g.lon[i] + 360.0, 360.0);
+            const double f = wmin + (1.0 - wmin) * (std::cos((west - 270.0) * M_PI / 180.0) + 1.0) / 2.0;
+            const double r = sm.getSpatialWeight(i) / f;
+            if (ratio0 < 0.0) ratio0 = r;
+            worst = std::max(worst, std::abs(r / ratio0 - 1.0));
+        }
+        check(worst < 1e-12, "BASE weight = cosine 3:1 in longitude only (no latitude term)", worst, 1e-12);
+    }
+    // O2 map: synthetic, 3% of the gross by radiolytic mass on average.
+    std::vector<double> O(n);
+    const double mean_cm = sc::GLOBAL_H2O_RATE / 3.0467e13 / 1e4;
+    for (size_t i = 0; i < n; ++i) O[i] = 0.01 * mean_cm * (1.0 + std::max(0.0, std::cos(g.lon[i] * M_PI / 180.0)));
+    exo::SputteringModel sm(n, c);
+    sm.setO2Map(O, "synthetic O2");
+    sm.initializeSpatialDistribution(g.centers, g.lat, g.lon, g.areas);
+    exo::SputteringState a(n), b(n);
+    sm.computeSputteringRates(std::vector<double>(n, 90.0), g.areas, a);
+    sm.computeSputteringRates(std::vector<double>(n, 130.0), g.areas, b);
+    double w_o2 = 0.0, w_h2 = 0.0, w_sum = 0.0, w_T = 0.0;
+    const double stoich = 2.0 * sc::H2_MASS / sc::O2_MASS;
+    exo::SputteringModel def(n, c);
+    def.initializeSpatialDistribution(g.centers, g.lat, g.lon, g.areas);
+    exo::SputteringState d0(n);
+    def.computeSputteringRates(std::vector<double>(n, 100.0), g.areas, d0);
+    for (size_t i = 0; i < n; ++i) {
+        w_o2 = std::max(w_o2, std::abs(a.o2_production_flux[i] / (O[i] * 1e4 * sc::O2_MASS) - 1.0));
+        w_h2 = std::max(w_h2, std::abs(a.h2_production_flux[i] / (a.o2_production_flux[i] * stoich) - 1.0));
+        w_sum = std::max(w_sum, std::abs(a.gross_removal_flux[i] / d0.gross_removal_flux[i] - 1.0));
+        w_T = std::max(w_T, std::abs(b.o2_production_flux[i] / a.o2_production_flux[i] - 1.0) +
+                            std::abs(b.h2o_sputter_flux[i] / a.h2o_sputter_flux[i] - 1.0));
+    }
+    check(w_o2 < 1e-14, "O2 per face = map x 1e4 x m_O2", w_o2, 1e-14);
+    check(w_h2 < 1e-13, "H2 stoichiometric to the mapped O2", w_h2, 1e-13);
+    check(w_sum < 1e-13, "gross unchanged (H2O = gross - O2 - H2)", w_sum, 1e-13);
+    check(w_T == 0.0, "no tau(T) on the mapped radiolytic part (90 K = 130 K)", w_T, 0.0);
+    const double o2_tot = sumA(a.o2_production_flux, g.areas);
+    check(std::abs(o2_tot / (sm.o2MapTotalRate() * sc::O2_MASS) - 1.0) < 1e-13,
+          "realized O2 at full exposure = the map total", o2_tot, sm.o2MapTotalRate() * sc::O2_MASS);
+    bool threw = false;
+    try {
+        std::vector<double> big(n, 50.0 * mean_cm);
+        exo::SputteringModel bad(n, c);
+        bad.setO2Map(big, "too large");
+        bad.initializeSpatialDistribution(g.centers, g.lat, g.lon, g.areas);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "an O2 map exceeding the gross on a face is refused");
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +569,7 @@ int main() {
     test_absolute_map();
     test_plugin_reproduces_default();
     test_fates();
+    test_o2_map_and_polar();
     test_end_to_end();
     std::printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail == 0 ? 0 : 1;

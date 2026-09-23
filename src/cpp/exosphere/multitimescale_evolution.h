@@ -673,6 +673,12 @@ struct EvolutionStatistics {
     long long steps_evolved = 0;
     long long step_solver_evaluations = 0;
     int step_solver_max_iterations = 0;
+    // PTM-640 albedo step limiter (predictions do not change the state).
+    long long step_solver_slope_fallbacks = 0;  // FD slope outside [-1, 0): used -1
+    long long step_solver_loose = 0;            // accepted at |residual| <= 1e-8 after stagnation
+    long long predictions = 0;
+    long long prediction_evaluations = 0;
+    long long steps_albedo_limited = 0;
 
     // Albedo coupling statistics
     double max_albedo_change = 0.0;       // [dimensionless] max albedo change this epoch
@@ -1105,9 +1111,11 @@ public:
             double f_end = 1.0 - std::clamp(nonice_new, 0.0, 1.0);
             out.nonice_new = nonice_new;
             out.net_rate = A * (1.0 - conc_before) - B;
-            if (std::abs(f_end - f0) < 1e-8) {
-                // f barely moves: the trapezoid is exact to < 1e-8 x |df| (as in
-                // solveExposedAreaStep) and keeps equilibrium faces bit-identical.
+            if (rate0 == 0.0) {
+                // Exact equilibrium: f is constant; the trapezoid of the end points keeps
+                // such faces bit-identical to the legacy step. (An absolute |df| < 1e-8
+                // switch here made the step mean discontinuous in B on nearly depleted
+                // faces, f ~ 1e-6, and stalled the deposition solve; PTM-640 work.)
                 out.mean_avail = 0.5 * (f0 + f_end);
                 return out;
             }
@@ -1186,6 +1194,35 @@ public:
                      IceLayerState& ice_state,
                      const std::vector<double>& face_areas,
                      double epoch_duration) {
+        evolveEpochImpl(ice_model, ice_state, face_areas, epoch_duration, nullptr);
+    }
+
+    /**
+     * PTM-640: the non-ice concentrations evolveEpoch() WOULD produce over
+     * epoch_duration from the current state (same deposition solve and closed
+     * form), without changing the state or the statistics.
+     */
+    void predictConcentrations(const IceLayerModel& ice_model,
+                               const IceLayerState& ice_state,
+                               const std::vector<double>& face_areas,
+                               double epoch_duration,
+                               std::vector<double>& nonice_out) {
+        const EvolutionStatistics saved = stats_;
+        nonice_out.resize(num_faces_);
+        evolveEpochImpl(ice_model, const_cast<IceLayerState&>(ice_state), face_areas, epoch_duration,
+                        &nonice_out);
+        const long long evals = stats_.step_solver_evaluations - saved.step_solver_evaluations;
+        stats_ = saved;
+        stats_.prediction_evaluations += evals;
+        ++stats_.predictions;
+    }
+
+private:
+    void evolveEpochImpl(const IceLayerModel& ice_model,
+                         IceLayerState& ice_state,
+                         const std::vector<double>& face_areas,
+                         double epoch_duration,
+                         std::vector<double>* predict_only) {
         const DiurnalAverages& d = *diurnal_avg_;
         double max_ice_mass = ice_model.getMaxIceMassPerArea();
         const bool consistent = config_.superstep_consistent_deposition;
@@ -1260,6 +1297,12 @@ public:
             evaluate(s, G);
             residual(G, s, g);
             while (!converged_at(g, s)) {
+                // Stagnation: the scale no longer moves (a kink at the root). Accept
+                // when the residual is far inside the 1e-6 step audit, count it.
+                if (iterations >= 8 && gnorm(g) <= 1e-8) {
+                    ++stats_.step_solver_loose;
+                    break;
+                }
                 if (++iterations > 40) {
                     std::ostringstream m;
                     m << std::scientific << std::setprecision(6)
@@ -1277,6 +1320,17 @@ public:
                     evaluate(sp, Gp);
                     residual(Gp, sp, gp);
                     for (int j = 0; j < 2; ++j) J[j][k] = active[j] ? (gp[j] - g[j]) / h : (j == k ? 1.0 : 0.0);
+                }
+                // g_k = G_k/S_k - s_k decreases in s_k with slope in [-1, 0) (more
+                // deposition, more ice, more emission, but never more than deposited).
+                // A finite difference across a kink in the per-face closed forms can
+                // violate that; fall back to the fixed-point slope -1 for that group.
+                for (int k = 0; k < 2; ++k) {
+                    if (active[k] && !(J[k][k] < 0.0 && J[k][k] >= -1.0 - 1e-6)) {
+                        J[k][k] = -1.0;
+                        J[k][1 - k] = 0.0;
+                        ++stats_.step_solver_slope_fallbacks;
+                    }
                 }
                 const double det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
                 if (!(std::abs(det) > 0.0) || !std::isfinite(det)) {
@@ -1296,6 +1350,18 @@ public:
                 }
                 s[0] = sn[0]; s[1] = sn[1]; g[0] = gn[0]; g[1] = gn[1];
             }
+        }
+        if (predict_only) {
+            // Prediction: the end-of-step concentrations only (state untouched).
+            #pragma omp parallel for
+            for (size_t i = 0; i < num_faces_; ++i) {
+                const double deposition = consistent ? dep_at(i, s) : d.avg_deposition_flux[i];
+                const double A = (d.base_sublimation_flux[i] + d.base_sputtering_flux[i]) / max_ice_mass;
+                const FaceStep st = stepFace(ice_model, ice_state.nonice_concentration[i], A,
+                                             deposition / max_ice_mass, epoch_duration, consistent);
+                (*predict_only)[i] = std::clamp(st.nonice_new, 0.0, layer_constants::MAX_NONICE_CONCENTRATION);
+            }
+            return;
         }
         stats_.step_solver_max_iterations = std::max(stats_.step_solver_max_iterations, iterations);
         ++stats_.steps_evolved;
@@ -1509,6 +1575,7 @@ public:
                 && max_change < 1e-4);
     }
 
+public:
     /**
      * Deposition flux [kg/(m²·s)] that the last evolveEpoch() step used, per face
      * (the step-consistent value; the start-of-step value in legacy mode).
