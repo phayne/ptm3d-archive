@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <numeric>
 #include <iomanip>
+#include <stdexcept>
+#include <string>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -129,6 +131,8 @@ void SputteringModel::computeSputteringRates(
 
     // Convert to mass flux (kg/m²/s)
     double avg_mass_flux = avg_molecule_flux * sputtering_constants::H2O_MASS;
+    const double o2_fraction = config_.o2Fraction();
+    const double h2_fraction = config_.h2Fraction();
 
     #pragma omp parallel for
     for (size_t i = 0; i < num_faces_; ++i) {
@@ -143,6 +147,8 @@ void SputteringModel::computeSputteringRates(
             state.h2_production_flux[i] = 0.0;
             state.total_mass_loss[i] = 0.0;
             state.redeposition_flux[i] = 0.0;
+            state.gross_removal_flux[i] = 0.0;
+            state.reservoir_flux[i] = 0.0;
             continue;
         }
 
@@ -158,15 +164,17 @@ void SputteringModel::computeSputteringRates(
         // Total sputtering mass flux for this face
         double total_sputter_flux = avg_mass_flux * spatial_factor * temp_factor;
 
-        // Partition into species
+        // Partition into products (mass fractions sum to 1; O2/H2 stoichiometric
+        // unless legacy_escape_only)
         double h2o_flux = total_sputter_flux * config_.h2o_fraction;
-        double o2_flux = total_sputter_flux * config_.o2_fraction;
-        double h2_flux = total_sputter_flux * config_.h2_fraction;
+        double o2_flux = total_sputter_flux * o2_fraction;
+        double h2_flux = total_sputter_flux * h2_fraction;
 
         // Store species fluxes
         state.h2o_sputter_flux[i] = h2o_flux;
         state.o2_production_flux[i] = o2_flux;
         state.h2_production_flux[i] = h2_flux;
+        state.gross_removal_flux[i] = total_sputter_flux;
 
         // Compute mass loss (what escapes to space)
         double h2o_escape = h2o_flux * config_.h2o_escape_fraction;
@@ -176,10 +184,15 @@ void SputteringModel::computeSputteringRates(
         // Net mass loss to space
         state.total_mass_loss[i] = h2o_escape + o2_escape + h2_escape;
 
-        // H2O that redeposits locally (ballistic hop returns to surface)
-        // This is already accounted for in the transport matrix, so we track it
-        // separately for diagnostics but don't apply it here
+        // Non-escaping H2O. New accounting: the multiscale path launches it into
+        // the ballistic transport kernel (runMultiTimescaleSimulation). Legacy:
+        // diagnostic only; it was never removed or transported (the old comment
+        // here claimed the transport matrix handled it; it did not; PTM-642).
         state.redeposition_flux[i] = h2o_flux * (1.0 - config_.h2o_escape_fraction);
+
+        // Non-escaping O2 + H2: non-condensable, an atmospheric reservoir.
+        state.reservoir_flux[i] = o2_flux * (1.0 - config_.o2_escape_fraction)
+                                + h2_flux * (1.0 - config_.h2_escape_fraction);
 
         // Ion flux for diagnostics (convert back to molecules/m²/s)
         state.ion_flux[i] = (total_sputter_flux / sputtering_constants::H2O_MASS) * spatial_factor;
@@ -272,8 +285,12 @@ void SputteringModel::printConfig() const {
 
     std::cout << "\n  Species fractions:" << std::endl;
     std::cout << "    H2O: " << (config_.h2o_fraction * 100) << "%" << std::endl;
-    std::cout << "    O2:  " << (config_.o2_fraction * 100) << "%" << std::endl;
-    std::cout << "    H2:  " << (config_.h2_fraction * 100) << "%" << std::endl;
+    std::cout << "    O2:  " << (config_.o2Fraction() * 100) << "%" << std::endl;
+    std::cout << "    H2:  " << (config_.h2Fraction() * 100) << "%" << std::endl;
+    std::cout << "    O2:H2 mass ratio: " << (config_.o2Fraction() / config_.h2Fraction())
+              << (config_.legacy_escape_only ? " (legacy, non-stoichiometric)"
+                                              : " (radiolytic stoichiometry 2 H2O -> 2 H2 + O2)")
+              << std::endl;
 
     std::cout << "\n  Escape fractions:" << std::endl;
     std::cout << "    H2O: " << (config_.h2o_escape_fraction * 100) << "%" << std::endl;
@@ -290,7 +307,49 @@ void SputteringModel::printConfig() const {
               << (sputtering_constants::GLOBAL_H2O_RATE * config_.rate_scale) << " molecules/s" << std::endl;
     std::cout << "    H2O mass loss rate: " << h2o_total << " kg/s" << std::endl;
     std::cout << "    H2O escape rate: " << h2o_escape_rate << " kg/s" << std::endl;
+    std::cout << std::fixed << std::setprecision(4);
+    if (config_.legacy_escape_only) {
+        std::cout << "\n  Mass accounting: LEGACY escape-only (--sputter-legacy-escape-only). Only the "
+                  << (100.0 * config_.escapeShare()) << "% escaping share leaves the surface; the other "
+                  << (100.0 * (1.0 - config_.escapeShare())) << "% is neither removed nor transported "
+                  << "(NOT mass-conserving; PTM-642)." << std::endl;
+    } else {
+        std::cout << "\n  Mass accounting (share of gross sputtered mass):" << std::endl;
+        std::cout << "    Redeposited via ballistic transport (non-escaping H2O): "
+                  << (100.0 * config_.transportShare()) << "%, launch temperature "
+                  << std::setprecision(1) << config_.launch_temperature_K << " K" << std::endl;
+        std::cout << std::setprecision(4);
+        std::cout << "    Escaped (all products):                  " << (100.0 * config_.escapeShare()) << "%" << std::endl;
+        std::cout << "    Atmospheric reservoir (non-escaping O2 + H2, non-condensable): "
+                  << (100.0 * config_.reservoirShare()) << "%" << std::endl;
+    }
     std::cout << std::fixed;
+}
+
+void SputteringConfig::validate() const {
+    auto in01 = [](double v, const char* name) {
+        if (!(v >= 0.0 && v <= 1.0)) {
+            throw std::invalid_argument(std::string("sputtering: ") + name + " = " +
+                                        std::to_string(v) + " is outside [0, 1]");
+        }
+    };
+    in01(h2o_fraction, "h2o_fraction (--sputter-h2o-fraction)");
+    in01(h2o_escape_fraction, "h2o_escape_fraction (--sputter-escape-h2o)");
+    in01(o2_escape_fraction, "o2_escape_fraction (--sputter-escape-o2)");
+    in01(h2_escape_fraction, "h2_escape_fraction (--sputter-escape-h2)");
+    if (!(launch_temperature_K > 0.0) || !std::isfinite(launch_temperature_K)) {
+        throw std::invalid_argument("sputtering: launch_temperature_K (--sputter-launch-temperature) = " +
+                                    std::to_string(launch_temperature_K) + " must be a positive temperature");
+    }
+    if (legacy_escape_only && launch_temperature_given) {
+        throw std::invalid_argument("sputtering: --sputter-launch-temperature has no effect with "
+                                    "--sputter-legacy-escape-only (nothing is transported)");
+    }
+    if (legacy_escape_only &&
+        std::abs(h2o_fraction + legacy_o2_fraction + legacy_h2_fraction - 1.0) > 1e-12) {
+        throw std::invalid_argument("sputtering: legacy_escape_only uses the fixed 0.10 O2 / 0.05 H2 "
+                                    "split, so h2o_fraction must stay 0.85");
+    }
 }
 
 } // namespace exosphere

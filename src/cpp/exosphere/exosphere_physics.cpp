@@ -2802,7 +2802,9 @@ void BallisticTransport::computeTransportProduct(
     const std::vector<double>& temperatures,
     const std::vector<double>& emission,
     std::vector<double>& deposition,
-    double threshold) const
+    double threshold,
+    const TransportCallOptions& options,
+    TransportTotals* totals) const
 {
     size_t n = face_centers.size();
     const double R = body_radius_;
@@ -2832,6 +2834,27 @@ void BallisticTransport::computeTransportProduct(
         spatial_index_.build(face_centers, cell_size_deg, theta_max_global * 1.1);
         spatial_index_query_radius_ = theta_max_global * 1.1;
         spatial_index_built_ = true;
+    }
+    // The persistent index keeps the query radius of its FIRST build. A later
+    // call with hotter sources would have its kernel silently truncated at that
+    // radius. Opt-in callers get a call-local index instead; everyone else is
+    // warned (PTM-643; the sublimation path's behavior is unchanged here).
+    const SphericalSpatialIndex* index = &spatial_index_;
+    SphericalSpatialIndex local_index;
+    if (theta_max_global > spatial_index_query_radius_ * (1.0 + 1e-12)) {
+        if (options.private_index_if_needed) {
+            double cell_size_deg = std::min(10.0, theta_max_global * 180.0 / M_PI / 3.0);
+            cell_size_deg = std::max(2.0, cell_size_deg);
+            local_index.build(face_centers, cell_size_deg, theta_max_global * 1.1);
+            index = &local_index;
+        } else {
+            std::cerr << "WARNING [PTM-643]: transport kernel cutoff " << std::fixed << std::setprecision(1)
+                      << (theta_max_global * 180.0 / M_PI) << " deg (T_max " << T_max
+                      << " K) exceeds the spatial index query radius "
+                      << (spatial_index_query_radius_ * 180.0 / M_PI)
+                      << " deg built on the first call; kernels of the hottest sources are truncated "
+                      << "(each source still conserves mass)" << std::endl;
+        }
     }
 
     // Kernel probability density with precomputed sigma2 for the source temperature.
@@ -2895,8 +2918,9 @@ void BallisticTransport::computeTransportProduct(
     std::vector<std::vector<double>> thread_cal(num_threads, std::vector<double>(n, 0.0));
 
     size_t total_scatter_ops = 0;
+    double jeans_escaped_total = 0.0, unscattered_total = 0.0;
 
-    #pragma omp parallel reduction(+:total_scatter_ops)
+    #pragma omp parallel reduction(+:total_scatter_ops,jeans_escaped_total,unscattered_total)
     {
         int tid = omp_get_thread_num();
         auto& local_dep = thread_dep[tid];
@@ -2915,7 +2939,10 @@ void BallisticTransport::computeTransportProduct(
             double T_i = temperatures[i];
 
             // Skip faces with no physical temperature
-            if (T_i <= 0.0) continue;
+            if (T_i <= 0.0) {
+                if (e_i > 0.0) unscattered_total += e_i;
+                continue;
+            }
 
             // Precompute per-source thermal parameters
             double sigma2_i = constants::BOLTZMANN_K * T_i / constants::WATER_MOLECULAR_MASS;
@@ -2925,7 +2952,7 @@ void BallisticTransport::computeTransportProduct(
             double vth = std::sqrt(2.0 * sigma2_i);
             double ratio = constants::EUROPA_ESCAPE_VELOCITY / vth;
             double escape_frac = 0.0;
-            if (ratio < 5.0) {
+            if (options.apply_jeans_escape && ratio < 5.0) {
                 escape_frac = std::exp(-ratio * ratio) * (1.0 + ratio * ratio) / (2.0 * ratio * ratio);
             }
 
@@ -2935,7 +2962,7 @@ void BallisticTransport::computeTransportProduct(
             double theta_cutoff_i = std::min(2.0 * sigma2_i * xi_cutoff / (constants::EUROPA_GRAVITY * R), M_PI);
             float cos_cutoff_i = static_cast<float>(std::cos(theta_cutoff_i));
 
-            spatial_index_.queryNeighborsByCosTheta(i, cos_cutoff_i, neighbors);
+            index->queryNeighborsByCosTheta(i, cos_cutoff_i, neighbors);
 
             // Phase 1: compute kernel weights and cache them
             cached_weights.clear();
@@ -2980,6 +3007,8 @@ void BallisticTransport::computeTransportProduct(
             // Self-deposition (calibration always, actual only if emitting)
             local_cal[i] += self_weight * scaled_a;
             if (e_i > 0.0) {
+                if (norm_i == 0.0) unscattered_total += e_i;
+                else jeans_escaped_total += e_i * escape_frac;
                 double scaled_e = e_i * norm_i;
                 local_dep[i] += self_weight * scaled_e;
                 total_scatter_ops++;
@@ -3114,6 +3143,12 @@ void BallisticTransport::computeTransportProduct(
         total_dep_final += deposition[j];
     }
     double conservation_ratio = (total_emission > 0.0) ? total_dep_final / total_emission : 1.0;
+    if (totals) {
+        totals->source = total_emission;
+        totals->deposited = total_dep_final;
+        totals->jeans_escaped = jeans_escaped_total;
+        totals->unscattered = unscattered_total;
+    }
 
     auto end2 = std::chrono::high_resolution_clock::now();
     auto ms_total = std::chrono::duration_cast<std::chrono::milliseconds>(end2 - start);
@@ -3133,10 +3168,12 @@ void BallisticTransport::computeTransportProduct(
 void ExosphereModel::computeTransportProduct(
     const std::vector<double>& temperatures,
     const std::vector<double>& emission,
-    std::vector<double>& deposition)
+    std::vector<double>& deposition,
+    const TransportCallOptions& options,
+    TransportTotals* totals)
 {
     transport_->computeTransportProduct(
-        face_centers_, face_areas_, temperatures, emission, deposition);
+        face_centers_, face_areas_, temperatures, emission, deposition, 1e-10, options, totals);
 }
 
 // Smooth a scalar field using the spatial index built by computeTransportProduct().
