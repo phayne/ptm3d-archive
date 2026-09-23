@@ -576,3 +576,42 @@ set_target_properties(test_sputter_mass_accounting
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# PTM-644 super-step deposition consistency (unit + ico3 end to end)
+add_executable(test_superstep_deposition
+    test_superstep_deposition.cpp
+)
+target_include_directories(test_superstep_deposition PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/constants
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_superstep_deposition
+    PRIVATE
+    exosphere_core
+    constants
+    mesh_utils
+    Eigen3::Eigen
+)
+if(OpenMP_CXX_FOUND)
+    if(APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang"))
+        if(OpenMP_CXX_FLAGS)
+            string(REPLACE " " ";" OMP_FLAGS_LIST "${OpenMP_CXX_FLAGS}")
+            target_compile_options(test_superstep_deposition PRIVATE ${OMP_FLAGS_LIST})
+        else()
+            target_compile_options(test_superstep_deposition PRIVATE -Xpreprocessor -fopenmp)
+        endif()
+        if(OpenMP_omp_LIBRARY)
+            target_link_libraries(test_superstep_deposition PRIVATE ${OpenMP_omp_LIBRARY})
+        elseif(LIBOMP_LIB)
+            target_link_libraries(test_superstep_deposition PRIVATE ${LIBOMP_LIB})
+        endif()
+    else()
+        target_link_libraries(test_superstep_deposition PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
+set_target_properties(test_superstep_deposition
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

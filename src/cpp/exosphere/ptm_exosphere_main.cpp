@@ -1816,6 +1816,9 @@ int main(int argc, char** argv)
     double convergence_threshold = -1.0;    // <0 = use default (1e-6)
     double flux_convergence_threshold = -1.0; // <0 = use default (0.01 = 1%)
     int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
+    bool superstep_legacy_deposition = false;  // PTM-644: reproduce the pre-fix super-step
+    int max_superstep_epochs = 0;              // 0 = no cap
+    std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
 
     // Albedo-composition coupling options
     bool albedo_coupling_enabled = false;
@@ -1922,6 +1925,18 @@ int main(int argc, char** argv)
         }
         else if (a == "--flux-convergence" && i+1 < argc) {
             flux_convergence_threshold = std::stod(argv[++i]);
+        }
+        else if (a == "--superstep-legacy-deposition") {
+            superstep_legacy_deposition = true;
+            if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--max-superstep-epochs" && i+1 < argc) {
+            max_superstep_epochs = std::stoi(argv[++i]);
+            if (max_superstep_epochs < 1) {
+                std::cerr << "Error: --max-superstep-epochs must be >= 1" << std::endl;
+                return 1;
+            }
+            if (superstep_flag.empty()) superstep_flag = a;
         }
         // Albedo-composition coupling options
         else if (a == "--albedo-coupling") {
@@ -2109,6 +2124,11 @@ int main(int argc, char** argv)
             std::cout << "  --convergence-threshold T  Max concentration change per epoch for convergence\n";
             std::cout << "                         (default: 1e-6)\n";
             std::cout << "  --flux-convergence T   Flux imbalance fraction for convergence (default: 0.01 = 1%%)\n";
+            std::cout << "  --max-superstep-epochs N  Cap one super-step at N epochs (default: none; for\n";
+            std::cout << "                         step-size refinement checks)\n";
+            std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
+            std::cout << "                         each super-step (pre-PTM-644; not mass-conserving;\n";
+            std::cout << "                         reproduces earlier products only)\n";
             std::cout << "  --diurnal-stride N     Use every Nth timestep in diurnal averaging (default: 1)\n";
             std::cout << "                         stride=4 gives ~4x faster diurnal computation, <2%% error\n\n";
             std::cout << "Albedo-composition coupling options (thermal segregation feedback):\n";
@@ -2202,6 +2222,10 @@ int main(int argc, char** argv)
         init_from_albedo_map = true;
         albedo_coupling_enabled = true;
         ice_layer_enabled = true;
+    }
+    if (!superstep_flag.empty() && !multiscale_enabled) {
+        std::cerr << "Error: " << superstep_flag << " requires --multiscale" << std::endl;
+        return 1;
     }
     if (ice_fraction_mode == "hapke-intimate") {
         if (!multiscale_enabled) {
@@ -2449,6 +2473,8 @@ int main(int argc, char** argv)
         if (flux_convergence_threshold >= 0.0) {
             integrator.setFluxConvergenceThreshold(flux_convergence_threshold);
         }
+        integrator.setSuperstepConsistentDeposition(!superstep_legacy_deposition);
+        integrator.setMaxSuperstepEpochs(max_superstep_epochs);
         if (diurnal_stride > 1) {
             integrator.setDiurnalStride(diurnal_stride);
             std::cout << "  Diurnal accumulation stride: " << diurnal_stride << std::endl;
