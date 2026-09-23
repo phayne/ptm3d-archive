@@ -423,6 +423,45 @@ set_target_properties(test_bessel_k0_and_areas
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# --albedo-coupling temperature-refresh test (always build; self-contained, exit code 0 = pass)
+add_executable(test_albedo_refresh
+    test_albedo_refresh.cpp
+)
+target_include_directories(test_albedo_refresh PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/constants
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_albedo_refresh
+    PRIVATE
+    exosphere_core
+    constants
+    mesh_utils
+    Eigen3::Eigen
+)
+if(OpenMP_CXX_FOUND)
+    if(APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang"))
+        if(OpenMP_CXX_FLAGS)
+            string(REPLACE " " ";" OMP_FLAGS_LIST "${OpenMP_CXX_FLAGS}")
+            target_compile_options(test_albedo_refresh PRIVATE ${OMP_FLAGS_LIST})
+        else()
+            target_compile_options(test_albedo_refresh PRIVATE -Xpreprocessor -fopenmp)
+        endif()
+        if(OpenMP_omp_LIBRARY)
+            target_link_libraries(test_albedo_refresh PRIVATE ${OpenMP_omp_LIBRARY})
+        elseif(LIBOMP_LIB)
+            target_link_libraries(test_albedo_refresh PRIVATE ${LIBOMP_LIB})
+        endif()
+    else()
+        target_link_libraries(test_albedo_refresh PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
+set_target_properties(test_albedo_refresh
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # --ice-fraction-from-albedo=hapke-intimate unit test (always build; header-only
 # code under test, exit code 0 = pass; optional arg: per-face Bond albedo .bin)
 add_executable(test_ice_fraction_from_albedo
@@ -443,7 +482,7 @@ set_target_properties(test_ice_fraction_from_albedo
 install(TARGETS ptm_exosphere
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-install(FILES exosphere_physics.h ptm_exosphere_integration.h distance_cache.h spherical_index.h sputtering_model.h ice_crystallization_model.h ice_layer_model.h multitimescale_evolution.h hapke_mixing.h
+install(FILES exosphere_physics.h ptm_exosphere_integration.h distance_cache.h spherical_index.h sputtering_model.h ice_crystallization_model.h ice_layer_model.h multitimescale_evolution.h hapke_mixing.h albedo_refresh.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ptm/exosphere
 )
 

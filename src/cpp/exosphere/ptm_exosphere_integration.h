@@ -8,6 +8,8 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
+#include "albedo_refresh.h"
+
 // Forward declarations
 namespace ptm {
     struct Mesh;
@@ -158,8 +160,19 @@ namespace ptm {
             bool albedo_coupling_enabled_ = false;
             std::unique_ptr<CompositionAlbedoMapper> albedo_mapper_;
             std::vector<double> current_face_albedos_;    // per-face current albedo
-            std::vector<double> previous_face_albedos_;   // for change detection
-            double initial_albedo_ = 0.5;                 // original albedo from PTM thermal sim
+            std::vector<double> previous_face_albedos_;   // previous pass (per-pass diagnostic only)
+            double initial_albedo_ = 0.5;                 // uniform fallback for getFaceAlbedo()
+
+            // Albedo the thermal run used, per face (--thermal-albedo / --thermal-albedo-map,
+            // or the hapke-intimate --ice-fraction-albedo-map). Required by enableAlbedoCoupling.
+            std::vector<double> thermal_face_albedos_;
+            std::string thermal_albedo_source_;
+            // Per-face albedo the CURRENT surface_temperatures_ correspond to; seeded from
+            // thermal_face_albedos_ and moved to the composition albedo on each refresh.
+            AlbedoRefreshTracker albedo_refresh_;
+            // hapke-intimate faces the forward model cannot reproduce at t = 0 (fill and
+            // clamped classes): anchored at their t = 0 composition albedo instead.
+            size_t albedo_anchored_faces_ = 0;
 
             // Per-face non-ice albedo endmembers from spatial map
             std::vector<double> nonice_albedo_map_;
@@ -178,7 +191,7 @@ namespace ptm {
 
             // Albedo coupling internal methods
             double updateAlbedoFromComposition();
-            void updateTemperaturesForAlbedoChange();
+            bool updateTemperaturesForAlbedoChange();  // true if a refresh fired
 
             // Private methods
             void calculateFaceProperties();
@@ -477,7 +490,23 @@ namespace ptm {
              *
              * @param config Albedo coupling configuration (endmember values, threshold)
              */
-            void enableAlbedoCoupling(const CompositionAlbedoConfig& config);
+            bool enableAlbedoCoupling(const CompositionAlbedoConfig& config);
+
+            /**
+             * Declare the Bond albedo the thermal run used (the albedo the loaded
+             * temperatures correspond to). One of these must be called before
+             * enableAlbedoCoupling(); coupling refuses to guess.
+             *   setThermalAlbedoUniform: one value on every face.
+             *   loadThermalAlbedoMap: per-face .bin (uint64 count + double[count]).
+             * Values must be finite and in [0, 1) on every face whose temperature is
+             * referenced to them (enableAlbedoCoupling refuses otherwise); only
+             * anchored hapke-intimate fill faces may hold other values.
+             */
+            bool setThermalAlbedoUniform(double albedo, const std::string& source);
+            bool loadThermalAlbedoMap(const std::string& path);
+            const std::vector<double>& getThermalFaceAlbedos() const { return thermal_face_albedos_; }
+            /** Per-face albedo the current temperature array corresponds to. */
+            const std::vector<double>& getAlbedoAtLastRefresh() const { return albedo_refresh_.baseline(); }
 
             /**
              * Disable albedo-composition coupling

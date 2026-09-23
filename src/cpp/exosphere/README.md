@@ -538,7 +538,9 @@ where $\Phi_{\mathrm{em},i}^{(\mathrm{base})}$ is the emission flux computed wit
 
 **Analytical acceleration:** For faces where the evolution is slow (time constants $\gg \Delta t_{\mathrm{epoch}}$), the model uses the analytical ODE solution directly rather than time-stepping. Always on; it cannot be disabled (`--no-analytical` is refused).
 
-**Diurnal-cycle cache:** The diurnal cycle is computed at the first epoch and recomputed only when `--albedo-coupling` changes temperatures by more than `--albedo-update-threshold`. There is no concentration-based or periodic refresh; `--cache-refresh N` is refused.
+**Diurnal-cycle cache:** The diurnal cycle is computed at the first epoch and recomputed only when `--albedo-coupling` refreshes the temperatures. There is no concentration-based or periodic refresh; `--cache-refresh N` is refused.
+
+**Albedo-coupling temperature refresh:** the exosphere does not re-solve the thermal model. It rescales the thermal-run temperatures, $T_{\mathrm{new}} = T_{\mathrm{ref}}\,[(1-A_{\mathrm{new}})/(1-A_{\mathrm{ref}})]^{1/4}$, where $A_{\mathrm{ref}}$ is the per-face albedo the current temperature array corresponds to: the thermal run's own albedo (`--thermal-albedo` / `--thermal-albedo-map`; `hapke-intimate` defaults to its `--ice-fraction-albedo-map`) until the first refresh, and the albedo of the last refresh after that. A refresh fires when $\max_f |A_f - A_{\mathrm{ref},f}|$ exceeds `--albedo-update-threshold`, so slow drift accumulates until it fires; every face is then rescaled from its own $A_{\mathrm{ref}}$, so no sub-threshold drift is lost. If the $t=0$ composition albedo differs from the thermal albedo by more than $10^{-3}$ on any face, the run prints a WARNING and the first pass rescales those temperatures; that difference is a configuration mismatch, not feedback. Exception: `hapke-intimate` faces the forward model cannot reproduce (fill, or clamped at $f=0$ or $f=1$) are anchored at their $t=0$ composition albedo, so their thermal temperatures are kept at $t=0$ (they are reported separately at startup).
 
 **Default parameters:**
 
@@ -754,10 +756,22 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `--ice-fraction-albedo-map` $F$ | (required for `hapke-intimate`) | Per-face Bond albedo `.bin` used by the thermal run |
 | `--albedo-fill-fits` $F$ | `Europa-0.5deg-BondAlbedo.fits` beside the `.bin` | FITS map for fill flagging; `none` skips it, with a warning |
 | `--ice-albedo` $A$ | 0.80 | Ice endmember Bond albedo (`hapke-intimate`) |
-| `--nonice-albedo` $A$ | map P10 | Non-ice endmember Bond albedo, explicit override (`hapke-intimate`) |
+| `--nonice-albedo` $A$ | map P10 | Pin the non-ice endmember Bond albedo (`hapke-intimate`); needed for a uniform map, whose P10 is the map value itself |
 | `--nonice-albedo-percentile` $P$ | 10 | Area-weighted map percentile (fill excluded) used as the non-ice endmember |
 | `--g-ice`, `--g-nonice` $g$ | 0, 0 | Endmember asymmetry parameters (`hapke-intimate`) |
 | `--grain-ratio` $r$ | 10 | $D_{\mathrm{ice}}/D_{\mathrm{nonice}}$ (`hapke-intimate`) |
+
+### Albedo Coupling Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--albedo-coupling` | off | Composition-dependent albedo with temperature refresh (enables `--ice-layer`) |
+| `--thermal-albedo` $A$ | (required) | Uniform Bond albedo the thermal run used; the temperature reference (`--initial-albedo` is an alias) |
+| `--thermal-albedo-map` $F$ | (required) | Per-face Bond albedo `.bin` (uint64 count + double[count]) the thermal run used |
+| `--albedo-update-threshold` $T$ | 0.01 | Refresh when any face has moved by more than $T$ since the last refresh |
+| `--albedo-ice`, `--albedo-nonice` $A$ | 0.65, 0.10 | Linear-law endmembers (not `hapke-intimate`) |
+
+Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to run unless the thermal-run albedo is declared; `hapke-intimate` takes its `--ice-fraction-albedo-map` unless one of the two flags overrides it. Declaring a uniform value when the thermal run's `config_used.yaml` says `use_albedo_map: true`, or a map when it says `false`, prints a WARNING. The flags are refused without albedo coupling. For the Europa uniform-ice thermal configs, pass `--thermal-albedo 0.5`.
 
 ### Multi-Timescale Options
 
@@ -811,6 +825,7 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `multitimescale_evolution.h` | ~650 | Operator splitting: epoch extrapolation, flux caching, analytical accel. |
 | `hapke_mixing.h` | ~220 | Hapke Bond albedo, endmember inversion, intimate mixture (`hapke-intimate`) |
 | `composition_albedo.h` | ~240 | Composition-to-albedo forward model (linear, or Hapke in `hapke-intimate`) |
+| `albedo_refresh.h` | ~170 | Albedo-coupling temperature refresh baseline and $t=0$ mismatch check |
 | `distance_cache.h` | ~300 | Great-circle distance cache with spatial indexing |
 | `spherical_index.h` | ~400 | Spatial hash grid on sphere for neighbor queries |
 
@@ -831,6 +846,7 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `test_cutoff_benchmark.cpp` | Performance benchmarks for $K_0$ cutoff distance |
 | `test_equilibrium_bias.cpp` | Equilibrium state bias analysis |
 | `test_bessel_k0_and_areas.cpp` | EXO-01/EXO-02 regression: $K_0$ values, m$^2$ areas, smoothing gate |
+| `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 

@@ -22,6 +22,7 @@
 #include <cmath>  // For M_PI and other math functions
 #include <chrono>
 #include <stdexcept>
+#include <limits>
 
 namespace ptm {
 namespace exosphere {
@@ -1239,15 +1240,76 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
     // Albedo-Composition Coupling Implementation
     // =========================================================================
 
-    void PTMExosphereIntegration::enableAlbedoCoupling(const CompositionAlbedoConfig& config) {
+    // Mean over finite values (a hapke-intimate fill face may hold a non-finite value).
+    static double finiteMean(const std::vector<double>& v) {
+        double sum = 0.0;
+        size_t k = 0;
+        for (double x : v) if (std::isfinite(x)) { sum += x; ++k; }
+        return k ? sum / static_cast<double>(k) : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    bool PTMExosphereIntegration::setThermalAlbedoUniform(double albedo, const std::string& source) {
+        if (num_faces_ == 0) {
+            std::cerr << "setThermalAlbedoUniform: no faces loaded yet" << std::endl;
+            return false;
+        }
+        if (!std::isfinite(albedo) || albedo < 0.0 || albedo >= 1.0) {
+            std::cerr << "Error: thermal-run albedo " << albedo << " (" << source
+                      << ") must be finite and in [0, 1)" << std::endl;
+            return false;
+        }
+        thermal_face_albedos_.assign(static_cast<size_t>(num_faces_), albedo);
+        thermal_albedo_source_ = source;
+        initial_albedo_ = albedo;
+        return true;
+    }
+
+    bool PTMExosphereIntegration::loadThermalAlbedoMap(const std::string& path) {
+        if (num_faces_ == 0) {
+            std::cerr << "loadThermalAlbedoMap: no faces loaded yet" << std::endl;
+            return false;
+        }
+        const size_t n = static_cast<size_t>(num_faces_);
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            std::cerr << "Error: cannot open the thermal-run albedo map " << path << std::endl;
+            return false;
+        }
+        uint64_t count = 0;
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!in || count != n) {
+            std::cerr << "Error: thermal-run albedo map " << path << " holds " << count
+                      << " values; the mesh has " << n << " faces" << std::endl;
+            return false;
+        }
+        std::vector<double> a(n);
+        in.read(reinterpret_cast<char*>(a.data()), static_cast<std::streamsize>(n * sizeof(double)));
+        if (!in) {
+            std::cerr << "Error: short read on the thermal-run albedo map " << path << std::endl;
+            return false;
+        }
+        // Values outside [0, 1) are checked in enableAlbedoCoupling: they are allowed
+        // only on hapke-intimate fill faces, which are anchored and never use them.
+        thermal_face_albedos_ = std::move(a);
+        thermal_albedo_source_ = "per-face map " + path;
+        return true;
+    }
+
+    bool PTMExosphereIntegration::enableAlbedoCoupling(const CompositionAlbedoConfig& config) {
         if (num_faces_ == 0) {
             std::cerr << "PTMExosphereIntegration::enableAlbedoCoupling: no faces loaded yet!" << std::endl;
-            return;
+            return false;
         }
         if (!ice_layer_enabled_ || !ice_layer_state_) {
             std::cerr << "PTMExosphereIntegration::enableAlbedoCoupling: "
                       << "ice layer model must be enabled first!" << std::endl;
-            return;
+            return false;
+        }
+        if (thermal_face_albedos_.size() != static_cast<size_t>(num_faces_)) {
+            std::cerr << "Error: albedo coupling needs the albedo the thermal run used (the albedo "
+                      << "the loaded temperatures correspond to). Pass --thermal-albedo A or "
+                      << "--thermal-albedo-map F; the exosphere will not guess it." << std::endl;
+            return false;
         }
 
         albedo_mapper_ = std::make_unique<CompositionAlbedoMapper>(config);
@@ -1265,14 +1327,103 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                                        current_face_albedos_);
         previous_face_albedos_ = current_face_albedos_;
 
+        // The temperature reference is the THERMAL run's albedo, not the t = 0
+        // composition albedo. Exception: hapke-intimate faces whose map albedo the
+        // forward model cannot reproduce (fill, clamped at f = 0 or 1) are anchored at
+        // their t = 0 composition albedo, so their thermal temperatures are kept at
+        // t = 0 and only later composition changes rescale them. Rescaling them to the
+        // endmember albedo would move a face clamped at f = 1 (map 0.98, model 0.80)
+        // by ((1 - 0.80) / (1 - 0.98))^(1/4) = 1.78x.
+        std::vector<char> anchored(static_cast<size_t>(num_faces_), 0);
+        albedo_anchored_faces_ = 0;
+        if (exposed_area_mode_ && ice_fraction_init_class_.size() == static_cast<size_t>(num_faces_)) {
+            for (size_t i = 0; i < anchored.size(); ++i) {
+                if (ice_fraction_init_class_[i] != 0.0) { anchored[i] = 1; ++albedo_anchored_faces_; }
+            }
+        }
+        if (exposed_area_mode_ && initial_face_albedos_.size() == thermal_face_albedos_.size()) {
+            const AlbedoMismatchReport rm = compareThermalAndCompositionAlbedo(
+                thermal_face_albedos_, initial_face_albedos_, 1e-3);
+            warnThermalCompositionMismatch(rm, 1e-3,
+                "hapke-intimate inverted map vs thermal-run albedo",
+                "  The ice fraction was inverted from a map the thermal run did not use. The\n"
+                "  temperatures stay referenced to the thermal-run albedo.\n",
+                std::cout, "inverted-map");
+        }
+        // Every face whose temperature is referenced to the thermal albedo needs a
+        // value the rescale is defined for.
+        {
+            size_t n_bad = 0, first_bad = 0;
+            for (size_t i = 0; i < thermal_face_albedos_.size(); ++i) {
+                const double a = thermal_face_albedos_[i];
+                if (!anchored[i] && (!std::isfinite(a) || a < 0.0 || a >= 1.0)) {
+                    if (n_bad == 0) first_bad = i;
+                    ++n_bad;
+                }
+            }
+            if (n_bad > 0) {
+                std::cerr << "Error: the thermal-run albedo (" << thermal_albedo_source_ << ") has "
+                          << n_bad << " non-anchored faces whose value is not finite or not in [0, 1) "
+                          << "(first: face " << first_bad << " = " << thermal_face_albedos_[first_bad]
+                          << "); the temperature rescale is undefined there" << std::endl;
+                return false;
+            }
+        }
+        std::vector<double> baseline = thermal_face_albedos_;
+        for (size_t i = 0; i < baseline.size(); ++i) {
+            if (anchored[i]) baseline[i] = current_face_albedos_[i];
+        }
+        albedo_refresh_.seed(baseline);
+
         albedo_coupling_enabled_ = true;
         config.print();
 
         std::cout << "Albedo-composition coupling enabled." << std::endl;
-        std::cout << "  Initial albedo from thermal sim: " << initial_albedo_ << std::endl;
+        std::cout << "  Thermal-run albedo (temperature reference): " << thermal_albedo_source_
+                  << "; mean " << std::fixed << std::setprecision(4)
+                  << finiteMean(thermal_face_albedos_) << std::endl;
+        if (albedo_anchored_faces_ > 0) {
+            std::cout << "  (" << albedo_anchored_faces_ << " anchored hapke-intimate faces are "
+                      << "referenced to their t = 0 composition albedo instead; see below)" << std::endl;
+        }
         std::cout << "  Current mean composition-albedo: " << std::fixed << std::setprecision(4)
                   << std::accumulate(current_face_albedos_.begin(), current_face_albedos_.end(), 0.0)
                      / num_faces_ << std::endl;
+        std::cout << "  Temperature refresh: when max_f |A_comp - A_at_last_refresh| > "
+                  << config.albedo_update_threshold << "; every face is then rescaled from its own "
+                  << "last-refresh albedo" << std::endl;
+
+        constexpr double kMismatchTol = 1e-3;
+        std::vector<char> not_anchored(anchored.size());
+        for (size_t i = 0; i < anchored.size(); ++i) not_anchored[i] = anchored[i] ? 0 : 1;
+        const AlbedoMismatchReport rep = compareThermalAndCompositionAlbedo(
+            thermal_face_albedos_, current_face_albedos_, kMismatchTol, &anchored);
+        const std::string when = (rep.max_abs > config.albedo_update_threshold)
+            ? "  The first multiscale coupling pass rescales these temperatures from the thermal\n"
+              "  albedo to the composition albedo (the max exceeds --albedo-update-threshold).\n"
+            : "  The max is below --albedo-update-threshold, so the temperatures are rescaled\n"
+              "  only once later drift carries some face past the threshold.\n";
+        if (!warnThermalCompositionMismatch(rep, kMismatchTol, "thermal vs composition",
+                when +
+                "  This is a CONFIGURATION difference, not feedback: the thermal and exosphere\n"
+                "  albedo models disagree before anything has evolved.\n",
+                std::cout)) {
+            std::cout << "  t = 0 check: composition albedo matches the thermal-run albedo to "
+                      << std::scientific << std::setprecision(3) << rep.max_abs << std::fixed
+                      << " (limit " << kMismatchTol << ") on " << rep.n_faces << " faces" << std::endl;
+        }
+        if (albedo_anchored_faces_ > 0) {
+            const AlbedoMismatchReport rep_a = compareThermalAndCompositionAlbedo(
+                thermal_face_albedos_, current_face_albedos_, kMismatchTol, &not_anchored);
+            warnThermalCompositionMismatch(rep_a, kMismatchTol,
+                "hapke-intimate fill/clamped faces, outside the forward model's range",
+                "  These faces are ANCHORED: their temperatures keep the thermal-run values at\n"
+                "  t = 0 and are rescaled only by later changes of the composition albedo.\n",
+                std::cout);
+            std::cout << "  Anchored hapke-intimate faces (fill or clamped): " << albedo_anchored_faces_
+                      << " of " << num_faces_ << std::endl;
+        }
+        return true;
     }
 
     void PTMExosphereIntegration::disableAlbedoCoupling() {
@@ -1671,39 +1822,30 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                                                         current_face_albedos_);
     }
 
-    void PTMExosphereIntegration::updateTemperaturesForAlbedoChange() {
-        if (surface_temperatures_.empty()) return;
+    bool PTMExosphereIntegration::updateTemperaturesForAlbedoChange() {
+        if (surface_temperatures_.empty()) return false;
 
-        size_t num_timesteps = surface_temperatures_[0].size();
-        double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
-        int faces_updated = 0;
+        // Compare against the albedo the temperatures correspond to (the last refresh,
+        // or the thermal run before the first one), not the previous pass. When the
+        // threshold is exceeded, EVERY face is rescaled from its own baseline:
+        // T_new = T_ref * ((1 - A_new) / (1 - A_ref))^(1/4)
+        const double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
+        const AlbedoRefreshResult r = albedo_refresh_.update(current_face_albedos_,
+                                                             surface_temperatures_, threshold);
+        if (!r.fired) return false;
 
-        // Scale temperatures for faces with significant albedo change
-        // T_new = T_old * ((1 - A_new) / (1 - A_old))^(1/4)
-        #pragma omp parallel for reduction(+:faces_updated)
-        for (size_t f = 0; f < static_cast<size_t>(num_faces_); ++f) {
-            double albedo_change = std::abs(current_face_albedos_[f] - previous_face_albedos_[f]);
-            if (albedo_change < threshold) continue;
-
-            double old_absorptivity = 1.0 - previous_face_albedos_[f];
-            double new_absorptivity = 1.0 - current_face_albedos_[f];
-
-            // Avoid division by zero
-            if (old_absorptivity < 1e-10) continue;
-
-            double ratio = new_absorptivity / old_absorptivity;
-            double scale = std::pow(ratio, 0.25);
-
-            for (size_t t = 0; t < num_timesteps; ++t) {
-                surface_temperatures_[f][t] *= scale;
-            }
-            faces_updated++;
+        if (show_progress_) {
+            std::cout << "  Albedo coupling: max |A - A_at_last_refresh| = " << std::scientific
+                      << std::setprecision(3) << r.max_deviation << std::fixed << " (face "
+                      << r.worst_face << ") > " << threshold << "; rescaled temperatures on "
+                      << r.faces_rescaled << " / " << num_faces_ << " faces" << std::endl;
         }
-
-        if (show_progress_ && faces_updated > 0) {
-            std::cout << "  Albedo coupling: updated temperatures for " << faces_updated
-                      << " / " << num_faces_ << " faces" << std::endl;
+        if (r.faces_singular > 0) {
+            std::cerr << "WARNING: albedo coupling could not rescale " << r.faces_singular
+                      << " faces whose last-refresh albedo is ~1 (1 - A < 1e-10); their "
+                      << "temperatures and baseline are unchanged" << std::endl;
         }
+        return true;
     }
 
     // =========================================================================
@@ -1836,9 +1978,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 }
                 stats.mean_albedo = albedo_sum / num_faces_;
 
-                if (max_albedo_change > albedo_mapper_->getConfig().albedo_update_threshold) {
-                    // Albedo changed significantly - update temperatures and force cache refresh
-                    updateTemperaturesForAlbedoChange();
+                // Refresh when the albedo has moved by more than the threshold since the
+                // temperatures were last computed/rescaled (drift accumulates across passes).
+                if (updateTemperaturesForAlbedoChange()) {
                     force_cache_refresh = true;
                     albedo_temp_refresh_count++;
                     stats.albedo_temp_refreshes = albedo_temp_refresh_count;
@@ -2324,7 +2466,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             double max_a = *std::max_element(current_face_albedos_.begin(), current_face_albedos_.end());
             double mean_a = std::accumulate(current_face_albedos_.begin(),
                                             current_face_albedos_.end(), 0.0) / num_faces_;
-            file << "  Initial albedo: " << std::fixed << std::setprecision(4) << initial_albedo_ << "\n";
+            const double mean_thermal = thermal_face_albedos_.empty() ? initial_albedo_ :
+                finiteMean(thermal_face_albedos_);
+            file << "  Thermal-run albedo: " << thermal_albedo_source_ << " (mean " << std::fixed
+                 << std::setprecision(4) << mean_thermal << ")\n";
+            if (albedo_anchored_faces_ > 0) {
+                file << "  Anchored hapke-intimate faces (fill or clamped): " << albedo_anchored_faces_ << "\n";
+            }
             file << "  Final mean albedo: " << mean_a << "\n";
             file << "  Final albedo range: " << min_a << " - " << max_a << "\n";
             const auto& acfg = albedo_mapper_->getConfig();

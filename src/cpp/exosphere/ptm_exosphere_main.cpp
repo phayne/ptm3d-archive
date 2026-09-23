@@ -21,6 +21,7 @@
 #include <memory>
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 
 #include "ptm_exosphere_integration.h"
 #include "exosphere_physics.h"
@@ -1736,6 +1737,49 @@ std::shared_ptr<Mesh> loadMesh(const std::string& mesh_file, const std::string& 
 #endif
 
 // Main function
+// Cross-check the declared thermal-run albedo against the thermal run's own
+// config_used.yaml (a verbatim copy of the config it read): a uniform declaration
+// against `use_albedo_map: true`, or a map against `use_albedo_map: false`, is
+// almost certainly the wrong temperature reference. A line-based read of one key,
+// not a YAML parser, so a contradiction WARNS rather than refuses.
+static void checkThermalConfigAlbedoMode(const std::string& ptm_dir, bool declared_map) {
+    const std::string cfg = ptm_dir + "/config_used.yaml";
+    std::ifstream in(cfg);
+    if (!in) {
+        std::cout << "  (no " << cfg << " to cross-check the thermal-run albedo against)" << std::endl;
+        return;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        const size_t k = line.find("use_albedo_map:");
+        if (k == std::string::npos) continue;
+        std::string v = line.substr(k + std::string("use_albedo_map:").size());
+        v.erase(0, v.find_first_not_of(" \t\"'"));
+        v.erase(v.find_last_not_of(" \t\r\"'") + 1);
+        const bool uses_map = (v == "true" || v == "True" || v == "yes");
+        const bool no_map = (v == "false" || v == "False" || v == "no");
+        if ((uses_map && !declared_map) || (no_map && declared_map)) {
+            std::cout << "\n********************************************************************************\n"
+                      << "WARNING: the declared thermal-run albedo is a " << (declared_map ? "per-face map" : "uniform value")
+                      << ", but " << cfg << "\n  says use_albedo_map: " << v
+                      << ". The temperature reference is probably wrong; check --thermal-albedo /\n"
+                      << "  --thermal-albedo-map against the thermal config.\n"
+                      << "********************************************************************************" << std::endl;
+        } else if (uses_map || no_map) {
+            std::cout << "  Thermal config cross-check: use_albedo_map: " << v << " is consistent with the "
+                      << "declared " << (declared_map ? "per-face map" : "uniform value") << std::endl;
+        }
+        return;
+    }
+    // config_parser.h: illumination.use_albedo_map defaults to true (auto-discovered map).
+    std::cout << "  Thermal config cross-check: " << cfg << " has no use_albedo_map key (the thermal "
+              << "default is true: an auto-discovered map, when one exists)"
+              << (declared_map ? "" : "; WARNING: a uniform thermal albedo was declared, check it")
+              << std::endl;
+}
+
 int main(int argc, char** argv)
 {
     std::string ptm_dir;
@@ -1772,7 +1816,13 @@ int main(int argc, char** argv)
     // Albedo-composition coupling options
     bool albedo_coupling_enabled = false;
     ptm::exosphere::CompositionAlbedoConfig albedo_config;
-    double initial_albedo = 0.5;  // Bond albedo used in PTM thermal simulation
+    // Bond albedo the thermal run used (the albedo the loaded temperatures correspond
+    // to). Required in albedo-coupling mode: --thermal-albedo A (uniform; the older
+    // --initial-albedo is an alias) or --thermal-albedo-map F (per-face .bin).
+    // hapke-intimate defaults to its --ice-fraction-albedo-map. No silent default.
+    double thermal_albedo = std::numeric_limits<double>::quiet_NaN();
+    std::string thermal_albedo_flag;     // which flag set thermal_albedo
+    std::string thermal_albedo_map_path;
     std::string albedo_nonice_map_path;  // FITS/binary albedo map for per-face non-ice endmember
     std::string albedo_maps_dir;         // Directory for auto-discovery of albedo map
     bool init_from_albedo_map = false;   // Initialize concentrations from albedo map
@@ -1871,8 +1921,17 @@ int main(int argc, char** argv)
         else if (a == "--albedo-update-threshold" && i+1 < argc) {
             albedo_config.albedo_update_threshold = std::stod(argv[++i]);
         }
-        else if (a == "--initial-albedo" && i+1 < argc) {
-            initial_albedo = std::stod(argv[++i]);
+        else if ((a == "--thermal-albedo" || a == "--initial-albedo") && i+1 < argc) {
+            if (!thermal_albedo_flag.empty()) {
+                std::cerr << "Error: " << a << " given after " << thermal_albedo_flag
+                          << " (they are the same setting; give one)" << std::endl;
+                return 1;
+            }
+            thermal_albedo_flag = a;
+            thermal_albedo = std::stod(argv[++i]);
+        }
+        else if (a == "--thermal-albedo-map" && i+1 < argc) {
+            thermal_albedo_map_path = argv[++i];
         }
         else if (a == "--albedo-nonice-map" && i+1 < argc) {
             if (legacy_albedo_flag_given.empty()) legacy_albedo_flag_given = a;
@@ -2006,8 +2065,14 @@ int main(int argc, char** argv)
             std::cout << "  --albedo-nonice-map F  FITS/binary albedo map for per-face non-ice endmember\n";
             std::cout << "                         Overrides --albedo-nonice with spatially-varying values\n";
             std::cout << "  --albedo-maps-dir DIR  Auto-discover albedo map in directory\n";
-            std::cout << "  --albedo-update-threshold T  Min albedo change for temp update (default: 0.01)\n";
-            std::cout << "  --initial-albedo A     Bond albedo used in PTM thermal sim (default: 0.5)\n\n";
+            std::cout << "  --albedo-update-threshold T  Refresh the temperatures when any face's albedo has\n";
+            std::cout << "                         moved by more than T since the last refresh (default: 0.01)\n";
+            std::cout << "  --thermal-albedo A     uniform Bond albedo the thermal run used; the temperature\n";
+            std::cout << "                         reference (--initial-albedo is an alias)\n";
+            std::cout << "  --thermal-albedo-map F per-face Bond albedo .bin the thermal run used\n";
+            std::cout << "                         (uint64 count + double[count]). Albedo coupling requires\n";
+            std::cout << "                         one of the two; hapke-intimate defaults to its\n";
+            std::cout << "                         --ice-fraction-albedo-map. There is no silent default\n\n";
             std::cout << "Ice fraction from albedo (optional coupling of initial ice to the albedo map):\n";
             std::cout << "  --ice-fraction-from-albedo=MODE\n";
             std::cout << "      uniform         (default) uniform --dust-fraction on every face\n";
@@ -2024,8 +2089,9 @@ int main(int argc, char** argv)
             std::cout << "                      'none' skips fill detection, with a warning). Fill faces\n";
             std::cout << "                      get exposed ice fraction 1 - --dust-fraction\n";
             std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80, Fermi's base case)\n";
-            std::cout << "  --nonice-albedo A  non-ice endmember Bond albedo; overrides the default,\n";
-            std::cout << "                     which is the map's area-weighted percentile below\n";
+            std::cout << "  --nonice-albedo A  pin the non-ice endmember Bond albedo (e.g. 0.3814); overrides\n";
+            std::cout << "                     the default, which is the map's area-weighted percentile below.\n";
+            std::cout << "                     Pin it when the map is uniform (its percentile is the map value)\n";
             std::cout << "  --nonice-albedo-percentile P  percentile of the map (area-weighted, fill\n";
             std::cout << "                     faces excluded) used as the non-ice endmember (default: 10)\n";
             std::cout << "  --g-ice G          ice asymmetry parameter (default: 0)\n";
@@ -2106,6 +2172,12 @@ int main(int argc, char** argv)
         hapke_cfg.fill_exposed_ice_fraction = 1.0 - std::clamp(ice_layer_dust_fraction, 0.0, 1.0);
         albedo_coupling_enabled = true;
         ice_layer_enabled = true;
+    }
+
+    if (!thermal_albedo_flag.empty() && !thermal_albedo_map_path.empty()) {
+        std::cerr << "Error: " << thermal_albedo_flag << " and --thermal-albedo-map both declare the "
+                  << "thermal-run albedo; give one" << std::endl;
+        return 1;
     }
 
     if (ptm_dir.empty()) {
@@ -2229,8 +2301,51 @@ int main(int argc, char** argv)
                 albedo_percentile_low, albedo_percentile_high);
         }
 
-        integrator.setInitialAlbedo(initial_albedo);
-        integrator.enableAlbedoCoupling(albedo_config);
+        // Temperature reference: the albedo the thermal run used. Refuse rather than guess.
+        bool thermal_ok = false;
+        if (!thermal_albedo_map_path.empty()) {
+            std::cout << "\nThermal-run albedo: per-face map " << thermal_albedo_map_path
+                      << " (--thermal-albedo-map)" << std::endl;
+            thermal_ok = integrator.loadThermalAlbedoMap(thermal_albedo_map_path);
+        } else if (!thermal_albedo_flag.empty()) {
+            std::cout << "\nThermal-run albedo: uniform " << thermal_albedo << " (" << thermal_albedo_flag
+                      << ")" << std::endl;
+            thermal_ok = integrator.setThermalAlbedoUniform(thermal_albedo, "uniform " +
+                std::to_string(thermal_albedo) + " (" + thermal_albedo_flag + ")");
+        } else if (ice_fraction_mode == "hapke-intimate") {
+            std::cout << "\nThermal-run albedo: per-face map " << hapke_cfg.albedo_map_path
+                      << " (the hapke-intimate --ice-fraction-albedo-map, documented as the map the "
+                      << "thermal run used; override with --thermal-albedo-map/--thermal-albedo)" << std::endl;
+            thermal_ok = integrator.loadThermalAlbedoMap(hapke_cfg.albedo_map_path);
+        } else {
+            std::cerr << "Error: albedo coupling (mode " << ice_fraction_mode << ") needs the Bond albedo "
+                      << "the thermal run used, because the temperatures are rescaled relative to it. "
+                      << "Pass --thermal-albedo A (uniform thermal albedo, e.g. 0.5 for the Europa "
+                      << "uniform-ice configs) or --thermal-albedo-map F (the per-face .bin the thermal "
+                      << "run used). The exosphere will not guess it." << std::endl;
+            return 1;
+        }
+        if (!thermal_ok) {
+            std::cerr << "Error: could not set the thermal-run albedo" << std::endl;
+            return 1;
+        }
+        checkThermalConfigAlbedoMode(ptm_dir, !thermal_albedo_map_path.empty() ||
+            (thermal_albedo_flag.empty() && ice_fraction_mode == "hapke-intimate"));
+        if (!integrator.enableAlbedoCoupling(albedo_config)) {
+            std::cerr << "Error: albedo coupling could not be enabled" << std::endl;
+            return 1;
+        }
+        if (!multiscale_enabled) {
+            std::cout << "WARNING: albedo coupling refreshes temperatures only in --multiscale mode. "
+                      << "This standard-mode run exports bond_albedo but keeps the thermal-run "
+                      << "temperatures unchanged." << std::endl;
+        }
+    } else if (!thermal_albedo_flag.empty() || !thermal_albedo_map_path.empty()) {
+        std::cerr << "Error: " << (thermal_albedo_map_path.empty() ? thermal_albedo_flag
+                                                                   : std::string("--thermal-albedo-map"))
+                  << " is used only with albedo coupling (--albedo-coupling or an "
+                  << "--ice-fraction-from-albedo mode other than uniform)" << std::endl;
+        return 1;
     }
 
     // Run simulation based on mode
