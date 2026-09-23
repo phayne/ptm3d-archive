@@ -255,6 +255,28 @@ public:
     }
 };
 
+// Per-call options for BallisticTransport::computeTransportProduct (PTM-642).
+struct TransportCallOptions {
+    // Remove the Jeans-escaping share of each source's Maxwellian. false = the
+    // source is already a bound population (its escaping share was removed
+    // upstream, e.g. the non-escaping sputtered H2O), so it must not escape twice.
+    bool apply_jeans_escape = true;
+    // Use a call-local spatial index sized for THIS call's temperatures when the
+    // persistent index (built on the first call) is too small, leaving the
+    // persistent index untouched so the sublimation transport stays bit-stable.
+    bool private_index_if_needed = false;
+};
+
+// Global mass totals of one transport call [kg/s]. source = deposited +
+// jeans_escaped + unscattered to rounding; unscattered is emission from sources
+// the kernel could not launch (T <= 0 or no kernel weight) and should be 0.
+struct TransportTotals {
+    double source = 0.0;
+    double deposited = 0.0;
+    double jeans_escaped = 0.0;
+    double unscattered = 0.0;
+};
+
 // Ballistic transport physics
 class BallisticTransport {
 private:
@@ -392,14 +414,17 @@ public:
 
     // Matrix-free transport product: computes deposition = M * emission
     // without forming the full sparse matrix. Uses O(N + N*threads) memory
-    // instead of O(nnz) for the full matrix.
+    // instead of O(nnz) for the full matrix. `options` and `totals` are
+    // optional; the defaults reproduce the original behavior exactly.
     void computeTransportProduct(
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<double>& face_areas,
         const std::vector<double>& temperatures,
         const std::vector<double>& emission,
         std::vector<double>& deposition,
-        double threshold = 1e-10) const;
+        double threshold = 1e-10,
+        const TransportCallOptions& options = TransportCallOptions(),
+        TransportTotals* totals = nullptr) const;
 
     // Area-weighted smoothing of a per-face scalar over the spatial-index
     // neighborhood within `smooth_radius_rad`. A radius <= 0 is a no-op
@@ -559,7 +584,9 @@ public:
     void computeTransportProduct(
         const std::vector<double>& temperatures,
         const std::vector<double>& emission,
-        std::vector<double>& deposition);
+        std::vector<double>& deposition,
+        const TransportCallOptions& options = TransportCallOptions(),
+        TransportTotals* totals = nullptr);
 
     // Area-weighted smoothing of a per-face scalar field. Forwards to
     // BallisticTransport::smoothField using face_areas_ and the transport's

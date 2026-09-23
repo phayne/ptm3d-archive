@@ -24,6 +24,7 @@
 #include <limits>
 
 #include "ptm_exosphere_integration.h"
+#include "sputtering_model.h"
 #include "exosphere_physics.h"
 #include "ice_crystallization_model.h"
 #include "composition_albedo.h"
@@ -1793,6 +1794,9 @@ int main(int argc, char** argv)
     bool sputtering_enabled = false;
     double sputtering_rate_scale = 1.0;
     double sputtering_hemisphere_contrast = 3.0;
+    // Sputter mass accounting / products (PTM-642). Defaults live in SputteringConfig.
+    ptm::exosphere::SputteringConfig sputter_cfg;
+    std::string sputter_physics_flag;   // first sputter-physics flag seen (needs --sputtering)
 
     // Ice layer model options (lag deposit tracking)
     bool ice_layer_enabled = false;
@@ -1855,6 +1859,24 @@ int main(int argc, char** argv)
         else if (a == "--sputtering-rate" && i+1 < argc) {
             sputtering_enabled = true;
             sputtering_rate_scale = std::stod(argv[++i]);
+        }
+        else if (a == "--sputter-legacy-escape-only") {
+            if (sputter_physics_flag.empty()) sputter_physics_flag = a;
+            sputter_cfg.legacy_escape_only = true;
+        }
+        else if ((a == "--sputter-h2o-fraction" || a == "--sputter-escape-h2o" ||
+                  a == "--sputter-escape-o2" || a == "--sputter-escape-h2" ||
+                  a == "--sputter-launch-temperature") && i+1 < argc) {
+            if (sputter_physics_flag.empty()) sputter_physics_flag = a;
+            const double v = std::stod(argv[++i]);
+            if (a == "--sputter-h2o-fraction") sputter_cfg.h2o_fraction = v;
+            else if (a == "--sputter-escape-h2o") sputter_cfg.h2o_escape_fraction = v;
+            else if (a == "--sputter-escape-o2") sputter_cfg.o2_escape_fraction = v;
+            else if (a == "--sputter-escape-h2") sputter_cfg.h2_escape_fraction = v;
+            else {
+                sputter_cfg.launch_temperature_K = v;
+                sputter_cfg.launch_temperature_given = true;
+            }
         }
         else if (a == "--sputtering-contrast" && i+1 < argc) {
             sputtering_hemisphere_contrast = std::stod(argv[++i]);
@@ -2058,7 +2080,18 @@ int main(int argc, char** argv)
             std::cout << "  --no-sputtering        Disable sputtering (sublimation only, default)\n";
             std::cout << "  --sputtering-rate S    Sputtering rate scale factor (default: 1.0)\n";
             std::cout << "                         1.0 = Cassidy et al. 2013 rates\n";
-            std::cout << "  --sputtering-contrast C  Trailing/leading hemisphere ratio (default: 3.0)\n\n";
+            std::cout << "  --sputtering-contrast C  Trailing/leading hemisphere ratio (default: 3.0)\n";
+            std::cout << "  --sputter-h2o-fraction F  Mass fraction of gross sputtered mass leaving as H2O\n";
+            std::cout << "                         (default 0.85); the rest is radiolytic O2 + H2 in the\n";
+            std::cout << "                         stoichiometric mass ratio (2 H2O -> 2 H2 + O2)\n";
+            std::cout << "  --sputter-escape-h2o F / --sputter-escape-o2 F / --sputter-escape-h2 F\n";
+            std::cout << "                         Escaping share of each product (default 0.10 / 0.90 / 0.95)\n";
+            std::cout << "  --sputter-launch-temperature K  Kernel temperature of the non-escaping sputtered\n";
+            std::cout << "                         H2O redeposited by ballistic transport (default 683 K: mean\n";
+            std::cout << "                         energy of the bound Sigmund-Thompson distribution, U=0.055 eV)\n";
+            std::cout << "  --sputter-legacy-escape-only  Pre-PTM-642 accounting: remove only the escaping\n";
+            std::cout << "                         share, no transport, 0.10/0.05 O2/H2 split (NOT mass-\n";
+            std::cout << "                         conserving; reproduces old products)\n\n";
             std::cout << "Ice layer model options (lag deposit tracking):\n";
             std::cout << "  --ice-layer            Enable multi-layer ice model with lag deposits\n";
             std::cout << "  --no-ice-layer         Disable ice layer model (default)\n";
@@ -2264,12 +2297,30 @@ int main(int argc, char** argv)
     double temp_sec = std::chrono::duration<double>(t_temp_end - t_temp_start).count();
     std::cout << " done (" << std::fixed << std::setprecision(1) << temp_sec << " s)" << std::endl;
 
+    // Sputter-physics flags without sputtering would be silently ignored.
+    if (!sputter_physics_flag.empty() && !sputtering_enabled) {
+        std::cerr << "Error: " << sputter_physics_flag << " requires --sputtering" << std::endl;
+        return 1;
+    }
+
     // Enable sputtering if requested
     if (sputtering_enabled) {
         std::cout << "\nEnabling magnetospheric plasma sputtering:" << std::endl;
         std::cout << "  Rate scale factor: " << sputtering_rate_scale << std::endl;
         std::cout << "  Hemisphere contrast: " << sputtering_hemisphere_contrast << std::endl;
-        integrator.enableSputtering(sputtering_rate_scale, sputtering_hemisphere_contrast);
+        sputter_cfg.rate_scale = sputtering_rate_scale;
+        sputter_cfg.hemisphere_contrast = sputtering_hemisphere_contrast;
+        try {
+            integrator.enableSputtering(sputter_cfg);
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+            return 1;
+        }
+        if (!multiscale_enabled && !sputter_cfg.legacy_escape_only) {
+            std::cerr << "WARNING [PTM-642]: the per-timestep (non --multiscale) path still removes only "
+                      << "the escaping share of sputtered mass and does not transport the rest; the "
+                      << "mass-conserving sputter accounting is implemented in --multiscale only." << std::endl;
+        }
     } else {
         std::cout << "\nSputtering disabled (sublimation-only mode)" << std::endl;
     }

@@ -148,6 +148,13 @@ namespace ptm {
             std::unique_ptr<SputteringState> sputtering_state_;
             bool sputtering_enabled_ = false;
 
+            // PTM-642: true when sputtering is on with the mass-conserving
+            // accounting (not --sputter-legacy-escape-only). Multiscale path only.
+            bool sputterTransportActive() const;
+            // Print the global sputter mass audit of the current multiscale flux
+            // state; throws if it does not close to 1e-6. No-op unless active.
+            void reportSputterAudit(const char* when) const;
+
             // Ice layer model (optional, for concentration tracking in thermally active layer)
             std::unique_ptr<IceLayerModel> ice_layer_model_;
             std::unique_ptr<IceLayerState> ice_layer_state_;
@@ -384,6 +391,13 @@ namespace ptm {
              * @param hemisphere_contrast Trailing/leading flux ratio (default 3.0)
              */
             void enableSputtering(double rate_scale = 1.0, double hemisphere_contrast = 3.0);
+
+            /**
+             * Enable sputtering with a full configuration (mass accounting,
+             * species split, escape fractions, launch temperature; PTM-642).
+             * Throws std::invalid_argument on an invalid configuration.
+             */
+            void enableSputtering(const SputteringConfig& config);
 
             /**
              * Disable sputtering (sublimation-only mode)

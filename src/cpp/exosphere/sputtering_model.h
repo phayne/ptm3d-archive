@@ -76,20 +76,95 @@ struct SputteringConfig {
     // Temperature dependence enable (Teolis et al. 2017)
     bool temperature_dependent = true;
 
-    // Fraction of sputtered material that escapes vs redeposits
-    // From Cassidy: most H2O redeposits, but O2/H2 largely escape
+    // Mass accounting (PTM-642). The gross sputtered mass (Cassidy et al. 2013,
+    // GLOBAL_H2O_RATE x H2O_MASS ~ 60 kg/s H2O-equivalent at rate_scale 1) is ice
+    // REMOVED from the face. It leaves as three products:
+    //   H2O (fraction h2o_fraction), and radiolytic O2 + H2 (the remainder),
+    // and each product has an escaping share. The non-escaping H2O is launched on
+    // ballistic hops and redeposits through the transport kernel (multiscale path).
+    // The non-escaping O2 and H2 are non-condensable at Europa surface temperatures
+    // (O2 sublimation is ~30 K, H2 far lower), so they never return as ice: they
+    // are booked as an atmospheric reservoir, which in steady state is lost by
+    // ionization/dissociation/pickup at the rate it is supplied. Surface ice loss
+    // from sputtering = escaped + reservoir = gross x (1 - h2o_fraction x (1 - h2o_escape)).
+    //
+    // legacy_escape_only = true restores the pre-PTM-642 accounting: only the
+    // escaping share is removed from the surface, the non-escaping ~78% is neither
+    // removed nor transported (NOT mass-conserving), the species split is the
+    // non-stoichiometric 0.85/0.10/0.05, and the multiscale deposition rescale uses
+    // the (sublimation + sputtering) ratio. Kept only to reproduce old products.
+    bool legacy_escape_only = false;
+
+    // Escaping share of each product. PROVENANCE: legacy defaults of this model,
+    // attributed in the original code to Cassidy et al. (2013); not traced to a
+    // specific table there. They are qualitatively consistent with Smyth & Marconi
+    // (2006, Icarus 181) and Johnson et al. (2009, in "Europa", Univ. Arizona
+    // Press): sputtered H2O mostly returns to the surface, H2 escapes readily, and
+    // O2 is lost from the atmosphere rather than condensing. They are inputs, not
+    // derived here; a Sigmund-Thompson energy distribution with U = 0.055 eV would
+    // put ~24% of sputtered H2O above the escape energy, not 10%. Override with
+    // --sputter-escape-h2o / -o2 / -h2.
     double h2o_escape_fraction = 0.1;   // 10% escapes
     double o2_escape_fraction = 0.9;    // 90% escapes
     double h2_escape_fraction = 0.95;   // 95% escapes
 
-    // Species production ratios (Cassidy et al. 2013)
-    // Relative to total sputtered mass
-    double h2o_fraction = 0.85;  // Most sputtering produces H2O
-    double o2_fraction = 0.10;   // Some O2 from radiolysis
-    double h2_fraction = 0.05;   // Small H2 component
+    // Mass fraction of the gross sputtered mass that leaves as H2O molecules
+    // (--sputter-h2o-fraction). The remainder is radiolytic O2 + H2 in the
+    // stoichiometric mass ratio of 2 H2O -> 2 H2 + O2, i.e.
+    // m_O2 : 2 m_H2 = 7.94 : 1 with this file's molecular masses (8:1 nominal).
+    double h2o_fraction = 0.85;
+
+    // Legacy (non-stoichiometric) O2 / H2 mass fractions: O2:H2 = 2:1 by mass
+    // against 7.94:1 from radiolysis. Used ONLY when legacy_escape_only is set.
+    double legacy_o2_fraction = 0.10;
+    double legacy_h2_fraction = 0.05;
+
+    // Launch temperature [K] the ballistic kernel uses for the non-escaping
+    // sputtered H2O (--sputter-launch-temperature). The kernel is the thermal
+    // (Maxwellian-flux) hop kernel, whose mean launch energy is 2kT. Sputtered H2O
+    // follows a Sigmund-Thompson distribution f(E) ~ E / (E + U)^3 with
+    // U = 0.055 eV (the value commonly used for H2O ice, e.g. Plainaki et al. 2012,
+    // after Johnson 1990). Truncated at the H2O escape energy
+    // (0.5 m v_esc^2 = 0.383 eV) its mean energy is 0.118 eV, so T = 0.118 eV / 2k
+    // = 683 K. At 683 K the hop scale 2kT/(mg) is ~480 km (0.31 R_Europa), where
+    // the kernel's flat, uniform-gravity form underestimates hop range; the
+    // redistribution PATTERN is therefore approximate. The global mass accounting
+    // does not depend on this value.
+    double launch_temperature_K = 683.0;
+    bool launch_temperature_given = false;  // set by the CLI; rejected with legacy (unused there)
 
     // Minimum temperature for sputtering (below this, surface is "cold trapped")
     double min_sputtering_temp = 50.0;  // K
+
+    // Product mass fractions of the gross sputtered mass (sum to 1).
+    double o2Fraction() const {
+        if (legacy_escape_only) return legacy_o2_fraction;
+        const double m_o2 = sputtering_constants::O2_MASS;
+        const double m_2h2 = 2.0 * sputtering_constants::H2_MASS;
+        return (1.0 - h2o_fraction) * m_o2 / (m_o2 + m_2h2);
+    }
+    double h2Fraction() const {
+        if (legacy_escape_only) return legacy_h2_fraction;
+        const double m_o2 = sputtering_constants::O2_MASS;
+        const double m_2h2 = 2.0 * sputtering_constants::H2_MASS;
+        return (1.0 - h2o_fraction) * m_2h2 / (m_o2 + m_2h2);
+    }
+
+    // Shares of the gross sputtered mass by fate (new accounting; sum to 1).
+    // transport: non-escaping H2O, redeposited through the ballistic kernel.
+    // escape:    escaping share of every product, lost to space.
+    // reservoir: non-escaping O2 + H2 (non-condensable), never returned as ice.
+    double transportShare() const { return h2o_fraction * (1.0 - h2o_escape_fraction); }
+    double escapeShare() const {
+        return h2o_fraction * h2o_escape_fraction + o2Fraction() * o2_escape_fraction
+             + h2Fraction() * h2_escape_fraction;
+    }
+    double reservoirShare() const {
+        return o2Fraction() * (1.0 - o2_escape_fraction) + h2Fraction() * (1.0 - h2_escape_fraction);
+    }
+
+    // Throws std::invalid_argument on an out-of-range parameter.
+    void validate() const;
 
     // Constructor with defaults
     SputteringConfig() = default;
@@ -111,8 +186,12 @@ struct SputteringState {
     std::vector<double> h2o_sputter_flux;   // kg/(m²·s) - H2O sputtered
     std::vector<double> o2_production_flux; // kg/(m²·s) - O2 produced
     std::vector<double> h2_production_flux; // kg/(m²·s) - H2 produced
-    std::vector<double> total_mass_loss;    // kg/(m²·s) - net mass removed
-    std::vector<double> redeposition_flux;  // kg/(m²·s) - H2O that redeposits locally
+    std::vector<double> total_mass_loss;    // kg/(m²·s) - escaping share, all products (lost to space)
+    // kg/(m²·s) - non-escaping H2O. New accounting: the ballistic transport source
+    // (multiscale path). Legacy: diagnostic only, never removed or transported.
+    std::vector<double> redeposition_flux;
+    std::vector<double> gross_removal_flux; // kg/(m²·s) - all sputtered mass (ice removed)
+    std::vector<double> reservoir_flux;     // kg/(m²·s) - non-escaping O2 + H2 (non-condensable)
 
     explicit SputteringState(size_t num_faces) {
         ion_flux.resize(num_faces, 0.0);
@@ -122,6 +201,8 @@ struct SputteringState {
         h2_production_flux.resize(num_faces, 0.0);
         total_mass_loss.resize(num_faces, 0.0);
         redeposition_flux.resize(num_faces, 0.0);
+        gross_removal_flux.resize(num_faces, 0.0);
+        reservoir_flux.resize(num_faces, 0.0);
     }
 
     void reset() {
@@ -132,6 +213,14 @@ struct SputteringState {
         std::fill(h2_production_flux.begin(), h2_production_flux.end(), 0.0);
         std::fill(total_mass_loss.begin(), total_mass_loss.end(), 0.0);
         std::fill(redeposition_flux.begin(), redeposition_flux.end(), 0.0);
+        std::fill(gross_removal_flux.begin(), gross_removal_flux.end(), 0.0);
+        std::fill(reservoir_flux.begin(), reservoir_flux.end(), 0.0);
+    }
+
+    // Per-face flux the SURFACE loses to sputtering: the gross removal (new
+    // accounting) or the escaping share only (legacy).
+    const std::vector<double>& surfaceRemovalFlux(bool legacy_escape_only) const {
+        return legacy_escape_only ? total_mass_loss : gross_removal_flux;
     }
 };
 

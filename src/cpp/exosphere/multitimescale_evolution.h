@@ -36,6 +36,8 @@
 #include <iomanip>
 #include <sstream>
 #include <functional>
+#include <stdexcept>
+#include <string>
 #include "ice_layer_model.h"
 
 namespace ptm {
@@ -306,6 +308,24 @@ struct DiurnalAverages {
     // Total emission at cache time (for scaling deposition)
     double total_base_emission = 0.0;  // [kg/s] (summed over all faces)
 
+    // PTM-642 sputter mass accounting. When sputter_transport is set,
+    // avg_sputtering_flux / base_sputtering_flux are the GROSS sputter removal,
+    // a fraction sputter_transport_share of it (the non-escaping H2O) enters the
+    // ballistic transport, and deposition is kept as two parts, each rescaled by
+    // the ratio of ITS OWN source (sublimation, sputter) to its cache-time value.
+    // When it is clear (sputtering off, or --sputter-legacy-escape-only), the
+    // original single (sublimation + sputtering) rescale runs unchanged.
+    bool sputter_transport = false;
+    double sputter_transport_share = 0.0;   // of gross: non-escaping H2O -> transport
+    double sputter_escape_share = 0.0;      // of gross: escaping, all products
+    double sputter_reservoir_share = 0.0;   // of gross: non-escaping O2 + H2
+    std::vector<double> avg_deposition_sublimation_flux;  // [kg/(m²·s)] from sublimation
+    std::vector<double> avg_deposition_sputter_flux;      // [kg/(m²·s)] from sputtered H2O
+    std::vector<double> base_deposition_sublimation_flux;
+    std::vector<double> base_deposition_sputter_flux;
+    double total_base_sublimation = 0.0;  // [kg/s] sublimation source at cache time
+    double total_base_sputter = 0.0;      // [kg/s] GROSS sputter removal at cache time
+
     explicit DiurnalAverages(size_t num_faces) {
         avg_sublimation_flux.resize(num_faces, 0.0);
         avg_deposition_flux.resize(num_faces, 0.0);
@@ -322,6 +342,11 @@ struct DiurnalAverages {
         base_deposition_flux.resize(num_faces, 0.0);
 
         cached_ice_availability.resize(num_faces, 1.0);
+
+        avg_deposition_sublimation_flux.resize(num_faces, 0.0);
+        avg_deposition_sputter_flux.resize(num_faces, 0.0);
+        base_deposition_sublimation_flux.resize(num_faces, 0.0);
+        base_deposition_sputter_flux.resize(num_faces, 0.0);
 
         max_temperature.resize(num_faces, 0.0);
         min_temperature.resize(num_faces, 1000.0);
@@ -386,6 +411,8 @@ struct DiurnalAverages {
                                  const std::vector<double>& ice_availability,
                                  const std::vector<double>& face_areas) {
         total_base_emission = 0.0;
+        total_base_sublimation = 0.0;
+        total_base_sputter = 0.0;
         for (size_t i = 0; i < avg_sublimation_flux.size(); ++i) {
             base_sublimation_flux[i] = unscaled_sublimation[i];
             base_sputtering_flux[i] = unscaled_sputtering.empty() ? 0.0 : unscaled_sputtering[i];
@@ -393,6 +420,12 @@ struct DiurnalAverages {
             total_base_emission += (base_sublimation_flux[i] + base_sputtering_flux[i])
                                    * ice_availability[i] * face_areas[i];
             cached_ice_availability[i] = ice_availability[i];
+            if (sputter_transport) {
+                base_deposition_sublimation_flux[i] = avg_deposition_sublimation_flux[i];
+                base_deposition_sputter_flux[i] = avg_deposition_sputter_flux[i];
+                total_base_sublimation += base_sublimation_flux[i] * ice_availability[i] * face_areas[i];
+                total_base_sputter += base_sputtering_flux[i] * ice_availability[i] * face_areas[i];
+            }
         }
         cache_valid = true;
     }
@@ -403,6 +436,33 @@ struct DiurnalAverages {
     void applyScaledFluxes(const std::vector<double>& ice_availability,
                            const std::vector<double>& face_areas) {
         size_t n = avg_sublimation_flux.size();
+
+        if (sputter_transport) {
+            // PTM-642 (c): each deposition part follows the source that produced
+            // it. The old single (sublimation + sputtering) ratio let deposition
+            // exceed sublimation whenever the two sources lost ice availability
+            // at different rates (sublimation is equatorial, sputtering trailing).
+            double s_now = 0.0, p_now = 0.0;
+            #pragma omp parallel for reduction(+:s_now,p_now)
+            for (size_t i = 0; i < n; ++i) {
+                double sublim_scaled = base_sublimation_flux[i] * ice_availability[i];
+                double sput_scaled = base_sputtering_flux[i] * ice_availability[i];
+                avg_sublimation_flux[i] = sublim_scaled;
+                avg_sputtering_flux[i] = sput_scaled;
+                s_now += sublim_scaled * face_areas[i];
+                p_now += sput_scaled * face_areas[i];
+            }
+            const double scale_s = (total_base_sublimation > 1e-30) ? s_now / total_base_sublimation : 1.0;
+            const double scale_p = (total_base_sputter > 1e-30) ? p_now / total_base_sputter : 1.0;
+            #pragma omp parallel for
+            for (size_t i = 0; i < n; ++i) {
+                avg_deposition_sublimation_flux[i] = base_deposition_sublimation_flux[i] * scale_s;
+                avg_deposition_sputter_flux[i] = base_deposition_sputter_flux[i] * scale_p;
+                avg_deposition_flux[i] = avg_deposition_sublimation_flux[i] + avg_deposition_sputter_flux[i];
+                avg_net_flux[i] = avg_deposition_flux[i] - avg_sublimation_flux[i] - avg_sputtering_flux[i];
+            }
+            return;
+        }
 
         // Pass 1: Compute scaled emission per face and global total (fused with reduction)
         double total_current_emission = 0.0;
@@ -493,6 +553,28 @@ struct EvolutionStatistics {
     double net_mass_loss_rate = 0.0;        // [kg/s] net loss (sublim + sput - depos)
     double flux_imbalance_fraction = 0.0;   // |net| / (sublim + sput), dimensionless
 
+    // PTM-642 sputter fates (set only when the new accounting is active; then
+    // sputtering_rate is the GROSS removal). Rates are per step [kg/s]; the
+    // redeposited rate is the start-of-step deposition the step used, while
+    // sputtering_rate is averaged over the step's ice availability, so the two
+    // differ by the operator-splitting lag of a super-step.
+    bool sputter_partition_active = false;
+    double sputter_redeposited_rate = 0.0;
+    double sputter_escaped_rate = 0.0;
+    double sputter_reservoir_rate = 0.0;
+    double sublimation_deposition_rate = 0.0;
+    double total_sputter_redeposited_mass = 0.0;  // [kg]
+    double total_sputter_escaped_mass = 0.0;      // [kg]
+    double total_sputter_reservoir_mass = 0.0;    // [kg]
+    // Decomposition of the cumulative balance (new accounting only):
+    // sublimated + sputtered - deposited = sputter escaped + reservoir
+    //   + sublimation Jeans escape - super-step lag.
+    // The lag is deposition in excess of the step-mean sources: a super-step
+    // holds deposition at its start-of-step value while sublimation and
+    // sputtering follow the step-mean ice availability (PTM-644).
+    double total_sublimation_jeans_mass = 0.0;    // [kg]
+    double total_superstep_lag_mass = 0.0;        // [kg]
+
     // Albedo coupling statistics
     double max_albedo_change = 0.0;       // [dimensionless] max albedo change this epoch
     double mean_albedo = 0.0;             // [dimensionless] mean albedo across all faces
@@ -516,7 +598,15 @@ struct EvolutionStatistics {
                       << sublimation_rate << " kg/s" << std::endl;
             std::cout << "    Deposition:  " << deposition_rate << " kg/s" << std::endl;
             if (sputtering_rate > 0.0) {
-                std::cout << "    Sputtering:  " << sputtering_rate << " kg/s" << std::endl;
+                std::cout << "    Sputtering:  " << sputtering_rate << " kg/s"
+                          << (sputter_partition_active ? " (gross removal)" : " (escaping share only; legacy)")
+                          << std::endl;
+            }
+            if (sputter_partition_active) {
+                std::cout << "      deposition from sublimation: " << sublimation_deposition_rate << " kg/s" << std::endl;
+                std::cout << "      sputter redeposited:         " << sputter_redeposited_rate << " kg/s" << std::endl;
+                std::cout << "      sputter escaped:             " << sputter_escaped_rate << " kg/s" << std::endl;
+                std::cout << "      sputter reservoir (O2+H2):   " << sputter_reservoir_rate << " kg/s" << std::endl;
             }
             std::cout << "    Net loss:    " << net_mass_loss_rate << " kg/s" << std::endl;
             std::cout << "    Flux imbalance: " << std::fixed << std::setprecision(2)
@@ -527,6 +617,16 @@ struct EvolutionStatistics {
             std::cout << "    Total deposited:  " << total_deposited_mass << " kg" << std::endl;
             if (total_sputtered_mass > 0.0) {
                 std::cout << "    Total sputtered:  " << total_sputtered_mass << " kg" << std::endl;
+            }
+            if (sputter_partition_active) {
+                std::cout << "      sputter redeposited: " << total_sputter_redeposited_mass << " kg" << std::endl;
+                std::cout << "      sputter escaped:     " << total_sputter_escaped_mass << " kg" << std::endl;
+                std::cout << "      sputter reservoir:   " << total_sputter_reservoir_mass << " kg" << std::endl;
+                std::cout << "    Sublimation Jeans escape: " << total_sublimation_jeans_mass << " kg" << std::endl;
+                std::cout << "    Super-step lag (deposition in excess of step-mean sources; PTM-644): "
+                          << total_superstep_lag_mass << " kg" << std::endl;
+                std::cout << "    (sublimated + sputtered - deposited = sputter escaped + reservoir + "
+                          << "Jeans - lag)" << std::endl;
             }
             std::cout << "    Total escaped:    " << total_escaped_mass << " kg" << std::endl;
         }
@@ -940,7 +1040,8 @@ public:
         stats_.total_deposited_mass += epoch_deposited * epoch_duration;
         stats_.total_sputtered_mass += epoch_sputtered * epoch_duration;
 
-        // Net mass loss = escape to space (sublimation + sputtering that isn't redeposited)
+        // Net surface mass loss = sublimation + sputtering - deposition. With the PTM-642
+        // accounting this is escape + atmospheric reservoir (+ Jeans), minus the super-step lag.
         double epoch_net_loss = epoch_sublimated + epoch_sputtered - epoch_deposited;
         stats_.total_escaped_mass += std::max(0.0, epoch_net_loss) * epoch_duration;
 
@@ -954,6 +1055,29 @@ public:
         stats_.flux_imbalance_fraction = (total_emission > 1e-30)
             ? std::abs(total_emission - epoch_deposited) / total_emission
             : 0.0;
+
+        if (diurnal_avg_->sputter_transport) {
+            // Separate pass so the reductions above are untouched.
+            double dep_sput = 0.0, dep_sub = 0.0, s0 = 0.0;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                dep_sput += diurnal_avg_->avg_deposition_sputter_flux[i] * face_areas[i];
+                dep_sub += diurnal_avg_->avg_deposition_sublimation_flux[i] * face_areas[i];
+                s0 += diurnal_avg_->avg_sublimation_flux[i] * face_areas[i];  // start of step
+            }
+            // Deposition from sublimation had the step followed the step-mean source.
+            const double dep_sub_mean = (s0 > 0.0) ? dep_sub * (epoch_sublimated / s0) : 0.0;
+            const double lag_rate = (dep_sub - dep_sub_mean)
+                + (dep_sput - diurnal_avg_->sputter_transport_share * epoch_sputtered);
+            stats_.total_sublimation_jeans_mass += (epoch_sublimated - dep_sub_mean) * epoch_duration;
+            stats_.total_superstep_lag_mass += lag_rate * epoch_duration;
+            stats_.sputter_redeposited_rate = dep_sput;
+            stats_.sublimation_deposition_rate = dep_sub;
+            stats_.sputter_escaped_rate = diurnal_avg_->sputter_escape_share * epoch_sputtered;
+            stats_.sputter_reservoir_rate = diurnal_avg_->sputter_reservoir_share * epoch_sputtered;
+            stats_.total_sputter_redeposited_mass += dep_sput * epoch_duration;
+            stats_.total_sputter_escaped_mass += stats_.sputter_escaped_rate * epoch_duration;
+            stats_.total_sputter_reservoir_mass += stats_.sputter_reservoir_rate * epoch_duration;
+        }
 
         // Multi-criteria convergence:
         // (a) Concentration change below threshold, OR
@@ -1005,6 +1129,62 @@ public:
      */
     const DiurnalAverages& getDiurnalAverages() const { return *diurnal_avg_; }
     DiurnalAverages& getMutableDiurnalAverages() { return *diurnal_avg_; }
+
+    /**
+     * Activate the PTM-642 sputter mass accounting (call before the first
+     * epoch). Shares are fractions of the gross sputtered mass and must sum to 1.
+     */
+    void setSputterPartition(double transport_share, double escape_share, double reservoir_share) {
+        const double sum = transport_share + escape_share + reservoir_share;
+        if (!(std::abs(sum - 1.0) <= 1e-12) || transport_share < 0.0 || escape_share < 0.0 ||
+            reservoir_share < 0.0) {
+            throw std::invalid_argument("setSputterPartition: shares must be >= 0 and sum to 1 (sum = " +
+                                        std::to_string(sum) + ")");
+        }
+        diurnal_avg_->sputter_transport = true;
+        diurnal_avg_->sputter_transport_share = transport_share;
+        diurnal_avg_->sputter_escape_share = escape_share;
+        diurnal_avg_->sputter_reservoir_share = reservoir_share;
+        stats_.sputter_partition_active = true;
+    }
+
+    /**
+     * Global sputter mass audit of the CURRENT flux state [kg/s].
+     * gross = redeposited + escaped + reservoir must close to 1e-6 (the caller throws);
+     * redeposited is MEASURED from the deposition field (the kernel output after
+     * rescaling), not assumed. Also checks the PTM-642 (c) regression:
+     * deposition <= sublimation + sputter transport source.
+     */
+    struct SputterAudit {
+        double gross = 0.0, transport_source = 0.0, redeposited = 0.0, escaped = 0.0, reservoir = 0.0;
+        double sublimation = 0.0, deposition = 0.0, deposition_from_sublimation = 0.0;
+        double closure_rel = 0.0;       // |gross - (redeposited + escaped + reservoir)| / gross
+        double transport_rel = 0.0;     // |transport_source - redeposited| / transport_source
+        double dep_excess_rel = 0.0;    // (deposition - sublimation - transport_source) / (sublimation + transport_source)
+    };
+    SputterAudit sputterFluxAudit(const std::vector<double>& face_areas) const {
+        SputterAudit a;
+        const auto& d = *diurnal_avg_;
+        for (size_t i = 0; i < num_faces_; ++i) {
+            a.gross += d.avg_sputtering_flux[i] * face_areas[i];
+            a.redeposited += d.avg_deposition_sputter_flux[i] * face_areas[i];
+            a.sublimation += d.avg_sublimation_flux[i] * face_areas[i];
+            a.deposition += d.avg_deposition_flux[i] * face_areas[i];
+            a.deposition_from_sublimation += d.avg_deposition_sublimation_flux[i] * face_areas[i];
+        }
+        a.transport_source = d.sputter_transport_share * a.gross;
+        a.escaped = d.sputter_escape_share * a.gross;
+        a.reservoir = d.sputter_reservoir_share * a.gross;
+        if (a.gross > 0.0) {
+            a.closure_rel = std::abs(a.gross - (a.redeposited + a.escaped + a.reservoir)) / a.gross;
+        }
+        if (a.transport_source > 0.0) {
+            a.transport_rel = std::abs(a.transport_source - a.redeposited) / a.transport_source;
+        }
+        const double src = a.sublimation + a.transport_source;
+        if (src > 0.0) a.dep_excess_rel = (a.deposition - src) / src;
+        return a;
+    }
 
     /**
      * Get configuration
