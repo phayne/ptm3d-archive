@@ -2017,6 +2017,25 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         if (flux_convergence_threshold_ >= 0.0) {
             config.flux_convergence_threshold = flux_convergence_threshold_;
         }
+        config.max_superstep_epochs = max_superstep_epochs_;
+        config.superstep_consistent_deposition = superstep_consistent_deposition_;
+        if (sputtering_enabled_ && sputtering_model_ && !sputterTransportActive() &&
+            config.superstep_consistent_deposition) {
+            // --sputter-legacy-escape-only reproduces pre-PTM-642 products byte for byte,
+            // which requires the pre-PTM-644 step as well; its deposition (from
+            // sublimation, rescaled by sublimation + escaping sputter) has no
+            // conserving counterpart to enforce.
+            config.superstep_consistent_deposition = false;
+            std::cerr << "WARNING [PTM-644]: --sputter-legacy-escape-only implies the legacy super-step "
+                      << "deposition (held at its start-of-step value; not mass-conserving). The step "
+                      << "conservation audit is reported, not enforced." << std::endl;
+        }
+        if (!superstep_consistent_deposition_) {
+            std::cerr << "WARNING [PTM-644]: --superstep-legacy-deposition: deposition is held at its "
+                      << "start-of-step value over each super-step while the sources follow the ice "
+                      << "availability; cumulative deposition can exceed emission. Reproduces pre-PTM-644 "
+                      << "products only. The step conservation audit is reported, not enforced." << std::endl;
+        }
 
         // analytical_acceleration and cache_refresh_interval are kept in the
         // signature for API compatibility only (M3). Nothing implements them:
@@ -2235,6 +2254,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                             *ice_layer_state_, face_areas_, epoch_duration, max_step) - 1;
                         // -1 because computeSafeEpochCount returns total including the one we already did
                         safe_extra = std::max(0, safe_extra);
+                    }
+                    // --max-superstep-epochs: the whole step (1 + safe_extra) stays within the cap.
+                    if (max_superstep_epochs_ > 0) {
+                        safe_extra = std::min(safe_extra, max_superstep_epochs_ - 1);
                     }
 
                     if (safe_extra > 0) {
@@ -2643,9 +2666,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 epoch_duration, diurnal_avg.avg_crystallization_rate,
                 ice_layer_state_->crystalline_fraction);
 
-            // Apply depositional amorphization from epoch-averaged deposition
+            // Apply depositional amorphization from the deposition the step used
+            // (PTM-644: the step-consistent value; the start-of-step value in legacy mode).
+            const auto& step_dep = multiscale_evolution_->getStepDepositionFlux();
             for (size_t i = 0; i < num_faces_; ++i) {
-                double deposited = diurnal_avg.avg_deposition_flux[i] * epoch_duration;
+                double deposited = step_dep[i] * epoch_duration;
                 if (deposited > 0.0 && ice_layer_state_->ice_mass[i] > 0.0) {
                     IceCrystallizationModel::applyDepositionalAmorphization(
                         deposited, ice_layer_state_->ice_mass[i],
@@ -2748,7 +2773,31 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                  << stats.total_superstep_lag_mass << " kg\n";
             file << "  (sublimated + sputtered - deposited = sputter escaped + reservoir + Jeans - lag)\n";
         }
-        file << "  Total escaped: " << stats.total_escaped_mass << " kg\n\n";
+        file << "  Total escaped: " << stats.total_escaped_mass << " kg\n";
+        if (stats.step_audit_count > 0) {
+            // PTM-644 step conservation audit (every evolved step).
+            file << "  Step conservation (PTM-644): "
+                 << (stats.superstep_consistent ? "deposition consistent with each step's emission"
+                                                : "LEGACY start-of-step deposition (reported, not enforced)")
+                 << "\n";
+            file << "    Not redeposited (Jeans, unscattered, sputter escape + reservoir): "
+                 << stats.total_not_redeposited_mass << " kg\n";
+            file << "    Step residual (deposited - retained emission): " << stats.total_step_residual_mass
+                 << " kg; max per step " << stats.max_step_residual_rel << " relative (limit 1e-6)\n";
+            file << "    (sublimated + sputtered - deposited = not redeposited - step residual)\n";
+            if (stats.total_external_deposition_mass > 0.0) {
+                file << "    External deposition (no cached source; excluded from the audit): "
+                     << stats.total_external_deposition_mass << " kg\n";
+            }
+            file << "    Layer overflow (deposition onto pure ice beyond the layer): "
+                 << stats.total_layer_overflow_mass << " kg\n";
+            file << "    Ice inventory vs booked fluxes: " << stats.total_inventory_error_mass
+                 << " kg; max per step " << stats.max_inventory_error_rel << " relative\n";
+            file << "    Steps: " << stats.steps_evolved << "; solver evaluations "
+                 << stats.step_solver_evaluations << ", max Newton iterations "
+                 << stats.step_solver_max_iterations << "\n";
+        }
+        file << "\n";
 
         // Latitude-dependent analysis of non-ice concentration
         file << "Latitude Distribution (final non-ice concentration):\n";

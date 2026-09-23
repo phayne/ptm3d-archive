@@ -788,8 +788,13 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--epochs` $N_e$ | 1000 | Number of geological epochs |
 | `--cycles-per-epoch` $N_c$ | 100 | Diurnal cycles per epoch (~100 = 1 Earth year) |
 | `--export-interval` $N$ | 100 | Export every $N$ epochs, plus the final state (0 = the final state only; earlier builds wrote nothing for 0). Snapshot $L$ is the state after exactly $L$ epochs ($t = L\,\Delta t_{\mathrm{epoch}}$); the last is labeled `--epochs`. `time_steps.txt` lists one time per snapshot (PTM-636; earlier builds wrote state fields after the epoch's super-step, up to one interval past the label, and omitted the final snapshot from `time_steps.txt`) |
+| `--max-superstep-epochs` $N$ | none | Cap one super-step at $N$ epochs (step-size refinement checks; the physical bound is the emission-weighted availability change) |
+| `--superstep-legacy-deposition` | off | Pre-PTM-644 step: deposition held at its start-of-step value while the sources follow the ice availability, and the trapezoid mean availability in the linear mode. Not mass-conserving; reproduces earlier products only. Implied by `--sputter-legacy-escape-only` |
 | `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
 | `--cache-refresh` $N$ | (refused) | Not implemented; the CLI exits with an error |
+
+**Deposition over a step (PTM-644).** Within a step, each face's emission follows its own ice availability, while deposition is the transport kernel's cached pattern times a global scale per source group (sublimation; sputtered H$_2$O). The scale is held at the value whose deposition equals what the kernel retains from the emission the step actually produced:
+$s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))$, solved by Newton on 1-2 scalars, with $\langle f_i \rangle$ the exact step-mean availability for that constant deposition. Each step then satisfies deposited $= \rho_k \times$ emitted per group ($\rho_{\mathrm{sub}} = 1 -$ Jeans/unscattered fraction; $\rho_{\mathrm{sput}}$ = the non-escaping H$_2$O share), and the run throws if a step departs from it by more than $10^{-6}$ relative. `evolution_summary.txt` reports the cumulative residual, the non-redeposited mass, deposition that overflows a pure-ice layer, and the ice inventory against the booked fluxes. Earlier builds held deposition at its start-of-step value, so a step in which availability fell deposited more than it emitted, by an amount that depended on the step size.
 
 ### Ice Crystallization Options
 

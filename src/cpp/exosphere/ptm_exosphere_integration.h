@@ -227,6 +227,8 @@ namespace ptm {
             // Convergence thresholds (set via CLI, applied to MultiTimescaleConfig)
             double convergence_threshold_ = -1.0;       // <0 means use default
             double flux_convergence_threshold_ = -1.0;   // <0 means use default
+            bool superstep_consistent_deposition_ = true;  // PTM-644
+            int max_superstep_epochs_ = 0;                  // 0 = no cap
 
             // Diurnal accumulation stride: use every Nth timestep for averaging.
             // stride=1 uses all timesteps (default), stride=4 uses every 4th (~4x faster).
@@ -614,6 +616,15 @@ namespace ptm {
              * @param threshold Flux imbalance fraction [0-1] for convergence (e.g. 0.01 = 1%)
              */
             void setFluxConvergenceThreshold(double threshold) { flux_convergence_threshold_ = threshold; }
+
+            /**
+             * PTM-644. false = legacy super-step deposition (held at its start-of-step
+             * value; reproduces pre-fix products, not mass-conserving).
+             */
+            void setSuperstepConsistentDeposition(bool on) { superstep_consistent_deposition_ = on; }
+
+            /** Upper bound on one multiscale super-step in epochs (0 = none; refinement checks). */
+            void setMaxSuperstepEpochs(int n) { max_superstep_epochs_ = std::max(0, n); }
 
             /**
              * Set diurnal accumulation stride for multi-timescale simulation

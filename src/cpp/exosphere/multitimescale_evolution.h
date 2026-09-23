@@ -20,7 +20,8 @@
  *
  * Key approximations:
  * - Transport matrix is fixed (computed once at start)
- * - Deposition is treated as constant within super-steps (globally scaled by total emission)
+ * - Deposition is constant within a step at the global scale (per source group) whose
+ *   deposition equals what the kernel retains from the step's own emission (PTM-644)
  *
  * References:
  * - Operator splitting: Strang (1968), LeVeque (2002)
@@ -36,6 +37,7 @@
 #include <iomanip>
 #include <sstream>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include "ice_layer_model.h"
@@ -230,6 +232,17 @@ struct MultiTimescaleConfig {
     // Converges when |sublimation + sputtering - deposition| / (sublimation + sputtering) < threshold
     double flux_convergence_threshold = timescale_constants::FLUX_CONVERGENCE_THRESHOLD;
 
+    // PTM-644: deposition over a step follows the emission produced over that step
+    // (see MultiTimescaleEvolution::evolveEpoch). false reproduces the pre-fix
+    // operator splitting: deposition held at its start-of-step value while the
+    // sources follow the ice availability, and (linear availability mode) the
+    // trapezoid mean of the availability.
+    bool superstep_consistent_deposition = true;
+
+    // Upper bound on one super-step, in epochs (0 = none). Used for step-size
+    // refinement checks; the physical bound is computeSafeEpochCount().
+    int max_superstep_epochs = 0;
+
     // Constructor with defaults
     MultiTimescaleConfig() = default;
 
@@ -249,6 +262,14 @@ struct MultiTimescaleConfig {
         std::cout << "  Export interval: " << export_interval << " epochs" << std::endl;
         std::cout << "  Convergence threshold: " << convergence_threshold << std::endl;
         std::cout << "  Flux convergence threshold: " << (flux_convergence_threshold * 100.0) << "%" << std::endl;
+        std::cout << "  Step deposition: "
+                  << (superstep_consistent_deposition
+                      ? "consistent with the step's emission (PTM-644)"
+                      : "LEGACY start-of-step value (PTM-644 not applied; not mass-conserving)")
+                  << std::endl;
+        if (max_superstep_epochs > 0) {
+            std::cout << "  Max super-step: " << max_superstep_epochs << " epochs" << std::endl;
+        }
         std::cout << std::fixed;
     }
 };
@@ -325,6 +346,21 @@ struct DiurnalAverages {
     std::vector<double> base_deposition_sputter_flux;
     double total_base_sublimation = 0.0;  // [kg/s] sublimation source at cache time
     double total_base_sputter = 0.0;      // [kg/s] GROSS sputter removal at cache time
+
+    // PTM-644. Deposition = base deposition x a global scale per source group
+    // (one group, total emission, without sputter transport; sublimation and
+    // sputter with it). The scales below are the CURRENT (start-of-step) values
+    // set by cacheBaseFluxesUnscaled() (1) and applyScaledFluxes(); evolveEpoch()
+    // replaces them over a step by the scales consistent with the step's
+    // emission. The base deposition totals (area-weighted, summed in face order)
+    // give each group's retention: deposited / emitted at cache time (sublimation:
+    // 1 - Jeans - unscattered fraction; sputter: the non-escaping H2O share).
+    double deposition_scale_total = 1.0;
+    double deposition_scale_sub = 1.0;
+    double deposition_scale_sput = 1.0;
+    double total_base_deposition = 0.0;      // [kg/s]
+    double total_base_deposition_sub = 0.0;  // [kg/s]
+    double total_base_deposition_sput = 0.0; // [kg/s]
 
     explicit DiurnalAverages(size_t num_faces) {
         avg_sublimation_flux.resize(num_faces, 0.0);
@@ -427,6 +463,13 @@ struct DiurnalAverages {
                 total_base_sputter += base_sputtering_flux[i] * ice_availability[i] * face_areas[i];
             }
         }
+        deposition_scale_total = deposition_scale_sub = deposition_scale_sput = 1.0;
+        total_base_deposition = total_base_deposition_sub = total_base_deposition_sput = 0.0;
+        for (size_t i = 0; i < avg_sublimation_flux.size(); ++i) {
+            total_base_deposition += base_deposition_flux[i] * face_areas[i];
+            total_base_deposition_sub += base_deposition_sublimation_flux[i] * face_areas[i];
+            total_base_deposition_sput += base_deposition_sputter_flux[i] * face_areas[i];
+        }
         cache_valid = true;
     }
 
@@ -454,6 +497,8 @@ struct DiurnalAverages {
             }
             const double scale_s = (total_base_sublimation > 1e-30) ? s_now / total_base_sublimation : 1.0;
             const double scale_p = (total_base_sputter > 1e-30) ? p_now / total_base_sputter : 1.0;
+            deposition_scale_sub = scale_s;
+            deposition_scale_sput = scale_p;
             #pragma omp parallel for
             for (size_t i = 0; i < n; ++i) {
                 avg_deposition_sublimation_flux[i] = base_deposition_sublimation_flux[i] * scale_s;
@@ -480,6 +525,7 @@ struct DiurnalAverages {
         double deposition_scale = (total_base_emission > 1e-30)
                                 ? total_current_emission / total_base_emission
                                 : 1.0;
+        deposition_scale_total = deposition_scale;
 
         // Pass 2: Apply deposition scaling and compute net flux
         #pragma omp parallel for
@@ -575,6 +621,26 @@ struct EvolutionStatistics {
     double total_sublimation_jeans_mass = 0.0;    // [kg]
     double total_superstep_lag_mass = 0.0;        // [kg]
 
+    // PTM-644 step conservation audit (all multiscale modes; it throws only in
+    // the consistent mode). Per step: deposited = retained emission, where each
+    // source group retains rho_k = kernel deposition / kernel source at cache time.
+    // Cumulative identity: sublimated + sputtered - deposited
+    //   = not_redeposited - step_residual.
+    bool superstep_consistent = false;
+    double total_step_residual_mass = 0.0;     // [kg] deposited - retained emission
+    double total_not_redeposited_mass = 0.0;   // [kg] emitted - retained (Jeans, unscattered, sputter escape + reservoir)
+    double max_step_residual_rel = 0.0;        // max |residual| / emitted over steps
+    double last_step_residual_rel = 0.0;
+    double total_layer_overflow_mass = 0.0;    // [kg] deposition onto pure-ice faces beyond the layer
+    double total_external_deposition_mass = 0.0;  // [kg] deposition with no cached source (synthetic only)
+    double total_inventory_error_mass = 0.0;   // [kg] sum |state change - booked fluxes| (numerical)
+    double max_inventory_error_rel = 0.0;      // per step, / emitted mass
+    double last_step_scale_sub = 1.0, last_step_scale_sput = 0.0;
+    long long step_audit_count = 0;
+    long long steps_evolved = 0;
+    long long step_solver_evaluations = 0;
+    int step_solver_max_iterations = 0;
+
     // Albedo coupling statistics
     double max_albedo_change = 0.0;       // [dimensionless] max albedo change this epoch
     double mean_albedo = 0.0;             // [dimensionless] mean albedo across all faces
@@ -629,6 +695,12 @@ struct EvolutionStatistics {
                           << "Jeans - lag)" << std::endl;
             }
             std::cout << "    Total escaped:    " << total_escaped_mass << " kg" << std::endl;
+            if (step_audit_count > 0) {
+                std::cout << "  Step conservation (PTM-644" << (superstep_consistent ? "" : "; LEGACY, not enforced")
+                          << "): not redeposited " << total_not_redeposited_mass << " kg, residual "
+                          << total_step_residual_mass << " kg (max step " << max_step_residual_rel
+                          << " rel), layer overflow " << total_layer_overflow_mass << " kg" << std::endl;
+            }
         }
         if (mean_albedo > 0.0) {
             std::cout << "  Albedo coupling:" << std::endl;
@@ -665,6 +737,18 @@ private:
 
     // Reusable buffer for ice availability queries (avoids per-epoch allocation)
     mutable std::vector<double> ice_availability_buf_;
+
+    // Per-face scratch for evolveEpoch()'s face-order sums (PTM-644).
+    struct StepBuffers {
+        std::vector<double> emit_sub, emit_sput, dep_sub, dep_sput, deposition, overflow, inventory_err;
+        void resize(size_t n) {
+            if (emit_sub.size() == n) return;
+            for (auto* v : {&emit_sub, &emit_sput, &dep_sub, &dep_sput, &deposition, &overflow, &inventory_err}) {
+                v->assign(n, 0.0);
+            }
+        }
+    };
+    StepBuffers step_buffers_;
 
 public:
     /**
@@ -933,6 +1017,94 @@ public:
     }
 
     /**
+     * One face over one step with deposition held at B (PTM-644 helper).
+     * conc_before: non-ice concentration at the start; A, B [1/s] as in
+     * evolveEpoch(). mean_avail is the step-mean ice availability, so that
+     * base_emission * mean_avail is the step-mean emission.
+     */
+    struct FaceStep {
+        double nonice_new = 0.0;   // unclamped end-of-step concentration
+        double mean_avail = 0.0;   // step-mean availability
+        double net_rate = 0.0;     // d(nonice)/dt at the start [1/s]
+    };
+    FaceStep stepFace(const IceLayerModel& ice_model, double conc_before, double A, double B,
+                      double dt, bool exact_linear_mean) const {
+        FaceStep out;
+        if (ice_model.usesExposedAreaFraction()) {
+            // Exposed-area mode: d(phi)/dt = B - A f(phi), solved in closed form.
+            const double phi0 = 1.0 - conc_before;
+            const ExposedAreaStep st =
+                solveExposedAreaStep(phi0, A, B, ice_model.getExposedAreaGrainRatio(), dt);
+            out.nonice_new = 1.0 - st.phi_end;
+            out.mean_avail = st.mean_f;
+            out.net_rate = A * ice_model.exposedAreaFraction(phi0) - B;
+            return out;
+        }
+        if (exact_linear_mean) {
+            // Well-conditioned closed form (PTM-644). With f = 1 - nonice, y = A t and
+            // rate0 = B - A f0 (df/dt at the start):
+            //   f(t) - f0 = rate0 t phi1(y),               phi1(y) = (1 - e^-y) / y
+            //   int_0^t f = t [f0 + rate0 t psi(y)],       psi(y) = (y - 1 + e^-y) / y^2
+            // The legacy form nonice_eq - (nonice_eq - c0) e^-y loses ulp(B/A) when a
+            // face barely emits (A t << 1, B/A >> 1: every cold receiving face), and
+            // its trapezoid mean is not the mean of an exponential. f is clamped at 1
+            // (pure ice; deposition beyond it overflows the layer).
+            auto phi1 = [](double y) {
+                return (y < 1e-8) ? 1.0 - 0.5 * y : -std::expm1(-y) / y;
+            };
+            auto psi = [](double y) {
+                if (y < 1e-2) return 0.5 - y / 6.0 + y * y / 24.0 - y * y * y / 120.0 + y * y * y * y / 720.0;
+                return (y + std::expm1(-y)) / (y * y);
+            };
+            const double f0 = 1.0 - conc_before;
+            const double rate0 = B - A * f0;
+            double nonice_new;
+            if (A > 1e-30 && B <= 2.0 * A) {
+                // |nonice_eq| <= 1: the legacy closed form is well conditioned; kept so
+                // that faces at (or near) equilibrium evolve bit for bit as before.
+                const double nonice_eq = 1.0 - B / A;
+                nonice_new = nonice_eq - (nonice_eq - conc_before) * std::exp(-A * dt);
+            } else {
+                nonice_new = conc_before - rate0 * dt * phi1(A * dt);
+            }
+            double f_end = 1.0 - std::clamp(nonice_new, 0.0, 1.0);
+            out.nonice_new = nonice_new;
+            out.net_rate = A * (1.0 - conc_before) - B;
+            if (std::abs(f_end - f0) < 1e-8) {
+                // f barely moves: the trapezoid is exact to < 1e-8 x |df| (as in
+                // solveExposedAreaStep) and keeps equilibrium faces bit-identical.
+                out.mean_avail = 0.5 * (f0 + f_end);
+                return out;
+            }
+            double integral;
+            if (nonice_new >= 0.0) {
+                integral = dt * (f0 + rate0 * dt * psi(A * dt));
+            } else {
+                // f reaches 1 at t1 (rate0 > 0 and B > A there), then stays at 1.
+                const double t1 = (A > 0.0) ? -std::log1p(-A * (1.0 - f0) / rate0) / A
+                                            : (1.0 - f0) / rate0;
+                integral = t1 * (f0 + rate0 * t1 * psi(A * t1)) + (dt - t1);
+            }
+            const double lo = std::min(f0, f_end), hi = std::max(f0, f_end);
+            out.mean_avail = std::clamp(integral / dt, lo, hi);
+            return out;
+        }
+        if (A > 1e-30) {
+            double nonice_eq = 1.0 - B / A;
+            double decay = std::exp(-A * dt);
+            out.nonice_new = nonice_eq - (nonice_eq - conc_before) * decay;
+        } else {
+            // No emission: pure deposition (linear)
+            out.nonice_new = conc_before - B * dt;
+        }
+        double ice_frac_before = 1.0 - conc_before;
+        double ice_frac_after = 1.0 - std::clamp(out.nonice_new, 0.0, 1.0);
+        out.mean_avail = 0.5 * (ice_frac_before + ice_frac_after);
+        out.net_rate = A * (1.0 - conc_before) - B;
+        return out;
+    }
+
+    /**
      * Evolve non-ice concentration using analytical exponential solution
      *
      * Solves the ODE: d(nonice)/dt = A*(1-nonice) - B exactly, where
@@ -943,6 +1115,33 @@ public:
      * Each face approaches equilibrium nonice_eq = 1 - B/A, where
      * sublimation (reduced by ice fraction) balances deposition.
      *
+     * Deposition over the step (PTM-644). Deposition is the transport kernel's
+     * output at cache time times a global scale per source group (s_sub, s_sput;
+     * one group without sputter transport), because the kernel is linear in its
+     * source and the pattern is fixed until the next full diurnal. Pre-fix, the
+     * scale was frozen at its start-of-step value while every face's emission
+     * followed its own availability trajectory, so a step deposited more than it
+     * emitted whenever availability fell (Europa uniform-hapke phase 0, sputtering
+     * off: +0.24% cumulative, 2.1e11 kg of ice from nothing; the lag halved with
+     * each halving of the step). Now B is held at the scale whose deposition equals what the
+     * kernel retains from the step's actual emission:
+     *     s_k * S_k,base = sum_i a_i E_k,i <f_i>(B(s))      for each group k,
+     * where <f_i> is the exact step-mean availability for that constant B. This
+     * is the implicit (self-consistent) coupling of the source and its deposition
+     * over the step; within the step the timing of deposition is approximated by
+     * its mean, so the pattern error is O(the step's change in emission), which
+     * computeSafeEpochCount() bounds, and it vanishes under step refinement
+     * (--max-superstep-epochs). (Temperatures and the albedo-coupling refresh are
+     * still evaluated only at step boundaries; that lag is PTM-640, not this.)
+     * The mass balance is exact for every step:
+     *     deposited_k = rho_k * emitted_k,  rho_k = D_k,base / S_k,base
+     * (sublimation: 1 - Jeans - unscattered; sputter: non-escaping H2O share).
+     * The scalar system is solved by Newton on s (1-2 unknowns; finite-difference
+     * Jacobian; it is affine in s in the linear availability mode). All sums that
+     * feed the solve are taken in face order, so the result is reproducible.
+     * The step audit throws above 1e-6 relative. When the start-of-step scale is
+     * already consistent (constant availability), it is kept bit for bit.
+     *
      * @param ice_model Ice layer model
      * @param ice_state Ice layer state (modified in place)
      * @param face_areas Face areas [m²]
@@ -952,11 +1151,115 @@ public:
                      IceLayerState& ice_state,
                      const std::vector<double>& face_areas,
                      double epoch_duration) {
+        const DiurnalAverages& d = *diurnal_avg_;
         double max_ice_mass = ice_model.getMaxIceMassPerArea();
-        const bool area_mode = ice_model.usesExposedAreaFraction();
-        const double grain_ratio = ice_model.getExposedAreaGrainRatio();
+        const bool consistent = config_.superstep_consistent_deposition;
+        const bool two = d.sputter_transport;
         double max_change = 0.0;
         double epoch_sublimated = 0.0, epoch_deposited = 0.0, epoch_sputtered = 0.0;
+        step_buffers_.resize(num_faces_);
+
+        // Source groups: 0 = sublimation (+ sputtering when it is not transported), 1 = sputter.
+        const double S_base[2] = {two ? d.total_base_sublimation : d.total_base_emission,
+                                  two ? d.total_base_sputter : 0.0};
+        const double D_base[2] = {two ? d.total_base_deposition_sub : d.total_base_deposition,
+                                  two ? d.total_base_deposition_sput : 0.0};
+        const bool active[2] = {S_base[0] > 1e-30, two && S_base[1] > 1e-30};
+        double s[2] = {two ? d.deposition_scale_sub : d.deposition_scale_total,
+                       two ? d.deposition_scale_sput : 0.0};
+        auto dep_at = [&](size_t i, const double* sc) {
+            return two ? d.base_deposition_sublimation_flux[i] * sc[0] + d.base_deposition_sputter_flux[i] * sc[1]
+                       : d.base_deposition_flux[i] * sc[0];
+        };
+
+        // Step-mean emission per group [kg/s] for deposition scales sc (face-order sums).
+        auto evaluate = [&](const double* sc, double* G) {
+            #pragma omp parallel for
+            for (size_t i = 0; i < num_faces_; ++i) {
+                const double bs = d.base_sublimation_flux[i], bp = d.base_sputtering_flux[i];
+                const FaceStep st = stepFace(ice_model, ice_state.nonice_concentration[i],
+                                             (bs + bp) / max_ice_mass, dep_at(i, sc) / max_ice_mass,
+                                             epoch_duration, true);
+                step_buffers_.emit_sub[i] = bs * st.mean_avail * face_areas[i];
+                step_buffers_.emit_sput[i] = bp * st.mean_avail * face_areas[i];
+            }
+            G[0] = G[1] = 0.0;
+            for (size_t i = 0; i < num_faces_; ++i) G[0] += step_buffers_.emit_sub[i];
+            for (size_t i = 0; i < num_faces_; ++i) G[1] += step_buffers_.emit_sput[i];
+            if (!two) { G[0] += G[1]; G[1] = 0.0; }
+            ++stats_.step_solver_evaluations;
+        };
+        auto residual = [&](const double* G, const double* sc, double* g) {
+            for (int k = 0; k < 2; ++k) g[k] = active[k] ? G[k] / S_base[k] - sc[k] : 0.0;
+        };
+        auto converged_at = [&](const double* g, const double* sc) {
+            for (int k = 0; k < 2; ++k) {
+                if (active[k] && !(std::abs(g[k]) <= 1e-12 * std::max(sc[k], 1e-6))) return false;
+            }
+            return true;
+        };
+        auto gnorm = [](const double* g) { return std::max(std::abs(g[0]), std::abs(g[1])); };
+
+        // The kernel cannot retain more than its source: rho_sub <= 1 (Jeans and
+        // unscattered losses only), rho_sput <= the non-escaping H2O share.
+        if (consistent) {
+            const double rho_max[2] = {1.0, two ? d.sputter_transport_share : 1.0};
+            for (int k = 0; k < 2; ++k) {
+                if (active[k] && D_base[k] > S_base[k] * rho_max[k] * (1.0 + 1e-6)) {
+                    std::ostringstream m;
+                    m << std::scientific << std::setprecision(6) << "evolveEpoch (PTM-644): cached deposition "
+                      << D_base[k] << " kg/s exceeds its source's retainable share " << S_base[k] * rho_max[k]
+                      << " kg/s (group " << k << ")";
+                    throw std::runtime_error(m.str());
+                }
+            }
+        }
+
+        int iterations = 0;
+        if (consistent && (active[0] || active[1])) {
+            double G[2], g[2];
+            evaluate(s, G);
+            residual(G, s, g);
+            while (!converged_at(g, s)) {
+                if (++iterations > 40) {
+                    std::ostringstream m;
+                    m << std::scientific << std::setprecision(6)
+                      << "evolveEpoch (PTM-644): step deposition scale did not converge in 40 Newton iterations"
+                      << " (s = " << s[0] << ", " << s[1] << "; residual " << g[0] << ", " << g[1] << ")";
+                    throw std::runtime_error(m.str());
+                }
+                // Finite-difference Jacobian of g (inactive groups: identity, g = 0).
+                double J[2][2] = {{1.0, 0.0}, {0.0, 1.0}};
+                for (int k = 0; k < 2; ++k) {
+                    if (!active[k]) continue;
+                    double sp[2] = {s[0], s[1]}, Gp[2], gp[2];
+                    const double h = 1e-6 * std::max(s[k], 1e-3);
+                    sp[k] += h;
+                    evaluate(sp, Gp);
+                    residual(Gp, sp, gp);
+                    for (int j = 0; j < 2; ++j) J[j][k] = active[j] ? (gp[j] - g[j]) / h : (j == k ? 1.0 : 0.0);
+                }
+                const double det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+                if (!(std::abs(det) > 0.0) || !std::isfinite(det)) {
+                    throw std::runtime_error("evolveEpoch (PTM-644): singular Jacobian in the step deposition solve");
+                }
+                const double dx0 = (-g[0] * J[1][1] + g[1] * J[0][1]) / det;
+                const double dx1 = (-g[1] * J[0][0] + g[0] * J[1][0]) / det;
+                // Damped update (g is monotone and nearly affine; damping only guards clamps).
+                double lambda = 1.0, sn[2], Gn[2], gn[2];
+                for (int ls = 0; ; ++ls) {
+                    sn[0] = active[0] ? std::max(0.0, s[0] + lambda * dx0) : s[0];
+                    sn[1] = active[1] ? std::max(0.0, s[1] + lambda * dx1) : s[1];
+                    evaluate(sn, Gn);
+                    residual(Gn, sn, gn);
+                    if (gnorm(gn) < gnorm(g) || converged_at(gn, sn) || ls >= 30) break;
+                    lambda *= 0.5;
+                }
+                s[0] = sn[0]; s[1] = sn[1]; g[0] = gn[0]; g[1] = gn[1];
+            }
+        }
+        stats_.step_solver_max_iterations = std::max(stats_.step_solver_max_iterations, iterations);
+        ++stats_.steps_evolved;
 
         #pragma omp parallel for reduction(max:max_change) \
             reduction(+:epoch_sublimated,epoch_deposited,epoch_sputtered)
@@ -964,9 +1267,9 @@ public:
             double conc_before = ice_state.nonice_concentration[i];
 
             // Base (unscaled) emission rates and deposition
-            double base_sublim = diurnal_avg_->base_sublimation_flux[i];
-            double base_sput = diurnal_avg_->base_sputtering_flux[i];
-            double deposition = diurnal_avg_->avg_deposition_flux[i];
+            double base_sublim = d.base_sublimation_flux[i];
+            double base_sput = d.base_sputtering_flux[i];
+            double deposition = consistent ? dep_at(i, s) : d.avg_deposition_flux[i];
 
             // Analytical exponential evolution:
             // The ODE is: d(nonice)/dt = [base_emission * (1-nonice) - deposition] / max_ice_mass
@@ -976,38 +1279,14 @@ public:
             // ODE: d(nonice)/dt = A*(1-nonice) - B = A - B - A*nonice
             // Solution: nonice(t) = nonice_eq - (nonice_eq - nonice_0) * exp(-A*t)
             //   where nonice_eq = 1 - B/A  (equilibrium concentration)
+            // (Exposed-area mode: d(phi)/dt = B - A f(phi); see stepFace().)
             double A = (base_sublim + base_sput) / max_ice_mass;
             double B = deposition / max_ice_mass;
 
-            double nonice_new;
-            double eff_sublimation, eff_sputtering, net_rate;
-            if (area_mode) {
-                // Exposed-area mode: d(phi)/dt = B - A f(phi), solved in closed form.
-                const double phi0 = 1.0 - conc_before;
-                const ExposedAreaStep st =
-                    solveExposedAreaStep(phi0, A, B, grain_ratio, epoch_duration);
-                nonice_new = 1.0 - st.phi_end;
-                eff_sublimation = base_sublim * st.mean_f;
-                eff_sputtering = base_sput * st.mean_f;
-                net_rate = A * ice_model.exposedAreaFraction(phi0) - B;
-            } else {
-                if (A > 1e-30) {
-                    double nonice_eq = 1.0 - B / A;
-                    double decay = std::exp(-A * epoch_duration);
-                    nonice_new = nonice_eq - (nonice_eq - conc_before) * decay;
-                } else {
-                    // No emission: pure deposition (linear)
-                    nonice_new = conc_before - B * epoch_duration;
-                }
-
-                // Effective rates for mass balance tracking (time-averaged over epoch)
-                double ice_frac_before = 1.0 - conc_before;
-                double ice_frac_after = 1.0 - std::clamp(nonice_new, 0.0, 1.0);
-                double avg_ice_frac = 0.5 * (ice_frac_before + ice_frac_after);
-                eff_sublimation = base_sublim * avg_ice_frac;
-                eff_sputtering = base_sput * avg_ice_frac;
-                net_rate = A * (1.0 - conc_before) - B;
-            }
+            const FaceStep st = stepFace(ice_model, conc_before, A, B, epoch_duration, consistent);
+            const double nonice_new = st.nonice_new;
+            const double eff_sublimation = base_sublim * st.mean_avail;
+            const double eff_sputtering = base_sput * st.mean_avail;
 
             // Accumulate area-weighted mass balance
             epoch_sublimated += eff_sublimation * face_areas[i];
@@ -1015,7 +1294,7 @@ public:
             epoch_sputtered += eff_sputtering * face_areas[i];
 
             // Store concentration change rate (instantaneous, for super-step estimation)
-            concentration_change_rate_[i] = net_rate;
+            concentration_change_rate_[i] = st.net_rate;
 
             // Clamp to valid range [0, 1]
             ice_state.nonice_concentration[i] = std::clamp(nonice_new, 0.0,
@@ -1032,6 +1311,85 @@ public:
             // Track maximum change
             double change = std::abs(ice_state.nonice_concentration[i] - conc_before);
             max_change = std::max(max_change, change);
+
+            // PTM-644 audit terms, summed in face order below.
+            step_buffers_.deposition[i] = deposition;
+            step_buffers_.emit_sub[i] = eff_sublimation * face_areas[i];
+            step_buffers_.emit_sput[i] = eff_sputtering * face_areas[i];
+            step_buffers_.dep_sub[i] = (two ? (consistent ? d.base_deposition_sublimation_flux[i] * s[0]
+                                                          : d.avg_deposition_sublimation_flux[i])
+                                            : deposition) * face_areas[i];
+            step_buffers_.dep_sput[i] = two ? deposition * face_areas[i] - step_buffers_.dep_sub[i] : 0.0;
+            // Ice inventory: the state change must equal (deposition - emission) x dt,
+            // except deposition that overflows a pure-ice face.
+            const double dphi = conc_before - ice_state.nonice_concentration[i];
+            const double booked = (B - A * st.mean_avail) * epoch_duration;
+            const bool pure_ice_end = (ice_state.nonice_concentration[i] <= 0.0);
+            const double over = (pure_ice_end && booked > dphi) ? booked - dphi : 0.0;
+            step_buffers_.overflow[i] = over * max_ice_mass * face_areas[i];
+            step_buffers_.inventory_err[i] = std::abs(booked - over - dphi) * max_ice_mass * face_areas[i];
+        }
+
+        // Face-order (reproducible) sums of the step.
+        // Gs, Gp, Ds, Dp [kg/s]; over, inv_err [kg] over the step.
+        double Gs = 0.0, Gp = 0.0, Ds = 0.0, Dp = 0.0, over = 0.0, inv_err = 0.0;
+        for (size_t i = 0; i < num_faces_; ++i) {
+            Gs += step_buffers_.emit_sub[i];
+            Gp += step_buffers_.emit_sput[i];
+            Ds += step_buffers_.dep_sub[i];
+            Dp += step_buffers_.dep_sput[i];
+            over += step_buffers_.overflow[i];
+            inv_err += step_buffers_.inventory_err[i];
+        }
+        if (consistent) {
+            // Stats from the reproducible sums (the OpenMP reductions above vary at
+            // ~1e-16 run to run; PTM-645).
+            epoch_sublimated = Gs;
+            epoch_sputtered = Gp;
+            epoch_deposited = Ds + Dp;
+        }
+
+        // Step conservation audit (PTM-644): deposited = retained share of what
+        // the step emitted, per group.
+        const double rho0 = active[0] ? D_base[0] / S_base[0] : 0.0;
+        const double rho1 = active[1] ? D_base[1] / S_base[1] : 0.0;
+        const double emitted = Gs + Gp;
+        const double retained = two ? rho0 * Gs + rho1 * Gp : rho0 * emitted;
+        // A group with deposition but no source at cache time (only in synthetic
+        // setups: the kernel conserves its source) is an external supply; it is
+        // reported separately and excluded from the audit, never silently.
+        const double external = ((!active[0] && D_base[0] > 0.0) ? Ds : 0.0) +
+                                ((!active[1] && D_base[1] > 0.0) ? Dp : 0.0);
+        if (external > 0.0 && stats_.total_external_deposition_mass == 0.0) {
+            std::cerr << "WARNING [PTM-644]: deposition with no cached source (external supply, "
+                      << std::scientific << std::setprecision(3) << external
+                      << " kg/s); it is excluded from the step conservation audit and reported as "
+                      << "external deposition" << std::fixed << std::endl;
+        }
+        stats_.total_external_deposition_mass += external * epoch_duration;
+        const double deposited = Ds + Dp - external;
+        const double step_residual = deposited - retained;
+        const double step_rel = (emitted > 0.0) ? step_residual / emitted
+                              : (deposited > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
+        const double inv_rel = (emitted > 0.0) ? inv_err / (emitted * epoch_duration) : 0.0;
+        stats_.superstep_consistent = consistent;
+        stats_.last_step_residual_rel = step_rel;
+        stats_.max_step_residual_rel = std::max(stats_.max_step_residual_rel, std::abs(step_rel));
+        stats_.max_inventory_error_rel = std::max(stats_.max_inventory_error_rel, inv_rel);
+        stats_.total_step_residual_mass += step_residual * epoch_duration;
+        stats_.total_not_redeposited_mass += (emitted - retained) * epoch_duration;
+        stats_.total_layer_overflow_mass += over;      // already [kg] over the step
+        stats_.total_inventory_error_mass += inv_err;  // already [kg] over the step
+        stats_.last_step_scale_sub = s[0];
+        stats_.last_step_scale_sput = s[1];
+        stats_.step_audit_count++;
+        if (consistent && !(std::abs(step_rel) <= 1e-6)) {
+            std::ostringstream m;
+            m << std::scientific << std::setprecision(6)
+              << "evolveEpoch (PTM-644): step conservation audit failed: deposited " << deposited
+              << " kg/s vs retained emission " << retained << " kg/s (emitted " << emitted
+              << "), residual " << step_rel << " relative (limit 1e-6)";
+            throw std::runtime_error(m.str());
         }
 
         // Update statistics
@@ -1056,24 +1414,36 @@ public:
             ? std::abs(total_emission - epoch_deposited) / total_emission
             : 0.0;
 
-        if (diurnal_avg_->sputter_transport) {
-            // Separate pass so the reductions above are untouched.
+        if (d.sputter_transport && consistent) {
+            // Deposition is the retained share of the step's own sources, so the
+            // Jeans term is (1 - rho_sub) x sublimated and the lag is the audit residual.
+            stats_.total_sublimation_jeans_mass += (1.0 - rho0) * Gs * epoch_duration;
+            stats_.total_superstep_lag_mass += step_residual * epoch_duration;
+            stats_.sputter_redeposited_rate = Dp;
+            stats_.sublimation_deposition_rate = Ds;
+            stats_.sputter_escaped_rate = d.sputter_escape_share * epoch_sputtered;
+            stats_.sputter_reservoir_rate = d.sputter_reservoir_share * epoch_sputtered;
+            stats_.total_sputter_redeposited_mass += Dp * epoch_duration;
+            stats_.total_sputter_escaped_mass += stats_.sputter_escaped_rate * epoch_duration;
+            stats_.total_sputter_reservoir_mass += stats_.sputter_reservoir_rate * epoch_duration;
+        } else if (d.sputter_transport) {
+            // Legacy (pre-PTM-644) diagnostics, unchanged. Separate pass so the reductions above are untouched.
             double dep_sput = 0.0, dep_sub = 0.0, s0 = 0.0;
             for (size_t i = 0; i < num_faces_; ++i) {
-                dep_sput += diurnal_avg_->avg_deposition_sputter_flux[i] * face_areas[i];
-                dep_sub += diurnal_avg_->avg_deposition_sublimation_flux[i] * face_areas[i];
-                s0 += diurnal_avg_->avg_sublimation_flux[i] * face_areas[i];  // start of step
+                dep_sput += d.avg_deposition_sputter_flux[i] * face_areas[i];
+                dep_sub += d.avg_deposition_sublimation_flux[i] * face_areas[i];
+                s0 += d.avg_sublimation_flux[i] * face_areas[i];  // start of step
             }
             // Deposition from sublimation had the step followed the step-mean source.
             const double dep_sub_mean = (s0 > 0.0) ? dep_sub * (epoch_sublimated / s0) : 0.0;
             const double lag_rate = (dep_sub - dep_sub_mean)
-                + (dep_sput - diurnal_avg_->sputter_transport_share * epoch_sputtered);
+                + (dep_sput - d.sputter_transport_share * epoch_sputtered);
             stats_.total_sublimation_jeans_mass += (epoch_sublimated - dep_sub_mean) * epoch_duration;
             stats_.total_superstep_lag_mass += lag_rate * epoch_duration;
             stats_.sputter_redeposited_rate = dep_sput;
             stats_.sublimation_deposition_rate = dep_sub;
-            stats_.sputter_escaped_rate = diurnal_avg_->sputter_escape_share * epoch_sputtered;
-            stats_.sputter_reservoir_rate = diurnal_avg_->sputter_reservoir_share * epoch_sputtered;
+            stats_.sputter_escaped_rate = d.sputter_escape_share * epoch_sputtered;
+            stats_.sputter_reservoir_rate = d.sputter_reservoir_share * epoch_sputtered;
             stats_.total_sputter_redeposited_mass += dep_sput * epoch_duration;
             stats_.total_sputter_escaped_mass += stats_.sputter_escaped_rate * epoch_duration;
             stats_.total_sputter_reservoir_mass += stats_.sputter_reservoir_rate * epoch_duration;
@@ -1086,6 +1456,12 @@ public:
             || (stats_.flux_imbalance_fraction < config_.flux_convergence_threshold
                 && max_change < 1e-4);
     }
+
+    /**
+     * Deposition flux [kg/(m²·s)] that the last evolveEpoch() step used, per face
+     * (the step-consistent value; the start-of-step value in legacy mode).
+     */
+    const std::vector<double>& getStepDepositionFlux() const { return step_buffers_.deposition; }
 
     /**
      * Update statistics after epoch evolution
