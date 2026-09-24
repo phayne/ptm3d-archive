@@ -625,6 +625,17 @@ each coupling iteration $k = 1, 2, \ldots, k_{\max}$:
    $$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
 
    warm-started from the previous iteration's temperature profile.
+
+   **The re-run uses the same integrator as the whole-mesh solve.** On the CPU
+   that is the SIMD-batch integrator (the default), re-entered on the batches
+   that hold a selected face; `--no-simd-batch` re-runs on the scalar
+   integrator. Before 2026-09-24 the default CPU run re-ran the selection on
+   the scalar integrator, whose flux sampling lags by half a substep, so a
+   selected face moved by the two integrators' difference even at zero
+   exchange: 0.26 K on a convex asteroid with 2.4e-5 W/m² of indirect flux.
+   On the coupled faces of the 80 N crater the mean error against a 32x finer
+   time step fell from 0.14 K (scalar re-run) to 0.08 K (BUGS.md PTM-665).
+   `scripts/test_rethermal_zero_exchange.py` holds that line.
 5. **Update** the temperatures and return to step 1.
 
 ### 7.2 Face selection
