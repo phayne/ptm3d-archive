@@ -46,6 +46,8 @@ from ptm.results import FIELD_INFO as _FIELD_INFO_ASCII            # noqa: E402
 from ptm.results import STATISTICS_FIELDS as _STATS_FIELDS_ASCII   # noqa: E402
 from ptm.results import detect_available_statistics as _detect_stats_in_dir  # noqa: E402
 from ptm.results import field_info as _results_field_info           # noqa: E402
+# Either per-step naming generation (BUGS.md PTM-664).
+from ptm.readers import frame_path as _frame_path                   # noqa: E402
 
 try:
     import rasterio
@@ -935,7 +937,7 @@ class DataExportWorker(QThread):
                     self.export_finished.emit(False, "Export canceled")
                     return
 
-                file_path = field_dir / f"{field_name}_{t:04d}.bin"
+                file_path = _frame_path(field_dir, field_name, t)
                 if file_path.exists():
                     data = read_binary_data(str(file_path), n_faces)
                     if data is not None:
@@ -990,7 +992,7 @@ class DataExportWorker(QThread):
                         np.nan, dtype=np.float32
                     )
                     for t in range(n_timesteps):
-                        file_path = field_dir / f"{field_name}_{t:04d}.bin"
+                        file_path = _frame_path(field_dir, field_name, t)
                         if file_path.exists():
                             data = read_binary_data(str(file_path), n_faces)
                             if data is not None:

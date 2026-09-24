@@ -1,4 +1,5 @@
 #include "ptm_output_reader.h"
+#include "../fileio/frame_naming.h"
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -128,10 +129,14 @@ std::vector<float> PTMOutputReader::readBinaryFile(const std::string& filepath) 
 }
 
 std::string PTMOutputReader::buildFilename(const std::string& field, int step_index) const {
-    std::ostringstream oss;
-    oss << output_dir_ << "/" << field << "/" << field << "_"
-        << std::setw(4) << std::setfill('0') << step_index << ".bin";
-    return oss.str();
+    // Either naming generation (BUGS.md PTM-664): >= 6-digit indices from
+    // current engines, 4-digit from runs written before. When neither exists
+    // the current-rule name is returned so the caller's "cannot open" message
+    // names a real candidate.
+    const std::string dir = output_dir_ + "/" + field;
+    const std::string found = ptm::resolveFrameFile(dir, field, step_index);
+    if (!found.empty()) return found;
+    return dir + "/" + field + "_" + ptm::frameIndexString(step_index, 0) + ".bin";
 }
 
 std::vector<float> PTMOutputReader::loadTimestepData(const std::string& field,

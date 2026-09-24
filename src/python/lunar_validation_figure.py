@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from ptm.pubstyle import apply_style, COLORS, DOUBLE_W, LATITUDE_COLORS, panel_label
+from ptm.readers import frame_path
 
 
 LUNAR_DAY_S = 29.530588 * 86400.0
@@ -103,7 +104,8 @@ def load_run(run_dir: Path) -> dict:
     T = np.empty((n_steps, n_faces), dtype=np.float32)
     temp_dir = run_dir / "temperature"
     for t in range(n_steps):
-        candidate = temp_dir / f"temperature_{t:04d}.bin"
+        # Either naming generation (BUGS.md PTM-664).
+        candidate = frame_path(temp_dir, "temperature", t, n_steps)
         if not candidate.exists():
             candidate = temp_dir / f"{t:06d}.bin"
         T[t] = read_binary_data(candidate)

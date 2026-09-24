@@ -37,7 +37,7 @@ def load_temperature_timeseries(run_dir: Path | str,
     Returns (times_s, temperatures_t) where times_s comes from time_steps.txt.
     """
     run_dir = Path(run_dir)
-    files = sorted((run_dir / subdir).glob("temperature_*.bin"))
+    files = sorted((run_dir / subdir).glob("temperature_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not files:
         raise FileNotFoundError(f"No temperature_*.bin files in {run_dir/subdir}")
 

@@ -16,7 +16,8 @@ Design goals:
 
 Binary format assumptions (temperature_XXXX.bin):
 - Each file contains contiguous float32 or float64 temperatures for all faces.
-- File naming pattern: temperature_0000.bin, temperature_0001.bin, ...
+- File naming pattern: temperature_<index>.bin (>= 6 digits from current engines,
+  4 from older ones), read in NUMERIC index order
 - All files same dtype & length; first file determines face count.
 
 Legacy VTK assumptions:
@@ -541,11 +542,11 @@ def load_statistics_arrays(source_dir: str, *, progress: bool = False, fast_only
 # ---------------------------------------------------------------------------
 
 def _enumerate_binary_files(source_dir: str) -> List[str]:
-    files = []
-    for name in sorted(os.listdir(source_dir)):
-        if re.match(r"temperature_\d+\.bin$", name):
-            files.append(os.path.join(source_dir, name))
-    return files
+    # NUMERIC order: 4-digit names from older engines roll over to 5 digits at
+    # frame 10,000 and sort out of order alphabetically (BUGS.md PTM-664).
+    names = [n for n in os.listdir(source_dir) if re.match(r"temperature_\d+\.bin$", n)]
+    names.sort(key=lambda n: int(n[len("temperature_"):-4]))
+    return [os.path.join(source_dir, n) for n in names]
 
 def infer_binary_layout(first_file: str, dtype: str) -> int:
     dt = np.dtype(dtype)

@@ -49,7 +49,7 @@ import loaders  # noqa: E402
 
 def _find_last_cpp_epoch(run_dir: Path) -> int:
     """Return the highest epoch index among crystalline_fraction_NNNN.bin files."""
-    files = sorted((run_dir / "crystalline_fraction").glob("crystalline_fraction_*.bin"))
+    files = sorted((run_dir / "crystalline_fraction").glob("crystalline_fraction_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not files:
         raise FileNotFoundError(
             f"No crystalline_fraction_*.bin files in {run_dir/'crystalline_fraction'}. "

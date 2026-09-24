@@ -60,6 +60,7 @@
 // Exit code = number of failures.
 // ---------------------------------------------------------------------------
 
+#include "../fileio/frame_naming.h"
 #include "../illumination/shadow_depth_pass.h"
 
 #include <algorithm>
@@ -335,7 +336,7 @@ int main() {
                 std::printf("  FAIL: %s\n", err.c_str()); ++g_fails; continue;
             }
             std::vector<float> v;
-            if (!readFrame(std::string(dir) + "/shadow_depth/shadow_depth_0000.bin", v)) {
+            if (!readFrame(ptm::resolveFrameFile(std::string(dir) + "/shadow_depth", "shadow_depth", 0), v)) {
                 std::printf("  FAIL: no frame written\n"); ++g_fails; continue;
             }
             const double eps = eps_deg * kPi / 180.0;
@@ -378,7 +379,7 @@ int main() {
         if (!runShadowDepthPass(in, err)) { std::printf("  FAIL: %s\n", err.c_str()); ++g_fails; }
         else {
             std::vector<float> v;
-            readFrame(dir + "/shadow_depth/shadow_depth_0000.bin", v);
+            readFrame(ptm::resolveFrameFile(dir + "/shadow_depth", "shadow_depth", 0), v);
             checkTrue("Z >> h_max reports +inf (not h_max, not a number)",
                       v.size() == 1 && std::isinf(v[0]) && v[0] > 0.0f);
             // The exact bit pattern, because downstream readers key on it.
@@ -424,7 +425,7 @@ int main() {
                     std::printf("  FAIL: %s\n", err.c_str()); ++g_fails; continue;
                 }
                 std::vector<float> v;
-                readFrame(std::string(dir) + "/shadow_depth/shadow_depth_0000.bin", v);
+                readFrame(ptm::resolveFrameFile(std::string(dir) + "/shadow_depth", "shadow_depth", 0), v);
                 const double eps = eps_deg * kPi / 180.0;
                 for (size_t i = 0; i < v.size(); ++i) {
                     const double s = s_list[i];
@@ -454,7 +455,7 @@ int main() {
         if (!runShadowDepthPass(in, err)) { std::printf("  FAIL: %s\n", err.c_str()); ++g_fails; }
         else {
             std::vector<float> v;
-            readFrame(dir + "/shadow_depth/shadow_depth_0000.bin", v);
+            readFrame(ptm::resolveFrameFile(dir + "/shadow_depth", "shadow_depth", 0), v);
             checkTrue("deep pit floor reports the +inf sentinel",
                       v.size() == 1 && std::isinf(v[0]));
         }
@@ -479,7 +480,7 @@ int main() {
             std::string err;
             if (!runShadowDepthPass(in, err)) { std::printf("  FAIL: %s\n", err.c_str()); ++g_fails; continue; }
             std::vector<float> v;
-            readFrame(std::string(dir) + "/shadow_depth/shadow_depth_0000.bin", v);
+            readFrame(ptm::resolveFrameFile(std::string(dir) + "/shadow_depth", "shadow_depth", 0), v);
             bool all_zero = !v.empty();
             for (float x : v) all_zero = all_zero && (x == 0.0f);
             char lbl[80];

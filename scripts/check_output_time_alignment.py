@@ -18,10 +18,17 @@ Two anchors work, and this script checks either one. Both pin index 0, where
 ZERO time has elapsed, so neither depends on the flux quadrature inside an
 interval:
 
-  --checkpoint <file.ptmt>   A warm-started run (thermal.initial_state_file)
-                             must reproduce the checkpoint's surface layer
-                             exactly at index 0. GPU path only -- the T(z)
-                             checkpoint is read and written only there.
+  --checkpoint <file.ptmt>   A warm-started GPU run (thermal.initial_state_file)
+                             reproduces the checkpoint's surface layer exactly
+                             at index 0. GPU PATH ONLY. Since BUGS.md PTM-662
+                             the CPU drivers re-solve a warm start's index-0
+                             surface at its own epoch -- the number an
+                             unchunked run files there -- so on a CPU run this
+                             anchor differs by the forcing-epoch correction
+                             (tenths of a kelvin at a sunrise) and is the
+                             wrong test. For CPU warm starts use
+                             scripts/test_chunk_seam_equivalence.py, which
+                             compares every frame against the unchunked run.
 
   --seed-csv <file.csv>      A run with thermal.equilibration_orbits = 0 starts
                              at the shared analytic spin-up seed, which every
@@ -60,7 +67,8 @@ def read_frame(path):
 
 
 def first_temperature_frame(rundir):
-    files = sorted(glob.glob(os.path.join(rundir, 'temperature', 'temperature_*.bin')))
+    files = sorted(glob.glob(os.path.join(rundir, 'temperature', 'temperature_*.bin')),
+                   key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not files:
         raise SystemExit('no temperature/temperature_*.bin under ' + rundir)
     return read_frame(files[0]), files[0]
@@ -110,6 +118,10 @@ def compare(frame, reference, tol, what, frame_path, ref_path):
     if n_over:
         print('  FAIL: output index 0 is not the state at times[0] -- the frame has'
               ' already been integrated past its own epoch.')
+        if what == 'checkpoint':
+            print('  NOTE: on a CPU-solver run this anchor is expected to differ'
+                  ' (BUGS.md PTM-662: index 0 is re-solved at its epoch); use'
+                  ' scripts/test_chunk_seam_equivalence.py there.')
         return 1
     print('  PASS: output index 0 is the state at times[0].')
     return 0

@@ -203,6 +203,78 @@ void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
     std::cerr << line.str() << std::endl;
 }
 
+// Same contract as warnUnreadThermophysicalKeys, for `generic_body:` and its
+// four subsections (BUGS.md PTM-663). Until 2026-09-24 two keys here --
+// spin.prime_meridian_deg and orbit.epoch -- were parsed and then dropped, and
+// a DAMIT rotational phase had to be imposed by rotating the mesh. They are
+// wired now; this warner exists so the next dead key, or a typo such as
+// `pole_ra` for `pole_ra_deg`, is named instead of silently doing nothing.
+//
+// INVARIANT: every getWithDefault(...) in the root["generic_body"] branch, and
+// every subsection it opens, must appear in kRead below. The reads are
+// individual statements, so the list is maintained by hand and this comment
+// is the contract.
+//
+// ACCEPTED-BUT-INERT keys are provenance the HORIZONS body-config writer puts
+// in the file for a human reader: they are echoed as a NOTE, not scolded.
+void warnUnreadGenericBodyKeys(const YAML::Node& gb) {
+    if (!gb || !gb.IsMap()) return;
+    struct Section { const char* name; std::vector<const char*> read; std::vector<const char*> inert; };
+    const std::vector<Section> sections = {
+        {"", {"config_file", "ephemeris_source", "name", "naif_id", "orbit", "shape",
+              "spice_metakernel", "spin", "surface"},
+             // Read by the GUI's body lookup (gui_core/body_lookup.py), never by
+             // the engine, which takes its kernels from spice_metakernel.
+             {"spk_file"}},
+        {"shape", {"mesh_file", "mesh_scale", "radius_km", "semi_axes_km", "type"}, {}},
+        {"orbit", {"arg_perihelion_deg", "eccentricity", "epoch", "inclination_deg",
+                   "lon_ascending_node_deg", "mean_anomaly_deg", "semi_major_axis_au"}, {}},
+        {"spin", {"epoch", "period_hours", "pole_dec_deg", "pole_ra_deg",
+                  "prime_meridian_deg"}, {}},
+        {"surface", {"H", "Qb", "albedo", "chi", "cp0", "emissivity", "kd", "ks",
+                     "rhod", "rhos"},
+             // How the Bond albedo was derived (body_config_writer.py). The
+             // engine reads only `albedo`.
+             {"albedo_geometric_pv", "albedo_provenance", "albedo_slope_parameter_g",
+              "albedo_type"}},
+    };
+    std::vector<std::string> dead, inert;
+    for (const auto& sec : sections) {
+        const YAML::Node node = sec.name[0] ? gb[sec.name] : gb;
+        if (!node || !node.IsMap()) continue;
+        const std::string prefix = std::string("generic_body.") +
+                                   (sec.name[0] ? std::string(sec.name) + "." : "");
+        for (const auto& kv : node) {
+            std::string key;
+            try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+            bool is_read = false, is_inert = false;
+            for (const char* r : sec.read) if (key == r) { is_read = true; break; }
+            if (is_read) continue;
+            for (const char* r : sec.inert) if (key == r) { is_inert = true; break; }
+            (is_inert ? inert : dead).push_back(prefix + key);
+        }
+    }
+    if (!inert.empty()) {
+        std::sort(inert.begin(), inert.end());
+        std::ostringstream line;
+        line << "[config] NOTE: " << inert.size()
+             << " provenance key(s) under `generic_body:` are recorded for the reader and "
+                "IGNORED by the engine: ";
+        for (size_t i = 0; i < inert.size(); ++i) line << (i ? ", " : "") << inert[i];
+        line << ".";
+        std::cerr << line.str() << std::endl;
+    }
+    if (dead.empty()) return;
+    std::sort(dead.begin(), dead.end());
+    std::ostringstream line;
+    line << "[config] WARNING: " << dead.size()
+         << " key(s) under `generic_body:` are read by nothing and have NO effect: ";
+    for (size_t i = 0; i < dead.size(); ++i) line << (i ? ", " : "") << dead[i];
+    line << " -- editing them changes no result (misspelled? see "
+            "examples/quickstart_asteroid_diurnal.yaml for the key set).";
+    std::cerr << line.str() << std::endl;
+}
+
 // Same contract as warnUnreadThermophysicalKeys, for `flux_cubes:`. PTM-67 is
 // the trap where a block's keys are read by nothing and the run prints one
 // warning rather than honoring them; the flux-cube block is top-level to stay
@@ -959,6 +1031,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         // Parse Generic Body section
         if (root["generic_body"]) {
             const auto& gb = root["generic_body"];
+            // BUGS.md PTM-663: name every key under generic_body that nothing
+            // reads, BEFORE reading the ones that are.
+            warnUnreadGenericBodyKeys(gb);
             config.generic_body.name = getWithDefault(gb, "name", config.generic_body.name);
             config.generic_body.config_file = getWithDefault(gb, "config_file", config.generic_body.config_file);
             config.generic_body.ephemeris_source = getWithDefault(gb, "ephemeris_source", config.generic_body.ephemeris_source);
@@ -1022,6 +1097,11 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 config.generic_body.pole_ra_deg = getWithDefault(spin, "pole_ra_deg", config.generic_body.pole_ra_deg);
                 config.generic_body.pole_dec_deg = getWithDefault(spin, "pole_dec_deg", config.generic_body.pole_dec_deg);
                 config.generic_body.prime_meridian_deg = getWithDefault(spin, "prime_meridian_deg", config.generic_body.prime_meridian_deg);
+                // Presence, not value: 0.0 is both the default and a legal
+                // angle, so the generic_body.config_file merge needs to know
+                // whether THIS file set it (BUGS.md PTM-663).
+                if (spin["prime_meridian_deg"]) config.generic_body.prime_meridian_set = true;
+                config.generic_body.spin_epoch = getWithDefault(spin, "epoch", config.generic_body.spin_epoch);
             }
 
             // Surface/thermophysical subsection

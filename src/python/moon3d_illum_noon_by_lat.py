@@ -79,7 +79,7 @@ def noon_index(run: Path, c: np.ndarray, up: np.ndarray):
     lon_ss = np.arctan2(sun[:, 1], sun[:, 0])
     ha = np.degrees((lon_ss - lon_site + np.pi) % (2.0 * np.pi) - np.pi)
     lst = (12.0 - ha / 15.0) % 24.0
-    steps = sorted((run / "illumination").glob("illumination_*.bin"))
+    steps = sorted((run / "illumination").glob("illumination_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     m = min(len(steps), len(lst))
     i = int(np.argmin(np.abs((lst[:m] - 12.0 + 12.0) % 24.0 - 12.0)))
     el = float(np.degrees(np.arcsin(np.clip(su[i] @ up, -1.0, 1.0))))

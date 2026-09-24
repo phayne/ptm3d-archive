@@ -52,7 +52,7 @@ def stat(run: Path, field: str, name: str) -> np.ndarray:
 
 def illum_maxmean(run: Path, qind: np.ndarray):
     """Per-face (max, mean) of direct (OFF) and direct+indirect (ON)."""
-    dsteps = sorted((run / "direct_solar").glob("direct_solar_*.bin"))
+    dsteps = sorted((run / "direct_solar").glob("direct_solar_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     nuse = min(len(dsteps), qind.shape[1])
     nf = qind.shape[0]
     d_max = np.zeros(nf); d_sum = np.zeros(nf)

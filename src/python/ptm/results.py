@@ -1275,7 +1275,8 @@ class Results:
 
     def field(self, field='temperature', step=0):
         """One per-step per-face field, e.g. ``field('temperature', 120)``."""
-        return self._read(self.path / field / f"{field}_{int(step):04d}.bin")
+        # Either naming generation (BUGS.md PTM-664).
+        return self._read(readers.frame_path(self.path / field, field, step))
 
     def albedo_map(self, path):
         """Read a per-face albedo map and check it against this run's mesh.

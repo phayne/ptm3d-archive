@@ -51,6 +51,9 @@ from gui_core._ptm_bootstrap import ensure_ptm_importable  # noqa: E402
 
 ensure_ptm_importable()
 from ptm.results import describe_mesh_frame  # noqa: E402
+# Per-step frames are listed and resolved NUMERICALLY, never by an alphabetical
+# sort: pre-PTM-664 runs roll over from 4 to 5 digits at frame 10,000.
+from ptm.readers import frame_path, sorted_frame_files  # noqa: E402
 
 # The pointer record. OFF unless `PTM_GUI_TRACE=1` -- the SAME switch the flux
 # cube record uses, deliberately not a second one. It exists because the
@@ -1101,7 +1104,7 @@ class PyVistaWidget(QWidget):
         if not data_dir.exists():
             return None
 
-        file_path = data_dir / f"{dir_name}_{timestep_index:04d}.bin"
+        file_path = frame_path(data_dir, dir_name, timestep_index)
         if not file_path.exists():
             return None
 
@@ -2091,7 +2094,7 @@ class PyVistaWidget(QWidget):
         global_max = float('-inf')
 
         # Sample a subset of files to compute range (for performance)
-        files = sorted(data_dir.glob(f"{dir_name}_*.bin"))
+        files = sorted_frame_files(data_dir, dir_name)
         # Sample every Nth file if there are many
         step = max(1, len(files) // 10)
         sampled_files = files[::step]
@@ -3098,7 +3101,7 @@ class PlotWidget(QWidget):
             return
 
         # Load temperature data for this face
-        files = sorted(temp_dir.glob("temperature_*.bin"))
+        files = sorted_frame_files(temp_dir, "temperature")
         temps = []
 
         for i, f in enumerate(files):
@@ -3187,7 +3190,7 @@ class PlotWidget(QWidget):
 
             field_dir = self.results_dir / field
             if field_dir.exists():
-                files = sorted(field_dir.glob(f"{field}_*.bin"))
+                files = sorted_frame_files(field_dir, field)
                 values = []
                 for f in files:
                     data = self.read_binary_data(f)
@@ -3217,7 +3220,7 @@ class PlotWidget(QWidget):
 
         temp_dir = self.results_dir / "temperature"
         if temp_dir.exists():
-            files = sorted(temp_dir.glob("temperature_*.bin"))
+            files = sorted_frame_files(temp_dir, "temperature")
             if files:
                 # Use current timestep, clamped to valid range
                 timestep_idx = min(self.current_timestep, len(files) - 1)
@@ -3273,7 +3276,7 @@ class PlotWidget(QWidget):
 
         temp_dir = self.results_dir / "temperature"
         if temp_dir.exists():
-            files = sorted(temp_dir.glob("temperature_*.bin"))
+            files = sorted_frame_files(temp_dir, "temperature")
             if files:
                 # Use current timestep, clamped to valid range
                 timestep_idx = min(self.current_timestep, len(files) - 1)
@@ -3328,7 +3331,7 @@ class PlotWidget(QWidget):
 
         temp_dir = self.results_dir / "temperature"
         if temp_dir.exists():
-            files = sorted(temp_dir.glob("temperature_*.bin"))
+            files = sorted_frame_files(temp_dir, "temperature")
             mins, maxs, means = [], [], []
 
             for f in files:

@@ -119,7 +119,7 @@ def main() -> int:
     ha = np.degrees((lon_ss - lon_site + np.pi) % (2.0 * np.pi) - np.pi)
     sun_lst = (12.0 - ha / 15.0) % 24.0
 
-    steps = sorted((run / "illumination").glob("illumination_*.bin"))
+    steps = sorted((run / "illumination").glob("illumination_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     n = len(steps)
     if a.local_times.strip():
         # pick the step nearest each requested local solar time (circular in 24 h)

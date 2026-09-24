@@ -13,6 +13,8 @@ contains, each of which was being re-derived at every call site:
 :func:`find_nearest_face`     nearest face to a lat/lon
 :func:`infer_mesh_length_unit`  meters or kilometers, by the engine's own rule
 :func:`local_solar_time_bins`   noon-referenced binning of a per-step field
+:func:`sorted_frame_files`    per-step frames in NUMERIC index order
+:func:`frame_path`            the file holding frame k, either naming
 ============================  =========================================
 
 Nothing here computes physics. These read files, convert units and select
@@ -22,6 +24,7 @@ indices; the temperatures and fluxes were computed by ``ptm_thermal_sim``.
 from __future__ import annotations
 
 import csv
+import re
 import struct
 import warnings
 from collections import namedtuple
@@ -34,15 +37,97 @@ __all__ = [
     "MeshUnitError",
     "MeshUnitReport",
     "TimeAxis",
+    "FRAME_INDEX_MIN_WIDTH",
     "find_nearest_face",
+    "frame_index",
+    "frame_index_width",
+    "frame_path",
     "infer_mesh_length_unit",
     "local_solar_time_bins",
     "read_albedo_map",
     "read_body_positions",
     "read_depth_series",
     "read_time_steps",
+    "sorted_frame_files",
     "subsolar_latlon",
 ]
+
+
+# --- per-step frame names ----------------------------------------------------
+#
+# A per-step product is <run>/<field>/<field>_<index>.bin. Engines before
+# BUGS.md PTM-664 zero-padded <index> to FOUR digits -- a minimum, so frame
+# 10000 was "10000" -- and an alphabetical sort of a run with more than 10,000
+# frames came out 0000 ... 1000, 10000, 10001, ..., 1001. That scrambled a
+# Justitia TWG Case 4 reduction. Current engines pad to
+# max(6, digits(n_frames - 1)). Readers must not rely on either width: sort by
+# the parsed integer, always. These helpers are the one implementation.
+
+#: Minimum index width current engines write (fileio/frame_naming.h).
+FRAME_INDEX_MIN_WIDTH = 6
+
+_FRAME_TAIL = re.compile(r"_(\d+)\.bin$")
+
+
+def frame_index_width(n_frames):
+    """Digits a current engine pads to for a run exporting ``n_frames``."""
+    last = max(int(n_frames) - 1, 0)
+    return max(FRAME_INDEX_MIN_WIDTH, len(str(last)))
+
+
+def frame_index(path):
+    """Integer frame index of ``.../<field>_<index>.bin``, or None."""
+    m = _FRAME_TAIL.search(str(path))
+    return int(m.group(1)) if m else None
+
+
+def sorted_frame_files(directory, field=None):
+    """Per-step frame files in ``directory``, sorted by NUMERIC index.
+
+    ``field`` defaults to the directory's own name (``temperature/`` holds
+    ``temperature_*.bin``). Only names of the exact form
+    ``<field>_<digits>.bin`` are returned, so ``temperature_z0p05m_max.bin``
+    style companions are never mistaken for frames. Works on both naming
+    generations and on a directory that mixes them.
+    """
+    directory = Path(directory)
+    field = directory.name if field is None else field
+    pat = re.compile(r"^" + re.escape(field) + r"_(\d+)\.bin$")
+    found = []
+    for p in directory.glob(f"{field}_*.bin"):
+        m = pat.match(p.name)
+        if m:
+            found.append((int(m.group(1)), p))
+    found.sort(key=lambda t: t[0])
+    idx = [i for i, _ in found]
+    if len(idx) != len(set(idx)):
+        dup = sorted({i for i in idx if idx.count(i) > 1})[:5]
+        raise ValueError(
+            f"{directory}: frame index(es) {dup} exist under more than one "
+            f"zero-padding width; the directory mixes two runs")
+    return [p for _, p in found]
+
+
+def frame_path(directory, field, index, n_frames=0):
+    """The existing file holding frame ``index``, under either naming.
+
+    Tries the current rule's widths first, then the legacy four-digit name.
+    When no file exists, returns the path a current engine WOULD write
+    (width from ``n_frames``), so a caller's "not found" message names a real
+    candidate.
+    """
+    directory = Path(directory)
+    index = int(index)
+    for w in range(FRAME_INDEX_MIN_WIDTH, 13):
+        p = directory / f"{field}_{index:0{w}d}.bin"
+        if p.exists():
+            return p
+        if len(str(index)) > w:
+            break
+    legacy = directory / f"{field}_{index:04d}.bin"
+    if legacy.exists():
+        return legacy
+    return directory / f"{field}_{index:0{frame_index_width(n_frames)}d}.bin"
 
 
 # --- time_steps.txt ---------------------------------------------------------
