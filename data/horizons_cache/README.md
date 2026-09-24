@@ -75,7 +75,7 @@ The tracked set, as of 2026-08-31:
 
 | body | file | what it is |
 |---|---|---|
-| (269) Justitia | `shape.obj` | DAMIT model 2858, the original |
+| (269) Justitia | `shape.obj` | DAMIT model 4966 (asteroid id 2858), the original |
 | (269) Justitia | `shape_reconstructed_20260704.obj` | the superseded 2026-07-04 hand reconstruction (PTM-303), geometrically identical to the original — max vertex deviation 0.000000000 km |
 | (623) Chimaera | `shape.obj` | DAMIT model 9110, the original (byte-identical to a 2026-08-31 re-download) |
 | (623) Chimaera | `shape_refined.obj` | 2-pass Loop subdivision of the above; **this** is what `body_config.yaml` loads, and its generator is not in this repository |

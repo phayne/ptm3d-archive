@@ -2,7 +2,9 @@
 
 ## `shape.obj` — the DAMIT original, tracked since 2026-08-31
 
-DAMIT model **2858** for asteroid (269) Justitia, converted to Wavefront OBJ by
+DAMIT **model 4966** (Marciniak et al. 2025) for asteroid (269) Justitia
+(DAMIT **asteroid** id 2858 -- a different number space; DAMIT *model* 2858
+is an unrelated body), converted to Wavefront OBJ by
 this project's own converter (`src/python/damit/shape_converter.py`) and scaled
 to a mean vertex radius of **25.364 km**, which is `generic_body.shape.radius_km`
 in `body_config.yaml`. **574 vertices, 1144 faces, kilometers.**
@@ -10,7 +12,9 @@ in `body_config.yaml`. **574 vertices, 1144 faces, kilometers.**
 | | |
 |---|---|
 | archive | DAMIT, Astronomical Institute, Charles University, Prague |
-| model page | `https://astro.troja.mff.cuni.cz/projects/damit/asteroids/view/2858` |
+| model page | `https://damit.cuni.cz/projects/damit/asteroid_models/view/4966` |
+| asteroid page | `https://damit.cuni.cz/projects/damit/asteroids/view/2858` (DAMIT asteroid id 2858) |
+| model files | `.../generated_files/open/AsteroidModel/4966/{shape.obj,spin.txt}` |
 | archive reference | Ďurech, J., Sidorin, V., Kaasalainen, M. (2010), *DAMIT: a database of asteroid models*, A&A **513**, A46, doi:10.1051/0004-6361/200912693 |
 | size | 37,311 bytes |
 | md5 | `4e7c109b8a2e17bc3c84bbd8a123a365` |
@@ -26,8 +30,9 @@ model has to be re-fetched, or the mesh scale set by hand.
 (λ, β) = (73°, −81°), which converts to equatorial RA/Dec = (85.069°, −57.852°),
 and the rotation period is 33.1296 h. Those are the values `body_config.yaml`
 and `justitia_spin.tpc` carry (the `.tpc` states the period as a prime-meridian
-rate, 260.8065684617242 °/day = 33.128 h; the 1.4 s difference against DAMIT's
-33.1296 h is the rounding in that conversion, not a second solution). A shape
+rate, 260.8065684617242 °/day = 33.1280 h, which is the JPL HORIZONS/LCDB
+synodic period, NOT DAMIT's sidereal 33.1296 h: they differ by 5.76 s, not by
+rounding. A run that needs DAMIT's own rotational phase must use 33.1296 h). A shape
 model is defined in the body-fixed frame its own pole and period establish, so
 this mesh with a different pole is Justitia pointing the wrong way, and nothing
 downstream re-checks it.
@@ -35,7 +40,11 @@ downstream re-checks it.
 **DAMIT has exactly one model for this asteroid**, so there was no spin solution
 to choose between: `search_asteroid("269")` returns a single exact match,
 `damit_id` 2858, and that is the id `data/horizons_cache/index.json` already
-recorded.
+recorded. That field is the DAMIT **asteroid** id; the one model under it is
+**model 4966** (spin.txt: `73 -81 33.1296` / `2445918 0`, i.e. JD0 = 2445918,
+phi0 = 0). Verified 2026-09-23: DAMIT's `AsteroidModel/4966/shape.obj` has the
+same 1144 face index lists as `shape.obj`, and every vertex equals it after one
+uniform scale factor of 0.7936780 (max residual 5e-9 km).
 
 ## `shape_reconstructed_20260704.obj` — superseded, not on any engine path
 
@@ -48,7 +57,7 @@ md5 `9626bf7eefe8af89ab9ae5cad8bdc021`.
 **It is faithful, and that is now measured rather than assumed.** Compared with
 the DAMIT original re-downloaded on 2026-08-31:
 
-| | reconstruction | DAMIT 2858 |
+| | reconstruction | DAMIT model 4966 |
 |---|---|---|
 | vertices | 574 | 574 |
 | faces | 1144 | 1144 |
