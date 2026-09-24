@@ -42,11 +42,20 @@ def main() -> int:
                     help="chunk directories IN TEMPORAL ORDER (chunk_000 chunk_001 ...)")
     ap.add_argument("--out-dir", required=True, type=Path,
                     help="run-level output dir; frames written to <out-dir>/<field>/")
-    ap.add_argument("--width", type=int, default=4, help="zero-pad width of output index")
+    ap.add_argument("--width", type=int, default=0,
+                    help="zero-pad width of output index; 0 (default) = the engine's rule, "
+                         "max(6, digits(total frames - 1)), so a lexicographic sort of the "
+                         "output is its numeric order (BUGS.md PTM-664)")
     a = ap.parse_args()
 
     dst_dir = a.out_dir / a.field
     dst_dir.mkdir(parents=True, exist_ok=True)
+
+    if a.width <= 0:
+        n_all = sum(1 for cd in a.chunk_dirs if (cd / a.field).is_dir()
+                    for p in (cd / a.field).glob(f"{a.field}_*.bin")
+                    if re.fullmatch(re.escape(a.field) + r"_\d+\.bin", p.name))
+        a.width = max(6, len(str(max(n_all - 1, 0))))
 
     global_idx = 0
     n_total = 0
@@ -58,7 +67,7 @@ def main() -> int:
                   "--keep-time-series).")
             continue
         files = sorted(src_field_dir.glob(f"{a.field}_*.bin"),
-                       key=lambda p: int(re.search(r"(\d+)", p.name).group(1)))
+                       key=lambda p: int(p.name.rsplit("_", 1)[1][:-4]))
         for f in files:
             dst = dst_dir / f"{a.field}_{global_idx:0{a.width}d}.bin"
             if dst.exists():

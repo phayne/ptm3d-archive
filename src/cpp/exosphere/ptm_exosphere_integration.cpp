@@ -1,4 +1,5 @@
 #include "ptm_exosphere_integration.h"
+#include "../fileio/frame_naming.h"
 #include "exosphere_physics.h"
 #include "sputtering_model.h"
 #include "ice_layer_model.h"
@@ -237,13 +238,16 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         int progress_interval = std::max(1, num_timesteps / 4);
 
         for (int t = 0; t < num_timesteps; ++t) {
-            std::stringstream filename;
-            filename << temperature_dir << "/temperature/temperature_"
-                    << std::setfill('0') << std::setw(4) << t << ".bin";  // Changed from setw(3) to setw(4)
-
-            std::ifstream file(filename.str(), std::ios::binary);
-            if (!file.is_open()) {
-                std::cerr << "Failed to open temperature file: " << filename.str() << std::endl;
+            // Either naming generation (BUGS.md PTM-664): >= 6-digit indices
+            // from current engines, 4-digit from runs written before.
+            const std::string frame_path = ptm::resolveFrameFile(
+                temperature_dir + "/temperature", "temperature", t);
+            std::ifstream file(frame_path, std::ios::binary);
+            if (frame_path.empty() || !file.is_open()) {
+                std::cerr << "Failed to open temperature file for step " << t
+                          << " under " << temperature_dir << "/temperature/ "
+                          << "(tried temperature_" << ptm::frameIndexString(t, num_timesteps)
+                          << ".bin and the legacy 4-digit name)" << std::endl;
                 return false;
             }
 

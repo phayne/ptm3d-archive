@@ -841,13 +841,27 @@ struct SimulationConfig {
         double lon_ascending_node_deg = -1.0;
         double arg_perihelion_deg = -1.0;
         double mean_anomaly_deg = -1.0;
+        // Epoch of the osculating elements above (TDB; orbital/epoch_parse.h).
+        // Wired BUGS.md PTM-663: mean_anomaly_deg is M0 AT this epoch. Before
+        // that it was parsed and dropped, and M0 was applied at J2000.
         std::string orbital_epoch = "";
 
         // Spin state (-1 = not specified)
         double spin_period_hours = -1.0;
         double pole_ra_deg = -1.0;
         double pole_dec_deg = -1.0;
+        // Prime meridian angle W0 (degrees) at the spin epoch below, measured
+        // about the pole from the body's reference axis (orbital/body_fixed_frame.cpp):
+        // J2000 ecliptic +x (the vernal equinox) projected onto the body's
+        // equatorial plane, or ecliptic +y if the pole is within 25.8 deg of +x.
+        // W(t) =
+        // W0 + 360 deg * (t - epoch) / period. Wired BUGS.md PTM-663; before
+        // that it was parsed and dropped.
         double prime_meridian_deg = 0.0;
+        bool prime_meridian_set = false;  // the key was present in this file
+        // Epoch of prime_meridian_deg, on the TDB scale (orbital/epoch_parse.h).
+        // "" = J2000 (JD 2451545.0 TDB), which is what every run used before.
+        std::string spin_epoch = "";
 
         // Thermophysical overrides (-1 = use body default)
         double albedo = -1.0;

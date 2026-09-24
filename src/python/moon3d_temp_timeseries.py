@@ -117,8 +117,8 @@ def main() -> int:
     tt = (np.array(t, dtype="datetime64[s]") - np.array(t[0], dtype="datetime64[s]")) / np.timedelta64(1, "D")
 
     # ---- read the time series for only the selected faces ----
-    csteps = sorted((cdir / "temperature").glob("temperature_*.bin"))
-    bsteps = sorted((bdir / "temperature").glob("temperature_*.bin"))
+    csteps = sorted((cdir / "temperature").glob("temperature_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
+    bsteps = sorted((bdir / "temperature").glob("temperature_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     idx = np.array(list(sel.values()))
     Tc = np.array([load_step(p)[idx] for p in csteps])   # (nt, nface)
     Tb = np.array([load_step(p)[idx] for p in bsteps])

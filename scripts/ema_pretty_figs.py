@@ -271,7 +271,7 @@ def lst_bin_diurnal(rundir, lat_max=25.0, nbins=24):
     rundir = Path(rundir)
     lon, lat = read_mesh_lonlat(rundir / "mesh.ply")
     subsolar_lon = read_subsolar_lon_deg(rundir / "body_positions.csv")
-    tfiles = sorted(glob.glob(str(rundir / "temperature" / "temperature_*.bin")))
+    tfiles = sorted(glob.glob(str(rundir / "temperature" / "temperature_*.bin")), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if len(tfiles) != len(subsolar_lon):
         raise RuntimeError(
             f"{rundir}: {len(tfiles)} temperature files but "
@@ -934,7 +934,7 @@ def render_diurnal_animation(
     verts, faces = read_mesh_verts_faces(tdir / "mesh.ply")
     tri_verts = verts[faces]
 
-    tfiles = sorted(glob.glob(str(tdir / "temperature" / "temperature_*.bin")))
+    tfiles = sorted(glob.glob(str(tdir / "temperature" / "temperature_*.bin")), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not tfiles:
         raise RuntimeError(f"no temperature_*.bin files under {tdir/'temperature'}")
 

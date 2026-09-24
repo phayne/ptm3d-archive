@@ -24,6 +24,7 @@
 #include <limits>
 
 #include "ptm_exosphere_integration.h"
+#include "../fileio/frame_naming.h"
 #include "sputtering_model.h"
 #include "exosphere_physics.h"
 #include "ice_crystallization_model.h"
@@ -1273,14 +1274,15 @@ public:
             net_flux_[t].resize(n_faces);
             accumulated_mass_[t].resize(n_faces, 0.0);  // Initialize to zero
             
-            // Build filename
-            std::stringstream filename;
-            filename << ptm_dir << "/temperature/temperature_" 
-                    << std::setfill('0') << std::setw(4) << t << ".bin";
-            
-            std::ifstream file(filename.str(), std::ios::binary);
-            if (!file.is_open()) {
-                std::cerr << "Failed to open temperature file: " << filename.str() << std::endl;
+            // Either naming generation (BUGS.md PTM-664): >= 6-digit indices
+            // from current engines, 4-digit from runs written before.
+            const std::string frame_path = ptm::resolveFrameFile(
+                ptm_dir + "/temperature", "temperature", t);
+            std::ifstream file(frame_path, std::ios::binary);
+            if (frame_path.empty() || !file.is_open()) {
+                std::cerr << "Failed to open temperature file for step " << t
+                          << " under " << ptm_dir << "/temperature/ "
+                          << "(tried the >= 6-digit and legacy 4-digit names)" << std::endl;
                 return false;
             }
             

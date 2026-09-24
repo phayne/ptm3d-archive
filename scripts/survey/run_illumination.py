@@ -145,7 +145,7 @@ def compute_duration_maps(cfg: SurveyConfig) -> bool:
             current_run[:] = 0
             continue
 
-        files = sorted(ds_dir.glob("direct_solar_*.bin"))
+        files = sorted(ds_dir.glob("direct_solar_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
         if len(files) < nt:
             print(f"  L{i:02d}: incomplete ({len(files)}/{nt} timesteps)")
             current_run[:] = 0

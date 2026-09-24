@@ -4,6 +4,9 @@ import os
 import sys
 import struct
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ptm.readers import frame_path as _frame_path  # noqa: E402
 import argparse
 from pathlib import Path
 import time
@@ -116,9 +119,8 @@ def read_data_files(data_dir, pattern, face_count, time_count):
     data = np.zeros((face_count, time_count), dtype=np.float32)
     
     for t in range(1, time_count+1):
-        # Format time step with leading zeros
-        time_str = f"{t:04d}"
-        filename = os.path.join(data_dir, f"{pattern}_{time_str}.bin")
+        # Either naming generation (BUGS.md PTM-664).
+        filename = str(_frame_path(data_dir, pattern, t))
         
         if not os.path.exists(filename):
             print(f"Warning: Missing file {filename}")

@@ -19,6 +19,19 @@ import numpy as np
 import pyvista as pv
 
 
+def _frame_file(directory, name, t):
+    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+
+    Current engines pad the index to >= 6 digits; runs written before used 4.
+    """
+    for w in range(6, 13):
+        p = os.path.join(str(directory), "%s_%0*d.bin" % (name, w, t))
+        if os.path.exists(p):
+            return p
+    return os.path.join(str(directory), "%s_%04d.bin" % (name, t))
+
+
+
 # ──────────────────────────────────────────────────────────────────────
 # I/O helpers
 # ──────────────────────────────────────────────────────────────────────
@@ -75,7 +88,7 @@ def load_all_temperatures(output_dir, n_faces, n_timesteps):
     """Load all temperature timesteps. Returns (n_faces, n_timesteps) array."""
     temps = np.empty((n_faces, n_timesteps), dtype=np.float32)
     for t in range(n_timesteps):
-        fpath = os.path.join(output_dir, "temperature", f"temperature_{t:04d}.bin")
+        fpath = _frame_file(os.path.join(output_dir, "temperature"), "temperature", t)
         temps[:, t] = load_binary_timestep(fpath, n_faces)
     return temps
 

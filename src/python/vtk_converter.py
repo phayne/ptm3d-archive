@@ -15,6 +15,11 @@ import tempfile
 from pathlib import Path
 import time
 import numpy as np
+
+# Per-step frames under either naming generation (BUGS.md PTM-664): >= 6-digit
+# indices from current engines, 4-digit from older runs.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ptm.readers import frame_path as _frame_path  # noqa: E402
 import gc
 import concurrent.futures
 import multiprocessing as mp
@@ -456,7 +461,7 @@ def process_batch_timesteps(batch_info):
         # Read data
         data = {}
         for dtype in data_types:
-            file_path = input_dir / dtype / f"{dtype}_{t:04d}.bin"
+            file_path = _frame_path(input_dir / dtype, dtype, t)
             data[dtype] = read_binary_timestep_vectorized(str(file_path), num_faces)
         
         # Write VTU
@@ -710,7 +715,7 @@ def export_timesteps_to_numpy(output_file, input_dir, data_types, timesteps_to_p
         dtype_data = np.zeros((len(timesteps_to_process), num_faces), dtype=np.float32)
         
         for idx, t in enumerate(timesteps_to_process):
-            file_path = input_dir / dtype / f"{dtype}_{t:04d}.bin"
+            file_path = _frame_path(input_dir / dtype, dtype, t)
             data = read_binary_timestep_vectorized(str(file_path), num_faces)
             if data is not None:
                 dtype_data[idx, :] = data
@@ -983,7 +988,7 @@ Examples:
                 # Read data
                 data = {}
                 for dtype in data_types:
-                    file_path = input_dir / dtype / f"{dtype}_{t:04d}.bin"
+                    file_path = _frame_path(input_dir / dtype, dtype, t)
                     data[dtype] = read_binary_timestep_vectorized(str(file_path), num_faces)
                 
                 # Write VTU
@@ -1061,7 +1066,7 @@ Examples:
                 # Read all timesteps for this data type
                 dtype_data = np.zeros((len(timesteps_to_process), num_faces), dtype=np.float32)
                 for idx, t in enumerate(timesteps_to_process):
-                    file_path = input_dir / dtype / f"{dtype}_{t:04d}.bin"
+                    file_path = _frame_path(input_dir / dtype, dtype, t)
                     data = read_binary_timestep_vectorized(str(file_path), num_faces)
                     if data is not None:
                         dtype_data[idx, :] = data
@@ -1120,7 +1125,7 @@ Examples:
                 print(f"  Reading {dtype} for HDF5...")
                 dtype_data = np.zeros((len(timesteps_to_process), num_faces), dtype=np.float32)
                 for idx, t in enumerate(timesteps_to_process):
-                    file_path = input_dir / dtype / f"{dtype}_{t:04d}.bin"
+                    file_path = _frame_path(input_dir / dtype, dtype, t)
                     data = read_binary_timestep_vectorized(str(file_path), num_faces)
                     if data is not None:
                         dtype_data[idx, :] = data

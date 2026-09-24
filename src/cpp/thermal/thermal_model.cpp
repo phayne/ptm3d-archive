@@ -2720,16 +2720,41 @@ void Model::run() {
         // equilibration prefix. With a prefix (the default) row 0 is an
         // equilibration step that is never exported, and the exported index 0
         // is a row below -- which does get the corrected surface.
+        //
+        // A WARM START IS THE EXCEPTION (BUGS.md PTM-662). A restored
+        // checkpoint is the column the previous chunk integrated to exactly
+        // this epoch, and that chunk -- like a single-shot run passing through
+        // the same epoch -- reported this frame with the surface re-solved at
+        // flux[0] (the "FORCING EPOCH" re-evaluation in the loop below). Filing
+        // the checkpoint's raw node instead put a different number under the
+        // seam frame than the unchunked run (0.44 K on
+        // scripts/test_chunk_seam_equivalence.py). So on a warm start row 0 is
+        // re-evaluated exactly as every other row is: read-only, Qs is already
+        // flux[0] (surfFlux() above), nothing is written back.
+        if (warm_started) {
+            T(0, 0) = outputSurfaceTemp(profile, Qs, planet.Qb);
+        }
         lt(0) = output_time_points[0];
         progressBar.update(1);
 
-        // Small initial settling. Unchanged, so every output from index 1 on is
-        // bit-identical to before: it perturbs the initial condition by 0.4*dt
-        // of integration at Qs(t_0), which the solver then forgets.
-        double initial_dt = dt / 10.0;
-        for (int i = 0; i < 4; i++) {
-            profile.update_T(initial_dt, Qs, planet.Qb);
-            t += initial_dt;
+        // Small initial settling, COLD START ONLY. Unchanged there, so every
+        // output from index 1 on is bit-identical to before: it perturbs the
+        // initial condition by 0.4*dt of integration at Qs(t_0), which the
+        // solver then forgets.
+        //
+        // Skipped on a warm start (BUGS.md PTM-662). There the perturbation is
+        // not forgotten on the timescale of a chunk: a continuous run passes
+        // through the seam epoch without it, so applying it to a restored
+        // column made every frame of the next chunk differ from the unchunked
+        // run -- measured 0.14 K on frames well past the seam on the scalar
+        // arm of scripts/test_chunk_seam_equivalence.py. A restored column is
+        // already a converged state; it has nothing to settle.
+        if (!warm_started) {
+            double initial_dt = dt / 10.0;
+            for (int i = 0; i < 4; i++) {
+                profile.update_T(initial_dt, Qs, planet.Qb);
+                t += initial_dt;
+            }
         }
         t = output_time_points[0];
 
