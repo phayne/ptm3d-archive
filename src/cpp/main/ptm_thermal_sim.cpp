@@ -2138,6 +2138,28 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
 // because the SIMD batch solver below takes an optional triple of these.
 using FluxFn = std::function<double(size_t,int)>;
 
+// Re-entry of the CPU SIMD-batch driver for the radiation-coupling re-thermal
+// (BUGS.md PTM-665). The coupled CPU run solved the whole mesh on this
+// integrator and then re-integrated every face carrying indirect flux on the
+// SCALAR one (Model::run), whose flux sampling lags by half a substep; the
+// selected faces moved by the two solvers' difference even at zero exchange
+// (0.26 K on Justitia). With a subset, the SAME driver re-integrates only the
+// batches that hold a selected face, from the SAME inputs as the whole-mesh
+// solve plus `extra_flux` on the selected faces:
+//   faces       global indices to re-integrate (the coupling selection)
+//   extra_flux  per-GLOBAL-face absorbed flux ADDED at every step, [f][t];
+//               read only for faces in `faces` (the time-varying indirect)
+// Batch-mates of a selected face are integrated too (the batch is the SIMD
+// unit) but are NOT products of this pass: the caller copies back only the
+// selected faces, and the location-column recorder skips the mates.
+// Report-only products -- spin-up / certificate / anchor censuses, the seed
+// recorder, the PTM-51 dump -- are NOT emitted by a subset pass: they would
+// print whole-mesh-looking banners over a selection. Streamed mode is refused.
+struct SimdFaceSubset {
+    const std::vector<int>* faces = nullptr;
+    const std::vector<std::vector<double>>* extra_flux = nullptr;
+};
+
 // SIMD batch thermal solver (SIMD-over-pixels)
 bool runThermalModelsForAllFacesBatchSoA(
     const std::string& thermal_output_dir,
@@ -2173,7 +2195,9 @@ bool runThermalModelsForAllFacesBatchSoA(
     // three is fatal, not silently array mode.
     FluxFn get_direct    = FluxFn(),
     FluxFn get_reflected = FluxFn(),
-    FluxFn get_ir        = FluxFn());
+    FluxFn get_ir        = FluxFn(),
+    // Radiation-coupling re-thermal of a face subset (BUGS.md PTM-665).
+    const SimdFaceSubset* subset = nullptr);
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
 // normal-incidence Bond albedo A0. Composes:
@@ -6477,11 +6501,52 @@ bool runThermalModelsForAllFacesBatchSoA(
     const std::string& final_state_file,
     FluxFn get_direct,
     FluxFn get_reflected,
-    FluxFn get_ir)
+    FluxFn get_ir,
+    const SimdFaceSubset* subset)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     const size_t n_batches = (n_faces + BS - 1) / BS;
+
+    // ---- face subset (BUGS.md PTM-665) ------------------------------------
+    const bool is_subset = (subset != nullptr);
+    std::vector<char> subset_batch_active;   // per batch; empty = all active
+    std::vector<char> subset_face_selected;  // per global face
+    if (is_subset) {
+        if (!subset->faces || !subset->extra_flux) {
+            std::cerr << "[SIMD Batch] FATAL: a face-subset pass needs both the face "
+                         "list and the extra-flux series.\n";
+            return false;
+        }
+        if (subset->extra_flux->size() != n_faces) {
+            std::cerr << "[SIMD Batch] FATAL: subset extra_flux has "
+                      << subset->extra_flux->size() << " rows for " << n_faces
+                      << " faces.\n";
+            return false;
+        }
+        subset_batch_active.assign(n_batches, 0);
+        subset_face_selected.assign(n_faces, 0);
+        for (int gf : *subset->faces) {
+            if (gf < 0 || static_cast<size_t>(gf) >= n_faces ||
+                (*subset->extra_flux)[static_cast<size_t>(gf)].size() !=
+                    static_cast<size_t>(total_time_steps)) {
+                std::cerr << "[SIMD Batch] FATAL: subset face " << gf
+                          << " is out of range or its extra-flux series is not "
+                          << total_time_steps << " steps long.\n";
+                return false;
+            }
+            subset_face_selected[static_cast<size_t>(gf)] = 1;
+            subset_batch_active[static_cast<size_t>(gf) / BS] = 1;
+        }
+        size_t n_active = 0;
+        for (char c : subset_batch_active) n_active += (c != 0);
+        std::cerr << "[SIMD Batch] re-thermal subset: " << subset->faces->size()
+                  << " selected face(s) in " << n_active << " of " << n_batches
+                  << " batches of " << BS << " (" << std::min(n_active * BS, n_faces)
+                  << " faces integrated; batch-mates are not copied back or recorded)."
+                     " The whole-mesh absorbed flux is"
+                     " re-composed for this pass.\n";
+    }
 
     // ---- STREAMED MODE (perf/streamed-simd-batch) --------------------------
     // Above the 10 GB illumination estimate the engine cannot materialize the
@@ -6496,6 +6561,11 @@ bool runThermalModelsForAllFacesBatchSoA(
     // is streaming while the solver silently reads empty arrays.
     const int n_getters = (get_direct ? 1 : 0) + (get_reflected ? 1 : 0) + (get_ir ? 1 : 0);
     const bool streamed = (n_getters == 3);
+    if (is_subset && n_getters != 0) {
+        std::cerr << "[SIMD Batch] FATAL: a face-subset re-thermal cannot run in "
+                     "streamed mode (radiation coupling always extracts the arrays).\n";
+        return false;
+    }
     if (n_getters != 0 && n_getters != 3) {
         std::cerr << "[SIMD Batch] FATAL: streamed mode needs all three flux "
                      "getters (direct, reflected, IR); " << n_getters
@@ -6675,13 +6745,28 @@ bool runThermalModelsForAllFacesBatchSoA(
         std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
                      " indirect flux over steps [0, " << eq_hi << ").\n";
     }
+    // Subset pass: the time-varying indirect flux on the selected faces, at
+    // every step. Added LAST, after the base composition and eq_indirect, so a
+    // zero series leaves the forcing bit-identical to the whole-mesh solve's.
+    if (is_subset) {
+        #pragma omp parallel for schedule(static)
+        for (int t = 0; t < total_time_steps; ++t) {
+            double* col = &flux_column_major[static_cast<size_t>(t) * n_faces];
+            for (int gf : *subset->faces)
+                col[gf] += (*subset->extra_flux)[static_cast<size_t>(gf)][t];
+        }
+    }
     }   // end array mode
 
     // Initialize output
     if (surface_temps_out) {
         surface_temps_out->resize(n_faces);
-        for (auto& v : *surface_temps_out) {
-            v.resize(total_time_steps, 0.0);
+        // A subset pass sizes only the rows of the batches it integrates, so
+        // re-thermaling a few faces of a large mesh does not allocate a second
+        // whole-mesh series (the caller copies the selected rows back).
+        for (size_t gf = 0; gf < n_faces; ++gf) {
+            if (is_subset && !subset_batch_active[gf / BS]) continue;
+            (*surface_temps_out)[gf].resize(total_time_steps, 0.0);
         }
     }
 
@@ -7047,7 +7132,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                            eq_cert_early_batches{0};
 
     std::unique_ptr<thermal::EqSpinupCensus> g_spinup_census;
-    if (thermal::eqCertificateEnabled()) {
+    if (thermal::eqCertificateEnabled() && !is_subset) {
         g_spinup_census.reset(new thermal::EqSpinupCensus(
             planet.day, eq_target_K,
             /*precision_floor_K=*/0.0,
@@ -7063,6 +7148,13 @@ bool runThermalModelsForAllFacesBatchSoA(
     // second pass restore the first pass's results. The dispatch already
     // refuses the coupled run that causes it, and this is the backstop for any
     // other route to a second entry.
+    if (is_subset && g_batch_ckpt.requested) {
+        // Unreachable today (batch_checkpoint + radiation is refused at
+        // startup), stated so a future path cannot bank a subset's partials.
+        std::cerr << "[SIMD Batch] FATAL: a face-subset re-thermal cannot run with "
+                     "thermal.batch_checkpoint on.\n";
+        return false;
+    }
     const bool bc_on = g_batch_ckpt.requested;
     if (bc_on && ++g_batch_ckpt.entries > 1) {
         std::cerr << "\n[SIMD Batch] FATAL: the whole-mesh thermal driver was "
@@ -7185,6 +7277,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
         #pragma omp for schedule(dynamic, 1)
         for (size_t batch_idx = 0; batch_idx < n_batches; ++batch_idx) {
+            if (is_subset && !subset_batch_active[batch_idx]) continue;
             size_t start_face = batch_idx * BS;
             size_t end_face = std::min(start_face + BS, n_faces);
             int faces_in_batch = static_cast<int>(end_face - start_face);
@@ -7426,8 +7519,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                     const thermal::EqSeedResult sres =
                         thermal::eqSeedColumn(sin_, T_col);
                     if (sres.clamped_low) ++seed_floor_faces;
-                    simd_anchor_census.add(sres);
-                    thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
+                    if (!is_subset) {
+                        simd_anchor_census.add(sres);
+                        thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
+                    }
 
                     batch.T_eq_init[f] = sres.T_surface;
                     for (int layer = 0; layer < n_layers; ++layer)
@@ -8003,6 +8098,9 @@ bool runThermalModelsForAllFacesBatchSoA(
             // equilibration prefix, which is the row set it has always had.
             if (locationColumnsOn()) {
                 for (int f = 0; f < faces_in_batch; ++f) {
+                    // Subset pass: only the SELECTED faces are this pass's to
+                    // record; a batch-mate keeps its whole-mesh column.
+                    if (is_subset && !subset_face_selected[start_face + f]) continue;
                     const int slot = locationColumnSlot(start_face + f);
                     if (slot >= 0)
                         g_loc_columns.series.record(slot, 0, &batch.T[f], BS,
@@ -8091,6 +8189,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // statistics/temperature_*.bin is reduced from.
                 if (locationColumnsOn()) {
                     for (int f = 0; f < faces_in_batch; ++f) {
+                        if (is_subset && !subset_face_selected[start_face + f]) continue;
                         const int slot = locationColumnSlot(start_face + f);
                         if (slot < 0) continue;
                         const double surf =
@@ -8266,7 +8365,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // whether or not it stopped anything -- "it ran the full count and is still
     // 6 K short" is the answer a user most needs and the one a silent
     // implementation would withhold.
-    if (g_eq_cert_census) {
+    if (g_eq_cert_census && !is_subset) {
         const long long nb = eq_cert_batches.load();
         const double mean_cycles = (nb > 0)
             ? static_cast<double>(eq_cert_cycles_sum.load()) / static_cast<double>(nb)
@@ -8284,7 +8383,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // PTM-51 diagnostic: write the per-face seed terms and the analytic
     // equilibration forcing that actually drove the column.
-    if (dump_eq_seed) {
+    if (dump_eq_seed && !is_subset) {
         std::ofstream fh(eq_seed_dump_path);
         if (!fh) {
             std::cerr << "[PTM-51 dump] WARNING: cannot open '" << eq_seed_dump_path
@@ -8363,8 +8462,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "cp(T) is not defined below that."
                   << std::endl;
     }
-    simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
-    thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
+    if (!is_subset) {
+        simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
+        thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
+    }
 
     // End timing
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -23508,7 +23609,82 @@ int main(int argc, char** argv) {
                                      " carry it), or drop output.map_depths_m.\n";
                         return 1;
                     }
-                    if (!use_gpu_thermal_rerun) {
+                    // ---- CPU re-thermal on the SIMD-batch integrator (BUGS.md PTM-665)
+                    // The whole mesh was solved by runThermalModelsForAllFacesBatchSoA
+                    // (the default CPU path), so the selected faces are re-integrated
+                    // by that SAME driver, from the SAME inputs (illumination arrays,
+                    // per-face Qb and H, checkpoint), plus their time-varying indirect
+                    // flux. Before this, they went through the scalar Model::run,
+                    // whose flux sampling lags by half a substep: on Justitia TWG
+                    // Case 3 (convex, exchange <= 2.4e-5 W/m^2) four faces moved
+                    // 0.26 K with radiation ON, matching the scalar solver's own
+                    // radiation-off answer to 2e-5 K. Measured against a 4608-step
+                    // reference the SIMD integrator is the more accurate of the two
+                    // (mean |dT| 0.20 vs 0.28 K at the production substep), so it is
+                    // the one kept. --no-simd-batch still re-thermals on the scalar
+                    // integrator -- the same solver as ITS whole-mesh solve.
+                    //
+                    // The indirect series goes in over the WHOLE span, equilibration
+                    // included, exactly as the scalar combined_flux did; so the
+                    // equilibration-mean term eq_indirect_vec is zeroed on the
+                    // selected faces (it would double-count there) and passed
+                    // unchanged for everyone else.
+                    bool simd_rethermal_done = false;
+                    if (!use_gpu_thermal_rerun &&
+                        thermal_config.getPropertyBool("use_simd_batch", true)) {
+                        ptm::discloseRethermalPath(
+                            ptm::RethermalPath::CpuSimdBatchFaces,
+                            thermal_config.getPropertyBool("use_gpu_thermal", false)
+                                ? "the GPU re-thermal failed and fell back; the CPU "
+                                  "SIMD-batch integrator re-integrates the selection"
+                                : "the whole mesh was solved by the CPU SIMD-batch "
+                                  "integrator; the selection is re-integrated by it");
+                        if (want_post_coupling_state) {
+                            std::cerr << "  [Re-thermal] WARNING: CPU re-thermal path — no T(z)"
+                                         " column is handed back, so the chunk checkpoint keeps"
+                                         " iter-0's UN-COUPLED column for these "
+                                      << faces_to_rerun.size() << " faces (BUGS.md PTM-57)."
+                                         " The next chunk will cold-start them.\n";
+                        }
+                        std::vector<double> eqi_subset = eq_indirect_vec;
+                        for (int f : faces_to_rerun)
+                            if (static_cast<size_t>(f) < eqi_subset.size())
+                                eqi_subset[static_cast<size_t>(f)] = 0.0;
+                        SimdFaceSubset sub;
+                        sub.faces      = &faces_to_rerun;
+                        sub.extra_flux = &indirect_flux_series;
+                        std::vector<std::vector<double>> rethermal_temps;
+                        const std::vector<double>* face_H_ptr_r =
+                            planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+                        const bool ok_simd = runThermalModelsForAllFacesBatchSoA(
+                            output_dir, mesh, direct_solar_values, primary_reflected_values,
+                            primary_ir_values, times, total_time_steps,
+                            thermal_config, default_visible_albedo, &rethermal_temps,
+                            equilibration_steps, total_time_steps, thermal_threads,
+                            face_Qb.empty() ? nullptr : &face_Qb, face_H_ptr_r, eqi_subset,
+                            sim_config.thermal.initial_state_file,
+                            /*final_state_file=*/"",
+                            FluxFn(), FluxFn(), FluxFn(), &sub);
+                        if (!ok_simd) {
+                            std::cerr << "\nFATAL: the SIMD-batch re-thermal of "
+                                      << faces_to_rerun.size() << " selected face(s) failed"
+                                         " in coupling iteration " << (iter + 1)
+                                      << ". Refusing to write results.\n";
+                            return 1;
+                        }
+                        for (int f : faces_to_rerun) {
+                            auto& row = rethermal_temps[static_cast<size_t>(f)];
+                            if (row.size() != static_cast<size_t>(total_time_steps)) {
+                                std::cerr << "\nFATAL: SIMD re-thermal returned no series for"
+                                             " face " << f << ".\n";
+                                return 1;
+                            }
+                            surface_temps[static_cast<size_t>(f)].swap(row);
+                        }
+                        simd_rethermal_done = true;
+                    }
+
+                    if (!use_gpu_thermal_rerun && !simd_rethermal_done) {
                         // Hayne (2017) parameters — match iter-0.
                         const double a_coef = (planet.albedoCoef.size() >= 2)
                                             ? planet.albedoCoef[0] : 0.0;
@@ -23548,7 +23724,7 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    if (!use_gpu_thermal_rerun) {
+                    if (!use_gpu_thermal_rerun && !simd_rethermal_done) {
                         // The CPU re-thermal returns surface temperatures only —
                         // runThermalModelWithMatchedTimes keeps no T(z) column —
                         // so a chunk checkpoint written after a CPU re-thermal
@@ -23571,31 +23747,8 @@ int main(int argc, char** argv) {
                         ptm::discloseRethermalPath(
                             ptm::RethermalPath::CpuScalarFaces,
                             "no GPU thermal, or the GPU re-thermal failed and fell back");
-                        // BUGS.md PTM-665. The whole mesh was solved by the CPU
-                        // SIMD batch integrator; the selected faces are now
-                        // re-integrated by the SCALAR one (Model::run), whose
-                        // discretization differs. So a selected face moves by
-                        // the two solvers' difference even when its indirect
-                        // flux is zero -- measured on Justitia TWG Case 3 (a
-                        // convex mesh, q_ind <= 2.4e-5 W/m^2): 0.26 K on 4
-                        // faces, equal to 2e-5 K to what the scalar solver gives
-                        // the same faces with radiation OFF. Said out loud; the
-                        // fix (re-thermal on the SIMD integrator) is owed.
-                        // Only when the whole mesh WAS the CPU SIMD solve: after a
-                        // failed GPU re-thermal the mesh was solved on the GPU,
-                        // and the GPU-vs-CPU warning above already covers it.
-                        if (thermal_config.getPropertyBool("use_simd_batch", true) &&
-                            !thermal_config.getPropertyBool("use_gpu_thermal", false)) {
-                            std::cerr << "  [Re-thermal] WARNING: the whole mesh was solved by the"
-                                         " CPU SIMD batch integrator, but these "
-                                      << faces_to_rerun.size()
-                                      << " face(s) are re-integrated by the CPU SCALAR one."
-                                         " The two discretizations differ (0.26 K measured on"
-                                         " Justitia, BUGS.md PTM-665), and that difference lands"
-                                         " on exactly the coupled faces whatever their indirect"
-                                         " flux. Compare against a --no-simd-batch run before"
-                                         " reading a sub-kelvin coupling signal.\n";
-                        }
+                        // BUGS.md PTM-665: reached only under --no-simd-batch now,
+                        // where this scalar integrator IS the whole-mesh solver.
                         // CPU path: OpenMP parallel loop
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
                         std::atomic<int> rerun_completed{0};
