@@ -510,15 +510,18 @@ struct DiurnalAverages {
             // it. The old single (sublimation + sputtering) ratio let deposition
             // exceed sublimation whenever the two sources lost ice availability
             // at different rates (sublimation is equatorial, sputtering trailing).
-            double s_now = 0.0, p_now = 0.0;
-            #pragma omp parallel for reduction(+:s_now,p_now)
+            // Face-order (deterministic) sums: an OpenMP reduction here made the
+            // deposition scale, and so every face's state, vary by an ulp with the
+            // thread count and run to run (PTM-645; flaked the PTM-644 equilibrium test).
+            #pragma omp parallel for
             for (size_t i = 0; i < n; ++i) {
-                double sublim_scaled = base_sublimation_flux[i] * ice_availability[i];
-                double sput_scaled = base_sputtering_flux[i] * ice_availability[i];
-                avg_sublimation_flux[i] = sublim_scaled;
-                avg_sputtering_flux[i] = sput_scaled;
-                s_now += sublim_scaled * face_areas[i];
-                p_now += sput_scaled * face_areas[i];
+                avg_sublimation_flux[i] = base_sublimation_flux[i] * ice_availability[i];
+                avg_sputtering_flux[i] = base_sputtering_flux[i] * ice_availability[i];
+            }
+            double s_now = 0.0, p_now = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                s_now += avg_sublimation_flux[i] * face_areas[i];
+                p_now += avg_sputtering_flux[i] * face_areas[i];
             }
             const double scale_s = (total_base_sublimation > 1e-30) ? s_now / total_base_sublimation : 1.0;
             double scale_p = (total_base_sputter > 1e-30) ? p_now / total_base_sputter : 1.0;
@@ -545,13 +548,13 @@ struct DiurnalAverages {
         // Pass 1: Compute scaled emission per face and global total (fused with reduction)
         double total_current_emission = 0.0;
 
-        #pragma omp parallel for reduction(+:total_current_emission)
+        #pragma omp parallel for
         for (size_t i = 0; i < n; ++i) {
-            double sublim_scaled = base_sublimation_flux[i] * ice_availability[i];
-            double sput_scaled = base_sputtering_flux[i] * ice_availability[i];
-            avg_sublimation_flux[i] = sublim_scaled;
-            avg_sputtering_flux[i] = sput_scaled;
-            total_current_emission += (sublim_scaled + sput_scaled) * face_areas[i];
+            avg_sublimation_flux[i] = base_sublimation_flux[i] * ice_availability[i];
+            avg_sputtering_flux[i] = base_sputtering_flux[i] * ice_availability[i];
+        }
+        for (size_t i = 0; i < n; ++i) {  // face order: deterministic (PTM-645)
+            total_current_emission += (avg_sublimation_flux[i] + avg_sputtering_flux[i]) * face_areas[i];
         }
 
         // Deposition scales with total emission (both now area-weighted [kg/s])
@@ -790,6 +793,7 @@ private:
         }
     };
     StepBuffers step_buffers_;
+    bool predict_skip_solve_ = false;
 
 public:
     /**
@@ -1206,7 +1210,13 @@ public:
                                const IceLayerState& ice_state,
                                const std::vector<double>& face_areas,
                                double epoch_duration,
-                               std::vector<double>& nonice_out) {
+                               std::vector<double>& nonice_out,
+                               bool solve_deposition = true) {
+        // solve_deposition = false (PTM-657): hold deposition at its start-of-step
+        // scale instead of solving the step-consistent scale; ~7x cheaper, and
+        // adequate for the albedo step limiter, which only needs where the albedo
+        // is heading (the step itself is still solved).
+        predict_skip_solve_ = !solve_deposition;
         const EvolutionStatistics saved = stats_;
         nonice_out.resize(num_faces_);
         evolveEpochImpl(ice_model, const_cast<IceLayerState&>(ice_state), face_areas, epoch_duration,
@@ -1215,6 +1225,7 @@ public:
         stats_ = saved;
         stats_.prediction_evaluations += evals;
         ++stats_.predictions;
+        predict_skip_solve_ = false;
     }
 
 private:
@@ -1292,7 +1303,7 @@ private:
         }
 
         int iterations = 0;
-        if (consistent && (active[0] || active[1])) {
+        if (consistent && (active[0] || active[1]) && !(predict_only && predict_skip_solve_)) {
             double G[2], g[2];
             evaluate(s, G);
             residual(G, s, g);

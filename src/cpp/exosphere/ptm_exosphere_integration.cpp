@@ -1983,8 +1983,12 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // threshold is exceeded, EVERY face is rescaled from its own baseline:
         // T_new = T_ref * ((1 - A_new) / (1 - A_ref))^(1/4)
         const double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
+        // PTM-657: in the face-local mode only faces whose deviation exceeds
+        // local_refresh_fraction_ x threshold are rescaled (and re-based); the rest
+        // keep their temperatures, which stay within the threshold by construction.
+        const double rescale_min = localRefreshEnabled() ? local_refresh_fraction_ * threshold : 0.0;
         const AlbedoRefreshResult r = albedo_refresh_.update(current_face_albedos_,
-                                                             surface_temperatures_, threshold);
+                                                             surface_temperatures_, threshold, rescale_min);
         if (!r.fired) return false;
         max_refresh_deviation_ = std::max(max_refresh_deviation_, r.max_deviation);
 
@@ -2230,6 +2234,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 multiscale_evolution_->cacheBaseFluxesUnscaled(
                     *ice_layer_model_, *ice_layer_state_, unscaled_sublimation_,
                     unscaled_sputtering_, face_areas_, epoch);
+                if (last_refresh_local_) {
+                    applyRepresentedSourceTotals();
+                    ++local_refresh_count_;
+                }
                 reportSputterAudit(("full diurnal, epoch " + std::to_string(epoch)).c_str());
                 if (final_state) final_pass_full_diurnal = true;
                 else full_diurnal_count++;
@@ -2320,25 +2328,60 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                         const auto t_lim0 = std::chrono::steady_clock::now();
                         const double thr = albedo_mapper_->getConfig().albedo_update_threshold;
                         std::vector<double> c_pred, a_pred;
+                        double last_dev = 0.0;
                         auto exceeds = [&](int n) {
                             multiscale_evolution_->predictConcentrations(
-                                *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration * n, c_pred);
+                                *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration * n, c_pred,
+                                /*solve_deposition=*/false);
                             albedo_mapper_->computeAlbedos(c_pred, a_pred);
-                            return albedo_refresh_.maxDeviation(a_pred) > thr;
+                            last_dev = albedo_refresh_.maxDeviation(a_pred);
+                            return last_dev > thr;
                         };
                         albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration, a_pred);
-                        if (albedo_refresh_.maxDeviation(a_pred) > thr) {
+                        const double dev0 = albedo_refresh_.maxDeviation(a_pred);  // at n = 0 (current)
+                        if (dev0 > thr) {
                             // The one-epoch step already passed the threshold: refresh next.
                             safe_extra = 0;
                             auto& st = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
                             ++st.steps_albedo_limited;
                         } else if (exceeds(safe_extra)) {
-                            // Smallest n in [1, safe_extra] with exceeds(n) (bisection; the
-                            // deviation grows with n over one step).
-                            int lo = 0, hi = safe_extra;   // exceeds(hi) true; lo = no-extra
+                            // Smallest n in [1, safe_extra] with exceeds(n); the deviation
+                            // grows with n over one step. Bracket [lo, hi] with exceeds(hi),
+                            // !exceeds(lo); the next trial interpolates the deviation linearly
+                            // to the threshold, with a bisection step whenever the bracket did
+                            // not halve (PTM-657). Same n as pure bisection for a monotone
+                            // deviation (checked with PTM657_CHECK_SEARCH=1).
+                            int lo = 0, hi = safe_extra;
+                            double dlo = dev0, dhi = last_dev;
+                            int width_before = hi - lo;
+                            bool use_interp = true;
                             while (hi - lo > 1) {
-                                const int mid = lo + (hi - lo) / 2;
-                                if (exceeds(mid)) hi = mid; else lo = mid;
+                                int mid;
+                                if (use_interp && dhi > dlo) {
+                                    const double x = lo + (thr - dlo) / (dhi - dlo) * (hi - lo);
+                                    mid = static_cast<int>(std::ceil(x));
+                                } else {
+                                    mid = lo + (hi - lo) / 2;
+                                }
+                                mid = std::min(hi - 1, std::max(lo + 1, mid));
+                                if (exceeds(mid)) { hi = mid; dhi = last_dev; }
+                                else { lo = mid; dlo = last_dev; }
+                                // Safeguard: interpolate only while it at least halves the bracket.
+                                const int width = hi - lo;
+                                use_interp = (2 * width <= width_before);
+                                width_before = width;
+                            }
+                            if (std::getenv("PTM657_CHECK_SEARCH")) {
+                                // Debug cross-check: pure bisection must give the same n.
+                                int blo = 0, bhi = safe_extra;
+                                while (bhi - blo > 1) {
+                                    const int bm = blo + (bhi - blo) / 2;
+                                    if (exceeds(bm)) bhi = bm; else blo = bm;
+                                }
+                                if (bhi != hi) {
+                                    throw std::logic_error("PTM-657 step-limiter search: interpolated n " +
+                                                           std::to_string(hi) + " != bisection n " + std::to_string(bhi));
+                                }
                             }
                             safe_extra = hi;
                             auto& st = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
@@ -2401,6 +2444,12 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         {
             const auto& st = multiscale_evolution_->getStatistics();
             if (albedo_coupling_enabled_) {
+                std::cout << "    Albedo refresh (PTM-657): "
+                          << (localRefreshEnabled() ? "face-local" : "GLOBAL") << ", " << local_refresh_count_
+                          << " local refreshes updating " << local_sources_sub_ << " sublimation and "
+                          << local_sources_sput_ << " sputter sources in total (tolerance "
+                          << std::scientific << std::setprecision(1) << local_refresh_tol_ << std::fixed
+                          << ")" << std::endl;
                 std::cout << "    Albedo step limiter (PTM-640): " << (albedo_step_limit_ ? "on" : "OFF (legacy)")
                           << ", " << st.steps_albedo_limited << " steps limited, " << st.predictions
                           << " predictions (" << st.prediction_evaluations << " solver evaluations), "
@@ -2485,6 +2534,114 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Reset export mode flag
         multiscale_export_mode_ = false;
+    }
+
+    bool PTMExosphereIntegration::localRefreshEnabled() const {
+        return local_refresh_ && multiscale_evolution_ &&
+               multiscale_evolution_->getConfig().superstep_consistent_deposition &&
+               spatialSmoothingRadiusRad() == 0.0 &&
+               (!sputtering_enabled_ || sputterTransportActive());
+    }
+
+    void PTMExosphereIntegration::localTransportUpdate(TransportCache& cache,
+                                                       const std::vector<double>& T_new,
+                                                       const std::vector<double>& e_new,
+                                                       bool apply_jeans, bool private_index,
+                                                       bool temperature_dependent,
+                                                       std::vector<double>& deposition,
+                                                       long long& sources_updated) {
+        // PTM-657. The cache holds the raw (uncorrected) transport sums R and the
+        // calibration sums C of a source field (cache.src, cache.temp): exactly what
+        // a full computeTransportProduct call accumulates before its row-bias
+        // correction and mass fix. Both are sums over sources of per-source terms,
+        // so updating the sources in U changes them by
+        //   R += K(T_new) e_new - K(T_old) e_old,  C += K(T_new) a - K(T_old) a   (i in U),
+        // and finalizeTransport(R, C) then equals a full call on the updated source
+        // field to rounding. U is the smallest set of sources, taken in decreasing
+        // order of mismatch, such that the sources left out differ from the current
+        // field by at most tol of the total emission (emission mismatch plus emission
+        // x relative temperature change) and, for the temperature-dependent kernel,
+        // tol of the total area in area x relative temperature change (calibration).
+        // tol = 0 updates every source that changed at all (exact).
+        const size_t n = static_cast<size_t>(num_faces_);
+        const double tol = local_refresh_tol_;
+        std::vector<char> mask(n, 0);
+        auto select = [&](const std::vector<double>& metric, double budget) {
+            std::vector<size_t> idx;
+            idx.reserve(n);
+            double total = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (metric[i] > 0.0) { idx.push_back(i); total += metric[i]; }
+            }
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return metric[a] > metric[b]; });
+            double left = total;
+            for (size_t i : idx) {
+                if (left <= budget) break;
+                mask[i] = 1;
+                left -= metric[i];
+            }
+        };
+        std::vector<double> m_e(n, 0.0), m_c(n, 0.0);
+        double e_tot = 0.0, a_tot = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double Tc = cache.temp[i];
+            const double dT = (Tc > 0.0) ? std::abs(T_new[i] - Tc) / Tc : (T_new[i] != Tc ? 1.0 : 0.0);
+            m_e[i] = std::abs(e_new[i] - cache.src[i]) + e_new[i] * dT;
+            if (temperature_dependent) m_c[i] = face_areas_[i] * dT;
+            e_tot += e_new[i];
+            a_tot += face_areas_[i];
+        }
+        select(m_e, tol * e_tot);
+        if (temperature_dependent) select(m_c, tol * a_tot);
+        size_t count = 0;
+        for (size_t i = 0; i < n; ++i) count += mask[i] ? 1 : 0;
+        sources_updated += static_cast<long long>(count);
+        if (count > 0) {
+            std::vector<double> r_new, r_old, c_new, c_old;
+            TransportCallOptions opt;
+            opt.apply_jeans_escape = apply_jeans;
+            opt.private_index_if_needed = private_index;
+            opt.source_mask = &mask;
+            opt.raw = true;
+            opt.raw_out = nullptr;
+            opt.calibration_out = temperature_dependent ? &c_new : nullptr;
+            exosphere_model_->computeTransportProduct(T_new, e_new, r_new, opt);
+            opt.calibration_out = temperature_dependent ? &c_old : nullptr;
+            exosphere_model_->computeTransportProduct(cache.temp, cache.src, r_old, opt);
+            for (size_t j = 0; j < n; ++j) cache.raw[j] += r_new[j] - r_old[j];
+            if (temperature_dependent) {
+                for (size_t j = 0; j < n; ++j) cache.cal[j] += c_new[j] - c_old[j];
+            }
+            for (size_t i = 0; i < n; ++i) {
+                if (mask[i]) { cache.src[i] = e_new[i]; cache.temp[i] = T_new[i]; }
+            }
+        }
+        exosphere_model_->finalizeTransport(cache.raw, cache.cal, deposition);
+        std::cout << "  [local refresh] updated " << count << " / " << n << " sources ("
+                  << (temperature_dependent ? "sublimation kernel" : "fixed-temperature kernel")
+                  << ", tolerance " << std::scientific << std::setprecision(1) << tol << std::fixed << ")"
+                  << std::endl;
+    }
+
+    void PTMExosphereIntegration::applyRepresentedSourceTotals() {
+        // PTM-657: after a local refresh the cached deposition is the transport of
+        // the represented source field (sub_cache_.src, sput_cache_.src), which
+        // differs from the current one by at most the tolerance. The PTM-644
+        // deposition scales must be relative to the represented totals.
+        auto& da = multiscale_evolution_->getMutableDiurnalAverages();
+        double s_sub = 0.0, s_sput = 0.0;
+        for (double v : sub_cache_.src) s_sub += v;
+        if (sputterTransportActive()) {
+            for (double v : sput_cache_.src) s_sput += v;
+        }
+        if (da.sputter_transport) {
+            da.total_base_sublimation = s_sub;
+            if (da.perFaceSputter()) da.total_base_sputter_transport = s_sput;
+            else if (da.sputter_transport_share > 0.0) da.total_base_sputter = s_sput / da.sputter_transport_share;
+        } else {
+            da.total_base_emission = s_sub;
+        }
+        multiscale_evolution_->applyScaledFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_);
     }
 
     bool PTMExosphereIntegration::computeDiurnalAverages(double dt_seconds) {
@@ -2698,8 +2855,29 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             }
         }
         std::vector<double> avg_dep;
-        exosphere_model_->computeTransportProduct(
-            diurnal_avg.emission_weighted_temperature, avg_emission, avg_dep);
+        // PTM-657: a refresh after the first reuses the raw transport sums and
+        // updates only the sources whose (emission, temperature) moved (see
+        // localTransportUpdate); the first computation fills the caches.
+        const bool local_now = localRefreshEnabled() && sub_cache_.valid &&
+                               (!sputterTransportActive() || sput_cache_.valid);
+        last_refresh_local_ = local_now;
+        if (local_now) {
+            localTransportUpdate(sub_cache_, diurnal_avg.emission_weighted_temperature, avg_emission,
+                                 true, false, true, avg_dep, local_sources_sub_);
+        } else {
+            TransportCallOptions o;
+            if (localRefreshEnabled()) {
+                o.raw_out = &sub_cache_.raw;
+                o.calibration_out = &sub_cache_.cal;
+            }
+            exosphere_model_->computeTransportProduct(
+                diurnal_avg.emission_weighted_temperature, avg_emission, avg_dep, o);
+            if (localRefreshEnabled()) {
+                sub_cache_.src = avg_emission;
+                sub_cache_.temp = diurnal_avg.emission_weighted_temperature;
+                sub_cache_.valid = true;
+            }
+        }
 
         for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
             diurnal_avg.avg_deposition_flux[i] = avg_dep[i] / face_areas_[i];
@@ -2726,7 +2904,23 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             TransportTotals tt;
             std::cout << "  Computing sputtered-H2O transport (launch " << std::fixed << std::setprecision(1)
                       << sc.launchTemperatureK() << " K, no Jeans escape)..." << std::endl;
-            exosphere_model_->computeTransportProduct(launch_T, sput_source, dep_sput, opt, &tt);
+            if (local_now) {
+                // The 683 K kernel does not depend on the thermal state, so only
+                // the emission changes; the calibration is constant.
+                localTransportUpdate(sput_cache_, launch_T, sput_source, false, true, false, dep_sput,
+                                     local_sources_sput_);
+            } else {
+                if (localRefreshEnabled()) {
+                    opt.raw_out = &sput_cache_.raw;
+                    opt.calibration_out = &sput_cache_.cal;
+                }
+                exosphere_model_->computeTransportProduct(launch_T, sput_source, dep_sput, opt, &tt);
+                if (localRefreshEnabled()) {
+                    sput_cache_.src = sput_source;
+                    sput_cache_.temp = launch_T;
+                    sput_cache_.valid = true;
+                }
+            }
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 diurnal_avg.avg_deposition_sputter_flux[i] = dep_sput[i] / face_areas_[i];
                 diurnal_avg.avg_deposition_flux[i] += diurnal_avg.avg_deposition_sputter_flux[i];
@@ -2939,6 +3133,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             file << "    Ice inventory vs booked fluxes: " << stats.total_inventory_error_mass
                  << " kg; max per step " << stats.max_inventory_error_rel << " relative\n";
             if (albedo_coupling_enabled_) {
+                file << "    Albedo refresh (PTM-657): " << (localRefreshEnabled() ? "face-local" : "GLOBAL")
+                     << "; local refreshes " << local_refresh_count_ << ", sources updated "
+                     << local_sources_sub_ << " (sublimation) + " << local_sources_sput_ << " (sputter), tolerance "
+                     << std::scientific << std::setprecision(1) << local_refresh_tol_ << "\n";
                 file << "    Albedo step limiter (PTM-640): " << (albedo_step_limit_ ? "on" : "OFF (legacy)")
                      << "; steps limited " << stats.steps_albedo_limited << ", predictions " << stats.predictions
                      << ", " << std::fixed << std::setprecision(1) << albedo_limit_seconds_ << " s\n";

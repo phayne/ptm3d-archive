@@ -1819,6 +1819,9 @@ int main(int argc, char** argv)
     int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
     bool superstep_legacy_deposition = false;  // PTM-644: reproduce the pre-fix super-step
     bool no_albedo_step_limit = false;         // PTM-640: reproduce the unlimited super-step
+    bool albedo_refresh_global = false;        // PTM-657: full recompute at every refresh
+    double albedo_refresh_tol = 1e-2;          // PTM-657 face-local refresh tolerance
+    double albedo_refresh_fraction = 0.0;      // PTM-657 faces past this x threshold are rescaled
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
 
@@ -1940,6 +1943,26 @@ int main(int argc, char** argv)
         }
         else if (a == "--flux-convergence" && i+1 < argc) {
             flux_convergence_threshold = std::stod(argv[++i]);
+        }
+        else if (a == "--albedo-refresh-global") {
+            albedo_refresh_global = true;
+            if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--albedo-refresh-tolerance" && i+1 < argc) {
+            albedo_refresh_tol = std::stod(argv[++i]);
+            if (!(albedo_refresh_tol >= 0.0 && albedo_refresh_tol < 0.1)) {
+                std::cerr << "Error: --albedo-refresh-tolerance must be in [0, 0.1)" << std::endl;
+                return 1;
+            }
+            if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--albedo-refresh-fraction" && i+1 < argc) {
+            albedo_refresh_fraction = std::stod(argv[++i]);
+            if (!(albedo_refresh_fraction >= 0.0 && albedo_refresh_fraction <= 1.0)) {
+                std::cerr << "Error: --albedo-refresh-fraction must be in [0, 1]" << std::endl;
+                return 1;
+            }
+            if (superstep_flag.empty()) superstep_flag = a;
         }
         else if (a == "--no-albedo-step-limit") {
             no_albedo_step_limit = true;
@@ -2162,6 +2185,17 @@ int main(int argc, char** argv)
             std::cout << "  --flux-convergence T   Flux imbalance fraction for convergence (default: 0.01 = 1%%)\n";
             std::cout << "  --max-superstep-epochs N  Cap one super-step at N epochs (default: none; for\n";
             std::cout << "                         step-size refinement checks)\n";
+            std::cout << "  --albedo-refresh-global  Recompute the full transport at every albedo refresh\n";
+            std::cout << "                         (pre-PTM-657; slower). Default: face-local update of the\n";
+            std::cout << "                         sources whose emission/temperature moved\n";
+            std::cout << "  --albedo-refresh-tolerance T  Face-local refresh: sources left stale may differ\n";
+            std::cout << "                         from the current field by at most T of the totals\n";
+            std::cout << "                         (default 1e-2; 0 = update every changed source)\n";
+            std::cout << "  --albedo-refresh-fraction F  Face-local refresh: rescale the temperatures of faces\n";
+            std::cout << "                         whose albedo moved by more than F x the threshold (default\n";
+            std::cout << "                         0 = every face that moved, as the global refresh; F > 0 is\n";
+            std::cout << "                         faster but re-bases faces at different times, face-scale\n";
+            std::cout << "                         jitter that the albedo feedback amplifies)\n";
             std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
             std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
             std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
@@ -2575,6 +2609,15 @@ int main(int argc, char** argv)
                       << "on the step size). Reproduces earlier products only." << std::endl;
         }
         integrator.setAlbedoStepLimit(!no_albedo_step_limit);
+        if (sputtering_enabled && sputter_cfg.legacy_escape_only) albedo_refresh_global = true;
+        integrator.setLocalAlbedoRefresh(!albedo_refresh_global, albedo_refresh_tol, albedo_refresh_fraction);
+        if (!albedo_refresh_global && albedo_refresh_fraction > 0.0 && albedo_coupling_enabled) {
+            std::cerr << "WARNING [PTM-657]: --albedo-refresh-fraction " << albedo_refresh_fraction
+                      << ": faces are re-based at different times, which injects face-scale temperature "
+                      << "jitter; the albedo-sublimation feedback is linearly unstable on warm faces "
+                      << "(PTM-658) and amplifies it, so local extremes can differ from the coherent "
+                      << "refresh (phase 0 cosine case: max non-ice 35.9% vs 18.2%)." << std::endl;
+        }
         integrator.setMaxSuperstepEpochs(max_superstep_epochs);
         if (diurnal_stride > 1) {
             integrator.setDiurnalStride(diurnal_stride);

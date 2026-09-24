@@ -2911,6 +2911,12 @@ void BallisticTransport::computeTransportProduct(
         num_threads = omp_get_num_threads();
     }
 
+    const std::vector<char>* mask = options.source_mask;
+    if (mask && mask->size() != n) {
+        throw std::invalid_argument("computeTransportProduct: source_mask size mismatch");
+    }
+    const bool want_cal = !options.raw || options.calibration_out != nullptr;
+
     // Thread-local deposition + calibration arrays
     // Calibration: scatter uniform unit flux (face_areas[i]) alongside actual emission
     // to measure area bias for Sinkhorn-like row correction.
@@ -2935,8 +2941,10 @@ void BallisticTransport::computeTransportProduct(
 
         #pragma omp for schedule(dynamic)
         for (size_t i = 0; i < n; ++i) {
+            if (mask && !(*mask)[i]) continue;
             double e_i = emission[i];
             double T_i = temperatures[i];
+            if (!want_cal && !(e_i > 0.0)) continue;  // raw, no calibration: nothing to scatter
 
             // Skip faces with no physical temperature
             if (T_i <= 0.0) {
@@ -3005,7 +3013,7 @@ void BallisticTransport::computeTransportProduct(
             double scaled_a = face_areas[i] * norm_i;
 
             // Self-deposition (calibration always, actual only if emitting)
-            local_cal[i] += self_weight * scaled_a;
+            if (want_cal) local_cal[i] += self_weight * scaled_a;
             if (e_i > 0.0) {
                 if (norm_i == 0.0) unscattered_total += e_i;
                 else jeans_escaped_total += e_i * escape_frac;
@@ -3021,8 +3029,10 @@ void BallisticTransport::computeTransportProduct(
             }
 
             // Phase 2b: scatter calibration (always, for all faces with T > 0)
-            for (const auto& [j, w] : cached_weights) {
-                local_cal[j] += w * scaled_a;
+            if (want_cal) {
+                for (const auto& [j, w] : cached_weights) {
+                    local_cal[j] += w * scaled_a;
+                }
             }
         }
     }
@@ -3042,6 +3052,23 @@ void BallisticTransport::computeTransportProduct(
 
     auto end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    (void)ms;
+    if (options.raw_out) *options.raw_out = deposition;
+    if (options.calibration_out) *options.calibration_out = calibration;
+    if (options.raw) {
+        if (totals) {
+            double src = 0.0, dep = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (!mask || (*mask)[i]) src += emission[i];
+                dep += deposition[i];
+            }
+            totals->source = src;
+            totals->deposited = dep;
+            totals->jeans_escaped = jeans_escaped_total;
+            totals->unscattered = unscattered_total;
+        }
+        return;  // raw sums only (PTM-657); no log line (called many times)
+    }
 
     // Pre-correction mass conservation
     double total_emission = 0.0, total_deposition = 0.0;
@@ -3162,6 +3189,43 @@ void BallisticTransport::computeTransportProduct(
               << ", smoothing="
               << (smooth_radius > 0.0 ? std::to_string(smooth_radius_deg) + " deg" : std::string("off"))
               << std::endl;
+}
+
+double BallisticTransport::finalizeTransport(const std::vector<double>& face_areas,
+                                             const std::vector<double>& raw,
+                                             const std::vector<double>& calibration,
+                                             std::vector<double>& deposition) {
+    // Must match the correction in computeTransportProduct exactly (PTM-657).
+    if (spatialSmoothingRadiusRad() > 0.0) {
+        throw std::invalid_argument("finalizeTransport: the face-local refresh does not support "
+                                    "EXO_DEP_SMOOTH_DEG spatial smoothing");
+    }
+    const size_t n = raw.size();
+    bool disable_bias_correction = false;
+    if (const char* envp = std::getenv("EXO_DISABLE_BIAS_CORR")) {
+        disable_bias_correction = (std::atoi(envp) != 0);
+    }
+    std::vector<double> bias(n, 1.0);
+    double max_bias = 0.0;
+    for (size_t j = 0; j < n; ++j) {
+        if (calibration[j] > 1e-30) {
+            bias[j] = face_areas[j] / calibration[j];
+            max_bias = std::max(max_bias, std::abs(bias[j] - 1.0));
+        }
+    }
+    deposition = raw;
+    double total_deposition = 0.0;
+    for (size_t j = 0; j < n; ++j) total_deposition += raw[j];
+    if (!disable_bias_correction && max_bias > 0.01) {
+        for (size_t j = 0; j < n; ++j) deposition[j] *= bias[j];
+    }
+    double total_dep_corrected = 0.0;
+    for (size_t j = 0; j < n; ++j) total_dep_corrected += deposition[j];
+    if (total_dep_corrected > 1e-30 && total_deposition > 1e-30) {
+        const double mass_fix = total_deposition / total_dep_corrected;
+        for (size_t j = 0; j < n; ++j) deposition[j] *= mass_fix;
+    }
+    return max_bias;
 }
 
 // ExosphereModel wrapper for matrix-free transport product

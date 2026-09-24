@@ -231,6 +231,24 @@ namespace ptm {
             bool albedo_step_limit_ = true;                 // PTM-640
             double albedo_limit_seconds_ = 0.0;
             double max_refresh_deviation_ = 0.0;            // max |A - A_ref| when a refresh fired
+
+            // PTM-657 face-local refresh: raw transport sums of the represented source field.
+            struct TransportCache {
+                std::vector<double> raw, cal, src, temp;
+                bool valid = false;
+            };
+            TransportCache sub_cache_, sput_cache_;
+            bool local_refresh_ = true;
+            double local_refresh_tol_ = 1e-2;
+            double local_refresh_fraction_ = 0.0;   // rescale faces past this x threshold (0 = all that moved)
+            bool last_refresh_local_ = false;
+            long long local_refresh_count_ = 0, local_sources_sub_ = 0, local_sources_sput_ = 0;
+            bool localRefreshEnabled() const;
+            void localTransportUpdate(TransportCache& cache, const std::vector<double>& T_new,
+                                      const std::vector<double>& e_new, bool apply_jeans,
+                                      bool private_index, bool temperature_dependent, std::vector<double>& deposition,
+                                      long long& sources_updated);
+            void applyRepresentedSourceTotals();
             int max_superstep_epochs_ = 0;                  // 0 = no cap
 
             // Diurnal accumulation stride: use every Nth timestep for averaging.
@@ -634,6 +652,18 @@ namespace ptm {
              * change (the temperature refresh can lag by a whole step).
              */
             void setAlbedoStepLimit(bool on) { albedo_step_limit_ = on; }
+
+            /**
+             * PTM-657. Face-local albedo refresh (default on): after the first full
+             * diurnal computation, a refresh updates the transport only for sources
+             * whose emission or temperature moved beyond `tol` of the totals (0 = every
+             * changed source; exact). false = the full (global) recompute.
+             */
+            void setLocalAlbedoRefresh(bool on, double tol, double fraction = 0.0) {
+                local_refresh_ = on;
+                local_refresh_tol_ = std::max(0.0, tol);
+                local_refresh_fraction_ = std::clamp(fraction, 0.0, 1.0);
+            }
 
             /**
              * Set diurnal accumulation stride for multi-timescale simulation

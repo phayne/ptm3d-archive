@@ -265,6 +265,22 @@ struct TransportCallOptions {
     // persistent index (built on the first call) is too small, leaving the
     // persistent index untouched so the sublimation transport stays bit-stable.
     bool private_index_if_needed = false;
+
+    // Face-local refresh (PTM-657). The product is linear per source up to the
+    // row-bias correction and the final mass fix, which are functions of the
+    // summed raw deposition and calibration only (see finalizeTransport). These
+    // options expose the raw sums so a caller can update them source by source:
+    //   source_mask      process only sources with (*source_mask)[i] != 0
+    //                    (their emission scatter AND their calibration scatter);
+    //   raw              return the raw (uncorrected) deposition; no bias
+    //                    correction, smoothing or mass fix;
+    //   raw_out / calibration_out  (full or raw calls) the raw deposition and the
+    //                    calibration sums. In a raw call without calibration_out
+    //                    the calibration scatter is skipped.
+    const std::vector<char>* source_mask = nullptr;
+    bool raw = false;
+    std::vector<double>* raw_out = nullptr;
+    std::vector<double>* calibration_out = nullptr;
 };
 
 // Global mass totals of one transport call [kg/s]. source = deposited +
@@ -425,6 +441,14 @@ public:
         double threshold = 1e-10,
         const TransportCallOptions& options = TransportCallOptions(),
         TransportTotals* totals = nullptr) const;
+
+    // The correction step of computeTransportProduct (row-bias correction from the
+    // calibration sums, then the global mass fix), applied to raw sums (PTM-657).
+    // Requires spatial smoothing off (throws otherwise). Returns max |bias - 1|.
+    static double finalizeTransport(const std::vector<double>& face_areas,
+                                    const std::vector<double>& raw,
+                                    const std::vector<double>& calibration,
+                                    std::vector<double>& deposition);
 
     // Area-weighted smoothing of a per-face scalar over the spatial-index
     // neighborhood within `smooth_radius_rad`. A radius <= 0 is a no-op
@@ -587,6 +611,12 @@ public:
         std::vector<double>& deposition,
         const TransportCallOptions& options = TransportCallOptions(),
         TransportTotals* totals = nullptr);
+
+    /** BallisticTransport::finalizeTransport with this model's face areas (PTM-657). */
+    double finalizeTransport(const std::vector<double>& raw, const std::vector<double>& calibration,
+                             std::vector<double>& deposition) const {
+        return BallisticTransport::finalizeTransport(face_areas_, raw, calibration, deposition);
+    }
 
     // Area-weighted smoothing of a per-face scalar field. Forwards to
     // BallisticTransport::smoothField using face_areas_ and the transport's
