@@ -52,6 +52,19 @@ import sys
 
 import numpy as np
 
+
+def _frame_file(directory, name, t):
+    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+
+    Current engines pad the index to >= 6 digits; runs written before used 4.
+    """
+    for w in range(6, 13):
+        p = os.path.join(str(directory), "%s_%0*d.bin" % (name, w, t))
+        if os.path.exists(p):
+            return p
+    return os.path.join(str(directory), "%s_%04d.bin" % (name, t))
+
+
 # constants.cpp
 SOLAR_CONSTANT = 1361.0
 KM_PER_AU = 149597870.7
@@ -197,9 +210,9 @@ def cmd_phase(args):
     worst = 0.0
     used = 0
     for t in range(nt):
-        ir = read_bin(os.path.join(run, "primary_ir", "primary_ir_%04d.bin" % t))
-        rf = read_bin(os.path.join(run, "primary_reflected",
-                                   "primary_reflected_%04d.bin" % t))
+        ir = read_bin(_frame_file(os.path.join(run, "primary_ir"), "primary_ir", t))
+        rf = read_bin(_frame_file(os.path.join(run, "primary_reflected"),
+                                   "primary_reflected", t))
         rel = pri[t] - cent                                     # face -> primary
         dist = np.linalg.norm(rel, axis=1)
         pdir = rel / dist[:, None]
@@ -259,8 +272,8 @@ def cmd_compare(args):
     max_gain = 0.0
     max_abs_dw = 0.0
     for t in range(nt):
-        b = read_bin(os.path.join(before, "primary_ir", "primary_ir_%04d.bin" % t))
-        a = read_bin(os.path.join(after, "primary_ir", "primary_ir_%04d.bin" % t))
+        b = read_bin(_frame_file(os.path.join(before, "primary_ir"), "primary_ir", t))
+        a = read_bin(_frame_file(os.path.join(after, "primary_ir"), "primary_ir", t))
         tot += b.size
         zb = b <= 0.0
         za = a <= 0.0
@@ -306,7 +319,7 @@ def cmd_horizon(args):
     below_geom_step0 = None
     worst_A = 0.0
     for t in range(nt):
-        ir = read_bin(os.path.join(run, "primary_ir", "primary_ir_%04d.bin" % t))
+        ir = read_bin(_frame_file(os.path.join(run, "primary_ir"), "primary_ir", t))
         rel = pri[t] - cent
         dist = np.linalg.norm(rel, axis=1)
         pdir = rel / dist[:, None]

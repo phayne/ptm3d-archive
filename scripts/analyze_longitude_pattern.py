@@ -16,6 +16,19 @@ import sys
 import os
 from pathlib import Path
 
+
+def _frame_file(directory, name, t):
+    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+
+    Current engines pad the index to >= 6 digits; runs written before used 4.
+    """
+    for w in range(6, 13):
+        p = os.path.join(str(directory), "%s_%0*d.bin" % (name, w, t))
+        if os.path.exists(p):
+            return p
+    return os.path.join(str(directory), "%s_%04d.bin" % (name, t))
+
+
 # Pentagon vertex unit vectors from createIcosphereMesh()
 _t = (1.0 + np.sqrt(5.0)) / 2.0
 _norm = np.sqrt(1.0 + _t**2)
@@ -160,7 +173,7 @@ def load_statistics(stats_dir, component):
 
 def load_timestep(data_dir, component, timestep):
     """Load per-face data for a single timestep."""
-    path = Path(data_dir) / component / f'{component}_{timestep:04d}.bin'
+    path = Path(_frame_file(Path(data_dir) / component, component, timestep))
     if not path.exists():
         return None
     arr = np.fromfile(str(path), dtype=np.float32)

@@ -43,6 +43,7 @@
 #include "../tools/run_provenance.h"
 #include "ptm_build_info.h"
 #include "../tools/solver_disclosure.h"
+#include "../fileio/frame_naming.h"
 #include "../thermal/thermal_model.h"
 #include "../thermal/eq_certificate.h"
 #include "../thermal/thermal_state_io.h"
@@ -62,6 +63,7 @@
 
 // Orbital mechanics module (generic bodies)
 #include "../orbital/generic_body.h"
+#include "../orbital/epoch_parse.h"
 
 // GPU thermal solver (optional)
 #ifdef PTM_GPU_OPENCL
@@ -86,6 +88,24 @@
 #include <omp.h>
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #endif
+
+// Before writing a per-step product, drop frames of the OTHER index width that
+// a previous run left in the same directory (BUGS.md PTM-664; see
+// ptm::removeOtherWidthFrames). Said out loud when it removes anything.
+static void clearOtherWidthFrames(const std::string& output_dir,
+                                  std::initializer_list<const char*> fields,
+                                  long long n_frames, const char* tag) {
+    const int w = ptm::frameIndexWidth(n_frames);
+    for (const char* fld : fields) {
+        const long long n = ptm::removeOtherWidthFrames(output_dir + "/" + fld, fld, w);
+        if (n > 0) {
+            std::cerr << tag << " NOTE: removed " << n << " stale " << fld
+                      << "_*.bin frame(s) of a different index width from " << output_dir
+                      << "/" << fld << "/ (a previous run's; this run writes "
+                      << w << "-digit names, BUGS.md PTM-664).\n";
+        }
+    }
+}
 
 using namespace ptm;
 using namespace ptm_thermal::constants;
@@ -7920,16 +7940,35 @@ bool runThermalModelsForAllFacesBatchSoA(
             // code stored the post-advance state at index t (off-by-one) and
             // duplicated the final state into indices total_time_steps-2 and -1.
             //
-            // ROW 0 IS THE INITIAL CONDITION, VERBATIM -- including its surface
-            // node, which getSurfaceTemp() returns as the seed or the restored
-            // checkpoint left it. Deliberately NOT re-solved at times[0],
-            // unlike every row below (fix/frame-forcing-epoch); see the
-            // matching note in Model::run (thermal_model.cpp) for the measured
-            // cost and why the convention is not settled here. Row 0 is only
-            // EXPORTED as output index 0 when there is no equilibration prefix.
+            // ROW 0 ON A COLD START IS THE INITIAL CONDITION, VERBATIM --
+            // including its surface node, which getSurfaceTemp() returns as the
+            // seed left it. Deliberately NOT re-solved at times[0], unlike every
+            // row below (fix/frame-forcing-epoch); see the matching note in
+            // Model::run (thermal_model.cpp) for the measured cost and why that
+            // convention is not settled here. Row 0 is only EXPORTED as output
+            // index 0 when there is no equilibration prefix.
+            //
+            // ROW 0 ON A WARM START IS RE-SOLVED (BUGS.md PTM-662). A restored
+            // checkpoint is the column the previous chunk integrated to exactly
+            // this epoch, and that chunk -- like a single-shot run passing
+            // through the same epoch -- filed its frame here with the surface
+            // re-solved against flux AT this epoch. The raw node the checkpoint
+            // carries was solved half a substep earlier (the midpoint flux of
+            // the last substep), so filing it verbatim put a different number
+            // under the seam frame than the unchunked run: measured 0.31 K on
+            // Justitia, 0.39 K on scripts/test_chunk_seam_equivalence.py. The
+            // re-solve is read-only, exactly as for every other row, so the
+            // trajectory is unchanged; only the reported frame moves.
+            const bool row0_resolve = ckpt.want_in;
+            alignas(64) double row0_surf[thermal::THERMAL_BATCH_SIZE];
+            for (int f = 0; f < faces_in_batch; ++f) {
+                row0_surf[f] = row0_resolve
+                    ? thermal::outputSurfaceTempBatch(batch, f, flux_base[f])
+                    : batch.getSurfaceTemp(f);
+            }
             if (surface_temps_out) {
                 for (int f = 0; f < faces_in_batch; ++f) {
-                    (*surface_temps_out)[start_face + f][0] = batch.getSurfaceTemp(f);
+                    (*surface_temps_out)[start_face + f][0] = row0_surf[f];
                 }
             }
             // REPLACE, not add: this driver can be entered more than once in a
@@ -7941,21 +7980,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                 for (int f = 0; f < faces_in_batch; ++f)
                     g_depth_map.acc.resetFace(start_face + f);
             }
-            // Depth product, same frame, same instant. Row 0's surface node IS
-            // batch.T[0*BS+f] (getSurfaceTemp returns exactly that), so no
-            // override is needed here -- unlike every row below.
+            // Depth product, same frame, same instant. On a cold start row 0's
+            // surface node IS batch.T[0*BS+f] (getSurfaceTemp returns exactly
+            // that), so no override is needed. On a warm start the frame carries
+            // the re-solved surface (above), and the depth product's z = 0 row
+            // takes the SAME number, as every row below does.
             if (depthMapOn() && g_depth_map.win_start <= 0 &&
                 0 < g_depth_map.win_end) {
                 for (int f = 0; f < faces_in_batch; ++f) {
                     g_depth_map.acc.addColumn(g_depth_map.plan, start_face + f,
-                                              &batch.T[f], BS);
+                                              &batch.T[f], BS,
+                                              row0_resolve ? &row0_surf[f] : nullptr);
                 }
             }
-            // Phase 2H, frame 0. No surface override for the same reason the
-            // depth map takes none here: row 0's surface node IS batch.T[f]
-            // (getSurfaceTemp returns exactly that), it is the initial
-            // condition verbatim, and re-solving it would put a different
-            // number in the CSV from the one surface_temps_out just stored.
+            // Phase 2H, frame 0. Same rule as the depth map: no surface override
+            // on a cold start, where row 0 is the initial condition verbatim;
+            // the re-solved surface on a warm start, so the CSV's z = 0 row is
+            // the number surface_temps_out just stored in both cases.
             //
             // Recorded UNCONDITIONALLY of the statistics window, unlike the
             // map: the CSV covers the whole integration including the
@@ -7965,7 +8006,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                     const int slot = locationColumnSlot(start_face + f);
                     if (slot >= 0)
                         g_loc_columns.series.record(slot, 0, &batch.T[f], BS,
-                                                    static_cast<size_t>(n_layers));
+                                                    static_cast<size_t>(n_layers),
+                                                    row0_resolve ? &row0_surf[f] : nullptr);
                 }
             }
             if (depthMapOn()) {
@@ -9548,6 +9590,20 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                   t_err, verdict)) {
             return false;
         }
+        // BUGS.md PTM-662, GPU half, NOT fixed here. The CPU drivers now
+        // re-solve a warm-started window's first frame at its own epoch, so a
+        // chunked CPU run equals the unchunked run at every frame. The GPU
+        // persistent kernel still files the restored column's raw surface
+        // node under output index 0 (thermal_kernels.cl, "ROW 0"), which is
+        // half a substep to a full output interval stale. Said out loud
+        // because a chunked GPU series carries it at every seam.
+        std::cerr << "[GPU Thermal] WARNING: warm start -- output frame 0 of this "
+                     "window is the checkpoint's RAW surface node, not the surface "
+                     "re-solved at this epoch (BUGS.md PTM-662, open on the GPU "
+                     "path). It can differ from the unchunked run's frame at the "
+                     "same epoch by a few tenths of a kelvin; frames 1.. are "
+                     "unaffected. Overlap chunks by one step and drop frame 0, or "
+                     "use the CPU solver, where the seam is exact.\n";
     }
 
     // A warm-start chunk is one that resumes from a checkpoint. It forces
@@ -15106,6 +15162,8 @@ bool writeIndirectBandOutputs(
 
         std::vector<float> buf_vis(F), buf_ir(F);
         int fail = 0;
+        clearOtherWidthFrames(output_dir, {"indirect_solar", "indirect_ir"}, out_steps,
+                              "[indirect-bands]");
         for (int t = 0; t < out_steps; ++t) {
             const int at = eq_steps + t;  // absolute step
             #pragma omp parallel for schedule(static)
@@ -15117,8 +15175,8 @@ bool writeIndirectBandOutputs(
                 buf_ir[f]  = (at >= 0 && at < static_cast<int>(ri.size()))
                     ? static_cast<float>(ri[at]) : 0.0f;
             }
-            std::ostringstream ss; ss << std::setw(4) << std::setfill('0') << t;
-            const std::string ts = ss.str();
+            // BUGS.md PTM-664: width from the run's frame count, minimum 6.
+            const std::string ts = ptm::frameIndexString(t, out_steps);
             if (!write_frame(output_dir + "/indirect_solar/indirect_solar_" + ts + ".bin", buf_vis)) ++fail;
             if (!write_frame(output_dir + "/indirect_ir/indirect_ir_" + ts + ".bin", buf_ir)) ++fail;
         }
@@ -15731,6 +15789,9 @@ bool exportDataAsBinary(
     int success_steps=0, fail_steps=0;
     int report_interval = std::max(1, time_steps/20);
 
+    clearOtherWidthFrames(output_dir, {"illumination", "direct_solar", "primary_reflected",
+                                       "primary_ir", "temperature"}, time_steps,
+                          "[exportDataAsBinary]");
     for (int t=0;t<time_steps;++t) {
         if ((t%report_interval)==0 || t==time_steps-1) {
             cout << "\r  Progress " << (t+1) << "/" << time_steps << std::flush;
@@ -15781,8 +15842,8 @@ bool exportDataAsBinary(
             }
         }
 
-        std::ostringstream oss; oss << std::setw(4) << std::setfill('0') << t;
-        std::string ts=oss.str();
+        // BUGS.md PTM-664: width from the run's frame count, minimum 6.
+        std::string ts = ptm::frameIndexString(t, time_steps);
         bool ok=true;
         auto writeComp=[&](const char* name, const std::vector<float>& buf){
             if (buf.empty()) return true;
@@ -17406,6 +17467,12 @@ int main(int argc, char** argv) {
                 if (dst.spin_period_hours < 0) dst.spin_period_hours = loaded.spin_period_hours;
                 if (dst.pole_ra_deg < 0) dst.pole_ra_deg = loaded.pole_ra_deg;
                 if (dst.pole_dec_deg < 0) dst.pole_dec_deg = loaded.pole_dec_deg;
+                // BUGS.md PTM-663: these two were never merged either.
+                if (!dst.prime_meridian_set && loaded.prime_meridian_set) {
+                    dst.prime_meridian_deg = loaded.prime_meridian_deg;
+                    dst.prime_meridian_set = true;
+                }
+                if (dst.spin_epoch.empty()) dst.spin_epoch = loaded.spin_epoch;
                 if (dst.albedo < 0) dst.albedo = loaded.albedo;
                 if (dst.emissivity < 0) dst.emissivity = loaded.emissivity;
                 if (dst.ks < 0) dst.ks = loaded.ks;
@@ -17456,6 +17523,37 @@ int main(int argc, char** argv) {
         generic_body.name = cfg.name.empty() ? "CustomBody" : cfg.name;
 
         // --- Shape ---
+        // Every branch below used to fall through to SPHERICAL in silence:
+        // an unknown type, `ellipsoidal` without three axes, `custom_mesh`
+        // without a mesh_file (BUGS.md PTM-663 audit). An unknown type is a
+        // typo and is refused; the two incomplete ones are said out loud.
+        if (!cfg.shape_type.empty() && cfg.shape_type != "spherical" &&
+            cfg.shape_type != "ellipsoidal" && cfg.shape_type != "custom_mesh") {
+            std::cerr << "FATAL: generic_body.shape.type = '" << cfg.shape_type
+                      << "' is not one of spherical, ellipsoidal, custom_mesh." << std::endl;
+            return 1;
+        }
+        if (cfg.shape_type == "ellipsoidal" &&
+            !(cfg.semi_axis_a_km > 0 && cfg.semi_axis_b_km > 0 && cfg.semi_axis_c_km > 0)) {
+            std::cerr << "WARNING: generic_body.shape.type is 'ellipsoidal' but "
+                         "semi_axes_km is missing or not all positive; the body is built "
+                         "SPHERICAL (radius_km)." << std::endl;
+        }
+        if (cfg.shape_type == "custom_mesh" && cfg.mesh_file.empty() && mesh_file.empty()) {
+            std::cerr << "WARNING: generic_body.shape.type is 'custom_mesh' but neither "
+                         "generic_body.shape.mesh_file nor mesh.import_file is set; the "
+                         "body is built SPHERICAL (radius_km)." << std::endl;
+        }
+        if (cfg.shape_type == "custom_mesh" && !cfg.mesh_file.empty() && !mesh_file.empty() &&
+            (std::filesystem::path(cfg.mesh_file).lexically_normal() !=
+                 std::filesystem::path(mesh_file).lexically_normal() ||
+             cfg.mesh_scale != mesh_scale_factor)) {
+            std::cerr << "WARNING: generic_body.shape.mesh_file / mesh_scale ('"
+                      << cfg.mesh_file << "' x " << cfg.mesh_scale
+                      << ") are IGNORED: mesh.import_file / scale_factor ('" << mesh_file
+                      << "' x " << mesh_scale_factor << ") is the mesh this run loads."
+                      << std::endl;
+        }
         if (cfg.shape_type == "custom_mesh" && !cfg.mesh_file.empty()) {
             generic_body.shape.type = orbital::BodyShape::CUSTOM_MESH;
             generic_body.shape.custom_mesh_file = cfg.mesh_file;
@@ -17481,6 +17579,32 @@ int main(int argc, char** argv) {
                 generic_body.shape.radius_km = cfg.radius_km;
         }
 
+        // --- Epochs (BUGS.md PTM-663) ---
+        // orbit.epoch and spin.epoch were parsed and dropped until 2026-09-24:
+        // M0 was applied at J2000 and the prime meridian was referred to J2000
+        // whatever the file said. Both are TDB (orbital/epoch_parse.h); an
+        // unreadable epoch is FATAL rather than quietly J2000.
+        {
+            auto parseOrDie = [](const std::string& text, const char* key, double& jd) {
+                std::string err;
+                if (!orbital::parseEpochJdTdb(text, jd, err)) {
+                    std::cerr << "FATAL: " << key << ": " << err << "." << std::endl;
+                    return false;
+                }
+                return true;
+            };
+            double jd = orbital::kJ2000JulianDate;
+            if (!cfg.orbital_epoch.empty()) {
+                if (!parseOrDie(cfg.orbital_epoch, "generic_body.orbit.epoch", jd)) return 1;
+            }
+            generic_body.orbit.epoch_jd = jd;
+            jd = orbital::kJ2000JulianDate;
+            if (!cfg.spin_epoch.empty()) {
+                if (!parseOrDie(cfg.spin_epoch, "generic_body.spin.epoch", jd)) return 1;
+            }
+            generic_body.spin.epoch_jd = jd;
+        }
+
         // --- Orbital elements ---
         if (cfg.hasOrbitalElements()) {
             generic_body.orbit.semi_major_axis_au = cfg.semi_major_axis_au;
@@ -17504,6 +17628,14 @@ int main(int argc, char** argv) {
             if (cfg.pole_dec_deg >= -90.0 && cfg.pole_dec_deg != -1.0)
                 generic_body.spin.pole_dec_deg = cfg.pole_dec_deg;
         }
+        // Prime meridian W0 at spin.epoch (BUGS.md PTM-663). Applied whether or
+        // not a period was given: the frame is built from it either way.
+        if (!std::isfinite(cfg.prime_meridian_deg)) {
+            std::cerr << "FATAL: generic_body.spin.prime_meridian_deg = "
+                      << cfg.prime_meridian_deg << " is not a finite angle." << std::endl;
+            return 1;
+        }
+        generic_body.spin.prime_meridian_deg = cfg.prime_meridian_deg;
 
         // --- Thermophysical properties ---
         // Start from reasonable rocky asteroid defaults, then apply any
@@ -17527,6 +17659,22 @@ int main(int argc, char** argv) {
         generic_body.thermo.body_radius_km = generic_body.shape.meanRadiusKm();
 
         // --- Ephemeris source ---
+        // Anything but "spice" has always resolved to Keplerian, so a typo
+        // ("SPICE", "horizons") ran a two-body orbit without a word. Refused
+        // now; and "auto" -- the default -- is Keplerian too, which a config
+        // that also names a metakernel will not expect (BUGS.md PTM-663 audit).
+        if (cfg.ephemeris_source != "spice" && cfg.ephemeris_source != "keplerian" &&
+            cfg.ephemeris_source != "auto") {
+            std::cerr << "FATAL: generic_body.ephemeris_source = '" << cfg.ephemeris_source
+                      << "' is not one of keplerian, spice, auto." << std::endl;
+            return 1;
+        }
+        if (cfg.ephemeris_source == "auto" && !cfg.spice_metakernel.empty()) {
+            std::cerr << "WARNING: generic_body.ephemeris_source is 'auto', which resolves "
+                         "to KEPLERIAN; generic_body.spice_metakernel ('"
+                      << cfg.spice_metakernel << "') is NOT used for the orbit. Set "
+                         "ephemeris_source: spice to use it." << std::endl;
+        }
         if (cfg.ephemeris_source == "spice") {
             generic_body.ephemeris_source = orbital::GenericBody::SPICE;
             generic_body.spice_metakernel = cfg.spice_metakernel;
@@ -17559,6 +17707,15 @@ int main(int argc, char** argv) {
         std::cout << "  Semi-major axis: " << generic_body.orbit.semi_major_axis_au << " AU" << std::endl;
         std::cout << "  Eccentricity: " << generic_body.orbit.eccentricity << std::endl;
         std::cout << "  Spin period: " << generic_body.spin.spin_period_s / 3600.0 << " hours" << std::endl;
+        const auto saved_precision = std::cout.precision();
+        std::cout << std::setprecision(10)
+                  << "  Orbit epoch: JD " << generic_body.orbit.epoch_jd << " TDB"
+                  << "  (mean anomaly " << generic_body.orbit.mean_anomaly_at_epoch_deg
+                  << " deg at this epoch)\n"
+                  << "  Spin epoch:  JD " << generic_body.spin.epoch_jd << " TDB"
+                  << "  (prime meridian W0 = " << generic_body.spin.prime_meridian_deg
+                  << " deg at this epoch)" << std::endl;
+        std::cout.precision(saved_precision);
         std::cout << "  Solar constant: " << generic_body.thermo.S << " W/m^2" << std::endl;
         std::cout << "  Synodic day: " << generic_body.thermo.day / 3600.0 << " hours" << std::endl;
         std::cout << "  Albedo: " << generic_body.thermo.albedo << std::endl;
@@ -23414,6 +23571,31 @@ int main(int argc, char** argv) {
                         ptm::discloseRethermalPath(
                             ptm::RethermalPath::CpuScalarFaces,
                             "no GPU thermal, or the GPU re-thermal failed and fell back");
+                        // BUGS.md PTM-665. The whole mesh was solved by the CPU
+                        // SIMD batch integrator; the selected faces are now
+                        // re-integrated by the SCALAR one (Model::run), whose
+                        // discretization differs. So a selected face moves by
+                        // the two solvers' difference even when its indirect
+                        // flux is zero -- measured on Justitia TWG Case 3 (a
+                        // convex mesh, q_ind <= 2.4e-5 W/m^2): 0.26 K on 4
+                        // faces, equal to 2e-5 K to what the scalar solver gives
+                        // the same faces with radiation OFF. Said out loud; the
+                        // fix (re-thermal on the SIMD integrator) is owed.
+                        // Only when the whole mesh WAS the CPU SIMD solve: after a
+                        // failed GPU re-thermal the mesh was solved on the GPU,
+                        // and the GPU-vs-CPU warning above already covers it.
+                        if (thermal_config.getPropertyBool("use_simd_batch", true) &&
+                            !thermal_config.getPropertyBool("use_gpu_thermal", false)) {
+                            std::cerr << "  [Re-thermal] WARNING: the whole mesh was solved by the"
+                                         " CPU SIMD batch integrator, but these "
+                                      << faces_to_rerun.size()
+                                      << " face(s) are re-integrated by the CPU SCALAR one."
+                                         " The two discretizations differ (0.26 K measured on"
+                                         " Justitia, BUGS.md PTM-665), and that difference lands"
+                                         " on exactly the coupled faces whatever their indirect"
+                                         " flux. Compare against a --no-simd-batch run before"
+                                         " reading a sub-kelvin coupling signal.\n";
+                        }
                         // CPU path: OpenMP parallel loop
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
                         std::atomic<int> rerun_completed{0};
@@ -24377,6 +24559,10 @@ int main(int argc, char** argv) {
                         return true;
                     };
 
+                    clearOtherWidthFrames(output_dir, {"illumination", "direct_solar",
+                                                       "primary_reflected", "primary_ir",
+                                                       "temperature"}, out_steps,
+                                          "[stride-export]");
                     for (int t = 0; t < out_steps; ++t) {
                         if (t % report == 0 || t == out_steps - 1) {
                             cout << "\r  Progress " << (t+1) << "/" << out_steps << std::flush;
@@ -24395,7 +24581,7 @@ int main(int argc, char** argv) {
                             }
                             std::ostringstream fn;
                             fn << output_dir << "/" << dir << "/" << prefix
-                               << "_" << std::setw(4) << std::setfill('0') << t << ".bin";
+                               << "_" << ptm::frameIndexString(t, out_steps) << ".bin";
                             return writeFrameFile(fn.str());
                         };
 
@@ -24412,7 +24598,7 @@ int main(int argc, char** argv) {
                             }
                             std::ostringstream fn;
                             fn << output_dir << "/illumination/illumination_"
-                               << std::setw(4) << std::setfill('0') << t << ".bin";
+                               << ptm::frameIndexString(t, out_steps) << ".bin";
                             step_ok = writeFrameFile(fn.str()) && step_ok;
                         }
 
@@ -24436,7 +24622,7 @@ int main(int argc, char** argv) {
                             }
                             std::ostringstream fn;
                             fn << output_dir << "/temperature/temperature_"
-                               << std::setw(4) << std::setfill('0') << t << ".bin";
+                               << ptm::frameIndexString(t, out_steps) << ".bin";
                             step_ok = writeFrameFile(fn.str()) && step_ok;
                         }
 

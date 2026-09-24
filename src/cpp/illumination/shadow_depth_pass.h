@@ -166,7 +166,7 @@ struct PassInputs {
 
     // --- output ------------------------------------------------------------
     std::string output_dir;         // run directory
-    bool write_frames = true;       // shadow_depth/shadow_depth_%04d.bin
+    bool write_frames = true;       // shadow_depth/shadow_depth_<index>.bin (>= 6 digits, PTM-664)
     bool write_raw_stats = false;   // statistics/_raw side files for chunk merge
     std::string provenance_json;    // engine sha / md5 / config, echoed verbatim
     // Monotonicity audit: how many faces and epochs to re-scan above the first

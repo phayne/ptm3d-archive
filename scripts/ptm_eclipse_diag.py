@@ -34,6 +34,19 @@ import sys
 
 import numpy as np
 
+
+def _frame_file(directory, name, t):
+    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+
+    Current engines pad the index to >= 6 digits; runs written before used 4.
+    """
+    for w in range(6, 13):
+        p = os.path.join(str(directory), "%s_%0*d.bin" % (name, w, t))
+        if os.path.exists(p):
+            return p
+    return os.path.join(str(directory), "%s_%04d.bin" % (name, t))
+
+
 # Primary radii exactly as the engine defines them (src/cpp/constants/constants.cpp).
 PRIMARY_RADIUS_KM = {
     "JUPITER": 69911.0,
@@ -106,7 +119,7 @@ def read_series(out_dir, component, face_idx, n_steps):
     """Per-timestep value of one face for a component directory."""
     vals = np.full(n_steps, np.nan)
     for t in range(n_steps):
-        path = os.path.join(out_dir, component, "%s_%04d.bin" % (component, t))
+        path = _frame_file(os.path.join(out_dir, component), component, t)
         if not os.path.exists(path):
             continue
         with open(path, "rb") as fh:

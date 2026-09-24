@@ -71,8 +71,8 @@ def main() -> int:
     # Average per-step temperature files. We assume the two runs have the
     # same number of steps (typically 288 per orbit at the same cadence);
     # the result is a single 288-step "annual-mean diurnal cycle."
-    s1_steps = sorted((args.season1 / "temperature").glob("temperature_*.bin"))
-    s2_steps = sorted((args.season2 / "temperature").glob("temperature_*.bin"))
+    s1_steps = sorted((args.season1 / "temperature").glob("temperature_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
+    s2_steps = sorted((args.season2 / "temperature").glob("temperature_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     n = min(len(s1_steps), len(s2_steps))
     if n == 0:
         print("No per-step files; skipping per-step averaging")

@@ -734,7 +734,7 @@ level, for the same PTM-67 reason `flux_cubes` is.
 | `march_steps` | int | 16 | March rungs from the surface to `h_max_m` |
 | `bisect_rounds` | int | 4 | Bisections inside the bracket the march found. Final bracket = `h_max_m / (march_steps * 2^bisect_rounds)` = 0.0195 m at the defaults |
 | `solar_disk_samples` | int | 128 | Disk samples when a unanimously *blocked* probe is escalated |
-| `write_frames` | bool | true | Per-epoch `shadow_depth/shadow_depth_%04d.bin` |
+| `write_frames` | bool | true | Per-epoch `shadow_depth/shadow_depth_<index>.bin` (index zero-padded to at least 6 digits) |
 | `monotonicity_faces` | int | 10000 | Faces sampled by the overhang audit (0 disables) |
 | `monotonicity_epochs` | int | 10 | Epochs sampled by the overhang audit (0 disables) |
 
@@ -758,7 +758,7 @@ Outputs:
 
 | Path | Contents |
 |---|---|
-| `shadow_depth/shadow_depth_%04d.bin` | one frame per output epoch: `uint32` face count then `float32[F]` |
+| `shadow_depth/shadow_depth_<index>.bin` | one frame per output epoch (index zero-padded to at least 6 digits): `uint32` face count then `float32[F]` |
 | `statistics/shadow_depth_{avg,max,min}.bin` | over **resolved, nonzero** epochs only; `NaN` where a face had none |
 | `statistics/shadow_lit_frac.bin` | fraction of evaluated epochs with the Sun visible at the surface |
 | `statistics/shadow_unresolved_frac.bin` | fraction umbral above `h_max_m` |
@@ -1191,6 +1191,38 @@ carries the full thermophysical property set. See the asteroid examples in
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `shape.semi_axes_km` | list[float] × 3 | body default | Triaxial semi-axes a, b, c in km. Must be exactly three entries; any other shape or length is refused (see [Keys the engine reads as lists](#keys-the-engine-reads-as-lists)) |
+| `shape.type` | string | spherical | `spherical`, `ellipsoidal` or `custom_mesh`; any other value is refused. `ellipsoidal` without three positive axes, or `custom_mesh` without a mesh, builds a sphere and says so |
+| `ephemeris_source` | string | auto | `keplerian`, `spice` or `auto`; any other value is refused. `auto` resolves to Keplerian (a warning is printed if a `spice_metakernel` is also set) |
+| `orbit.epoch` | epoch string | J2000 | Epoch of the osculating elements; `orbit.mean_anomaly_deg` is the mean anomaly **at** this epoch. See the epoch formats below |
+| `spin.prime_meridian_deg` | float | 0.0 | Prime meridian angle W0 at `spin.epoch`, degrees about the pole, measured from the body's reference axis: the J2000 ecliptic +x (the vernal equinox) projected onto the body's equatorial plane, or ecliptic +y if the pole lies within 25.8° of +x (`orbital/body_fixed_frame.cpp`). W(t) = W0 + 360° (t − epoch) / `spin.period_hours` |
+| `spin.epoch` | epoch string | J2000 | Epoch of `spin.prime_meridian_deg` |
+
+Before 2026-09-24, `orbit.epoch` and `spin.prime_meridian_deg` were parsed and
+**ignored**: every generic body rotated from W = 0 at J2000 and applied its mean
+anomaly at J2000 (BUGS.md PTM-663). A config that set them to anything but the
+J2000 defaults produces a different, now correct, run.
+
+**Epoch formats** (both `*.epoch` keys, all on the **TDB** scale, the scale of
+SPICE ET and of JPL osculating-element epochs): `YYYY-MM-DDTHH:MM:SS[.fff]`
+(a space may replace the `T`; the time and seconds are optional), the same with
+a ` TDB` suffix, or a Julian date `JD 2451545.0` (the `JD` may be omitted for a
+number above 100000). A `UTC`, `Z`, `TT`, `TAI` or `UT` suffix is refused rather
+than converted. So `'2000-01-01T12:00:00'`, the value every shipped config
+carries, is J2000 exactly.
+
+**A DAMIT spin state** (`lambda beta P` / `JD0 phi0`) maps onto these keys by
+`spin.epoch: JD <JD0>`, the pole from (lambda, beta) converted to equatorial
+RA/Dec, and `prime_meridian_deg = phi0 + delta`. DAMIT's zero of phi and this
+engine's zero of W are different directions in the body's equatorial plane,
+so delta, the angle about the pole between them, is a constant for a given
+pole; compute it once from the two reference vectors, and confirm the result
+(sign included) by comparing the sub-solar point at one epoch against an
+independent prediction.
+
+Any key under `generic_body:` (or its `shape:`, `orbit:`, `spin:`, `surface:`
+blocks) that the engine does not read is named in a `[config] WARNING` at load
+time. The HORIZONS writer's provenance keys (`spk_file`, `surface.albedo_*`
+other than `albedo`) are named in a `NOTE` instead.
 
 ### How `generic_body.spice_metakernel` is resolved
 

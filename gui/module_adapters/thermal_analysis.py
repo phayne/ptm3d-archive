@@ -366,7 +366,11 @@ class ThermalAnalysisPanel(QWidget):
             return
 
         # Find all temperature files
-        temp_files = sorted(temp_dir.glob("temperature_*.bin"))
+        # Numeric order, either naming generation (BUGS.md PTM-664).
+        from gui_core._ptm_bootstrap import ensure_ptm_importable
+        ensure_ptm_importable()
+        from ptm.readers import sorted_frame_files
+        temp_files = sorted_frame_files(temp_dir, "temperature")
         if not temp_files:
             return
 

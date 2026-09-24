@@ -2817,13 +2817,33 @@ double IlluminationModel::convertTimeToET(const std::string& time_str) {
     return et;
 }
 
+namespace {
+// Seconds from the SPIN epoch, for the body-fixed rotation (BUGS.md PTM-663).
+//
+// The Keplerian branches used to rotate the body by the seconds from the
+// ORBIT epoch. That was invisible only because both epochs were pinned to
+// J2000 (neither generic_body key was wired); with orbit.epoch honored it
+// would have shifted the rotational phase by omega * (orbit epoch - J2000).
+//
+// The expression is deliberately the propagator's own
+// (KeplerianPropagator::etToSecondsFromEpoch: JD round trip, then scale), so
+// that when spin.epoch_jd == orbit.epoch_jd -- every config written before
+// this change -- the angle is BIT-identical to what it was.
+inline double secondsFromSpinEpoch(double et, const orbital::SpinState& spin) {
+    const double jd = 2451545.0 + et / 86400.0;
+    return (jd - spin.epoch_jd) * 86400.0;
+}
+}  // namespace
+
 std::array<double, 3> IlluminationModel::getSunPosition(double et) {
     if (use_keplerian_ && keplerian_propagator_ && body_fixed_frame_) {
-        // Keplerian mode: compute body position from orbital elements,
-        // then get Sun direction in body-fixed frame
+        // Keplerian mode: compute body position from orbital elements (time
+        // from the ORBIT epoch), then rotate into the body-fixed frame (time
+        // from the SPIN epoch).
         double t_sec = keplerian_propagator_->etToSecondsFromEpoch(et);
         auto body_pos = keplerian_propagator_->getPosition(t_sec);
-        return body_fixed_frame_->getSunInBodyFixed(t_sec, body_pos);
+        return body_fixed_frame_->getSunInBodyFixed(
+            secondsFromSpinEpoch(et, body_fixed_frame_->spinState()), body_pos);
     }
 
     // SPICE mode
@@ -2855,7 +2875,8 @@ std::array<double, 3> IlluminationModel::getSunPosition(double et) {
         if (keplerian_propagator_ && body_fixed_frame_) {
             double t_sec = keplerian_propagator_->etToSecondsFromEpoch(et);
             auto body_pos = keplerian_propagator_->getPosition(t_sec);
-            return body_fixed_frame_->getSunInBodyFixed(t_sec, body_pos);
+            return body_fixed_frame_->getSunInBodyFixed(
+                secondsFromSpinEpoch(et, body_fixed_frame_->spinState()), body_pos);
         }
         return {{0.0, 0.0, 0.0}};
     }

@@ -44,7 +44,7 @@ def build_icosphere(level):
 
 
 def load_T(d):
-    files = sorted(Path(d).glob('temperature/temperature_*.bin'))
+    files = sorted(Path(d).glob('temperature/temperature_*.bin'), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     return np.stack([np.fromfile(f, dtype=np.float32) for f in files])
 
 

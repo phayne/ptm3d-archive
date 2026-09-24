@@ -81,7 +81,7 @@ def process_lunation_timesteps(lunation_dir, nf):
     if not ds_dir.exists():
         return None
 
-    files = sorted(ds_dir.glob("direct_solar_*.bin"))
+    files = sorted(ds_dir.glob("direct_solar_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     nt = len(files)
     if nt == 0:
         return None

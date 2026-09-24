@@ -101,7 +101,7 @@ def write_bin(path, arr):
 
 
 def find_last_epoch(run_dir: Path, field_dir: str) -> int:
-    files = sorted((run_dir / field_dir).glob(f"{field_dir}_*.bin"))
+    files = sorted((run_dir / field_dir).glob(f"{field_dir}_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not files:
         return -1
     m = re.search(r"_(\d+)\.bin$", files[-1].name)

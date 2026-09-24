@@ -71,7 +71,7 @@ def main() -> int:
 
     # stream the direct_solar step files; build per-face max/mean of direct and
     # of total = direct + indirect (max over time must use the per-step sum).
-    dsteps = sorted((run / "direct_solar").glob("direct_solar_*.bin"))
+    dsteps = sorted((run / "direct_solar").glob("direct_solar_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if len(dsteps) != ns:
         print(f"WARNING: {len(dsteps)} direct_solar steps vs {ns} indirect columns; "
               f"using min", file=sys.stderr)

@@ -369,6 +369,28 @@ set_target_properties(test_state_io
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Per-step frame file names (BUGS.md PTM-664): the >= 6-digit width rule, sort
+# order within a run, and reader resolution of both naming generations.
+# Header-only; links nothing.
+add_executable(test_frame_naming test_frame_naming.cpp)
+set_target_properties(test_frame_naming
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# Epoch strings for generic_body.orbit.epoch / spin.epoch (BUGS.md PTM-663):
+# TDB reading, the exact-J2000 spelling, and refusal of every other scale or
+# malformed date. Header-only; links nothing.
+add_executable(test_epoch_parse test_epoch_parse.cpp)
+set_target_properties(test_epoch_parse
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Thermal-state checkpoint INSPECTOR -- "what is this checkpoint". Links
 # `thermal` for two reasons: the optional --body grid block builds a real
 # thermal::Profile (so the depth grid reported is the SOLVER's, not a

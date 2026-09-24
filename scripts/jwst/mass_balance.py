@@ -24,7 +24,7 @@ SECONDS_PER_YEAR = 365.25 * 86400.0
 
 def find_last_epoch(run_dir: Path | str, subdir: str) -> int:
     """Highest epoch index among <subdir>/<subdir>_NNNN.bin files."""
-    files = sorted((Path(run_dir) / subdir).glob(f"{subdir}_*.bin"))
+    files = sorted((Path(run_dir) / subdir).glob(f"{subdir}_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not files:
         raise FileNotFoundError(f"No files in {Path(run_dir)/subdir}/")
     m = re.search(r"_(\d+)\.bin$", files[-1].name)

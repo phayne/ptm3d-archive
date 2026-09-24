@@ -375,7 +375,7 @@ output/
 │   ├── illumination_avg.bin    # Mean solar flux
 │   └── ice_depth.bin           # Ice stability depth
 ├── temperature/
-│   ├── temperature_00001.bin   # Per-timestep temperatures
+│   ├── temperature_000001.bin  # Per-timestep temperatures
 │   └── ...
 └── illumination_series.csv     # Location time series (if --locations)
 ```
@@ -389,14 +389,27 @@ means the same thing in every one of them. `temperature/temperature_NNNN.bin`
 holds the surface state **at** the epoch on line `NNNN` of `time_steps.txt`,
 which is the same epoch at which `direct_solar/direct_solar_NNNN.bin` and
 `illumination/illumination_NNNN.bin` are sampled. So index 0 is the state the
-run started from — the spin-up seed, or the checkpoint of a warm-started chunk
-— and no frame reflects flux that arrives after its own epoch. Joining
+run started from (the spin-up seed, or the checkpoint of a warm-started chunk),
+and no frame reflects flux that arrives after its own epoch. On the CPU solvers
+a warm-started chunk's index 0 reports the surface re-solved at that epoch,
+exactly as the unchunked run reports the same epoch, so a chunked CPU series
+equals the single-shot series at every frame
+(`scripts/test_chunk_seam_equivalence.py`; BUGS.md PTM-662). The GPU solver
+still reports the checkpoint's raw surface node there and says so in its log.
+
+**Index width**: the index is zero-padded to at least **six** digits, and to
+more when a run has more frames than six digits hold, so every frame of one
+run has the same width and an alphabetical listing is in time order. Runs
+written before 2026-09-24 used four digits, which roll over to five at frame
+10,000 and then sort out of order. Read frames by their parsed integer index:
+`ptm.readers.sorted_frame_files()` and `ptm.readers.frame_path()` handle both
+namings (BUGS.md PTM-664). Joining
 temperature to illumination by index is therefore safe, and a chunked run
 merged with `ptm_merge_chunks` tiles the epochs exactly once with no gap and no
 duplicate. To confirm this on a build, run
 `scripts/check_output_time_alignment.py` (it needs an anchor outside the
-series — a warm-start checkpoint or a `PTM_DUMP_SEED` file — because a uniform
-shift of the whole series is invisible from inside it).
+series, a GPU warm-start checkpoint or a `PTM_DUMP_SEED` file, because a
+uniform shift of the whole series is invisible from inside it).
 
 **VTK/PVD export**: Use `python src/python/vtk_converter.py` to create ParaView-compatible time series.
 

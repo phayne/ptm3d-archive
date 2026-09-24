@@ -2,6 +2,7 @@
 #include "shadow_depth_pass.h"
 
 #include "solar_disk_visibility.h"
+#include "../fileio/frame_naming.h"
 
 #include <algorithm>
 #include <cmath>
@@ -79,10 +80,10 @@ bool writeRawCount(const std::string& path, const std::vector<uint32_t>& v) {
     return static_cast<bool>(o);
 }
 
-std::string frameIndex(int k) {
-    std::ostringstream s;
-    s << std::setw(4) << std::setfill('0') << k;
-    return s.str();
+// Same naming rule as every other per-step product (BUGS.md PTM-664): width
+// from the window's epoch count, minimum six digits.
+std::string frameIndex(int k, int n_steps) {
+    return ptm::frameIndexString(k, n_steps);
 }
 
 }  // namespace
@@ -314,6 +315,14 @@ bool runShadowDepthPass(const PassInputs& in, std::string& err) {
         catch (const std::exception& e) {
             err = std::string("shadow depth: cannot create ") + frames_dir + ": " + e.what();
             return false;
+        }
+        // Frames of the other index width are a previous run's (BUGS.md PTM-664).
+        const long long stale = ptm::removeOtherWidthFrames(
+            frames_dir, "shadow_depth", ptm::frameIndexWidth(n_steps));
+        if (stale > 0) {
+            std::cerr << "[shadow-depth] NOTE: removed " << stale << " stale shadow_depth_*.bin "
+                         "frame(s) of a different index width from " << frames_dir
+                      << "/ (a previous run's; BUGS.md PTM-664)." << std::endl;
         }
     }
 
@@ -610,7 +619,7 @@ bool runShadowDepthPass(const PassInputs& in, std::string& err) {
         }
 
         if (in.write_frames) {
-            const std::string fp = frames_dir + "/shadow_depth_" + frameIndex(k) + ".bin";
+            const std::string fp = frames_dir + "/shadow_depth_" + frameIndex(k, n_steps) + ".bin";
             if (!writeFrame(fp, depth)) {
                 err = "shadow depth: cannot write " + fp;
                 return false;

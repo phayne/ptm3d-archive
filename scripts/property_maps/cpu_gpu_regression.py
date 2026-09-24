@@ -59,7 +59,7 @@ def run(repo: Path, yaml_path: Path) -> int:
 
 
 def load_temps(d: Path) -> np.ndarray:
-    files = sorted((d / "temperature").glob("temperature_*.bin"))
+    files = sorted((d / "temperature").glob("temperature_*.bin"), key=lambda p: int(str(p).rsplit("_", 1)[1][:-4]))
     if not files:
         raise FileNotFoundError(f"no temperature_*.bin in {d}/temperature")
     return np.stack([np.fromfile(f, dtype=np.float32) for f in files])

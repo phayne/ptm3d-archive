@@ -25,6 +25,19 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 
+def _frame_file(directory, name, t):
+    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+
+    Current engines pad the index to >= 6 digits; runs written before used 4.
+    """
+    for w in range(6, 13):
+        p = os.path.join(str(directory), "%s_%0*d.bin" % (name, w, t))
+        if os.path.exists(p):
+            return p
+    return os.path.join(str(directory), "%s_%04d.bin" % (name, t))
+
+
+
 # ---------------------------------------------------------------------------
 # Publication style
 # ---------------------------------------------------------------------------
@@ -95,7 +108,7 @@ def load_temperature_cube(data_dir, n_steps=288):
     """Load all timestep temperature files into a (n_faces, n_steps) array."""
     temps = []
     for i in range(n_steps):
-        fpath = os.path.join(data_dir, 'temperature', f'temperature_{i:04d}.bin')
+        fpath = _frame_file(os.path.join(data_dir, 'temperature'), 'temperature', i)
         temps.append(read_binary_field(fpath))
     return np.column_stack(temps)
 
