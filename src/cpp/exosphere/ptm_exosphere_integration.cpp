@@ -754,6 +754,36 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             }
         }
 
+        // Lag-layer diffusion barrier state (lag mode only).
+        if (ice_layer_enabled_ && ice_layer_state_ && ice_layer_state_->hasLag() && ice_layer_model_) {
+            const auto& st = *ice_layer_state_;
+            const double ell = ice_layer_model_->getLagBarrierLength();
+            const double phi = ice_layer_model_->getLagConfig().lag_porosity;
+            writeBinaryArray("lag_thickness_m", st.lag_thickness);
+            writeBinaryArray("frost_veneer_kg_m2", st.frost_veneer);
+            writeBinaryArray("substrate_ice_kg_m2", st.substrate_ice);
+            std::vector<double> nonice_mass(num_faces), cls(num_faces), avail(num_faces), regime(num_faces, -1.0);
+            static const std::vector<int> no_regime;
+            const auto& rg = multiscale_evolution_ ? multiscale_evolution_->getLagRegime() : no_regime;
+            std::vector<double> lag_as, lag_ap;
+            if (multiscale_evolution_) {
+                const auto& da = multiscale_evolution_->getDiurnalAverages();
+                multiscale_evolution_->lagAvailabilities(*ice_layer_model_, st, da.base_sublimation_flux,
+                                                         da.base_sputtering_flux, lag_as, lag_ap);
+            }
+            for (size_t i = 0; i < num_faces; ++i) {
+                // Non-ice grains in the lag: volume (1 - phi_lag) d at the dust density.
+                nonice_mass[i] = layer_constants::DUST_DENSITY * (1.0 - phi) * st.lag_thickness[i];
+                cls[i] = (st.frost_veneer[i] > 0.0) ? 1.0 : (st.lag_thickness[i] > 10.0 * ell ? 2.0 : 0.0);
+                avail[i] = lag_as.empty() ? ice_layer_model_->getSublimationAvailability(st, i) : lag_as[i];
+                if (rg.size() == num_faces) regime[i] = rg[i];
+            }
+            writeBinaryArray("lag_nonice_mass_kg_m2", nonice_mass);
+            writeBinaryArray("lag_class", cls);            // 0 mixed, 1 frost veneer, 2 sealed (d > 10 l)
+            writeBinaryArray("lag_regime", regime);        // last step: 0 substrate, 1 recycling, 2 veneer, 3 none; -1 before
+            writeBinaryArray("sublimation_availability", avail);
+        }
+
         // Write composition-dependent albedo if coupling is enabled
         if (albedo_coupling_enabled_ && !current_face_albedos_.empty()) {
             writeBinaryArray("bond_albedo", current_face_albedos_);
@@ -921,7 +951,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
             // Gate vapor pressure by ice availability (no ice = no local vapor source)
             double vp = state.vapor_pressure[i];
-            if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+            // (Lag barrier: the multiscale export already scaled vapor_pressure by the
+            // face's availability; do not apply it twice. The legacy path does, PTM-661.)
+            if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_ &&
+                !(multiscale_export_mode_ && ice_layer_model_->usesLagBarrier())) {
                 vp *= ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
             }
 
@@ -1966,9 +1999,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // Save previous albedos for change detection
         previous_face_albedos_ = current_face_albedos_;
 
-        // Compute new albedos from current composition
-        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration,
-                                       current_face_albedos_);
+        // Compute new albedos from current composition (and lag, if on)
+        computeCompositionAlbedos(ice_layer_state_->nonice_concentration,
+                                  ice_layer_state_->hasLag() ? &ice_layer_state_->lag_thickness : nullptr,
+                                  current_face_albedos_);
 
         // Compute maximum change
         return CompositionAlbedoMapper::maxAlbedoChange(previous_face_albedos_,
@@ -2004,6 +2038,165 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                       << "temperatures and baseline are unchanged" << std::endl;
         }
         return true;
+    }
+
+    void PTMExosphereIntegration::computeCompositionAlbedos(const std::vector<double>& nonice,
+                                                            const std::vector<double>* lag_d,
+                                                            std::vector<double>& out) const {
+        if (lag_d) {
+            albedo_mapper_->computeAlbedosWithLag(nonice, *lag_d, lag_cfg_.optical_depth, out);
+        } else {
+            albedo_mapper_->computeAlbedos(nonice, out);
+        }
+    }
+
+    void PTMExosphereIntegration::enableLagBarrierState() {
+        const size_t n = static_cast<size_t>(num_faces_);
+        // t = 0 references, taken before the switch.
+        std::vector<double> avail0(n), albedo0;
+        for (size_t i = 0; i < n; ++i) avail0[i] = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
+        if (albedo_mapper_) albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration, albedo0);
+
+        ice_layer_model_->enableLagBarrier(*ice_layer_state_, lag_cfg_);
+        const double ell = ice_layer_model_->getLagBarrierLength();
+
+        // t = 0 invariance: at d = 0 every availability and albedo is the legacy value
+        // bit for bit, so the initialization gates and the t = 0 fields are unchanged.
+        size_t bad_avail = 0, bad_albedo = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (ice_layer_model_->getSublimationAvailability(*ice_layer_state_, i) != avail0[i] ||
+                ice_layer_model_->getSputterAvailability(*ice_layer_state_, i) != avail0[i]) ++bad_avail;
+        }
+        if (albedo_mapper_) {
+            std::vector<double> a_lag;
+            computeCompositionAlbedos(ice_layer_state_->nonice_concentration, &ice_layer_state_->lag_thickness, a_lag);
+            for (size_t i = 0; i < n; ++i) if (a_lag[i] != albedo0[i]) ++bad_albedo;
+        }
+        if (bad_avail > 0 || bad_albedo > 0) {
+            throw std::logic_error("lag barrier t = 0 invariance failed: " + std::to_string(bad_avail) +
+                                   " availabilities and " + std::to_string(bad_albedo) +
+                                   " albedos differ from the legacy values at d = 0");
+        }
+
+        double bmin = std::numeric_limits<double>::infinity(), bmax = 0.0, xmin = 1.0, xmax = 0.0;
+        size_t n_pure = 0, n_noice = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double xn = ice_layer_state_->nonice_concentration[i];
+            xmin = std::min(xmin, xn);
+            xmax = std::max(xmax, xn);
+            if (xn <= 0.0) ++n_pure;
+            else if (xn >= 1.0) ++n_noice;
+            else {
+                bmin = std::min(bmin, ice_layer_state_->lag_beta[i]);
+                bmax = std::max(bmax, ice_layer_state_->lag_beta[i]);
+            }
+        }
+        const auto& c = lag_cfg_;
+        std::cout << "\n=== Lag-layer diffusion barrier (multiscale) ===" << std::endl;
+        std::cout << std::scientific << std::setprecision(4);
+        if (c.barrier_length > 0.0) {
+            std::cout << "  Barrier length l = " << ell << " m (explicit --lag-barrier-length; the Knudsen value "
+                      << "for the grain parameters would be "
+                      << LagBarrierConfig::derivedLength(c.lag_porosity, c.grain_radius, c.tortuosity) << " m)"
+                      << std::endl;
+        } else {
+            std::cout << "  Barrier length l = 1.128 [phi/(1-phi)] r / tau = " << ell << " m  (Knudsen D_K, "
+                      << "Schorghofer 2008 ApJ 682:697 eq. 3; phi_lag = " << c.lag_porosity << ", r = "
+                      << c.grain_radius << " m, tau = " << c.tortuosity << ")" << std::endl;
+        }
+        std::cout << "  Sublimation through the lag: J = J_0 f(x_n) / (1 + d/l); sputtering NOT barriered "
+                  << "(energetic ions reach cm depths; Paul, 2026-09-24)" << std::endl;
+        std::cout << "  Lag growth d(lag_d) = beta x (net ice loss), beta = x_n / [(1-x_n) rho_ice (1-phi_lag)]: "
+                  << bmin << " .. " << bmax << " m^3/kg over the faces that can form lag" << std::endl;
+        std::cout << "  x_n (frozen t = 0 non-ice fraction): " << xmin << " .. " << xmax << "; pure-ice faces "
+                  << "(no lag forms): " << n_pure << "; faces with no ice: " << n_noice << std::endl;
+        std::cout << "  Frost veneer: deposition beyond the face's barriered loss builds unbarriered frost; "
+                  << "deposition never removes lag (the legacy layer overflow now has a home)" << std::endl;
+        if (albedo_mapper_) {
+            std::cout << "  Lag albedo: A = A_lag + (A_mix - A_lag) exp(-d/delta_opt), delta_opt = "
+                      << c.optical_depth << " m, A_lag = forward albedo at c = 1 (" << albedo_mapper_->computeAlbedo(1.0, 0)
+                      << " on face 0); the frost veneer is optically neutral" << std::endl;
+        } else {
+            std::cout << "  Lag albedo: not used (no albedo coupling)" << std::endl;
+        }
+        std::cout << "  Thermal inertia: unchanged; WARNING if any d exceeds " << c.warn_thickness << " m" << std::endl;
+        std::cout << "  Transport refresh when the emission pattern moves by > " << c.source_refresh_tol
+                  << " (total variation)" << std::endl;
+        std::cout << "  t = 0 invariance: availability and albedo bit-identical to the legacy values on all "
+                  << n << " faces" << std::endl;
+        std::cout << std::fixed;
+    }
+
+    void PTMExosphereIntegration::writeLagTimeseriesRow(int epoch, double t_seconds, bool header) {
+        const size_t n = static_cast<size_t>(num_faces_);
+        const auto& da = multiscale_evolution_->getDiurnalAverages();
+        const auto& st = *ice_layer_state_;
+        const double ell = ice_layer_model_->getLagBarrierLength();
+        if (lag_top_decile_.size() != n) {
+            // Top decile (by area) of the t = 0 diurnal-mean temperature.
+            std::vector<size_t> idx(n);
+            for (size_t i = 0; i < n; ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                return da.avg_temperature[a] > da.avg_temperature[b] ||
+                       (da.avg_temperature[a] == da.avg_temperature[b] && a < b);
+            });
+            double a_tot = 0.0, a_cum = 0.0;
+            for (size_t i = 0; i < n; ++i) a_tot += face_areas_[i];
+            lag_top_decile_.assign(n, 0);
+            for (size_t k : idx) {
+                if (a_cum >= 0.1 * a_tot) break;
+                lag_top_decile_[k] = 1;
+                a_cum += face_areas_[k];
+            }
+        }
+        const std::string dir = output_dir_ + "/lag";
+        std::filesystem::create_directories(dir);
+        std::ofstream f(dir + "/lag_timeseries.csv", header ? std::ios::trunc : std::ios::app);
+        if (header) {
+            f << "# lag-layer diffusion barrier; l = " << std::scientific << std::setprecision(6) << ell
+              << " m; classes: frost = veneer m_f > 0, sealed = d > 10 l, mixed = the rest; "
+              << "top decile = top 10% of area by t = 0 diurnal-mean temperature; "
+              << "top_decile_pred = sum area sqrt(l J0 f / (2 beta t)) at the current J0\n";
+            f << "epoch,time_yr,sublimation_kg_s,sputtering_kg_s,deposition_kg_s,net_loss_kg_s,"
+                 "veneer_mass_kg,max_lag_m,area_frac_mixed,area_frac_frost,area_frac_sealed,"
+                 "sub_share_mixed,sub_share_frost,sub_share_sealed,area_frac_recycling,sub_share_recycling,"
+                 "top_decile_sublimation_kg_s,top_decile_pred_kg_s,"
+                 "last_step_sublimation_kg_s,last_step_sputtering_kg_s,last_step_deposition_kg_s\n";
+            f << std::defaultfloat;
+        }
+        const std::vector<int>& regime = multiscale_evolution_->getLagRegime();
+        double sub = 0.0, sput = 0.0, dep = 0.0, ven = 0.0, dmax = 0.0, a_tot = 0.0;
+        double area_c[3] = {0, 0, 0}, sub_c[3] = {0, 0, 0}, a_rec = 0.0, s_rec = 0.0, top = 0.0, pred = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double a = face_areas_[i];
+            const double q = da.avg_sublimation_flux[i] * a;
+            sub += q;
+            sput += da.avg_sputtering_flux[i] * a;
+            dep += da.avg_deposition_flux[i] * a;
+            ven += st.frost_veneer[i] * a;
+            dmax = std::max(dmax, st.lag_thickness[i]);
+            a_tot += a;
+            const int cls = (st.frost_veneer[i] > 0.0) ? 1 : (st.lag_thickness[i] > 10.0 * ell ? 2 : 0);
+            area_c[cls] += a;
+            sub_c[cls] += q;
+            if (regime.size() == n && regime[i] == 1) { a_rec += a; s_rec += q; }
+            if (lag_top_decile_[i]) {
+                top += q;
+                const double beta = st.lag_beta[i];
+                if (t_seconds > 0.0 && beta > 0.0) {
+                    pred += a * std::sqrt(ell * da.base_sublimation_flux[i] * st.lag_exposed_fraction[i]
+                                          / (2.0 * beta * t_seconds));
+                }
+            }
+        }
+        const double sy = timescale_constants::SECONDS_PER_YEAR;
+        f << epoch << "," << std::setprecision(10) << (t_seconds / sy) << "," << sub << "," << sput << "," << dep
+          << "," << (sub + sput - dep) << "," << ven << "," << dmax;
+        for (int k = 0; k < 3; ++k) f << "," << area_c[k] / a_tot;
+        for (int k = 0; k < 3; ++k) f << "," << (sub > 0.0 ? sub_c[k] / sub : 0.0);
+        const auto& ms = multiscale_evolution_->getStatistics();
+        f << "," << a_rec / a_tot << "," << (sub > 0.0 ? s_rec / sub : 0.0) << "," << top << "," << pred
+          << "," << ms.sublimation_rate << "," << ms.sputtering_rate << "," << ms.deposition_rate << "\n";
     }
 
     // =========================================================================
@@ -2102,6 +2295,17 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         multiscale_enabled_ = true;
 
         config.print();
+
+        if (lag_cfg_.enabled) {
+            if (!config.superstep_consistent_deposition) {
+                throw std::invalid_argument("the lag barrier requires the step-consistent super-step deposition "
+                                            "(PTM-644); legacy deposition modes need --no-lag-barrier");
+            }
+            enableLagBarrierState();
+        } else {
+            std::cout << "[lag] lag-layer diffusion barrier OFF (--no-lag-barrier): legacy well-mixed layer; "
+                      << "lost ice is booked as non-ice volume (void counted as non-ice)" << std::endl;
+        }
 
         // Sputter mass accounting (PTM-642).
         if (sputterTransportActive()) {
@@ -2223,6 +2427,23 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             bool need_full_diurnal = force_cache_refresh ||
                 multiscale_evolution_->needsCacheRefresh(
                     *ice_layer_model_, *ice_layer_state_, face_areas_, epoch);
+            if (!need_full_diurnal && ice_layer_model_->usesLagBarrier()) {
+                // Lag barrier: the emission pattern moves without any albedo change
+                // (the barrier grows); refresh the transport once it has moved by more
+                // than the tolerance, so the deposition pattern follows its sources.
+                const double drift = multiscale_evolution_->lagSourcePatternDrift(
+                    *ice_layer_model_, *ice_layer_state_, face_areas_);
+                if (drift > lag_cfg_.source_refresh_tol) {
+                    need_full_diurnal = true;
+                    ++lag_source_refreshes_;
+                    if (show_progress_) {
+                        std::cout << "  [lag] emission pattern moved " << std::scientific << std::setprecision(3)
+                                  << drift << " (total variation) > " << lag_cfg_.source_refresh_tol
+                                  << std::fixed << " since the transport was cached: refresh"
+                                  << std::endl;
+                    }
+                }
+            }
 
             if (need_full_diurnal) {
                 // Run full diurnal cycle (expensive)
@@ -2247,6 +2468,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 if (!final_state) cached_epoch_count++;
             }
 
+            if (ice_layer_model_->usesLagBarrier()) {
+                writeLagTimeseriesRow(epoch, static_cast<double>(epoch) * epoch_duration, epoch == 0);
+            }
+
             // Export the state at t = epoch * epoch_duration (see the note above the loop).
             if (export_now) {
                 if (!need_full_diurnal) {
@@ -2257,6 +2482,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     auto& exo_state = exosphere_model_->getMutableState();
                     const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
 
+                    // Lag barrier: the availability that scales the exported emission
+                    // (regime-aware), so vapor pressure and emission agree.
+                    std::vector<double> lag_as, lag_ap;
+                    if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_ &&
+                        ice_layer_model_->usesLagBarrier()) {
+                        multiscale_evolution_->lagAvailabilities(*ice_layer_model_, *ice_layer_state_,
+                            diurnal_avg.base_sublimation_flux, diurnal_avg.base_sputtering_flux, lag_as, lag_ap);
+                    }
                     for (size_t i = 0; i < num_faces_; ++i) {
                         // Sync ice mass from ice layer state
                         if (ice_layer_enabled_ && ice_layer_state_) {
@@ -2271,7 +2504,8 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
                         // Recompute atmospheric properties from diurnal-averaged temperature
                         double T = std::max(50.0, diurnal_avg.avg_temperature[i]);
-                        double ice_avail = (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
+                        double ice_avail = !lag_as.empty() ? lag_as[i]
+                            : (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
                             ? ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i)
                             : 1.0;
                         exo_state.vapor_pressure[i] = VaporPressure::calculateVaporPressure(T) * ice_avail;
@@ -2307,8 +2541,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     }
 
                     if (max_step > 0) {
-                        safe_extra = multiscale_evolution_->computeSafeEpochCount(
-                            *ice_layer_state_, face_areas_, epoch_duration, max_step) - 1;
+                        safe_extra = (ice_layer_model_->usesLagBarrier()
+                            ? multiscale_evolution_->computeSafeEpochCountLag(
+                                  *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration, max_step)
+                            : multiscale_evolution_->computeSafeEpochCount(
+                                  *ice_layer_state_, face_areas_, epoch_duration, max_step)) - 1;
                         // -1 because computeSafeEpochCount returns total including the one we already did
                         safe_extra = std::max(0, safe_extra);
                     }
@@ -2327,17 +2564,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                         albedo_refresh_.seeded() && albedo_step_limit_) {
                         const auto t_lim0 = std::chrono::steady_clock::now();
                         const double thr = albedo_mapper_->getConfig().albedo_update_threshold;
-                        std::vector<double> c_pred, a_pred;
+                        std::vector<double> c_pred, a_pred, d_pred;
+                        const bool lag_on = ice_layer_state_->hasLag();
                         double last_dev = 0.0;
                         auto exceeds = [&](int n) {
                             multiscale_evolution_->predictConcentrations(
                                 *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration * n, c_pred,
-                                /*solve_deposition=*/false);
-                            albedo_mapper_->computeAlbedos(c_pred, a_pred);
+                                /*solve_deposition=*/false, lag_on ? &d_pred : nullptr);
+                            computeCompositionAlbedos(c_pred, lag_on ? &d_pred : nullptr, a_pred);
                             last_dev = albedo_refresh_.maxDeviation(a_pred);
                             return last_dev > thr;
                         };
-                        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration, a_pred);
+                        computeCompositionAlbedos(ice_layer_state_->nonice_concentration,
+                                                  lag_on ? &ice_layer_state_->lag_thickness : nullptr, a_pred);
                         const double dev0 = albedo_refresh_.maxDeviation(a_pred);  // at n = 0 (current)
                         if (dev0 > thr) {
                             // The one-epoch step already passed the threshold: refresh next.
@@ -2416,6 +2655,16 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             // Step 4: Update statistics (accounts for all epochs in this super-step)
             multiscale_evolution_->updateStatistics(*ice_layer_model_, *ice_layer_state_,
                                                      epoch_duration, step_size);
+            if (ice_layer_model_->usesLagBarrier() && !lag_warned_thickness_ &&
+                multiscale_evolution_->getStatistics().lag_faces_over_warn > 0) {
+                lag_warned_thickness_ = true;
+                const auto& st = multiscale_evolution_->getStatistics();
+                std::cerr << "\nWARNING [lag]: " << st.lag_faces_over_warn << " faces have a lag thicker than "
+                          << std::scientific << std::setprecision(3) << lag_cfg_.warn_thickness
+                          << " m (max " << st.lag_max_thickness << " m) at epoch " << (epoch + step_size)
+                          << "; the thermal inertia is NOT changed for the lag, so the thermal model no longer "
+                          << "describes these faces" << std::fixed << std::endl;
+            }
 
             // Progress reporting
             if (show_progress_) {
@@ -2462,6 +2711,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         if (full_diurnal_count > 0) {
             double speedup = static_cast<double>(full_diurnal_count + cached_epoch_count) / full_diurnal_count;
             std::cout << "    Effective speedup: " << std::setprecision(1) << speedup << "x" << std::endl;
+        }
+        if (ice_layer_model_->usesLagBarrier()) {
+            std::cout << "    Lag barrier: " << lag_source_refreshes_ << " transport refreshes forced by the "
+                      << "emission pattern (tolerance " << std::scientific << std::setprecision(2)
+                      << lag_cfg_.source_refresh_tol << std::fixed << ")" << std::endl;
         }
         if (final_pass_full_diurnal) {
             std::cout << "    Plus 1 full diurnal computation at the final state for its snapshot "
@@ -2813,6 +3067,22 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             unscaled_sublimation_ = diurnal_avg.avg_sublimation_flux;
             unscaled_sputtering_ = diurnal_avg.avg_sputtering_flux;
             double pure_total = 0.0, exposed_total = 0.0;
+            if (ice_layer_model_->usesLagBarrier()) {
+                // Lag barrier: sublimation (and its Jeans escape) sees the barrier,
+                // sputtering does not; recycling faces emit what lands on them.
+                std::vector<double> as, ap;
+                multiscale_evolution_->lagAvailabilities(*ice_layer_model_, *ice_layer_state_,
+                    diurnal_avg.avg_sublimation_flux, diurnal_avg.avg_sputtering_flux, as, ap);
+                for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                    const double fs = as[i];
+                    const double fp = ap[i];
+                    pure_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+                    diurnal_avg.avg_sublimation_flux[i] *= fs;
+                    diurnal_avg.avg_sputtering_flux[i] *= fp;
+                    diurnal_avg.avg_escape_flux[i] *= fs;
+                    exposed_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+                }
+            } else
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 const double fa = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
                 pure_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
@@ -3153,6 +3423,37 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                  << stats.step_solver_max_iterations << "\n";
         }
         file << "\n";
+
+        if (stats.lag_active && ice_layer_model_ && ice_layer_state_) {
+            const auto& st = *ice_layer_state_;
+            const double ell = ice_layer_model_->getLagBarrierLength();
+            const auto& lc = ice_layer_model_->getLagConfig();
+            double a_tot = 0.0, a_cls[3] = {0, 0, 0};
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                const double a = face_areas_[i];
+                a_tot += a;
+                a_cls[(st.frost_veneer[i] > 0.0) ? 1 : (st.lag_thickness[i] > 10.0 * ell ? 2 : 0)] += a;
+            }
+            const double net = stats.total_sublimated_mass + stats.total_sputtered_mass - stats.total_deposited_mass;
+            const double resid = (stats.lag_inventory_mass - stats.lag_inventory_initial_mass) + net;
+            file << "Lag-Layer Diffusion Barrier:\n" << std::scientific << std::setprecision(6);
+            file << "  Barrier length l: " << ell << " m" << (lc.barrier_length > 0.0 ? " (explicit)" : " (Knudsen)")
+                 << "; phi_lag " << lc.lag_porosity << ", grain radius " << lc.grain_radius << " m, tortuosity "
+                 << lc.tortuosity << ", delta_opt " << lc.optical_depth << " m\n";
+            file << "  Max lag thickness: " << stats.lag_max_thickness << " m; faces above "
+                 << lc.warn_thickness << " m: " << stats.lag_faces_over_warn << "\n";
+            file << "  Area fractions: mixed " << std::fixed << std::setprecision(6) << a_cls[0] / a_tot
+                 << ", frost veneer " << a_cls[1] / a_tot << ", lag-sealed (d > 10 l) " << a_cls[2] / a_tot << "\n";
+            file << std::scientific << std::setprecision(6);
+            file << "  Frost veneer mass: " << stats.lag_veneer_mass << " kg\n";
+            file << "  Ice inventory (substrate + veneer): initial " << stats.lag_inventory_initial_mass
+                 << " kg, final " << stats.lag_inventory_mass << " kg\n";
+            file << "    change + (sublimated + sputtered - deposited) = " << resid << " kg ("
+                 << (stats.lag_inventory_initial_mass > 0.0 ? resid / stats.lag_inventory_initial_mass : 0.0)
+                 << " of the inventory)\n";
+            file << "  Transport refreshes forced by the emission pattern: " << lag_source_refreshes_
+                 << " (tolerance " << lc.source_refresh_tol << ")\n\n";
+        }
 
         // Latitude-dependent analysis of non-ice concentration
         file << "Latitude Distribution (final non-ice concentration):\n";

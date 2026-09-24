@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <iostream>
 #include <iomanip>
+#include <stdexcept>
+#include <string>
 
 namespace ptm {
 namespace exosphere {
@@ -67,6 +69,51 @@ struct IceLayerConfig {
 };
 
 /**
+ * Lag-layer diffusion barrier (multiscale evolution; on by default in the CLI,
+ * --no-lag-barrier restores the legacy well-mixed box).
+ *
+ * Ice lost from the well-mixed regolith (non-ice volume fraction x_n, frozen at
+ * t = 0) leaves its non-ice grains behind as a lag of porosity phi_lag on top of
+ * the unchanged mixture. Removing a net mass dM [kg/m^2] of ice frees
+ * x_n / (1 - x_n) * dM / rho_ice of non-ice volume, so the lag thickens by
+ *     d(lag_d) = beta dM,  beta = x_n / [(1 - x_n) rho_ice (1 - phi_lag)]   [m^3/kg].
+ * Vapor from the ice table crosses the lag by Knudsen diffusion. With the free
+ * surface flux J_0 = rho_sat v/4 and D_K = [pi/(8+pi)] [phi/(1-phi)] v r / tau
+ * (Schorghofer 2008, ApJ 682:697, eq. 3) in series,
+ *     J = J_0 f / (1 + d / l),   l = 4 D_K / v = [4 pi/(8+pi)] [phi/(1-phi)] r / tau,
+ * 4 pi/(8+pi) = 1.128. Defaults r = 5 um, phi_lag = 0.6, tau = 2 give l = 4.23 um.
+ * Sputtering is NOT barriered (Paul's ruling, 2026-09-24: energetic ions reach
+ * cm depths). Deposition onto a face with no net loss builds a frost veneer m_f
+ * that sublimates and sputters unbarriered over the whole face; deposition never
+ * removes lag. The lag darkens the face toward the non-ice endmember,
+ *     A = A_lag + (A_mix - A_lag) exp(-d / delta_opt).
+ * Thermal inertia is unchanged.
+ */
+struct LagBarrierConfig {
+    bool enabled = false;
+    double barrier_length = -1.0;     // l [m]; < 0 = derived from the three below
+    double grain_radius = 5e-6;       // non-ice grain radius r [m]
+    double lag_porosity = 0.6;        // phi_lag
+    double tortuosity = 2.0;          // tau
+    double optical_depth = 10e-6;     // delta_opt [m] (albedo e-folding thickness)
+    double warn_thickness = 5e-3;     // warn once any d exceeds this [m]
+    double source_refresh_tol = 0.02; // transport refresh when the emission pattern moves this much
+
+    // 4 pi / (8 + pi): the Knudsen series-resistance factor (Schorghofer 2008, eq. 3).
+    static double knudsenFactor() {
+        constexpr double pi = 3.14159265358979323846;
+        return 4.0 * pi / (8.0 + pi);
+    }
+    static double derivedLength(double phi, double r, double tau) {
+        return knudsenFactor() * (phi / (1.0 - phi)) * r / tau;
+    }
+    double length() const {
+        return (barrier_length > 0.0) ? barrier_length
+                                      : derivedLength(lag_porosity, grain_radius, tortuosity);
+    }
+};
+
+/**
  * Per-face ice layer state
  *
  * Units are documented for each field.
@@ -91,6 +138,16 @@ struct IceLayerState {
     std::vector<double> porosity;                // [0-1], volume fraction of pore space
     std::vector<double> radiation_dose_rate;     // [eV/(molecule·s)] energy deposition rate
     std::vector<double> cumulative_dose;         // [eV/molecule] total accumulated radiation dose
+
+    // Lag-layer diffusion barrier (empty unless IceLayerModel::enableLagBarrier ran).
+    // nonice_concentration is then frozen at x_n (the mixture below the lag does not
+    // change) and ice_mass = substrate_ice + frost_veneer.
+    std::vector<double> lag_thickness;           // d [m]
+    std::vector<double> frost_veneer;            // m_f [kg/m²], unbarriered frost on top
+    std::vector<double> substrate_ice;           // ice left in the mixed layer [kg/m²]
+    std::vector<double> lag_exposed_fraction;    // f(x_n), the mixture's exposed ice area (frozen)
+    std::vector<double> lag_beta;                // beta [m³/kg]: d(lag_d) per kg/m² of net ice loss
+    bool hasLag() const { return !lag_thickness.empty(); }
 
     explicit IceLayerState(size_t num_faces) {
         nonice_concentration.resize(num_faces, 0.0);
@@ -141,6 +198,18 @@ private:
     // r > 0 = availability is the exposed ice AREA fraction
     //   f = phi / (phi + r (1 - phi)),  phi = 1 - c,  r = D_ice / D_nonice.
     double exposed_area_grain_ratio_ = 0.0;
+
+    // Lag-layer diffusion barrier (see LagBarrierConfig).
+    bool lag_enabled_ = false;
+    LagBarrierConfig lag_config_;
+    double lag_length_ = 0.0;   // l [m]
+
+    void refuseWithLag(const char* who) const {
+        if (lag_enabled_) {
+            throw std::logic_error(std::string("IceLayerModel::") + who + ": the per-timestep ice bookkeeping "
+                                   "is not defined with the lag barrier (multiscale only)");
+        }
+    }
 
 public:
     /**
@@ -245,6 +314,10 @@ public:
      * @param face_idx Face index
      */
     void updateIceMass(IceLayerState& state, size_t face_idx) const {
+        if (lag_enabled_ && state.hasLag()) {
+            state.ice_mass[face_idx] = state.substrate_ice[face_idx] + state.frost_veneer[face_idx];
+            return;
+        }
         double ice_fraction = 1.0 - state.nonice_concentration[face_idx];
         state.ice_mass[face_idx] = ice_fraction * max_ice_mass_per_area_;
     }
@@ -267,6 +340,9 @@ public:
      * @return true if ice is available (concentration < 1)
      */
     bool hasIce(const IceLayerState& state, size_t face_idx) const {
+        if (lag_enabled_ && state.hasLag()) {
+            return state.substrate_ice[face_idx] + state.frost_veneer[face_idx] > 0.0;
+        }
         return state.nonice_concentration[face_idx] < layer_constants::MAX_NONICE_CONCENTRATION;
     }
 
@@ -315,6 +391,65 @@ public:
     }
 
     /**
+     * Switch on the lag-layer diffusion barrier. Call after the concentrations are
+     * initialized: it freezes x_n = the current nonice_concentration and the exposed
+     * fraction f(x_n) (this model's availability at t = 0), and starts every face with
+     * d = 0, m_f = 0, substrate ice = its current ice mass. At d = 0 the availability
+     * is f(x_n) bit for bit, so the t = 0 state is unchanged.
+     */
+    void enableLagBarrier(IceLayerState& state, const LagBarrierConfig& cfg) {
+        if (!(cfg.lag_porosity >= 0.0 && cfg.lag_porosity < 1.0) || !(cfg.optical_depth > 0.0) ||
+            !(cfg.length() > 0.0) || !std::isfinite(cfg.length())) {
+            throw std::invalid_argument("IceLayerModel::enableLagBarrier: need 0 <= phi_lag < 1, "
+                                        "delta_opt > 0 and a finite barrier length l > 0");
+        }
+        const size_t n = num_faces_;
+        state.lag_thickness.assign(n, 0.0);
+        state.frost_veneer.assign(n, 0.0);
+        state.substrate_ice.assign(n, 0.0);
+        state.lag_exposed_fraction.assign(n, 0.0);
+        state.lag_beta.assign(n, 0.0);
+        for (size_t i = 0; i < n; ++i) {
+            const double xn = state.nonice_concentration[i];
+            state.lag_exposed_fraction[i] = getIceAvailabilityFactor(state, i);
+            state.substrate_ice[i] = state.ice_mass[i];
+            // x_n = 0 (pure ice) builds no lag; x_n = 1 holds no ice to lose.
+            state.lag_beta[i] = (xn > 0.0 && xn < 1.0)
+                ? xn / ((1.0 - xn) * layer_constants::ICE_DENSITY * (1.0 - cfg.lag_porosity))
+                : 0.0;
+        }
+        lag_config_ = cfg;
+        lag_length_ = cfg.length();
+        lag_enabled_ = true;
+    }
+
+    bool usesLagBarrier() const { return lag_enabled_; }
+    const LagBarrierConfig& getLagConfig() const { return lag_config_; }
+    double getLagBarrierLength() const { return lag_length_; }
+
+    /**
+     * Availability of sublimation: base (pure-ice) flux x this factor is the current
+     * sublimation. Legacy: getIceAvailabilityFactor. Lag: 1 under a frost veneer,
+     * otherwise f(x_n) / (1 + d / l) (0 once the substrate holds no ice).
+     */
+    double getSublimationAvailability(const IceLayerState& state, size_t i) const {
+        if (!(lag_enabled_ && state.hasLag())) return getIceAvailabilityFactor(state, i);
+        if (state.frost_veneer[i] > 0.0) return 1.0;
+        if (!(state.substrate_ice[i] > 0.0)) return 0.0;
+        const double d = state.lag_thickness[i];
+        return (d > 0.0) ? state.lag_exposed_fraction[i] / (1.0 + d / lag_length_)
+                         : state.lag_exposed_fraction[i];
+    }
+
+    /** Availability of sputtering (never barriered): 1 under a veneer, else f(x_n). */
+    double getSputterAvailability(const IceLayerState& state, size_t i) const {
+        if (!(lag_enabled_ && state.hasLag())) return getIceAvailabilityFactor(state, i);
+        if (state.frost_veneer[i] > 0.0) return 1.0;
+        if (!(state.substrate_ice[i] > 0.0)) return 0.0;
+        return state.lag_exposed_fraction[i];
+    }
+
+    /**
      * Apply ice loss from sublimation
      * Increases non-ice concentration as ice is removed from the layer
      *
@@ -325,6 +460,7 @@ public:
     void applySublimation(IceLayerState& state,
                           const std::vector<double>& sublimation_flux,
                           double dt) {
+        refuseWithLag("applySublimation");
         #pragma omp parallel for
         for (size_t i = 0; i < num_faces_; ++i) {
             // Only sublimate if ice is present
@@ -368,6 +504,7 @@ public:
                          const std::vector<double>& sputtering_flux,
                          double escape_fraction,
                          double dt) {
+        refuseWithLag("applySputtering");
         #pragma omp parallel for
         for (size_t i = 0; i < num_faces_; ++i) {
             // Only sputter if ice is present
@@ -409,6 +546,7 @@ public:
     void applyDeposition(IceLayerState& state,
                          const std::vector<double>& deposition_flux,
                          double dt) {
+        refuseWithLag("applyDeposition");
         #pragma omp parallel for
         for (size_t i = 0; i < num_faces_; ++i) {
             double ice_gain = deposition_flux[i] * dt;  // [kg/m²]

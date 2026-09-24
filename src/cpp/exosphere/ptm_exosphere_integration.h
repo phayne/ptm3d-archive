@@ -9,6 +9,7 @@
 #include <Eigen/Sparse>
 
 #include "albedo_refresh.h"
+#include "ice_layer_model.h"   // LagBarrierConfig (held by value)
 
 // Forward declarations
 namespace ptm {
@@ -250,6 +251,17 @@ namespace ptm {
                                       long long& sources_updated);
             void applyRepresentedSourceTotals();
             int max_superstep_epochs_ = 0;                  // 0 = no cap
+
+            // Lag-layer diffusion barrier (multiscale; see LagBarrierConfig in ice_layer_model.h).
+            LagBarrierConfig lag_cfg_;
+            long long lag_source_refreshes_ = 0;           // transport refreshes forced by the emission pattern
+            bool lag_warned_thickness_ = false;
+            std::vector<char> lag_top_decile_;             // faces in the top decile of t = 0 mean temperature
+            void enableLagBarrierState();                  // freeze x_n, verify the t = 0 invariance
+            void computeCompositionAlbedos(const std::vector<double>& nonice,
+                                           const std::vector<double>* lag_d,
+                                           std::vector<double>& out) const;
+            void writeLagTimeseriesRow(int epoch, double t_seconds, bool header);
 
             // Diurnal accumulation stride: use every Nth timestep for averaging.
             // stride=1 uses all timesteps (default), stride=4 uses every 4th (~4x faster).
@@ -643,6 +655,13 @@ namespace ptm {
              * value; reproduces pre-fix products, not mass-conserving).
              */
             void setSuperstepConsistentDeposition(bool on) { superstep_consistent_deposition_ = on; }
+
+            /**
+             * Lag-layer diffusion barrier for the multiscale evolution (cfg.enabled;
+             * the CLI default). Applied at the start of runMultiTimescaleSimulation.
+             */
+            void setLagBarrier(const LagBarrierConfig& cfg) { lag_cfg_ = cfg; }
+            const LagBarrierConfig& getLagBarrier() const { return lag_cfg_; }
 
             /** Upper bound on one multiscale super-step in epochs (0 = none; refinement checks). */
             void setMaxSuperstepEpochs(int n) { max_superstep_epochs_ = std::max(0, n); }

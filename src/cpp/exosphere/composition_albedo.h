@@ -123,6 +123,32 @@ public:
     }
 
     /**
+     * Lag-barrier albedo (IceLayerModel::enableLagBarrier): a lag of thickness d [m]
+     * over the mixture darkens the face toward the non-ice endmember,
+     *   A = A_lag + (A_mix - A_lag) exp(-d / delta_opt),
+     * A_mix = computeAlbedo(c), A_lag = computeAlbedo(1) (hapke-intimate: the mixture at
+     * f = 0, i.e. the non-ice endmember). Written as A_mix - (A_mix - A_lag)(1 - e^-x)
+     * with expm1, so d = 0 returns A_mix bit for bit.
+     */
+    double computeAlbedoWithLag(double nonice_concentration, double lag_thickness, double delta_opt,
+                                size_t face_idx = 0) const {
+        const double a_mix = computeAlbedo(nonice_concentration, face_idx);
+        if (!(lag_thickness > 0.0)) return a_mix;
+        const double a_lag = computeAlbedo(1.0, face_idx);
+        return a_mix - (a_mix - a_lag) * (-std::expm1(-lag_thickness / delta_opt));
+    }
+
+    void computeAlbedosWithLag(const std::vector<double>& nonice_concentration,
+                               const std::vector<double>& lag_thickness, double delta_opt,
+                               std::vector<double>& albedos_out) const {
+        albedos_out.resize(nonice_concentration.size());
+        #pragma omp parallel for
+        for (size_t i = 0; i < nonice_concentration.size(); ++i) {
+            albedos_out[i] = computeAlbedoWithLag(nonice_concentration[i], lag_thickness[i], delta_opt, i);
+        }
+    }
+
+    /**
      * Compute albedos for all faces
      * @param nonice_concentration Per-face non-ice concentration [0, 1]
      * @param albedos_out Output per-face albedos (resized if needed)

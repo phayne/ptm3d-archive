@@ -436,11 +436,35 @@ before transport, and caches the unscaled potential as the base flux. So the ini
 composition sets the first-epoch sublimation, and a face that starts with no ice sublimates
 again once deposition gives it ice.
 
-**Assumptions:**
+**Assumptions (legacy well-mixed layer, `--no-lag-barrier`):**
 - Well-mixed layer (uniform concentration within skin depth)
 - Instantaneous vertical mixing
 - No grain size effects on sublimation rate
 - Lag deposit does not affect thermal conductivity (future work)
+
+**Lag-layer diffusion barrier (multiscale default).** The legacy layer books lost ice as
+non-ice volume (the void counts as dark material) and throttles sublimation only through
+the exposed ice area. By default `--multiscale` instead keeps the mixture at its $t = 0$
+non-ice fraction $x_n$ and grows a lag of porosity $\phi_{\mathrm{lag}}$ on top:
+$\Delta d = \beta \Delta M$, $\beta = x_n / [(1 - x_n) \rho_{\mathrm{ice}}(1 - \phi_{\mathrm{lag}})]$
+per net ice loss $\Delta M$. Sublimation crosses the lag by Knudsen diffusion
+(Schorghofer 2008, eq. 3), $J = J_0 f(x_n) / (1 + d/\ell)$ with
+$\ell = 1.128\thinspace [\phi_{\mathrm{lag}}/(1-\phi_{\mathrm{lag}})]\thinspace r/\tau$ = 4.23 µm at the
+defaults ($r$ = 5 µm, $\phi_{\mathrm{lag}}$ = 0.6, $\tau$ = 2). **Sputtering is not
+barriered** (energetic ions reach cm depths; Paul, 2026-09-24). Deposition offsets a
+face's net loss (the lag then tends to $d^* = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$,
+where the face stops being a net source); deposition above the free-frost loss builds an
+unbarriered frost veneer, which replaces the legacy off-book layer overflow; in between
+the face recycles what lands on it. Deposition never removes lag. The lag darkens the
+face, $A = A_{\mathrm{lag}} + (A_{\mathrm{mix}} - A_{\mathrm{lag}})\thinspace e^{-d/\delta_{\mathrm{opt}}}$
+($\delta_{\mathrm{opt}}$ = 10 µm; $A_{\mathrm{lag}}$ = the non-ice endmember). Each step is
+integrated in closed form ($d + d^2/2\ell = \beta J_0 f t$ without deposition). At $t = 0$
+($d = 0$) every availability and albedo equals the legacy value bit for bit (checked at
+startup). The thermal inertia is unchanged (WARNING above 5 mm of lag); the veneer is
+optically neutral. Snapshots add `lag_thickness_m`, `frost_veneer_kg_m2`,
+`substrate_ice_kg_m2`, `lag_nonice_mass_kg_m2`, `lag_class` (0 mixed, 1 frost veneer,
+2 sealed, $d > 10\ell$), `lag_regime` and `sublimation_availability`; `lag/lag_timeseries.csv`
+has one row per iteration. See Appendix D.6.5.
 
 ### Ice Crystallization
 
@@ -827,6 +851,13 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--albedo-refresh-fraction` $F$ | 0 | Face-local refresh: rescale only faces whose albedo deviation exceeds $F$ × `--albedo-update-threshold`. The default 0 rescales every face that moved, as the global refresh does; $F > 0$ is faster but re-bases faces at different times, face-scale jitter that the albedo feedback amplifies (PTM-658) |
 | `--albedo-refresh-tolerance` $\epsilon$ | $10^{-2}$ | Face-local refresh: sources left un-updated may differ from the current source field by at most $\epsilon$ of the total emission (emission change plus emission × relative temperature change) and $\epsilon$ of the total area in relative temperature change (0 = update every source that changed; with $F = 0$ this reproduces the global refresh) |
 | `--no-albedo-step-limit` | off | Pre-PTM-640 step: super-steps are not ended when a face's albedo would pass `--albedo-update-threshold`, so the temperature refresh can lag by a whole step and the answer depends on the step size. Implied by `--sputter-legacy-escape-only`. By default, with `--albedo-coupling`, each super-step ends at the first epoch count whose predicted albedo deviation (from the albedo the temperatures correspond to) exceeds the threshold (bisection on the closed-form step), so every refresh fires within one epoch of being due |
+| `--no-lag-barrier` | off | Legacy well-mixed layer (lost ice becomes non-ice volume; no diffusion barrier), for comparison. Implied, with a WARNING, by `--superstep-legacy-deposition` and `--sputter-legacy-escape-only` |
+| `--lag-barrier-length` $\ell$ | Knudsen value (4.23e-6 m) | Barrier length [m] directly |
+| `--lag-grain-radius` $r$ | 5e-6 | Non-ice grain radius [m] |
+| `--lag-porosity` $\phi_{\mathrm{lag}}$ | 0.6 | Lag porosity |
+| `--lag-tortuosity` $\tau$ | 2 | Lag tortuosity |
+| `--lag-optical-depth` $\delta_{\mathrm{opt}}$ | 1e-5 | Albedo e-folding lag thickness [m] |
+| `--lag-source-refresh-tol` $X$ | 0.02 | Refresh the transport when the emission pattern has moved by $X$ (total variation) since it was cached |
 | `--superstep-legacy-deposition` | off | Pre-PTM-644 step: deposition held at its start-of-step value while the sources follow the ice availability, and the trapezoid mean availability in the linear mode. Not mass-conserving; reproduces earlier products only. Implied by `--sputter-legacy-escape-only` |
 | `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
 | `--cache-refresh` $N$ | (refused) | Not implemented; the CLI exits with an error |
@@ -901,6 +932,7 @@ $s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))$, solve
 | `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember; with `<mesh.ply> <map.bin>`, fill faces follow the thermal albedo (PTM-637) |
 | `test_multiscale_snapshot_time.cpp` | PTM-636: snapshot $L$ is the state after $L$ epochs (== a run stopped at $L$), same-state fields, complete `time_steps.txt` |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
+| `test_lag_barrier.cpp` | Lag barrier: $d + d^2/2\ell = \beta J_0 f t$ (one step, many steps, engine), closed form vs RK4 with sputtering and deposition, veneer first then the barrier, recycling, global mass conservation, $t = 0$ bit-identity, $\ell$ and lag albedo |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 
 ---
@@ -924,5 +956,9 @@ Marti, J. & Mauersberger, K. (1993). A survey and new measurements of ice vapor 
 Mitchell, E.H. et al. (2017). Porosity effects on crystallization kinetics of amorphous water ice: Implications for cold icy bodies in the outer Solar System. *Icarus*, 285, 291-299. doi:10.1016/j.icarus.2016.11.004
 
 Nordheim, T.A. et al. (2022). Magnetospheric Ion Bombardment of Europa's Surface. *Planet. Sci. J.*, 3, 5. doi:10.3847/PSJ/ac382a
+
+Schorghofer, N. (2008). The lifetime of ice on main belt asteroids. *Astrophys. J.*, 682, 697-705.
+
+Spencer, J.R. (1987). Thermal segregation of water ice on the Galilean satellites. *Icarus*, 69(2), 297-313. doi:10.1016/0019-1035(87)90107-2
 
 Teolis, B.D. et al. (2017). Plume and surface feature structure and compositional effects on Europa's global exosphere: Preliminary Europa flyby science. *Icarus*, 284, 18-29. doi:10.1016/j.icarus.2016.10.027

@@ -285,7 +285,7 @@ Deposition cannot reduce $c$ below zero (the layer cannot hold more ice than its
 
 Europa's ice contains a small fraction of refractory contaminants (silicates, salts, organics), parameterized as an initial dust fraction $f_{\mathrm{dust}} = 0.01$ (1% by volume, default). As ice sublimates, this non-volatile material accumulates at the surface, forming a lag deposit. The lag deposit does not sublimate, so the non-ice concentration $c$ increases monotonically in the absence of deposition.
 
-This produces a self-limiting feedback: as the lag deposit thickens, it armors the underlying ice against further sublimation (in reality, by reducing the ice surface area exposed to vacuum). In our simplified model, sublimation ceases entirely when $c = 1$. More sophisticated treatments incorporating grain-size effects on sublimation rate through a porous lag are left for future work.
+This produces a self-limiting feedback: as the lag deposit thickens, it armors the underlying ice against further sublimation (in reality, by reducing the ice surface area exposed to vacuum). In the legacy well-mixed model (`--no-lag-barrier`), sublimation ceases entirely when $c = 1$, and nothing else throttles it. The multi-timescale evolution instead uses a lag-layer diffusion barrier by default (Section D.6.5).
 
 Key assumptions: (1) The layer is well-mixed (uniform concentration throughout the skin depth). (2) Vertical mixing is instantaneous. (3) The lag deposit does not alter the thermal conductivity (but does alter the albedo; see Section D.6.4). (4) No grain-size dependence of sublimation rate.
 
@@ -306,6 +306,36 @@ $$T_{\mathrm{new}}(i, t) = T_{\mathrm{old}}(i, t) \left(\frac{1 - A_{\mathrm{new
 This scaling is applied to all diurnal timesteps $t$ for each face $i$ where the albedo change exceeds a threshold $\Delta A_{\mathrm{min}} = 0.01$. The updated temperatures then produce modified sublimation and sputtering rates in the next epoch, closing the feedback loop.
 
 The thermal segregation feedback is self-reinforcing: darker surfaces absorb more sunlight, sublimate faster, concentrate more non-ice material, and darken further. This runaway process is ultimately limited by either complete ice depletion ($c = 1$) or by deposition of fresh ice from colder regions. The competition between these effects determines the steady-state spatial pattern of ice and lag deposits.
+
+### D.6.5 Lag-Layer Diffusion Barrier
+
+The well-mixed layer of Sections D.6.1--D.6.3 books every kilogram of lost ice as non-ice volume ($\Delta c = \Delta m / \delta_{\mathrm{th}} \rho_{\mathrm{ice}}$), so the void left by sublimation is counted as dark material, and the exposed ice area is the only throttle on sublimation. In the `hapke-intimate` mode that feedback is linearly unstable on warm faces (PTM-658). By default the multi-timescale evolution replaces it with a lag layer on top of an unchanged mixture (`--no-lag-barrier` restores the legacy model, for comparison).
+
+**Lag growth.** The mixture keeps its $t = 0$ non-ice volume fraction $x_n$ (frozen from the initialization). Removing a net ice mass $\Delta M$ per unit area frees $x_n \Delta M / [(1 - x_n)\rho_{\mathrm{ice}}]$ of non-ice volume, which stays behind as a lag of porosity $\phi_{\mathrm{lag}}$:
+
+$$\Delta d = \beta \thinspace \Delta M, \qquad \beta = \frac{x_n}{(1 - x_n) \thinspace \rho_{\mathrm{ice}} \thinspace (1 - \phi_{\mathrm{lag}})} \tag{D27a}$$
+
+The substrate ice, the lag thickness $d$, and the non-ice mass of the lag, $\rho_{\mathrm{dust}} (1 - \phi_{\mathrm{lag}}) d$, are tracked per face. A pure-ice face ($x_n = 0$) forms no lag.
+
+**Barrier.** Vapor from the ice table crosses the lag by Knudsen diffusion, $D_K = [\pi/(8+\pi)] [\phi/(1-\phi)] \bar{v} r / \tau$ (Schorghofer 2008, eq. 3), in series with the free-surface flux $J_0 = \rho_{\mathrm{sat}} \bar{v}/4$:
+
+$$J_{\mathrm{sub}} = \frac{J_0 \thinspace f(x_n)}{1 + d/\ell}, \qquad \ell = \frac{4 D_K}{\bar{v}} = \frac{4\pi}{8+\pi} \thinspace \frac{\phi_{\mathrm{lag}}}{1 - \phi_{\mathrm{lag}}} \thinspace \frac{r}{\tau} \tag{D27b}$$
+
+where $f(x_n)$ is the mixture's exposed ice area fraction and $4\pi/(8+\pi) = 1.128$. With the defaults $r = 5$ µm, $\phi_{\mathrm{lag}} = 0.6$, $\tau = 2$, $\ell = 4.23$ µm (`--lag-barrier-length` sets $\ell$ directly). Sputtering is **not** barriered: energetic ions reach at least centimeter depths, so the sputter flux stays $J_{\mathrm{sput}} f(x_n)$ (Paul Hayne, 2026-09-24).
+
+**Deposition and the frost veneer.** On a face whose net loss $E_S = J_0 f/(1+d/\ell) + J_{\mathrm{sput}} f$ exceeds the deposition $B$, deposition offsets the loss and the lag grows at $\beta (E_S - B)$. Such a face approaches $d^* = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$, where it stops being a net water source. Deposition beyond the free-frost loss $J_0 + J_{\mathrm{sput}}$ builds a frost veneer $m_f$ that sublimates and sputters unbarriered over the whole face; the barrier applies again only once $m_f = 0$. Between the two ($E_S < B < J_0 + J_{\mathrm{sput}}$) the face recycles: frost that lands sublimates again as fast as it arrives, so the emission equals $B$ and the state does not change. Deposition never removes lag. The veneer replaces the legacy off-book "layer overflow", and the global inventory (substrate plus veneer) closes against the booked fluxes to rounding.
+
+**Integration.** With $u = 1 + d/\ell$ and $B$ held over a step (Section D.7), the substrate regime separates exactly,
+
+$$t = \frac{\ell}{\beta} \int_{u_0}^{u} \frac{u' \thinspace du'}{J_0 f + (J_{\mathrm{sput}} f - B)\thinspace u'} \tag{D27c}$$
+
+which for $B = J_{\mathrm{sput}} = 0$ gives $d + d^2/2\ell = \beta J_0 f t$. The step is solved in closed form (no hold-$d$ approximation), including the veneer phase and substrate exhaustion. Super-steps end when faces carrying 10% of the current emission have changed their barrier factor by 10%, and the transport is refreshed when the emission pattern has moved by more than 2% (total variation; `--lag-source-refresh-tol`).
+
+**Albedo.** The lag darkens the face toward the non-ice endmember,
+
+$$A = A_{\mathrm{lag}} + (A_{\mathrm{mix}} - A_{\mathrm{lag}}) \thinspace e^{-d/\delta_{\mathrm{opt}}} \tag{D27d}$$
+
+with $A_{\mathrm{mix}}$ the albedo of the mixture (Equation D26, or the Hapke intimate mixture), $A_{\mathrm{lag}}$ the non-ice endmember, and $\delta_{\mathrm{opt}} = 10$ µm. At $t = 0$, $d = 0$ on every face, so the availabilities, the albedo and the initialization gates are unchanged bit for bit; the run checks this at startup. The frost veneer is optically neutral, and the lag does not change the thermal inertia (the run warns if any lag exceeds 5 mm).
 
 ---
 
@@ -433,6 +463,8 @@ Oza, A.V. et al. (2019). Sodium and Potassium Atmospheres of the Icy Moons. *Ast
 Plainaki, C. et al. (2012). The role of sputtering and radiolysis in the generation of the Europa exosphere. *Icarus*, 218(2), 956--966.
 
 Plainaki, C. et al. (2013). Exospheric O$_2$ densities at Europa during different orbital phases. *Planet. Space Sci.*, 88, 42--52.
+
+Schorghofer, N. (2008). The lifetime of ice on main belt asteroids. *Astrophys. J.*, 682, 697--705.
 
 Schorghofer, N. (2015). Two-dimensional description of surface-bounded exospheres with application to the migration of water molecules on the Moon. *Phys. Rev. E*, 91, 052154. doi:10.1103/PhysRevE.91.052154
 

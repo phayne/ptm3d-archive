@@ -1824,6 +1824,10 @@ int main(int argc, char** argv)
     double albedo_refresh_fraction = 0.0;      // PTM-657 faces past this x threshold are rescaled
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
+    // Lag-layer diffusion barrier (multiscale; on by default, --no-lag-barrier = legacy).
+    ptm::exosphere::LagBarrierConfig lag_cfg;
+    bool no_lag_barrier = false;
+    std::string lag_param_flag;                // first lag parameter flag seen
 
     // Albedo-composition coupling options
     bool albedo_coupling_enabled = false;
@@ -1967,6 +1971,27 @@ int main(int argc, char** argv)
         else if (a == "--no-albedo-step-limit") {
             no_albedo_step_limit = true;
             if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--no-lag-barrier") {
+            no_lag_barrier = true;
+        }
+        else if ((a == "--lag-barrier-length" || a == "--lag-grain-radius" || a == "--lag-porosity" ||
+                  a == "--lag-tortuosity" || a == "--lag-optical-depth" || a == "--lag-source-refresh-tol")
+                 && i+1 < argc) {
+            if (lag_param_flag.empty()) lag_param_flag = a;
+            const double v = std::stod(argv[++i]);
+            bool ok = std::isfinite(v);
+            if (a == "--lag-barrier-length") { ok = ok && v > 0.0; lag_cfg.barrier_length = v; }
+            else if (a == "--lag-grain-radius") { ok = ok && v > 0.0; lag_cfg.grain_radius = v; }
+            else if (a == "--lag-porosity") { ok = ok && v > 0.0 && v < 1.0; lag_cfg.lag_porosity = v; }
+            else if (a == "--lag-tortuosity") { ok = ok && v >= 1.0; lag_cfg.tortuosity = v; }
+            else if (a == "--lag-optical-depth") { ok = ok && v > 0.0; lag_cfg.optical_depth = v; }
+            else { ok = ok && v > 0.0 && v < 1.0; lag_cfg.source_refresh_tol = v; }
+            if (!ok) {
+                std::cerr << "Error: " << a << " " << v << " is out of range (lengths [m] > 0; porosity in (0, 1); "
+                          << "tortuosity >= 1; refresh tolerance in (0, 1))" << std::endl;
+                return 1;
+            }
         }
         else if (a == "--superstep-legacy-deposition") {
             superstep_legacy_deposition = true;
@@ -2198,6 +2223,21 @@ int main(int argc, char** argv)
             std::cout << "                         jitter that the albedo feedback amplifies)\n";
             std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
             std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
+            std::cout << "  --no-lag-barrier       Legacy well-mixed layer: lost ice becomes non-ice volume and\n";
+            std::cout << "                         nothing limits sublimation but the exposed ice area (for\n";
+            std::cout << "                         comparison; default: the lag-layer diffusion barrier)\n";
+            std::cout << "  Lag barrier (default on in --multiscale): sublimation J_0 f / (1 + d/l) through a lag\n";
+            std::cout << "  of thickness d left by the lost ice; sputtering is not barriered; deposition beyond\n";
+            std::cout << "  the face's loss builds an unbarriered frost veneer; the lag darkens the face,\n";
+            std::cout << "  A = A_lag + (A_mix - A_lag) exp(-d/delta_opt). Thermal inertia is unchanged.\n";
+            std::cout << "  --lag-barrier-length L  l [m] directly (default: Knudsen, 1.128 [phi/(1-phi)] r / tau,\n";
+            std::cout << "                         Schorghofer 2008 ApJ 682:697 eq. 3; 4.23e-6 m at the defaults)\n";
+            std::cout << "  --lag-grain-radius R   Non-ice grain radius r [m] (default 5e-6)\n";
+            std::cout << "  --lag-porosity P       Lag porosity phi_lag (default 0.6)\n";
+            std::cout << "  --lag-tortuosity T     Lag tortuosity tau (default 2)\n";
+            std::cout << "  --lag-optical-depth D  Albedo e-folding lag thickness delta_opt [m] (default 1e-5)\n";
+            std::cout << "  --lag-source-refresh-tol X  Refresh the transport when the emission pattern has\n";
+            std::cout << "                         moved by X (total variation; default 0.02)\n";
             std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
             std::cout << "                         each super-step (pre-PTM-644; not mass-conserving;\n";
             std::cout << "                         reproduces earlier products only)\n";
@@ -2294,6 +2334,16 @@ int main(int argc, char** argv)
         init_from_albedo_map = true;
         albedo_coupling_enabled = true;
         ice_layer_enabled = true;
+    }
+    if (!lag_param_flag.empty() && no_lag_barrier) {
+        std::cerr << "Error: " << lag_param_flag << " sets a lag-barrier parameter but --no-lag-barrier "
+                  << "switches the barrier off" << std::endl;
+        return 1;
+    }
+    if (!lag_param_flag.empty() && !multiscale_enabled) {
+        std::cerr << "Error: " << lag_param_flag << " requires --multiscale (the lag barrier is a "
+                  << "multiscale model)" << std::endl;
+        return 1;
     }
     if (!superstep_flag.empty() && !multiscale_enabled) {
         std::cerr << "Error: " << superstep_flag << " requires --multiscale" << std::endl;
@@ -2619,6 +2669,23 @@ int main(int argc, char** argv)
                       << "refresh (phase 0 cosine case: max non-ice 35.9% vs 18.2%)." << std::endl;
         }
         integrator.setMaxSuperstepEpochs(max_superstep_epochs);
+        // Lag-layer diffusion barrier (default on). The legacy reproduction modes imply
+        // --no-lag-barrier (they reproduce pre-fix products); say so.
+        if (!no_lag_barrier && (superstep_legacy_deposition ||
+                                (sputtering_enabled && sputter_cfg.legacy_escape_only))) {
+            if (!lag_param_flag.empty()) {
+                std::cerr << "Error: " << lag_param_flag << " needs the lag barrier, which the legacy reproduction "
+                          << "flags (--superstep-legacy-deposition, --sputter-legacy-escape-only) switch off"
+                          << std::endl;
+                return 1;
+            }
+            no_lag_barrier = true;
+            std::cerr << "WARNING [lag]: " << (superstep_legacy_deposition ? "--superstep-legacy-deposition"
+                                                                           : "--sputter-legacy-escape-only")
+                      << " implies --no-lag-barrier (reproduces pre-lag products)" << std::endl;
+        }
+        lag_cfg.enabled = !no_lag_barrier;
+        integrator.setLagBarrier(lag_cfg);
         if (diurnal_stride > 1) {
             integrator.setDiurnalStride(diurnal_stride);
             std::cout << "  Diurnal accumulation stride: " << diurnal_stride << std::endl;
@@ -2635,6 +2702,10 @@ int main(int argc, char** argv)
             return 1;
         }
     } else {
+        if (ice_layer_enabled && !no_lag_barrier) {
+            std::cerr << "WARNING [lag]: the lag-layer diffusion barrier is a --multiscale model; this "
+                      << "per-timestep run uses the legacy well-mixed ice layer" << std::endl;
+        }
         // Standard diurnal simulation
         std::cout << "\nRunning standard diurnal simulation..." << std::endl;
         integrator.runSimulation(3600.0, true);

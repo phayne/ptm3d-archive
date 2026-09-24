@@ -210,6 +210,189 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
 }
 
 /**
+ * One step of the lag-barrier face model (IceLayerModel::enableLagBarrier), with
+ * deposition B held constant over the step (PTM-644 solves for B).
+ *
+ * Inputs [SI]: Js, Jp = pure-ice potential sublimation and gross sputter fluxes,
+ * B = deposition [kg/(m² s)]; d0 [m], mf0 (frost veneer), M0 (substrate ice) [kg/m²];
+ * f = exposed ice area fraction of the mixture; beta [m³/kg]; ell = l [m].
+ *
+ * Regimes (a = Js f, p = Jp f, u = 1 + d/l, E_S = a/u + p):
+ *  V  veneer (m_f > 0): emission Js + Jp (unbarriered, whole face), dm_f/dt = B - Js - Jp.
+ *  S  substrate (m_f = 0, B <= E_S): emission a/u (sublimation) + p (sputter); the net
+ *     loss E_S - B comes out of the substrate and thickens the lag,
+ *       dd/dt = beta (a/u + p - B).
+ *     With q = p - B, g0 = a + q u0, eps = q/g0, s = u - u0 this separates to
+ *       t(s) = l / (beta g0) [u0 L(s) + M(s)],  L = int_0^s dx/(1+eps x), M = int_0^s x dx/(1+eps x),
+ *     and the sublimation emitted is int a/u dt = l a / (beta g0) L(s). For B = p = 0 this
+ *     is d + d^2/(2l) = beta a t. The equilibrium u* = a/(B - p) (Fermi's
+ *     d* = l (Js f / B - 1) for p = 0) is approached, never crossed.
+ *  sliding (m_f = 0, E_S < B < Js + Jp): frost that lands sublimates again as fast as
+ *     it arrives (Filippov: the face is frost-free a fraction lambda = (Jv - B)/(Jv - E_S)
+ *     of the time); emission = B, d, m_f and the substrate are constant.
+ *  V also when B >= Js + Jp at m_f = 0: the veneer grows.
+ * The step is integrated exactly (no hold-d approximation): at most V -> (S | sliding),
+ * and S -> depleted (substrate exhausted) -> (sliding | V).
+ * sub_int, sput_int are the emitted masses over the step [kg/m²]; the substrate
+ * change is booked from them, so the per-face inventory closes exactly.
+ */
+struct LagFaceStep {
+    double d_end = 0.0, mf_end = 0.0, M_end = 0.0;
+    double sub_int = 0.0, sput_int = 0.0;   // [kg/m²] over the step
+    int regime_end = 0;                     // 0 = S, 1 = sliding, 2 = veneer, 3 = no ice and no deposition
+};
+
+inline void lagLM(double eps, double s, double& L, double& M) {
+    const double y = eps * s;
+    if (std::abs(y) < 1e-4) {
+        L = s * (1.0 - y / 2.0 + y * y / 3.0 - y * y * y / 4.0);
+        M = s * s * (0.5 - y / 3.0 + y * y / 4.0 - y * y * y / 5.0);
+    } else {
+        L = std::log1p(y) / eps;
+        M = (s - L) / eps;
+    }
+}
+
+inline LagFaceStep solveLagFaceStep(double Js, double Jp, double B, double d0, double mf0,
+                                    double M0, double f, double beta, double ell, double dt) {
+    LagFaceStep out;
+    double d = d0, mf = std::max(0.0, mf0), M = std::max(0.0, M0), t_left = std::max(0.0, dt);
+    const double Jv = Js + Jp;
+    double sub = 0.0, sput = 0.0;
+    int regime = 0;
+    // Veneer phase.
+    if (mf > 0.0 && t_left > 0.0) {
+        const double rate = B - Jv;
+        const double tv = (rate < 0.0) ? mf / (-rate) : std::numeric_limits<double>::infinity();
+        const double tau = std::min(tv, t_left);
+        sub += Js * tau;
+        sput += Jp * tau;
+        mf = (tau == tv) ? 0.0 : std::max(0.0, mf + rate * tau);
+        t_left -= tau;
+        regime = 2;
+    }
+    for (int phase = 0; phase < 3 && t_left > 0.0; ++phase) {
+        const bool has = M > 0.0;
+        const double a = has ? Js * f : 0.0, p = has ? Jp * f : 0.0;
+        const double u0 = 1.0 + d / ell;
+        const double ES = a / u0 + p;
+        if (has && ES > 0.0 && B <= ES) {
+            regime = 0;
+            const double net = ES - B;                 // >= 0
+            const double g0 = u0 * net;                // a + (p - B) u0
+            if (!(beta > 0.0) || !(g0 > 0.0)) {
+                // No lag can form (x_n = 0) or exact equilibrium: constant rates.
+                const double t_dep = (net > 0.0) ? M / net : std::numeric_limits<double>::infinity();
+                const double tau = std::min(t_dep, t_left);
+                sub += (a / u0) * tau;
+                sput += p * tau;
+                M = (tau == t_dep) ? 0.0 : std::max(0.0, M - net * tau);
+                if (beta > 0.0) d += beta * net * tau;
+                t_left -= tau;
+                continue;
+            }
+            const double q = p - B;
+            const double eps = q / g0;
+            const double k = ell / (beta * g0);        // t = k [u0 L + M]
+            auto t_of = [&](double sv) { double L, Mm; lagLM(eps, sv, L, Mm); return k * (u0 * L + Mm); };
+            // Substrate exhausted at s_dep (net loss l s / beta = M).
+            const double s_dep = beta * M / ell;
+            const double t_dep = t_of(s_dep);
+            double s_end;
+            double tau;
+            if (t_dep <= t_left) {
+                s_end = s_dep;
+                tau = t_dep;
+            } else {
+                // Root of t(s) = t_left on (0, s_dep); t is increasing, convex-free; safeguarded Newton.
+                double lo = 0.0, hi = s_dep;
+                if (eps < 0.0) hi = std::min(hi, -1.0 / eps);   // equilibrium, t -> infinity
+                const double rate0 = beta * net / ell;          // ds/dt at s = 0
+                double sv = std::min(0.5 * (lo + hi), rate0 * t_left);
+                for (int it = 0; it < 200; ++it) {
+                    const double tv = t_of(sv);
+                    if (tv < t_left) lo = sv; else hi = sv;
+                    const double dtds = k * (u0 + sv) / (1.0 + eps * sv);
+                    double sn = sv - (tv - t_left) / dtds;
+                    if (!(sn > lo && sn < hi)) sn = 0.5 * (lo + hi);
+                    if (std::abs(sn - sv) <= 1e-15 * std::max(sv, 1e-300) || hi - lo <= 1e-15 * hi) { sv = sn; break; }
+                    sv = sn;
+                }
+                s_end = sv;
+                tau = t_left;
+            }
+            // Sublimation emitted over the segment, two exact forms:
+            //   balance: l s / beta - (p - B) tau   (the lag grew by beta x the net loss);
+            //   direct:  l a / (beta g0) L(s)       (log-singular at the equilibrium u*).
+            // Use the balance unless it loses more than 3 digits to cancellation (then
+            // the face is far from u* and the direct form is well conditioned).
+            const double grown = ell * s_end / beta, other = (B - p) * tau;
+            double sub_seg = grown + other;
+            if (!(std::abs(sub_seg) > 1e-3 * std::max(std::abs(grown), std::abs(other)))) {
+                double L, Mm;
+                lagLM(eps, s_end, L, Mm);
+                sub_seg = ell * a / (beta * g0) * L;
+            }
+            sub += sub_seg;
+            sput += p * tau;
+            const double loss = sub_seg + p * tau - B * tau;   // booked net loss, >= 0
+            M = (tau == t_dep) ? 0.0 : std::max(0.0, M - loss);
+            d += ell * s_end;
+            t_left -= tau;
+            continue;
+        }
+        if (B < Jv) {
+            // Sliding (or no ice and B < Jv): emission = B, split by the frost-free fraction.
+            const double lam = (Jv - B) / (Jv - ES);
+            sub += (lam * (a / u0) + (1.0 - lam) * Js) * t_left;
+            sput += (lam * p + (1.0 - lam) * Jp) * t_left;
+            regime = (B > 0.0 || ES > 0.0) ? 1 : 3;
+            t_left = 0.0;
+        } else {
+            // Deposition at or above the free-frost loss: the veneer grows.
+            sub += Js * t_left;
+            sput += Jp * t_left;
+            mf += (B - Jv) * t_left;
+            regime = (B > 0.0) ? 2 : 3;
+            t_left = 0.0;
+        }
+    }
+    out.d_end = d;
+    out.mf_end = mf;
+    out.M_end = M;
+    out.sub_int = sub;
+    out.sput_int = sput;
+    out.regime_end = regime;
+    return out;
+}
+
+/**
+ * Lag barrier: the instantaneous availabilities (sublimation, sputter) of a face,
+ * i.e. its current emission / pure-ice potential, matching the first instant of
+ * solveLagFaceStep. Without a deposition value (have_B = false: before the first
+ * step) the recycling regime cannot be identified and the plain rule is used
+ * (veneer: 1, 1; no substrate ice: 0, 0; else f/(1 + d/l), f), which is
+ * IceLayerModel::getSublimationAvailability / getSputterAvailability bit for bit.
+ */
+inline void lagInstantAvailability(double Js, double Jp, double B, bool have_B, double d, double mf,
+                                   double M, double f, double ell, double& as, double& ap) {
+    if (mf > 0.0) { as = ap = 1.0; return; }
+    const bool has = M > 0.0;
+    const double fs = has ? ((d > 0.0) ? f / (1.0 + d / ell) : f) : 0.0;
+    const double fp = has ? f : 0.0;
+    if (!have_B) { as = fs; ap = fp; return; }
+    const double ES = Js * fs + Jp * fp, Jv = Js + Jp;
+    if (has && ES > 0.0 && B <= ES) { as = fs; ap = fp; return; }
+    if (B < Jv) {
+        const double lam = (Jv - B) / (Jv - ES);
+        as = lam * fs + (1.0 - lam);
+        ap = lam * fp + (1.0 - lam);
+        return;
+    }
+    as = ap = (B > 0.0) ? 1.0 : 0.0;
+}
+
+/**
  * Configuration for multi-timescale evolution
  */
 struct MultiTimescaleConfig {
@@ -571,6 +754,107 @@ struct DiurnalAverages {
         }
     }
 
+    // Lag barrier: sublimation and sputtering have separate availabilities (the
+    // barrier acts on sublimation only). The same bookkeeping as cacheBaseFluxesUnscaled /
+    // applyScaledFluxes, deliberately NOT shared with them: routing the legacy path
+    // through these functions changed its double-precision rounding under -ffast-math
+    // and broke the --no-lag-barrier byte identity (measured, 1 thread).
+    std::vector<double> cached_sub_availability;   // lag only: availabilities at cache time
+    std::vector<double> cached_sput_availability;
+
+    void cacheBaseFluxesUnscaledLag(const std::vector<double>& unscaled_sublimation,
+                                    const std::vector<double>& unscaled_sputtering,
+                                    const std::vector<double>& avail_sub,
+                                    const std::vector<double>& avail_sput,
+                                    const std::vector<double>& face_areas) {
+        const size_t n = avg_sublimation_flux.size();
+        total_base_emission = total_base_sublimation = total_base_sputter = 0.0;
+        cached_sub_availability = avail_sub;
+        cached_sput_availability = avail_sput;
+        for (size_t i = 0; i < n; ++i) {
+            base_sublimation_flux[i] = unscaled_sublimation[i];
+            base_sputtering_flux[i] = unscaled_sputtering.empty() ? 0.0 : unscaled_sputtering[i];
+            base_deposition_flux[i] = avg_deposition_flux[i];
+            const double es = base_sublimation_flux[i] * avail_sub[i] * face_areas[i];
+            const double ep = base_sputtering_flux[i] * avail_sput[i] * face_areas[i];
+            // Equal availabilities (every face at t = 0): the legacy expression, bit for bit.
+            total_base_emission += (avail_sub[i] == avail_sput[i])
+                ? (base_sublimation_flux[i] + base_sputtering_flux[i]) * avail_sub[i] * face_areas[i]
+                : es + ep;
+            cached_ice_availability[i] = avail_sub[i];
+            if (sputter_transport) {
+                base_deposition_sublimation_flux[i] = avg_deposition_sublimation_flux[i];
+                base_deposition_sputter_flux[i] = avg_deposition_sputter_flux[i];
+                total_base_sublimation += es;
+                total_base_sputter += ep;
+            }
+        }
+        total_base_sputter_transport = 0.0;
+        if (sputter_transport && perFaceSputter()) {
+            for (size_t i = 0; i < n; ++i) {
+                total_base_sputter_transport += base_sputtering_flux[i] * sputter_face_transport_frac[i]
+                                                * avail_sput[i] * face_areas[i];
+            }
+        }
+        deposition_scale_total = deposition_scale_sub = deposition_scale_sput = 1.0;
+        total_base_deposition = total_base_deposition_sub = total_base_deposition_sput = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            total_base_deposition += base_deposition_flux[i] * face_areas[i];
+            total_base_deposition_sub += base_deposition_sublimation_flux[i] * face_areas[i];
+            total_base_deposition_sput += base_deposition_sputter_flux[i] * face_areas[i];
+        }
+        cache_valid = true;
+    }
+
+    void applyScaledFluxesLag(const std::vector<double>& avail_sub,
+                              const std::vector<double>& avail_sput,
+                              const std::vector<double>& face_areas) {
+        const size_t n = avg_sublimation_flux.size();
+        #pragma omp parallel for
+        for (size_t i = 0; i < n; ++i) {
+            avg_sublimation_flux[i] = base_sublimation_flux[i] * avail_sub[i];
+            avg_sputtering_flux[i] = base_sputtering_flux[i] * avail_sput[i];
+        }
+        if (sputter_transport) {
+            double s_now = 0.0, p_now = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                s_now += avg_sublimation_flux[i] * face_areas[i];
+                p_now += avg_sputtering_flux[i] * face_areas[i];
+            }
+            const double scale_s = (total_base_sublimation > 1e-30) ? s_now / total_base_sublimation : 1.0;
+            double scale_p = (total_base_sputter > 1e-30) ? p_now / total_base_sputter : 1.0;
+            if (perFaceSputter()) {
+                double c_now = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    c_now += avg_sputtering_flux[i] * sputter_face_transport_frac[i] * face_areas[i];
+                }
+                scale_p = (total_base_sputter_transport > 1e-30) ? c_now / total_base_sputter_transport : 1.0;
+            }
+            deposition_scale_sub = scale_s;
+            deposition_scale_sput = scale_p;
+            #pragma omp parallel for
+            for (size_t i = 0; i < n; ++i) {
+                avg_deposition_sublimation_flux[i] = base_deposition_sublimation_flux[i] * scale_s;
+                avg_deposition_sputter_flux[i] = base_deposition_sputter_flux[i] * scale_p;
+                avg_deposition_flux[i] = avg_deposition_sublimation_flux[i] + avg_deposition_sputter_flux[i];
+                avg_net_flux[i] = avg_deposition_flux[i] - avg_sublimation_flux[i] - avg_sputtering_flux[i];
+            }
+            return;
+        }
+        double total_current_emission = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            total_current_emission += (avg_sublimation_flux[i] + avg_sputtering_flux[i]) * face_areas[i];
+        }
+        const double deposition_scale = (total_base_emission > 1e-30)
+                                      ? total_current_emission / total_base_emission : 1.0;
+        deposition_scale_total = deposition_scale;
+        #pragma omp parallel for
+        for (size_t i = 0; i < n; ++i) {
+            avg_deposition_flux[i] = base_deposition_flux[i] * deposition_scale;
+            avg_net_flux[i] = avg_deposition_flux[i] - avg_sublimation_flux[i] - avg_sputtering_flux[i];
+        }
+    }
+
     // Check if cache refresh is needed based on ice fraction changes.
     // Uses emission-weighted mean change: a face that contributes 0.1% of global
     // emission can deplete without triggering a global recomputation.
@@ -683,6 +967,17 @@ struct EvolutionStatistics {
     long long prediction_evaluations = 0;
     long long steps_albedo_limited = 0;
 
+    // Lag-layer diffusion barrier (lag_active only when IceLayerModel::enableLagBarrier ran).
+    // The inventory is sum (substrate ice + frost veneer) x area; the global audit is
+    //   inventory_now - inventory_0 = -(sublimated + sputtered - deposited).
+    bool lag_active = false;
+    double lag_inventory_initial_mass = 0.0;   // [kg]
+    double lag_inventory_mass = 0.0;           // [kg]
+    double lag_veneer_mass = 0.0;              // [kg] sum m_f x area
+    double lag_max_thickness = 0.0;            // [m]
+    size_t lag_faces_over_warn = 0;            // faces with d above the warning thickness
+    size_t lag_regime_count[4] = {0, 0, 0, 0}; // last step: S, sliding, veneer, none
+
     // Albedo coupling statistics
     double max_albedo_change = 0.0;       // [dimensionless] max albedo change this epoch
     double mean_albedo = 0.0;             // [dimensionless] mean albedo across all faces
@@ -737,6 +1032,21 @@ struct EvolutionStatistics {
                           << "Jeans - lag)" << std::endl;
             }
             std::cout << "    Total escaped:    " << total_escaped_mass << " kg" << std::endl;
+            if (lag_active) {
+                const double net = total_sublimated_mass + total_sputtered_mass - total_deposited_mass;
+                const double resid = (lag_inventory_mass - lag_inventory_initial_mass) + net;
+                std::cout << "  Lag barrier: ice inventory (substrate + frost veneer) " << lag_inventory_mass
+                          << " kg, change " << (lag_inventory_mass - lag_inventory_initial_mass)
+                          << " kg vs -(sublimated + sputtered - deposited) " << -net << " kg; residual "
+                          << resid << " kg (" << (lag_inventory_initial_mass > 0.0
+                                                  ? resid / lag_inventory_initial_mass : 0.0)
+                          << " of the inventory)" << std::endl;
+                std::cout << "    frost veneer " << lag_veneer_mass << " kg; max lag thickness "
+                          << lag_max_thickness << " m; last step regimes: substrate " << lag_regime_count[0]
+                          << ", recycling (frost-free fraction < 1) " << lag_regime_count[1]
+                          << ", veneer " << lag_regime_count[2] << ", no ice " << lag_regime_count[3]
+                          << std::endl;
+            }
             if (step_audit_count > 0) {
                 std::cout << "  Step conservation (PTM-644" << (superstep_consistent ? "" : "; LEGACY, not enforced")
                           << "): not redeposited " << total_not_redeposited_mass << " kg, residual "
@@ -794,6 +1104,8 @@ private:
     };
     StepBuffers step_buffers_;
     bool predict_skip_solve_ = false;
+    std::vector<int> lag_regime_;      // lag barrier: regime at the end of the last step (see LagFaceStep)
+    std::vector<double> lag_change_;   // lag barrier: |change of sublimation availability| over the last step
 
 public:
     /**
@@ -895,6 +1207,14 @@ public:
                                  const std::vector<double>& unscaled_sputtering,
                                  const std::vector<double>& face_areas,
                                  int epoch) {
+        if (lagOn(ice_model, ice_state)) {
+            std::vector<double> as, ap;
+            lagAvailabilities(ice_model, ice_state, unscaled_sublimation, unscaled_sputtering, as, ap);
+            diurnal_avg_->cacheBaseFluxesUnscaledLag(unscaled_sublimation, unscaled_sputtering, as, ap,
+                                                     face_areas);
+            diurnal_avg_->cache_epoch = epoch;
+            return;
+        }
         for (size_t i = 0; i < num_faces_; ++i) {
             ice_availability_buf_[i] = ice_model.getIceAvailabilityFactor(ice_state, i);
         }
@@ -910,12 +1230,82 @@ public:
     void applyScaledFluxes(const IceLayerModel& ice_model,
                            const IceLayerState& ice_state,
                            const std::vector<double>& face_areas) {
+        if (lagOn(ice_model, ice_state)) {
+            std::vector<double> as, ap;
+            lagAvailabilities(ice_model, ice_state, diurnal_avg_->base_sublimation_flux,
+                              diurnal_avg_->base_sputtering_flux, as, ap);
+            diurnal_avg_->applyScaledFluxesLag(as, ap, face_areas);
+            return;
+        }
         // Compute current ice availability factors
         for (size_t i = 0; i < num_faces_; ++i) {
             ice_availability_buf_[i] = ice_model.getIceAvailabilityFactor(ice_state, i);
         }
 
         diurnal_avg_->applyScaledFluxes(ice_availability_buf_, face_areas);
+    }
+
+    /**
+     * Lag barrier: per-face instantaneous availabilities (lagInstantAvailability) for
+     * the pure-ice potentials Js, Jp, with the last step's deposition once a step has run.
+     */
+    // The lag model and its state go together; a lag-enabled model paired with a
+    // state that enableLagBarrier() did not initialize is a programming error.
+    static bool lagOn(const IceLayerModel& ice_model, const IceLayerState& st) {
+        if (!ice_model.usesLagBarrier()) return false;
+        if (!st.hasLag()) {
+            throw std::logic_error("MultiTimescaleEvolution: the ice model has the lag barrier enabled but "
+                                   "the ice state was not initialized by enableLagBarrier()");
+        }
+        return true;
+    }
+
+    void lagAvailabilities(const IceLayerModel& ice_model, const IceLayerState& st,
+                           const std::vector<double>& Js, const std::vector<double>& Jp,
+                           std::vector<double>& as, std::vector<double>& ap) const {
+        lagOn(ice_model, st);
+        as.resize(num_faces_);
+        ap.resize(num_faces_);
+        const bool have_B = step_buffers_.deposition.size() == num_faces_ && stats_.steps_evolved > 0;
+        const double ell = ice_model.getLagBarrierLength();
+        for (size_t i = 0; i < num_faces_; ++i) {
+            lagInstantAvailability(Js[i], Jp.empty() ? 0.0 : Jp[i], have_B ? step_buffers_.deposition[i] : 0.0,
+                                   have_B, st.lag_thickness[i], st.frost_veneer[i], st.substrate_ice[i],
+                                   st.lag_exposed_fraction[i], ell, as[i], ap[i]);
+        }
+    }
+
+    /**
+     * Lag barrier: how far the emission PATTERN has moved since the transport was
+     * cached, as the total-variation distance between the normalized current and
+     * cached per-face emission (max over sublimation and sputtering; 0..1). A uniform
+     * decay is not a pattern change (the PTM-644 scale absorbs it); a change here is,
+     * and the cached deposition pattern no longer matches its sources.
+     */
+    double lagSourcePatternDrift(const IceLayerModel& ice_model, const IceLayerState& ice_state,
+                                 const std::vector<double>& face_areas) const {
+        const DiurnalAverages& d = *diurnal_avg_;
+        if (!d.cache_valid || d.cached_sub_availability.size() != num_faces_) return 0.0;
+        std::vector<double> as, ap;
+        lagAvailabilities(ice_model, ice_state, d.base_sublimation_flux, d.base_sputtering_flux, as, ap);
+        double worst = 0.0;
+        for (int g = 0; g < 2; ++g) {
+            const std::vector<double>& base = g == 0 ? d.base_sublimation_flux : d.base_sputtering_flux;
+            const std::vector<double>& ref = g == 0 ? d.cached_sub_availability : d.cached_sput_availability;
+            const std::vector<double>& now = g == 0 ? as : ap;
+            double s_now = 0.0, s_ref = 0.0;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                s_now += base[i] * now[i] * face_areas[i];
+                s_ref += base[i] * ref[i] * face_areas[i];
+            }
+            if (!(s_now > 0.0) || !(s_ref > 0.0)) continue;
+            double tv = 0.0;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                tv += std::abs(base[i] * now[i] * face_areas[i] / s_now - base[i] * ref[i] * face_areas[i] / s_ref);
+            }
+            worst = std::max(worst, 0.5 * tv);
+        }
+        return worst;
     }
 
     /**
@@ -1062,6 +1452,71 @@ public:
     }
 
     /**
+     * Lag barrier: the super-step bound. The face state no longer moves the
+     * concentration; the events are, per face, (a) the barrier factor 1/(1 + d/l)
+     * changing by 10% (d grows by 0.1 (l + d) at the current rate), weighted by the
+     * face's sublimation; (b) the substrate running out; (c) a veneer vanishing,
+     * weighted by (an upper bound on) the emission jump. As in computeSafeEpochCount, the step ends when
+     * the events passed carry 10% of the current emission. The per-face step is
+     * exact; this bounds the within-step change of the emission the PTM-644
+     * deposition solve averages over, and of the pattern the cached transport holds.
+     */
+    int computeSafeEpochCountLag(const IceLayerModel& ice_model, const IceLayerState& st,
+                                 const std::vector<double>& face_areas, double epoch_duration,
+                                 int max_epochs) const {
+        if (max_epochs <= 1 || epoch_duration <= 0.0) return 1;
+        lagOn(ice_model, st);
+        const DiurnalAverages& dv = *diurnal_avg_;
+        const double ell = ice_model.getLagBarrierLength();
+        const bool have_step_dep = step_buffers_.deposition.size() == num_faces_;
+        struct FaceEvent { double time, weight; };
+        std::vector<FaceEvent> events;
+        events.reserve(num_faces_);
+        const double max_time = max_epochs * epoch_duration;
+        std::vector<double> as_now, ap_now;
+        lagAvailabilities(ice_model, st, dv.base_sublimation_flux, dv.base_sputtering_flux, as_now, ap_now);
+        double total = 0.0;
+        for (size_t i = 0; i < num_faces_; ++i) {
+            const double Js = dv.base_sublimation_flux[i], Jp = dv.base_sputtering_flux[i];
+            total += (Js * as_now[i] + Jp * ap_now[i]) * face_areas[i];
+            const double B = have_step_dep ? step_buffers_.deposition[i] : dv.avg_deposition_flux[i];
+            const double M = st.substrate_ice[i], f = st.lag_exposed_fraction[i];
+            const double u = 1.0 + st.lag_thickness[i] / ell;
+            const double a = (M > 0.0) ? Js * f : 0.0, p = (M > 0.0) ? Jp * f : 0.0;
+            const double ES = a / u + p;
+            if (st.frost_veneer[i] > 0.0) {
+                const double Jv = Js + Jp;
+                if (B < Jv) {
+                    const double t = st.frost_veneer[i] / (Jv - B);
+                    // Weight: Jv - min(ES, B) bounds the jump Jv - max(ES, B) from above
+                    // (conservative: the step ends no later than the documented criterion).
+                    if (t < max_time) events.push_back({t, std::abs(Jv - std::min(ES, B)) * face_areas[i]});
+                }
+                continue;
+            }
+            if (!(M > 0.0) || !(ES > B)) continue;       // recycling, veneer growth or no ice: steady
+            const double net = ES - B;
+            const double t_dep = M / net;
+            if (t_dep < max_time) events.push_back({t_dep, ES * face_areas[i]});
+            const double beta = st.lag_beta[i];
+            if (beta > 0.0 && a > 0.0) {
+                const double t10 = 0.1 * u * ell / (beta * net);
+                if (t10 < max_time) events.push_back({t10, (a / u) * face_areas[i]});
+            }
+        }
+        if (!(total > 1e-30) || events.empty()) return max_epochs;
+        std::sort(events.begin(), events.end(),
+                  [](const FaceEvent& x, const FaceEvent& y) { return x.time < y.time; });
+        double cum = 0.0, safe_time = max_time;
+        for (const auto& e : events) {
+            cum += e.weight / total;
+            if (cum > 0.1) { safe_time = e.time; break; }
+        }
+        const int n = static_cast<int>(safe_time / epoch_duration);
+        return std::max(1, std::min(n, max_epochs));
+    }
+
+    /**
      * One face over one step with deposition held at B (PTM-644 helper).
      * conc_before: non-ice concentration at the start; A, B [1/s] as in
      * evolveEpoch(). mean_avail is the step-mean ice availability, so that
@@ -1198,7 +1653,7 @@ public:
                      IceLayerState& ice_state,
                      const std::vector<double>& face_areas,
                      double epoch_duration) {
-        evolveEpochImpl(ice_model, ice_state, face_areas, epoch_duration, nullptr);
+        evolveEpochImpl(ice_model, ice_state, face_areas, epoch_duration, nullptr, nullptr);
     }
 
     /**
@@ -1211,7 +1666,8 @@ public:
                                const std::vector<double>& face_areas,
                                double epoch_duration,
                                std::vector<double>& nonice_out,
-                               bool solve_deposition = true) {
+                               bool solve_deposition = true,
+                               std::vector<double>* lag_thickness_out = nullptr) {
         // solve_deposition = false (PTM-657): hold deposition at its start-of-step
         // scale instead of solving the step-consistent scale; ~7x cheaper, and
         // adequate for the albedo step limiter, which only needs where the albedo
@@ -1219,8 +1675,9 @@ public:
         predict_skip_solve_ = !solve_deposition;
         const EvolutionStatistics saved = stats_;
         nonice_out.resize(num_faces_);
+        if (lag_thickness_out) lag_thickness_out->resize(num_faces_);
         evolveEpochImpl(ice_model, const_cast<IceLayerState&>(ice_state), face_areas, epoch_duration,
-                        &nonice_out);
+                        &nonice_out, lag_thickness_out);
         const long long evals = stats_.step_solver_evaluations - saved.step_solver_evaluations;
         stats_ = saved;
         stats_.prediction_evaluations += evals;
@@ -1233,8 +1690,22 @@ private:
                          IceLayerState& ice_state,
                          const std::vector<double>& face_areas,
                          double epoch_duration,
-                         std::vector<double>* predict_only) {
+                         std::vector<double>* predict_only,
+                         std::vector<double>* predict_lag_d) {
         const DiurnalAverages& d = *diurnal_avg_;
+        // Lag barrier (IceLayerModel::enableLagBarrier): the per-face step is
+        // solveLagFaceStep, with separate sublimation and sputter emission.
+        const bool lag = lagOn(ice_model, ice_state);
+        const double ell = lag ? ice_model.getLagBarrierLength() : 0.0;
+        if (lag && !config_.superstep_consistent_deposition) {
+            throw std::logic_error("evolveEpoch: the lag barrier requires the step-consistent deposition (PTM-644)");
+        }
+        auto lagStep = [&](size_t i, double B) {
+            return solveLagFaceStep(d.base_sublimation_flux[i], d.base_sputtering_flux[i], B,
+                                    ice_state.lag_thickness[i], ice_state.frost_veneer[i],
+                                    ice_state.substrate_ice[i], ice_state.lag_exposed_fraction[i],
+                                    ice_state.lag_beta[i], ell, epoch_duration);
+        };
         double max_ice_mass = ice_model.getMaxIceMassPerArea();
         const bool consistent = config_.superstep_consistent_deposition;
         const bool two = d.sputter_transport;
@@ -1261,6 +1732,14 @@ private:
 
         // Step-mean emission per group [kg/s] for deposition scales sc (face-order sums).
         auto evaluate = [&](const double* sc, double* G) {
+            if (lag) {
+                #pragma omp parallel for
+                for (size_t i = 0; i < num_faces_; ++i) {
+                    const LagFaceStep st = lagStep(i, dep_at(i, sc));
+                    step_buffers_.emit_sub[i] = st.sub_int / epoch_duration * face_areas[i];
+                    step_buffers_.emit_sput[i] = st.sput_int / epoch_duration * w1(i) * face_areas[i];
+                }
+            } else {
             #pragma omp parallel for
             for (size_t i = 0; i < num_faces_; ++i) {
                 const double bs = d.base_sublimation_flux[i], bp = d.base_sputtering_flux[i];
@@ -1269,6 +1748,7 @@ private:
                                              epoch_duration, true);
                 step_buffers_.emit_sub[i] = bs * st.mean_avail * face_areas[i];
                 step_buffers_.emit_sput[i] = bp * w1(i) * st.mean_avail * face_areas[i];
+            }
             }
             G[0] = G[1] = 0.0;
             for (size_t i = 0; i < num_faces_; ++i) G[0] += step_buffers_.emit_sub[i];
@@ -1362,6 +1842,15 @@ private:
                 s[0] = sn[0]; s[1] = sn[1]; g[0] = gn[0]; g[1] = gn[1];
             }
         }
+        if (predict_only && lag) {
+            // Prediction: the end-of-step lag thickness (the concentration is frozen).
+            #pragma omp parallel for
+            for (size_t i = 0; i < num_faces_; ++i) {
+                (*predict_only)[i] = ice_state.nonice_concentration[i];
+                if (predict_lag_d) (*predict_lag_d)[i] = lagStep(i, dep_at(i, s)).d_end;
+            }
+            return;
+        }
         if (predict_only) {
             // Prediction: the end-of-step concentrations only (state untouched).
             #pragma omp parallel for
@@ -1377,6 +1866,70 @@ private:
         stats_.step_solver_max_iterations = std::max(stats_.step_solver_max_iterations, iterations);
         ++stats_.steps_evolved;
 
+        if (lag) {
+            if (lag_regime_.size() != num_faces_) lag_regime_.assign(num_faces_, 0);
+            if (lag_change_.size() != num_faces_) lag_change_.assign(num_faces_, 0.0);
+            if (!stats_.lag_active) {
+                double inv0 = 0.0;
+                for (size_t i = 0; i < num_faces_; ++i) {
+                    inv0 += (ice_state.substrate_ice[i] + ice_state.frost_veneer[i]) * face_areas[i];
+                }
+                stats_.lag_inventory_initial_mass = inv0;
+                stats_.lag_active = true;
+            }
+            #pragma omp parallel for
+            for (size_t i = 0; i < num_faces_; ++i) {
+                const double deposition = dep_at(i, s);
+                const double avail_before = ice_model.getSublimationAvailability(ice_state, i);
+                const double inv_before = ice_state.substrate_ice[i] + ice_state.frost_veneer[i];
+                const LagFaceStep st = lagStep(i, deposition);
+                const double eff_sublimation = st.sub_int / epoch_duration;
+                const double eff_sputtering = st.sput_int / epoch_duration;
+                ice_state.lag_thickness[i] = st.d_end;
+                ice_state.frost_veneer[i] = st.mf_end;
+                ice_state.substrate_ice[i] = st.M_end;
+                ice_model.updateIceMass(ice_state, i);
+                lag_regime_[i] = st.regime_end;
+                lag_change_[i] = std::abs(ice_model.getSublimationAvailability(ice_state, i) - avail_before);
+                concentration_change_rate_[i] = 0.0;   // the concentration is frozen
+                ice_state.cumulative_sublimated[i] += st.sub_int;
+                ice_state.cumulative_sputtered[i] += st.sput_int;
+                ice_state.cumulative_deposited[i] += deposition * epoch_duration;
+                step_buffers_.deposition[i] = deposition;
+                step_buffers_.emit_sub[i] = eff_sublimation * face_areas[i];
+                step_buffers_.emit_sput[i] = eff_sputtering * face_areas[i];
+                if (per_face) {
+                    step_buffers_.sput_transport[i] = eff_sputtering * d.sputter_face_transport_frac[i] * face_areas[i];
+                    step_buffers_.sput_escape[i] = eff_sputtering * d.sputter_face_escape_frac[i] * face_areas[i];
+                    step_buffers_.sput_reservoir[i] = eff_sputtering * d.sputter_face_reservoir_frac[i] * face_areas[i];
+                }
+                step_buffers_.dep_sub[i] = (two ? d.base_deposition_sublimation_flux[i] * s[0] : deposition)
+                                           * face_areas[i];
+                step_buffers_.dep_sput[i] = two ? deposition * face_areas[i] - step_buffers_.dep_sub[i] : 0.0;
+                // Deposition the substrate cannot take goes to the veneer: no overflow.
+                step_buffers_.overflow[i] = 0.0;
+                const double booked = deposition * epoch_duration - st.sub_int - st.sput_int;
+                const double inv_after = ice_state.substrate_ice[i] + ice_state.frost_veneer[i];
+                step_buffers_.inventory_err[i] = std::abs((inv_after - inv_before) - booked) * face_areas[i];
+            }
+            double inv = 0.0, ven = 0.0, dmax = 0.0;
+            size_t over = 0;
+            size_t rc[4] = {0, 0, 0, 0};
+            const double warn = ice_model.getLagConfig().warn_thickness;
+            for (size_t i = 0; i < num_faces_; ++i) {
+                inv += (ice_state.substrate_ice[i] + ice_state.frost_veneer[i]) * face_areas[i];
+                ven += ice_state.frost_veneer[i] * face_areas[i];
+                dmax = std::max(dmax, ice_state.lag_thickness[i]);
+                if (ice_state.lag_thickness[i] > warn) ++over;
+                ++rc[std::clamp(lag_regime_[i], 0, 3)];
+                max_change = std::max(max_change, lag_change_[i]);
+            }
+            stats_.lag_inventory_mass = inv;
+            stats_.lag_veneer_mass = ven;
+            stats_.lag_max_thickness = dmax;
+            stats_.lag_faces_over_warn = over;
+            for (int k = 0; k < 4; ++k) stats_.lag_regime_count[k] = rc[k];
+        } else {
         #pragma omp parallel for reduction(max:max_change) \
             reduction(+:epoch_sublimated,epoch_deposited,epoch_sputtered)
         for (size_t i = 0; i < num_faces_; ++i) {
@@ -1450,6 +2003,7 @@ private:
             step_buffers_.overflow[i] = over * max_ice_mass * face_areas[i];
             step_buffers_.inventory_err[i] = std::abs(booked - over - dphi) * max_ice_mass * face_areas[i];
         }
+        }
 
         // Face-order (reproducible) sums of the step.
         // Gs, Gp, Ds, Dp [kg/s]; over, inv_err [kg] over the step.
@@ -1470,7 +2024,7 @@ private:
             over += step_buffers_.overflow[i];
             inv_err += step_buffers_.inventory_err[i];
         }
-        if (consistent) {
+        if (consistent) {   // (the lag barrier requires it; see the top of this function)
             // Stats from the reproducible sums (the OpenMP reductions above vary at
             // ~1e-16 run to run; PTM-645).
             epoch_sublimated = Gs;
@@ -1592,6 +2146,9 @@ public:
      * (the step-consistent value; the start-of-step value in legacy mode).
      */
     const std::vector<double>& getStepDepositionFlux() const { return step_buffers_.deposition; }
+
+    /** Lag barrier: regime of each face at the end of the last step (empty before the first). */
+    const std::vector<int>& getLagRegime() const { return lag_regime_; }
 
     /**
      * Update statistics after epoch evolution
