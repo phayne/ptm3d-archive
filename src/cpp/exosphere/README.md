@@ -466,6 +466,26 @@ optically neutral. Snapshots add `lag_thickness_m`, `frost_veneer_kg_m2`,
 2 sealed, $d > 10\ell$), `lag_regime` and `sublimation_availability`; `lag/lag_timeseries.csv`
 has one row per iteration. See Appendix D.6.5.
 
+**Gardening and the sputter split (PTM-669, multiscale default).** Paul's rulings
+(2026-09-24): H$_2$O sputter EJECTION is shielded by the lag (ions deposit their energy
+within ~0.1 to a few µm, Plainaki et al. 2010 p. 389; ejected H$_2$O below the top grains
+sticks, Johnson et al. 2004 pp. 494, 502 and Cassidy & Johnson 2005); radiolytic O$_2$ + H$_2$
+(36/32 of the O$_2$ mass in ice) stay unshielded (O$_2$ does not stick and diffuses out,
+Johnson et al. 2004, 2019; caveat: the O$_2$ source uses Teolis thin-layer ~28 Å yields).
+Micrometeoroid gardening at $v_m$ = 0.3 µm/yr (Johnson et al. 2004 Table 20.2, citing Cooper
+et al. 2001) mixes the lag back into the box:
+$\dot d = \beta_c[(a + p_w)/(1 + d/\ell) + p_r - B] - v_m$ for $d > 0$, $\beta_c$ from the
+CURRENT box $c$; $d = 0$ is absorbing where $\beta_c (a + p_w + p_r - B) \le v_m$ (Spencer
+criterion; the box then loses ice and its $c$ rises). The veneer is gardened into the box at
+$
+ho_{\mathrm{ice}}(1 - \phi) v_m$. The box deepens as $h_g = \sqrt{h_{\mathrm{mm}}^2 + K_{99} t}$
+($h_{\mathrm{mm}}$ = 1 cm; $K_{99}$ = 3.84e-9 m$^2$/yr, Costello et al. 2021 Eq. 1 Case B, 99%;
+$h$ = 0.04 and $c$ = 1 UNVERIFIED), entraining column material at the $t = 0$ composition
+(booked as an external supply in the mass audit). The box starts at 1 cm, so `ice_mass`
+at $t = 0$ differs from the legacy 5 cm layer; the composition does not. Snapshots add
+`box_nonice_volume_m3_m2` and `sputter_h2o_share`; `lag_regime` 4 = Spencer-absorbing.
+See Appendix D.6.6.
+
 ### Ice Crystallization
 
 Water ice on Europa exists in a competition between thermally-driven crystallization and radiation-induced amorphization. The model tracks the crystalline fraction $\phi_C$ (dimensionless, $0 \le \phi_C \le 1$) at each mesh face.
@@ -857,6 +877,16 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--lag-porosity` $\phi_{\mathrm{lag}}$ | 0.6 | Lag porosity |
 | `--lag-tortuosity` $\tau$ | 2 | Lag tortuosity |
 | `--lag-optical-depth` $\delta_{\mathrm{opt}}$ | 1e-5 | Albedo e-folding lag thickness [m] |
+| `--no-gardening` | off | No micrometeoroid gardening ($v_m$ = 0) and the fixed 5 cm box (PTM-669) |
+| `--no-sputter-shield` | off | H$_2$O sputter ejection not barriered by the lag. With `--no-gardening` this is the PTM-659 model exactly |
+| `--gardening-rate` $v_m$ | 0.3 | Lag and veneer gardening rate [µm/yr] (arm 1.2) |
+| `--gardening-case` A\|B | B | Costello et al. 2021 secondary-crater rate for the box depth $h_g(t)$ |
+| `--gardening-box-depth` $h_{\mathrm{mm}}$ | 0.01 | Box depth at $t = 0$ [m] |
+| `--gardening-k99` $K_{99}$ | from the case | Box-deepening coefficient [m$^2$/yr] directly; overrides the case, $h$ and $c$ |
+| `--gardening-excavation-h` $h$ | 0.04 | Costello excavation depth / crater diameter (UNVERIFIED; not in Costello et al. 2021) |
+| `--gardening-overlap-c` $c$ | 1 | Costello overlap parameter (UNVERIFIED) |
+
+Every gardening value ($v_m$ with its citation, $h_{\mathrm{mm}}$, $K_{99}$ and its provenance, case, $h$, $c$) is echoed in the run log banner and in `evolution_summary.txt`, so a sweep over $v_m$ (or the box law) needs no code change.
 | `--lag-source-refresh-tol` $X$ | 0.02 | Refresh the transport when the emission pattern has moved by $X$ (total variation) since it was cached |
 | `--superstep-legacy-deposition` | off | Pre-PTM-644 step: deposition held at its start-of-step value while the sources follow the ice availability, and the trapezoid mean availability in the linear mode. Not mass-conserving; reproduces earlier products only. Implied by `--sputter-legacy-escape-only` |
 | `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
@@ -932,6 +962,7 @@ $s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))$, solve
 | `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember; with `<mesh.ply> <map.bin>`, fill faces follow the thermal albedo (PTM-637) |
 | `test_multiscale_snapshot_time.cpp` | PTM-636: snapshot $L$ is the state after $L$ epochs (== a run stopped at $L$), same-state fields, complete `time_steps.txt` |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
+| `test_lag_gardening.cpp` | PTM-669: box depth vs `scripts/jwst/gardening.py`, Spencer criterion ($d = 0$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the PTM-659 step, global mass closure with entrainment, $t = 0$ invariance |
 | `test_lag_barrier.cpp` | Lag barrier: $d + d^2/2\ell = \beta J_0 f t$ (one step, many steps, engine), closed form vs RK4 with sputtering and deposition, veneer first then the barrier, recycling, global mass conservation, $t = 0$ bit-identity, $\ell$ and lag albedo |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 
@@ -956,6 +987,16 @@ Marti, J. & Mauersberger, K. (1993). A survey and new measurements of ice vapor 
 Mitchell, E.H. et al. (2017). Porosity effects on crystallization kinetics of amorphous water ice: Implications for cold icy bodies in the outer Solar System. *Icarus*, 285, 291-299. doi:10.1016/j.icarus.2016.11.004
 
 Nordheim, T.A. et al. (2022). Magnetospheric Ion Bombardment of Europa's Surface. *Planet. Sci. J.*, 3, 5. doi:10.3847/PSJ/ac382a
+
+Cassidy, T.A. & Johnson, R.E. (2005). Monte Carlo model of sputtering and other ejection processes within a regolith. *Icarus*, 176, 499-507.
+
+Cooper, J.F. et al. (2001). Energetic ion and electron irradiation of the icy Galilean satellites. *Icarus*, 149, 133-159.
+
+Costello, E.S. et al. (2021). Impact gardening on Europa and repercussions for possible biosignatures. *Nat. Astron.*, 5, 951-956. doi:10.1038/s41550-021-01393-1
+
+Johnson, R.E. et al. (2004). Radiation effects on the surfaces of the Galilean satellites. In *Jupiter: The Planet, Satellites and Magnetosphere*, Ch. 20. Cambridge Univ. Press.
+
+Plainaki, C. et al. (2010). Neutral particle release from Europa's surface. *Icarus*, 210, 385-395.
 
 Schorghofer, N. (2008). The lifetime of ice on main belt asteroids. *Astrophys. J.*, 682, 697-705.
 

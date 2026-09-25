@@ -786,6 +786,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             writeBinaryArray("lag_class", cls);            // 0 mixed, 1 frost veneer, 2 sealed (d > 10 l)
             writeBinaryArray("lag_regime", regime);        // last step: 0 substrate, 1 recycling, 2 veneer, 3 none; -1 before
             writeBinaryArray("sublimation_availability", avail);
+            if (ice_layer_model_->usesGardenMode()) {
+                // regime 4 = Spencer-absorbing d = 0 (the box loses ice, no lag holds).
+                writeBinaryArray("box_nonice_volume_m3_m2", st.box_nonice_volume);
+                if (multiscale_evolution_ && multiscale_evolution_->getDiurnalAverages().hasSputterSplit()) {
+                    writeBinaryArray("sputter_h2o_share", multiscale_evolution_->getDiurnalAverages().sput_w);
+                }
+            }
         }
 
         // Write composition-dependent albedo if coupling is enabled
@@ -2126,6 +2133,29 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         std::cout << "  Thermal inertia: unchanged; WARNING if any d exceeds " << c.warn_thickness << " m" << std::endl;
         std::cout << "  Transport refresh when the emission pattern moves by > " << c.source_refresh_tol
                   << " (total variation)" << std::endl;
+        if (c.gardenMode()) {
+            const double yr = 365.25 * 86400.0;
+            std::cout << "  Sputter split (PTM-669): H2O ejection " << (c.sputter_shield ? "SHIELDED by the lag "
+                      "(ejected H2O below the top grains sticks: Johnson et al. 2004 pp. 494, 502; Cassidy & "
+                      "Johnson 2005; ion range 0.1 to a few um, Plainaki et al. 2010 p. 389)"
+                      : "NOT shielded (--no-sputter-shield)") << "; radiolytic O2 + H2 unshielded (O2 does not "
+                      "stick and diffuses out: Johnson et al. 2004, 2019). CAVEAT: the O2 source uses Teolis "
+                      "thin-layer (~28 A) yields" << std::endl;
+            if (c.gardening) {
+                std::cout << "  Gardening (PTM-669): lag and veneer mixed into the box at v_m = " << (c.gardening_rate * yr * 1e6)
+                          << " um/yr (Johnson et al. 2004 Table 20.2 p. 490, citing Cooper et al. 2001); d = 0 is "
+                          << "absorbing where beta_c (a + p_w + p_r - B) <= v_m (Spencer criterion)" << std::endl;
+                std::cout << "  Box depth h_g(t) = sqrt(h_mm^2 + K99 t), h_mm = " << c.box_depth0 << " m, K99 = "
+                          << (c.box_K99 * yr) << " m^2/yr ("
+                          << (c.garden_K99_explicit ? std::string("explicit --gardening-k99")
+                              : std::string("Costello et al. 2021 Eq. 1, 99%, Case ") + c.garden_case + ", h = "
+                                + std::to_string(c.garden_h) + ", c = " + std::to_string(c.garden_c) + ", UNVERIFIED")
+                          << "); column entrained at the t = 0 composition. The box starts at h_mm, so "
+                          << "ice_mass at t = 0 differs from the legacy 5 cm layer (composition unchanged)" << std::endl;
+            } else {
+                std::cout << "  Gardening OFF (--no-gardening): fixed box " << c.box_depth0 << " m, v_m = 0" << std::endl;
+            }
+        }
         std::cout << "  t = 0 invariance: availability and albedo bit-identical to the legacy values on all "
                   << n << " faces" << std::endl;
         std::cout << std::fixed;
@@ -2166,6 +2196,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                  "sub_share_mixed,sub_share_frost,sub_share_sealed,area_frac_recycling,sub_share_recycling,"
                  "top_decile_sublimation_kg_s,top_decile_pred_kg_s,"
                  "last_step_sublimation_kg_s,last_step_sputtering_kg_s,last_step_deposition_kg_s\n";
+            if (ice_layer_model_->usesGardenMode()) {
+                f << "# garden mode (PTM-669): extra columns area_mean_c, area_frac_absorbing, "
+                     "box_depth_m, entrained_kg (cumulative), area_frac_lag (d > 0)\n";
+            }
             f << std::defaultfloat;
         }
         const std::vector<int>& regime = multiscale_evolution_->getLagRegime();
@@ -2200,7 +2234,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         for (int k = 0; k < 3; ++k) f << "," << (sub > 0.0 ? sub_c[k] / sub : 0.0);
         const auto& ms = multiscale_evolution_->getStatistics();
         f << "," << a_rec / a_tot << "," << (sub > 0.0 ? s_rec / sub : 0.0) << "," << top << "," << pred
-          << "," << ms.sublimation_rate << "," << ms.sputtering_rate << "," << ms.deposition_rate << "\n";
+          << "," << ms.sublimation_rate << "," << ms.sputtering_rate << "," << ms.deposition_rate;
+        if (ice_layer_model_->usesGardenMode()) {
+            double cA = 0.0, absA = 0.0, lagA = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                cA += st.nonice_concentration[i] * face_areas_[i];
+                if (regime.size() == n && regime[i] == 4) absA += face_areas_[i];
+                if (st.lag_thickness[i] > 0.0) lagA += face_areas_[i];
+            }
+            f << "," << cA / a_tot << "," << absA / a_tot << ","
+              << ice_layer_model_->getLagConfig().gardenBoxDepth(st.lag_time) << "," << ms.garden_entrained_mass
+              << "," << lagA / a_tot;
+        }
+        f << "\n";
     }
 
     // =========================================================================
@@ -2959,7 +3005,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // cycle so the multiscale step can use diurnal-mean per-face shares.
         const bool per_face_sputter = sputterTransportActive() &&
                                       !sputtering_model_->getConfig().legacyParams();
-        std::vector<double> sp_gross, sp_transport, sp_escape, sp_reservoir;
+        std::vector<double> sp_gross, sp_transport, sp_escape, sp_reservoir, sp_h2o;
+        // Garden mode (PTM-669): also the H2O-ejection part, for the sputter split.
+        const bool garden_split = per_face_sputter && ice_layer_model_ && ice_layer_model_->usesGardenMode();
+        if (garden_split) sp_h2o.assign(nf, 0.0);
         if (per_face_sputter) {
             sp_gross.assign(nf, 0.0);
             sp_transport.assign(nf, 0.0);
@@ -2992,6 +3041,7 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                         sp_transport[f] += sputtering_state_->redeposition_flux[f];
                         sp_escape[f] += sputtering_state_->total_mass_loss[f];
                         sp_reservoir[f] += sputtering_state_->reservoir_flux[f];
+                        if (garden_split) sp_h2o[f] += sputtering_state_->h2o_sputter_flux[f];
                     }
                 }
             }
@@ -3043,6 +3093,22 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 }
             }
         }
+        if (garden_split) {
+            // Per-face composition of the gross potential: H2O share w, and the fates of each
+            // part (radiolytic ice is 36/32 of the O2 mass; the engine already books it so).
+            auto& da = multiscale_evolution_->getMutableDiurnalAverages();
+            const auto& sc = sputtering_model_->getConfig();
+            const double ew = sc.h2oEscapeFraction();
+            da.sput_w.assign(nf, 0.0); da.sput_tw.assign(nf, 0.0);
+            da.sput_ew.assign(nf, ew); da.sput_er.assign(nf, 0.0);
+            for (size_t f = 0; f < nf; ++f) {
+                const double g = sp_gross[f], h = sp_h2o[f], r = g - h;
+                da.sput_w[f] = (g > 0.0) ? h / g : sc.h2o_fraction;
+                da.sput_tw[f] = (h > 0.0) ? sp_transport[f] / h : 1.0 - ew;
+                da.sput_er[f] = (r > 0.0) ? std::clamp((sp_escape[f] - ew * h) / r, 0.0, 1.0)
+                                          : sc.o2EscapeFraction();
+            }
+        }
         if (!saved_mass.empty()) {
             exosphere_model_->getMutableState().accumulated_mass = std::move(saved_mass);
         }
@@ -3077,6 +3143,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 std::vector<double> as, ap;
                 multiscale_evolution_->lagAvailabilities(*ice_layer_model_, *ice_layer_state_,
                     diurnal_avg.avg_sublimation_flux, diurnal_avg.avg_sputtering_flux, as, ap);
+                if (ice_layer_model_->usesGardenMode()) {
+                    // The fate shares of the CURRENT gross (the shielded H2O part shrinks).
+                    multiscale_evolution_->setGardenSputterFractions(*ice_layer_model_, *ice_layer_state_,
+                        diurnal_avg.avg_sublimation_flux, diurnal_avg.avg_sputtering_flux);
+                }
                 for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                     const double fs = as[i];
                     const double fp = ap[i];
@@ -3439,7 +3510,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 a_cls[(st.frost_veneer[i] > 0.0) ? 1 : (st.lag_thickness[i] > 10.0 * ell ? 2 : 0)] += a;
             }
             const double net = stats.total_sublimated_mass + stats.total_sputtered_mass - stats.total_deposited_mass;
-            const double resid = (stats.lag_inventory_mass - stats.lag_inventory_initial_mass) + net;
+            double resid = (stats.lag_inventory_mass - stats.lag_inventory_initial_mass) + net;
+            if (ice_layer_model_->usesGardenMode()) {   // out of line: see gardenAuditResidual
+                resid = gardenAuditResidual(stats.lag_inventory_mass, stats.lag_inventory_initial_mass, net,
+                                            stats.garden_entrained_mass);
+            }
             file << "Lag-Layer Diffusion Barrier:\n" << std::scientific << std::setprecision(6);
             file << "  Barrier length l: " << ell << " m" << (lc.barrier_length > 0.0 ? " (explicit)" : " (Knudsen)")
                  << "; phi_lag " << lc.lag_porosity << ", grain radius " << lc.grain_radius << " m, tortuosity "
@@ -3452,7 +3527,29 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             file << "  Frost veneer mass: " << stats.lag_veneer_mass << " kg\n";
             file << "  Ice inventory (substrate + veneer): initial " << stats.lag_inventory_initial_mass
                  << " kg, final " << stats.lag_inventory_mass << " kg\n";
-            file << "    change + (sublimated + sputtered - deposited) = " << resid << " kg ("
+            if (ice_layer_model_->usesGardenMode()) {
+                file << "  Garden mode (PTM-669): sputter shield " << (lc.sputter_shield ? "on" : "off")
+                     << ", gardening " << (lc.gardening ? "on" : "off") << ", v_m " << lc.gardening_rate * 365.25 * 86400.0
+                     << " m/yr, box depth " << lc.gardenBoxDepth(st.lag_time) << " m at t = " << st.lag_time << " s\n";
+                file << "  Gardening parameters: v_m " << lc.gardening_rate * 365.25 * 86400.0 * 1e6
+                     << " um/yr (Johnson et al. 2004 Table 20.2, citing Cooper et al. 2001); h_mm " << lc.box_depth0
+                     << " m; K99 " << lc.box_K99 * 365.25 * 86400.0 << " m^2/yr ("
+                     << (lc.garden_K99_explicit ? std::string("explicit")
+                         : std::string("Costello Case ") + lc.garden_case) << "); Costello h " << lc.garden_h
+                     << ", c " << lc.garden_c << " (UNVERIFIED); veneer gardening rho (1 - phi) v_m\n";
+                file << "  Ice entrained by the box growth: " << stats.garden_entrained_mass << " kg; "
+                     << "Spencer-absorbing faces (last step): " << stats.garden_absorbing_faces << "\n";
+                double cA = 0.0, c0A = 0.0, aT = 0.0;
+                for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                    cA += st.nonice_concentration[i] * face_areas_[i];
+                    c0A += st.box_c0[i] * face_areas_[i];
+                    aT += face_areas_[i];
+                }
+                file << "  Box non-ice c: area mean " << cA / aT << " (t = 0: " << c0A / aT << ")\n";
+            }
+            file << (ice_layer_model_->usesGardenMode()
+                     ? "    change + (sublimated + sputtered - deposited) - entrained = "
+                     : "    change + (sublimated + sputtered - deposited) = ") << resid << " kg ("
                  << (stats.lag_inventory_initial_mass > 0.0 ? resid / stats.lag_inventory_initial_mass : 0.0)
                  << " of the inventory)\n";
             file << "  Transport refreshes forced by the emission pattern: " << lag_source_refreshes_

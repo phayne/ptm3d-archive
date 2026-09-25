@@ -69,6 +69,30 @@ struct IceLayerConfig {
 };
 
 /**
+ * Impact-gardening depth, Costello et al. (2021, Nat. Astron. 5, 951) Eq. 1 for
+ * secondary craters (v = -4):  Lambda(t)^2 = u pi c^2 h^2 t / (2 lambda),  i.e. a
+ * diffusive growth Lambda^2 = K t. Ported from scripts/jwst/gardening.py (the test
+ * cross-checks the two). u [km^-2 yr^-1]: Case A 2.02e-12 (Zahnle et al. 2003 Case A),
+ * Case B 7.03e-12 (Case B + Levison et al. 2000). lambda = 4.605 is the 99% level.
+ * h = 0.04 (excavation depth / diameter) and c = 1 are NOT in Costello et al. 2021
+ * (UNVERIFIED; gardening.py attributes h to the Costello et al. 2018 lunar calibration).
+ */
+namespace gardening_constants {
+    constexpr double U_CASE_A = 2.02e-12;     // km^-2 yr^-1
+    constexpr double U_CASE_B = 7.03e-12;     // km^-2 yr^-1
+    constexpr double LAMBDA_SAT = 4.605;      // 99 %
+    constexpr double H_EXCAVATION = 0.04;     // UNVERIFIED
+    constexpr double C_OVERLAP = 1.0;         // UNVERIFIED
+    constexpr double SECONDS_PER_YEAR = 365.25 * 86400.0;
+    /** K [m^2/s] of Lambda^2 = K t at probability level lambda. */
+    inline double K(double u_km2_yr, double lambda = LAMBDA_SAT, double h = H_EXCAVATION,
+                    double c = C_OVERLAP) {
+        constexpr double pi = 3.14159265358979323846;
+        return u_km2_yr * pi * c * c * h * h / (2.0 * lambda) * 1e6 / SECONDS_PER_YEAR;
+    }
+}
+
+/**
  * Lag-layer diffusion barrier (multiscale evolution; on by default in the CLI,
  * --no-lag-barrier restores the legacy well-mixed box).
  *
@@ -98,6 +122,43 @@ struct LagBarrierConfig {
     double optical_depth = 10e-6;     // delta_opt [m] (albedo e-folding thickness)
     double warn_thickness = 5e-3;     // warn once any d exceeds this [m]
     double source_refresh_tol = 0.02; // transport refresh when the emission pattern moves this much
+
+    // Gardening and the sputter split (PTM-669; Paul's rulings 2026-09-24, Fermi's design).
+    // sputter_shield: H2O sputter EJECTION crosses the lag like sublimation (ejected H2O
+    //   below the top grains sticks: Johnson et al. 2004, Jupiter ch. 20, pp. 494, 502;
+    //   Cassidy & Johnson 2005); radiolytic O2 + H2 stay unshielded (O2 does not stick
+    //   and diffuses out: Johnson et al. 2004; Johnson et al. 2019). Ions deposit their
+    //   energy within ~0.1 to a few um (Plainaki et al. 2010, p. 389).
+    //   CAVEAT: the O2 source uses Teolis thin-layer (~28 A) yields; read literally
+    //   those would be shielded too. The unshielded-O2 ruling rests on the
+    //   trapped/diffusing picture.
+    // gardening_rate v_m [m/s]: micrometeoroid gardening mixes the lag (and a frost
+    //   veneer) back into the box: 0.3 um/yr default, 1.2 um/yr arm (Johnson et al. 2004,
+    //   Table 20.2 p. 490 and Sec. 20.4.1 p. 491, citing Cooper et al. 2001).
+    // Box depth h_g(t) = sqrt(h_mm^2 + K99 t) (Costello et al. 2021 Eq. 1 at the 99%
+    //   level, secondaries v = -4: K99 = u pi c^2 h^2 / (2 x 4.605); Case B 3.84e-9,
+    //   Case A 1.10e-9 m^2/yr; h = 0.04 and c = 1 are UNVERIFIED, not in Costello 2021);
+    //   column material at the t = 0 composition c_0 is entrained at dh_g/dt.
+    // Both off (--no-gardening --no-sputter-shield) = PTM-659 exactly.
+    bool sputter_shield = false;
+    bool gardening = false;
+    double gardening_rate = 0.3e-6 / (365.25 * 86400.0);   // v_m [m/s]
+    double box_depth0 = 0.01;                               // h_mm [m] (gardening on)
+    double box_K99 = gardening_constants::K(gardening_constants::U_CASE_B);  // [m^2/s], Case B (3.84e-9 m^2/yr)
+    // Provenance of box_K99 (echoed in the log and summary; all CLI-tunable).
+    char garden_case = 'B';                                  // Costello secondary-crater case
+    double garden_h = gardening_constants::H_EXCAVATION;     // excavation depth / diameter (UNVERIFIED)
+    double garden_c = gardening_constants::C_OVERLAP;        // overlap parameter (UNVERIFIED)
+    bool garden_K99_explicit = false;                        // --gardening-k99 given
+    /** K99 from the case, h and c (Costello et al. 2021 Eq. 1 at the 99% level). */
+    double costelloK99() const {
+        return gardening_constants::K(garden_case == 'A' ? gardening_constants::U_CASE_A : gardening_constants::U_CASE_B,
+                                      gardening_constants::LAMBDA_SAT, garden_h, garden_c);
+    }
+    bool gardenMode() const { return sputter_shield || gardening; }
+    double gardenBoxDepth(double t_seconds) const {
+        return gardening ? std::sqrt(box_depth0 * box_depth0 + box_K99 * t_seconds) : box_depth0;
+    }
 
     // 4 pi / (8 + pi): the Knudsen series-resistance factor (Schorghofer 2008, eq. 3).
     static double knudsenFactor() {
@@ -147,6 +208,10 @@ struct IceLayerState {
     std::vector<double> substrate_ice;           // ice left in the mixed layer [kg/m²]
     std::vector<double> lag_exposed_fraction;    // f(x_n), the mixture's exposed ice area (frozen)
     std::vector<double> lag_beta;                // beta [m³/kg]: d(lag_d) per kg/m² of net ice loss
+    // Garden mode (PTM-669): the box composition moves. c = N / (N + M / rho_ice).
+    std::vector<double> box_nonice_volume;       // N [m³/m²], non-ice grains in the box
+    std::vector<double> box_c0;                  // column composition entrained by gardening (t = 0 c)
+    double lag_time = 0.0;                       // [s] model time of the lag state (box depth)
     bool hasLag() const { return !lag_thickness.empty(); }
 
     explicit IceLayerState(size_t num_faces) {
@@ -421,6 +486,37 @@ public:
         lag_config_ = cfg;
         lag_length_ = cfg.length();
         lag_enabled_ = true;
+        if (cfg.gardenMode()) {
+            // Box of depth h_g(0): with gardening the 1 cm micrometeoroid layer, else the
+            // legacy fixed layer (thermal skin depth), so the t = 0 composition is kept.
+            const double h0 = cfg.gardening ? cfg.box_depth0 : config_.thermal_skin_depth;
+            lag_config_.box_depth0 = h0;
+            state.box_nonice_volume.assign(n, 0.0);
+            state.box_c0.assign(n, 0.0);
+            for (size_t i = 0; i < n; ++i) {
+                const double c = state.nonice_concentration[i];
+                state.box_c0[i] = c;
+                state.box_nonice_volume[i] = c * h0;
+                state.substrate_ice[i] = (1.0 - c) * layer_constants::ICE_DENSITY * h0;
+                updateIceMass(state, i);
+            }
+            state.lag_time = 0.0;
+        }
+    }
+
+    bool usesGardenMode() const { return lag_enabled_ && lag_config_.gardenMode(); }
+
+    /** Garden mode: recompute c, f(c) and beta_c of face i from the box contents. */
+    void updateBoxComposition(IceLayerState& state, size_t i) const {
+        const double N = state.box_nonice_volume[i];
+        const double V = N + state.substrate_ice[i] / layer_constants::ICE_DENSITY;
+        const double c = (V > 0.0) ? std::clamp(N / V, 0.0, 1.0) : 1.0;
+        state.nonice_concentration[i] = c;
+        state.lag_exposed_fraction[i] = (c >= 1.0) ? 0.0
+            : (exposed_area_grain_ratio_ > 0.0 ? exposedAreaFraction(1.0 - c) : 1.0 - c);
+        state.lag_beta[i] = (c > 0.0 && c < 1.0)
+            ? c / ((1.0 - c) * layer_constants::ICE_DENSITY * (1.0 - lag_config_.lag_porosity))
+            : 0.0;
     }
 
     bool usesLagBarrier() const { return lag_enabled_; }

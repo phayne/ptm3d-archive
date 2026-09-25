@@ -337,6 +337,20 @@ $$A = A_{\mathrm{lag}} + (A_{\mathrm{mix}} - A_{\mathrm{lag}}) \thinspace e^{-d/
 
 with $A_{\mathrm{mix}}$ the albedo of the mixture (Equation D26, or the Hapke intimate mixture), $A_{\mathrm{lag}}$ the non-ice endmember, and $\delta_{\mathrm{opt}} = 10$ µm. At $t = 0$, $d = 0$ on every face, so the availabilities, the albedo and the initialization gates are unchanged bit for bit; the run checks this at startup. The frost veneer is optically neutral, and the lag does not change the thermal inertia (the run warns if any lag exceeds 5 mm).
 
+### D.6.6 Impact Gardening and the Sputter Split
+
+Without mixing, the lag of Section D.6.5 darkens every net-source face within $\sim 10^4$ yr, far faster than Europa's 10--200 Myr surface age. Two refinements (Paul Hayne's rulings, 2026-09-24; Fermi's formulation) are on by default (`--no-gardening --no-sputter-shield` restores D.6.5 exactly).
+
+**Sputter split.** The gross sputter flux is split per face into H$_2$O ejection $p_w$ and radiolytic O$_2$ + H$_2$ $p_r$ (the ice consumed by radiolysis is 36/32 of the O$_2$ mass). Ions deposit their energy within $\sim 0.1$ to a few µm (Plainaki et al. 2010, p. 389), and H$_2$O ejected below the top grains sticks to the regolith (Johnson et al. 2004, pp. 494, 502; Cassidy & Johnson 2005), so the ejection is **shielded** by the lag like sublimation. O$_2$ does not stick and diffuses out (Johnson et al. 2004; Johnson et al. 2019), so the radiolytic loss stays **unshielded**. Caveat: the engine's O$_2$ source uses the Teolis thin-layer ($\sim 28$ Å) yields, which read literally would be shielded too; the unshielded ruling rests on the trapped-and-diffusing picture.
+
+**Lag with gardening.** Micrometeoroid gardening at $v_m$ mixes the lag back into the box:
+
+$$\frac{dd}{dt} = \beta_c \left[\frac{a + p_w}{1 + d/\ell} + p_r - B\right] - v_m \thinspace \mathbb{1}(d > 0), \qquad \beta_c = \frac{c}{(1 - c)\thinspace \rho_{\mathrm{ice}} \thinspace (1 - \phi)} \tag{D27e}$$
+
+with $c$ the CURRENT box non-ice fraction and $v_m = 0.3$ µm/yr (arm 1.2; Johnson et al. 2004, Table 20.2 p. 490 and Section 20.4.1 p. 491, citing Cooper et al. 2001). This is Equation D27c with $a \to a + p_w$ and $p \to p_r - v_m/\beta_c$, so the closed form carries over. $d = 0$ is absorbing where $\beta_c (a + p_w + p_r - B) \le v_m$ (the Spencer criterion): such a face holds no lag and its box loses ice, so its $c$ rises. Elsewhere the lag tends to $d^*$ with $\beta_c [(a + p_w)/u^* + p_r - B] = v_m$. While $d > 0$ the non-ice freed by ice loss goes to the lag ($c$ fixed) and the gardened lag returns $(1 - \phi)\thinspace v_m$ of non-ice volume to the box. A frost veneer is gardened into the box ice at $\rho_{\mathrm{ice}}(1 - \phi) v_m$.
+
+**Box depth.** The mixed box deepens as $h_g(t) = \sqrt{h_{\mathrm{mm}}^2 + K_{99} t}$, $h_{\mathrm{mm}} = 1$ cm, with $K_{99} = u \pi c^2 h^2 / (2 \times 4.605)$ from Costello et al. (2021) Eq. 1 for secondary craters ($v = -4$) at the 99% level: $3.84 \times 10^{-9}$ m$^2$/yr (Case B, default) or $1.10 \times 10^{-9}$ (Case A). Column material at the $t = 0$ composition is entrained at $dh_g/dt$, and the global audit books it: $\Delta(\mathrm{inventory}) = \mathrm{entrained} - (\mathrm{sublimated} + \mathrm{sputtered} - \mathrm{deposited})$. The values $h = 0.04$ and $c = 1$ are not in Costello et al. (2021) and are unverified.
+
 ---
 
 ## D.7 Multi-Timescale Evolution
@@ -463,6 +477,18 @@ Oza, A.V. et al. (2019). Sodium and Potassium Atmospheres of the Icy Moons. *Ast
 Plainaki, C. et al. (2012). The role of sputtering and radiolysis in the generation of the Europa exosphere. *Icarus*, 218(2), 956--966.
 
 Plainaki, C. et al. (2013). Exospheric O$_2$ densities at Europa during different orbital phases. *Planet. Space Sci.*, 88, 42--52.
+
+Cassidy, T.A. & Johnson, R.E. (2005). Monte Carlo model of sputtering and other ejection processes within a regolith. *Icarus*, 176, 499--507.
+
+Cooper, J.F. et al. (2001). Energetic ion and electron irradiation of the icy Galilean satellites. *Icarus*, 149, 133--159.
+
+Costello, E.S., Phillips, C.B., Lucey, P.G. & Ghent, R.R. (2021). Impact gardening on Europa and repercussions for possible biosignatures. *Nature Astronomy*, 5, 951--956. doi:10.1038/s41550-021-01393-1
+
+Johnson, R.E. et al. (2004). Radiation effects on the surfaces of the Galilean satellites. In *Jupiter: The Planet, Satellites and Magnetosphere*, Ch. 20, 485--512. Cambridge University Press.
+
+Johnson, R.E. et al. (2019). Sputtering of the Galilean satellites (and the Jovian magnetosphere). *Space Sci. Rev.*
+
+Plainaki, C. et al. (2010). Neutral particle release from Europa's surface. *Icarus*, 210, 385--395.
 
 Schorghofer, N. (2008). The lifetime of ice on main belt asteroids. *Astrophys. J.*, 682, 697--705.
 

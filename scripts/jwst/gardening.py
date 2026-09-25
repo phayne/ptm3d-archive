@@ -25,8 +25,15 @@ inverted to a closed-form timescale:
     τ(Λ; λ) = (2 λ) / (u π c^2) * (Λ / h)^2
 
 The headline result of the paper is that gardening on Europa, with
-secondary craters included, reaches ~30 cm at 50 % probability over 10-200
-Myr — vastly faster than earlier estimates that omitted secondaries.
+secondary craters included, reaches ~30 cm at 99 % probability (the
+"homogenized reworking zone") over 10-200 Myr — vastly faster than earlier
+estimates that omitted secondaries. (Earlier versions of this docstring said
+50 %; 30 cm is the 99 % depth.)
+
+The C++ exosphere engine ports these constants (src/cpp/exosphere/
+ice_layer_model.h, namespace gardening_constants) for its box depth
+h_g(t) = sqrt(h_mm^2 + K99 t), K99 = u pi c^2 h^2 / (2 x 4.605) (`k_lambda`
+below); test_lag_gardening.cpp cross-checks the two.
 
 Constants come from the paper's "Modelling secondary impacts" /
 "The impact rate at Europa" subsections. Both cratering-rate scenarios are
@@ -57,12 +64,14 @@ LAMBDA_EQUIL = 0.02       # 2 %  — equilibrium / degradation-zone boundary
 LAMBDA_INTERMED = 0.693   # 50 % — intermediate / "in-situ reworking zone"
 LAMBDA_SAT = 4.605        # 99 % — saturation / homogenized-reworking-zone boundary
 
-# Geometric defaults. h = excavation-depth fraction of crater diameter
-# (Costello et al. 2018 calibrated h_0 ≈ 0.04 against Apollo cores;
-# Costello et al. 2021 uses the same value). c = overlap-scaling parameter
-# (1.0 for the geometric-saturation Poisson formulation).
-H_DEFAULT = 0.04
-C_DEFAULT = 1.0
+# Geometric defaults. h = excavation-depth fraction of crater diameter,
+# c = overlap-scaling parameter. UNVERIFIED: neither h = 0.04 nor c = 1 appears
+# in Costello et al. (2021) (Fermi audit, 2026-09-24). h ~ 0.04 is attributed
+# here to the Costello et al. (2018, Icarus) lunar Apollo-core calibration, which
+# has not been checked against the paper; c = 1 is the geometric-saturation
+# Poisson choice. Treat both as assumptions until sourced.
+H_DEFAULT = 0.04   # UNVERIFIED
+C_DEFAULT = 1.0    # UNVERIFIED
 
 # Reference depth scales used by the talk's timescales plot.
 Z_OPTICAL_M = 10e-6     # 10 µm — 3.1 µm Fresnel-peak probe depth
@@ -158,11 +167,16 @@ def gardening_timescale(depth_m,
 
 
 def gardening_rate(depth_m,
-                   lam=LAMBDA_INTERMED,
+                   lam=1.0,
                    case="B",
                    h=H_DEFAULT,
                    c=C_DEFAULT):
-    """Effective overturn rate k_gard ≡ 1/τ(Λ) at the given reference depth.
+    """Effective overturn rate k_gard ≡ 1/τ(Λ; λ) at the given reference depth.
+
+    A RATE is the Poisson intensity of overturn events at depth z,
+    r(z) = K_1 / z² with K_1 the λ = 1 constant, so the default is λ = 1
+    (one expected event per τ). The earlier default λ = 0.693 (the 50 % bin)
+    made the rate 1/0.693 = 1.44× too fast.
 
     Useful for the C++ Phase 7b coupling: a per-face relaxation rate that
     pulls the surface bin's φ_C and non-ice concentration toward the
@@ -171,7 +185,18 @@ def gardening_rate(depth_m,
     return 1.0 / gardening_timescale(depth_m, lam=lam, case=case, h=h, c=c)
 
 
+def k_lambda(lam=LAMBDA_SAT, case="B", h=H_DEFAULT, c=C_DEFAULT):
+    """K [m^2/yr] of the square-root law Λ(t)² = K t (v = -4 only):
+    K = u π c² h² / (2 λ). At λ = 4.605 (99 %): 3.84e-9 (Case B), 1.10e-9 (Case A).
+    """
+    p = _resolve_case(case)
+    if p["v"] != -4:
+        raise ValueError("k_lambda: the square-root law needs v = -4")
+    return p["u"] * np.pi * c * c * h * h / (2.0 * lam) * 1e6
+
+
 __all__ = [
+    "k_lambda",
     "CASE_A_SEC", "CASE_B_SEC", "CASES",
     "LAMBDA_EQUIL", "LAMBDA_INTERMED", "LAMBDA_SAT",
     "H_DEFAULT", "C_DEFAULT",

@@ -1829,6 +1829,8 @@ int main(int argc, char** argv)
     // Lag-layer diffusion barrier (multiscale; on by default, --no-lag-barrier = legacy).
     ptm::exosphere::LagBarrierConfig lag_cfg;
     bool no_lag_barrier = false;
+    bool no_gardening = false, no_sputter_shield = false;   // PTM-669
+    std::string garden_param_flag;
     std::string lag_param_flag;                // first lag parameter flag seen
 
     // Albedo-composition coupling options
@@ -1976,6 +1978,34 @@ int main(int argc, char** argv)
         }
         else if (a == "--no-lag-barrier") {
             no_lag_barrier = true;
+        }
+        // Garden mode (PTM-669): on by default with the lag barrier.
+        else if (a == "--no-gardening") { no_gardening = true; }
+        else if (a == "--no-sputter-shield") { no_sputter_shield = true; }
+        else if ((a == "--gardening-rate" || a == "--gardening-box-depth" || a == "--gardening-k99" ||
+                  a == "--gardening-excavation-h" || a == "--gardening-overlap-c") && i+1 < argc) {
+            if (garden_param_flag.empty()) garden_param_flag = a;
+            const double v = std::stod(argv[++i]);
+            if (!(std::isfinite(v) && v > 0.0)) {
+                std::cerr << "Error: " << a << " must be > 0" << std::endl;
+                return 1;
+            }
+            if (a == "--gardening-rate") lag_cfg.gardening_rate = v * 1e-6 / (365.25 * 86400.0);  // um/yr
+            else if (a == "--gardening-box-depth") lag_cfg.box_depth0 = v;
+            else if (a == "--gardening-k99") {                                                  // m^2/yr
+                lag_cfg.box_K99 = v / (365.25 * 86400.0);
+                lag_cfg.garden_K99_explicit = true;
+            }
+            else if (a == "--gardening-excavation-h") lag_cfg.garden_h = v;
+            else lag_cfg.garden_c = v;
+        }
+        else if (a == "--gardening-case" && i+1 < argc) {
+            if (garden_param_flag.empty()) garden_param_flag = a;
+            const std::string v = argv[++i];
+            // K99 = u pi c^2 h^2 / (2 x 4.605) [m^2/yr], Costello et al. 2021 Eq. 1 (v = -4);
+            // u = 7.03e-12 (B) / 2.02e-12 (A) km^-2 yr^-1, h = 0.04, c = 1 (scripts/jwst/gardening.py).
+            if (v == "B" || v == "A") lag_cfg.garden_case = v[0];
+            else { std::cerr << "Error: --gardening-case must be A or B" << std::endl; return 1; }
         }
         else if ((a == "--lag-barrier-length" || a == "--lag-grain-radius" || a == "--lag-porosity" ||
                   a == "--lag-tortuosity" || a == "--lag-optical-depth" || a == "--lag-source-refresh-tol")
@@ -2238,6 +2268,17 @@ int main(int argc, char** argv)
             std::cout << "  --lag-porosity P       Lag porosity phi_lag (default 0.6)\n";
             std::cout << "  --lag-tortuosity T     Lag tortuosity tau (default 2)\n";
             std::cout << "  --lag-optical-depth D  Albedo e-folding lag thickness delta_opt [m] (default 1e-5)\n";
+            std::cout << "  --no-gardening         No micrometeoroid gardening (v_m = 0, fixed 5 cm box)\n";
+            std::cout << "  --no-sputter-shield    H2O sputter ejection not barriered by the lag (PTM-659)\n";
+            std::cout << "  --gardening-rate V     Lag/veneer gardening rate v_m [um/yr] (default 0.3; Johnson\n";
+            std::cout << "                         et al. 2004 Table 20.2, citing Cooper et al. 2001; arm 1.2)\n";
+            std::cout << "  --gardening-case A|B   Costello et al. 2021 secondary rate for the box depth\n";
+            std::cout << "                         h_g = sqrt(h_mm^2 + K99 t) (default B, 3.84e-9 m^2/yr)\n";
+            std::cout << "  --gardening-box-depth H  h_mm [m] (default 0.01)\n";
+            std::cout << "  --gardening-k99 K      Box-deepening coefficient K99 [m^2/yr] directly (overrides\n";
+            std::cout << "                         the case, h and c)\n";
+            std::cout << "  --gardening-excavation-h H  Costello excavation depth / diameter (default 0.04, UNVERIFIED)\n";
+            std::cout << "  --gardening-overlap-c C  Costello overlap parameter (default 1, UNVERIFIED)\n";
             std::cout << "  --lag-source-refresh-tol X  Refresh the transport when the emission pattern has\n";
             std::cout << "                         moved by X (total variation; default 0.02)\n";
             std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
@@ -2687,6 +2728,19 @@ int main(int argc, char** argv)
                       << " implies --no-lag-barrier (reproduces pre-lag products)" << std::endl;
         }
         lag_cfg.enabled = !no_lag_barrier;
+        if (!garden_param_flag.empty() && (no_lag_barrier || no_gardening)) {
+            std::cerr << "Error: " << garden_param_flag << " needs gardening (not --no-gardening / --no-lag-barrier)"
+                      << std::endl;
+            return 1;
+        }
+        lag_cfg.gardening = lag_cfg.enabled && !no_gardening;
+        // Box deepening: an explicit --gardening-k99 wins; otherwise K99 from the case, h, c.
+        if (!lag_cfg.garden_K99_explicit) lag_cfg.box_K99 = lag_cfg.costelloK99();
+        lag_cfg.sputter_shield = lag_cfg.enabled && !no_sputter_shield && sputtering_enabled;
+        if (lag_cfg.enabled && !lag_cfg.gardenMode()) {
+            std::cerr << "WARNING [PTM-669]: --no-gardening --no-sputter-shield: the PTM-659 lag model "
+                      << "(no gardening, fixed 5 cm box, H2O ejection unbarriered)" << std::endl;
+        }
         integrator.setLagBarrier(lag_cfg);
         if (diurnal_stride > 1) {
             integrator.setDiurnalStride(diurnal_stride);
