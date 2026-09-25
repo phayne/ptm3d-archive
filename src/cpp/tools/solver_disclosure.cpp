@@ -92,6 +92,7 @@ const char* rethermalPathId(RethermalPath p) {
     switch (p) {
         case RethermalPath::GpuSelectedFaces: return "gpu_selected_faces";
         case RethermalPath::CpuScalarFaces:   return "cpu_scalar_selected_faces";
+        case RethermalPath::CpuSimdBatchFaces: return "cpu_simd_batch_selected_faces";
         case RethermalPath::NotRun:           break;
     }
     return "not_run";

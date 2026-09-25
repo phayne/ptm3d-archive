@@ -112,7 +112,9 @@ enum class ThermalSolverReason {
 enum class RethermalPath {
     NotRun,           // no radiation coupling, or no face selected
     GpuSelectedFaces, // runThermalForSelectedFaces_GPU
-    CpuScalarFaces    // runThermalModelWithMatchedTimes, per selected face
+    CpuScalarFaces,   // runThermalModelWithMatchedTimes, per selected face
+    CpuSimdBatchFaces // runThermalModelsForAllFacesBatchSoA on the selection
+                      // (BUGS.md PTM-665): the whole-mesh CPU integrator
 };
 
 // Announce the whole-mesh thermal solver. Prints the banner on the first call.
