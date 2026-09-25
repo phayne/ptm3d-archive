@@ -758,6 +758,43 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             }
         }
 
+        // Lag-layer diffusion barrier state (lag mode only).
+        if (ice_layer_enabled_ && ice_layer_state_ && ice_layer_state_->hasLag() && ice_layer_model_) {
+            const auto& st = *ice_layer_state_;
+            const double ell = ice_layer_model_->getLagBarrierLength();
+            const double phi = ice_layer_model_->getLagConfig().lag_porosity;
+            writeBinaryArray("lag_thickness_m", st.lag_thickness);
+            writeBinaryArray("frost_veneer_kg_m2", st.frost_veneer);
+            writeBinaryArray("substrate_ice_kg_m2", st.substrate_ice);
+            std::vector<double> nonice_mass(num_faces), cls(num_faces), avail(num_faces), regime(num_faces, -1.0);
+            static const std::vector<int> no_regime;
+            const auto& rg = multiscale_evolution_ ? multiscale_evolution_->getLagRegime() : no_regime;
+            std::vector<double> lag_as, lag_ap;
+            if (multiscale_evolution_) {
+                const auto& da = multiscale_evolution_->getDiurnalAverages();
+                multiscale_evolution_->lagAvailabilities(*ice_layer_model_, st, da.base_sublimation_flux,
+                                                         da.base_sputtering_flux, lag_as, lag_ap);
+            }
+            for (size_t i = 0; i < num_faces; ++i) {
+                // Non-ice grains in the lag: volume (1 - phi_lag) d at the dust density.
+                nonice_mass[i] = layer_constants::DUST_DENSITY * (1.0 - phi) * st.lag_thickness[i];
+                cls[i] = (st.frost_veneer[i] > 0.0) ? 1.0 : (st.lag_thickness[i] > 10.0 * ell ? 2.0 : 0.0);
+                avail[i] = lag_as.empty() ? ice_layer_model_->getSublimationAvailability(st, i) : lag_as[i];
+                if (rg.size() == num_faces) regime[i] = rg[i];
+            }
+            writeBinaryArray("lag_nonice_mass_kg_m2", nonice_mass);
+            writeBinaryArray("lag_class", cls);            // 0 mixed, 1 frost veneer, 2 sealed (d > 10 l)
+            writeBinaryArray("lag_regime", regime);        // last step: 0 substrate, 1 recycling, 2 veneer, 3 none; -1 before
+            writeBinaryArray("sublimation_availability", avail);
+            if (ice_layer_model_->usesGardenMode()) {
+                // regime 4 = Spencer-absorbing d = 0 (the box loses ice, no lag holds).
+                writeBinaryArray("box_nonice_volume_m3_m2", st.box_nonice_volume);
+                if (multiscale_evolution_ && multiscale_evolution_->getDiurnalAverages().hasSputterSplit()) {
+                    writeBinaryArray("sputter_h2o_share", multiscale_evolution_->getDiurnalAverages().sput_w);
+                }
+            }
+        }
+
         // Write composition-dependent albedo if coupling is enabled
         if (albedo_coupling_enabled_ && !current_face_albedos_.empty()) {
             writeBinaryArray("bond_albedo", current_face_albedos_);
@@ -925,7 +962,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
             // Gate vapor pressure by ice availability (no ice = no local vapor source)
             double vp = state.vapor_pressure[i];
-            if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_) {
+            // (Lag barrier: the multiscale export already scaled vapor_pressure by the
+            // face's availability; do not apply it twice. The legacy path does, PTM-661.)
+            if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_ &&
+                !(multiscale_export_mode_ && ice_layer_model_->usesLagBarrier())) {
                 vp *= ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
             }
 
@@ -1970,9 +2010,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // Save previous albedos for change detection
         previous_face_albedos_ = current_face_albedos_;
 
-        // Compute new albedos from current composition
-        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration,
-                                       current_face_albedos_);
+        // Compute new albedos from current composition (and lag, if on)
+        computeCompositionAlbedos(ice_layer_state_->nonice_concentration,
+                                  ice_layer_state_->hasLag() ? &ice_layer_state_->lag_thickness : nullptr,
+                                  current_face_albedos_);
 
         // Compute maximum change
         return CompositionAlbedoMapper::maxAlbedoChange(previous_face_albedos_,
@@ -1987,8 +2028,12 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // threshold is exceeded, EVERY face is rescaled from its own baseline:
         // T_new = T_ref * ((1 - A_new) / (1 - A_ref))^(1/4)
         const double threshold = albedo_mapper_->getConfig().albedo_update_threshold;
+        // PTM-657: in the face-local mode only faces whose deviation exceeds
+        // local_refresh_fraction_ x threshold are rescaled (and re-based); the rest
+        // keep their temperatures, which stay within the threshold by construction.
+        const double rescale_min = localRefreshEnabled() ? local_refresh_fraction_ * threshold : 0.0;
         const AlbedoRefreshResult r = albedo_refresh_.update(current_face_albedos_,
-                                                             surface_temperatures_, threshold);
+                                                             surface_temperatures_, threshold, rescale_min);
         if (!r.fired) return false;
         max_refresh_deviation_ = std::max(max_refresh_deviation_, r.max_deviation);
 
@@ -2004,6 +2049,204 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                       << "temperatures and baseline are unchanged" << std::endl;
         }
         return true;
+    }
+
+    void PTMExosphereIntegration::computeCompositionAlbedos(const std::vector<double>& nonice,
+                                                            const std::vector<double>* lag_d,
+                                                            std::vector<double>& out) const {
+        if (lag_d) {
+            albedo_mapper_->computeAlbedosWithLag(nonice, *lag_d, lag_cfg_.optical_depth, out);
+        } else {
+            albedo_mapper_->computeAlbedos(nonice, out);
+        }
+    }
+
+    void PTMExosphereIntegration::enableLagBarrierState() {
+        const size_t n = static_cast<size_t>(num_faces_);
+        // t = 0 references, taken before the switch.
+        std::vector<double> avail0(n), albedo0;
+        for (size_t i = 0; i < n; ++i) avail0[i] = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
+        if (albedo_mapper_) albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration, albedo0);
+
+        ice_layer_model_->enableLagBarrier(*ice_layer_state_, lag_cfg_);
+        const double ell = ice_layer_model_->getLagBarrierLength();
+
+        // t = 0 invariance: at d = 0 every availability and albedo is the legacy value
+        // bit for bit, so the initialization gates and the t = 0 fields are unchanged.
+        size_t bad_avail = 0, bad_albedo = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (ice_layer_model_->getSublimationAvailability(*ice_layer_state_, i) != avail0[i] ||
+                ice_layer_model_->getSputterAvailability(*ice_layer_state_, i) != avail0[i]) ++bad_avail;
+        }
+        if (albedo_mapper_) {
+            std::vector<double> a_lag;
+            computeCompositionAlbedos(ice_layer_state_->nonice_concentration, &ice_layer_state_->lag_thickness, a_lag);
+            for (size_t i = 0; i < n; ++i) if (a_lag[i] != albedo0[i]) ++bad_albedo;
+        }
+        if (bad_avail > 0 || bad_albedo > 0) {
+            throw std::logic_error("lag barrier t = 0 invariance failed: " + std::to_string(bad_avail) +
+                                   " availabilities and " + std::to_string(bad_albedo) +
+                                   " albedos differ from the legacy values at d = 0");
+        }
+
+        double bmin = std::numeric_limits<double>::infinity(), bmax = 0.0, xmin = 1.0, xmax = 0.0;
+        size_t n_pure = 0, n_noice = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double xn = ice_layer_state_->nonice_concentration[i];
+            xmin = std::min(xmin, xn);
+            xmax = std::max(xmax, xn);
+            if (xn <= 0.0) ++n_pure;
+            else if (xn >= 1.0) ++n_noice;
+            else {
+                bmin = std::min(bmin, ice_layer_state_->lag_beta[i]);
+                bmax = std::max(bmax, ice_layer_state_->lag_beta[i]);
+            }
+        }
+        const auto& c = lag_cfg_;
+        std::cout << "\n=== Lag-layer diffusion barrier (multiscale) ===" << std::endl;
+        std::cout << std::scientific << std::setprecision(4);
+        if (c.barrier_length > 0.0) {
+            std::cout << "  Barrier length l = " << ell << " m (explicit --lag-barrier-length; the Knudsen value "
+                      << "for the grain parameters would be "
+                      << LagBarrierConfig::derivedLength(c.lag_porosity, c.grain_radius, c.tortuosity) << " m)"
+                      << std::endl;
+        } else {
+            std::cout << "  Barrier length l = 1.128 [phi/(1-phi)] r / tau = " << ell << " m  (Knudsen D_K, "
+                      << "Schorghofer 2008 ApJ 682:697 eq. 3; phi_lag = " << c.lag_porosity << ", r = "
+                      << c.grain_radius << " m, tau = " << c.tortuosity << ")" << std::endl;
+        }
+        std::cout << "  Sublimation through the lag: J = J_0 f(x_n) / (1 + d/l); sputtering NOT barriered "
+                  << "(energetic ions reach cm depths; Paul, 2026-09-24)" << std::endl;
+        std::cout << "  Lag growth d(lag_d) = beta x (net ice loss), beta = x_n / [(1-x_n) rho_ice (1-phi_lag)]: "
+                  << bmin << " .. " << bmax << " m^3/kg over the faces that can form lag" << std::endl;
+        std::cout << "  x_n (frozen t = 0 non-ice fraction): " << xmin << " .. " << xmax << "; pure-ice faces "
+                  << "(no lag forms): " << n_pure << "; faces with no ice: " << n_noice << std::endl;
+        std::cout << "  Frost veneer: deposition beyond the face's barriered loss builds unbarriered frost; "
+                  << "deposition never removes lag (the legacy layer overflow now has a home)" << std::endl;
+        if (albedo_mapper_) {
+            std::cout << "  Lag albedo: A = A_lag + (A_mix - A_lag) exp(-d/delta_opt), delta_opt = "
+                      << c.optical_depth << " m, A_lag = forward albedo at c = 1 (" << albedo_mapper_->computeAlbedo(1.0, 0)
+                      << " on face 0); the frost veneer is optically neutral" << std::endl;
+        } else {
+            std::cout << "  Lag albedo: not used (no albedo coupling)" << std::endl;
+        }
+        std::cout << "  Thermal inertia: unchanged; WARNING if any d exceeds " << c.warn_thickness << " m" << std::endl;
+        std::cout << "  Transport refresh when the emission pattern moves by > " << c.source_refresh_tol
+                  << " (total variation)" << std::endl;
+        if (c.gardenMode()) {
+            const double yr = 365.25 * 86400.0;
+            std::cout << "  Sputter split (PTM-669): H2O ejection " << (c.sputter_shield ? "SHIELDED by the lag "
+                      "(ejected H2O below the top grains sticks: Johnson et al. 2004 pp. 494, 502; Cassidy & "
+                      "Johnson 2005; ion range 0.1 to a few um, Plainaki et al. 2010 p. 389)"
+                      : "NOT shielded (--no-sputter-shield)") << "; radiolytic O2 + H2 unshielded (O2 does not "
+                      "stick and diffuses out: Johnson et al. 2004, 2019). CAVEAT: the O2 source uses Teolis "
+                      "thin-layer (~28 A) yields" << std::endl;
+            if (c.gardening) {
+                std::cout << "  Gardening (PTM-669): lag and veneer mixed into the box at v_m = " << (c.gardening_rate * yr * 1e6)
+                          << " um/yr (Johnson et al. 2004 Table 20.2 p. 490, citing Cooper et al. 2001); d = 0 is "
+                          << "absorbing where beta_c (a + p_w + p_r - B) <= v_m (Spencer criterion)" << std::endl;
+                std::cout << "  Box depth h_g(t) = sqrt(h_mm^2 + K99 t), h_mm = " << c.box_depth0 << " m, K99 = "
+                          << (c.box_K99 * yr) << " m^2/yr ("
+                          << (c.garden_K99_explicit ? std::string("explicit --gardening-k99")
+                              : std::string("Costello et al. 2021 Eq. 1, 99%, Case ") + c.garden_case + ", h = "
+                                + std::to_string(c.garden_h) + ", c = " + std::to_string(c.garden_c) + ", UNVERIFIED")
+                          << "); column entrained at the t = 0 composition. The box starts at h_mm, so "
+                          << "ice_mass at t = 0 differs from the legacy 5 cm layer (composition unchanged)" << std::endl;
+            } else {
+                std::cout << "  Gardening OFF (--no-gardening): fixed box " << c.box_depth0 << " m, v_m = 0" << std::endl;
+            }
+        }
+        std::cout << "  t = 0 invariance: availability and albedo bit-identical to the legacy values on all "
+                  << n << " faces" << std::endl;
+        std::cout << std::fixed;
+    }
+
+    void PTMExosphereIntegration::writeLagTimeseriesRow(int epoch, double t_seconds, bool header) {
+        const size_t n = static_cast<size_t>(num_faces_);
+        const auto& da = multiscale_evolution_->getDiurnalAverages();
+        const auto& st = *ice_layer_state_;
+        const double ell = ice_layer_model_->getLagBarrierLength();
+        if (lag_top_decile_.size() != n) {
+            // Top decile (by area) of the t = 0 diurnal-mean temperature.
+            std::vector<size_t> idx(n);
+            for (size_t i = 0; i < n; ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                return da.avg_temperature[a] > da.avg_temperature[b] ||
+                       (da.avg_temperature[a] == da.avg_temperature[b] && a < b);
+            });
+            double a_tot = 0.0, a_cum = 0.0;
+            for (size_t i = 0; i < n; ++i) a_tot += face_areas_[i];
+            lag_top_decile_.assign(n, 0);
+            for (size_t k : idx) {
+                if (a_cum >= 0.1 * a_tot) break;
+                lag_top_decile_[k] = 1;
+                a_cum += face_areas_[k];
+            }
+        }
+        const std::string dir = output_dir_ + "/lag";
+        std::filesystem::create_directories(dir);
+        std::ofstream f(dir + "/lag_timeseries.csv", header ? std::ios::trunc : std::ios::app);
+        if (header) {
+            f << "# lag-layer diffusion barrier; l = " << std::scientific << std::setprecision(6) << ell
+              << " m; classes: frost = veneer m_f > 0, sealed = d > 10 l, mixed = the rest; "
+              << "top decile = top 10% of area by t = 0 diurnal-mean temperature; "
+              << "top_decile_pred = sum area sqrt(l J0 f / (2 beta t)) at the current J0\n";
+            f << "epoch,time_yr,sublimation_kg_s,sputtering_kg_s,deposition_kg_s,net_loss_kg_s,"
+                 "veneer_mass_kg,max_lag_m,area_frac_mixed,area_frac_frost,area_frac_sealed,"
+                 "sub_share_mixed,sub_share_frost,sub_share_sealed,area_frac_recycling,sub_share_recycling,"
+                 "top_decile_sublimation_kg_s,top_decile_pred_kg_s,"
+                 "last_step_sublimation_kg_s,last_step_sputtering_kg_s,last_step_deposition_kg_s\n";
+            if (ice_layer_model_->usesGardenMode()) {
+                f << "# garden mode (PTM-669): extra columns area_mean_c, area_frac_absorbing, "
+                     "box_depth_m, entrained_kg (cumulative), area_frac_lag (d > 0)\n";
+            }
+            f << std::defaultfloat;
+        }
+        const std::vector<int>& regime = multiscale_evolution_->getLagRegime();
+        double sub = 0.0, sput = 0.0, dep = 0.0, ven = 0.0, dmax = 0.0, a_tot = 0.0;
+        double area_c[3] = {0, 0, 0}, sub_c[3] = {0, 0, 0}, a_rec = 0.0, s_rec = 0.0, top = 0.0, pred = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double a = face_areas_[i];
+            const double q = da.avg_sublimation_flux[i] * a;
+            sub += q;
+            sput += da.avg_sputtering_flux[i] * a;
+            dep += da.avg_deposition_flux[i] * a;
+            ven += st.frost_veneer[i] * a;
+            dmax = std::max(dmax, st.lag_thickness[i]);
+            a_tot += a;
+            const int cls = (st.frost_veneer[i] > 0.0) ? 1 : (st.lag_thickness[i] > 10.0 * ell ? 2 : 0);
+            area_c[cls] += a;
+            sub_c[cls] += q;
+            if (regime.size() == n && regime[i] == 1) { a_rec += a; s_rec += q; }
+            if (lag_top_decile_[i]) {
+                top += q;
+                const double beta = st.lag_beta[i];
+                if (t_seconds > 0.0 && beta > 0.0) {
+                    pred += a * std::sqrt(ell * da.base_sublimation_flux[i] * st.lag_exposed_fraction[i]
+                                          / (2.0 * beta * t_seconds));
+                }
+            }
+        }
+        const double sy = timescale_constants::SECONDS_PER_YEAR;
+        f << epoch << "," << std::setprecision(10) << (t_seconds / sy) << "," << sub << "," << sput << "," << dep
+          << "," << (sub + sput - dep) << "," << ven << "," << dmax;
+        for (int k = 0; k < 3; ++k) f << "," << area_c[k] / a_tot;
+        for (int k = 0; k < 3; ++k) f << "," << (sub > 0.0 ? sub_c[k] / sub : 0.0);
+        const auto& ms = multiscale_evolution_->getStatistics();
+        f << "," << a_rec / a_tot << "," << (sub > 0.0 ? s_rec / sub : 0.0) << "," << top << "," << pred
+          << "," << ms.sublimation_rate << "," << ms.sputtering_rate << "," << ms.deposition_rate;
+        if (ice_layer_model_->usesGardenMode()) {
+            double cA = 0.0, absA = 0.0, lagA = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                cA += st.nonice_concentration[i] * face_areas_[i];
+                if (regime.size() == n && regime[i] == 4) absA += face_areas_[i];
+                if (st.lag_thickness[i] > 0.0) lagA += face_areas_[i];
+            }
+            f << "," << cA / a_tot << "," << absA / a_tot << ","
+              << ice_layer_model_->getLagConfig().gardenBoxDepth(st.lag_time) << "," << ms.garden_entrained_mass
+              << "," << lagA / a_tot;
+        }
+        f << "\n";
     }
 
     // =========================================================================
@@ -2102,6 +2345,17 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         multiscale_enabled_ = true;
 
         config.print();
+
+        if (lag_cfg_.enabled) {
+            if (!config.superstep_consistent_deposition) {
+                throw std::invalid_argument("the lag barrier requires the step-consistent super-step deposition "
+                                            "(PTM-644); legacy deposition modes need --no-lag-barrier");
+            }
+            enableLagBarrierState();
+        } else {
+            std::cout << "[lag] lag-layer diffusion barrier OFF (--no-lag-barrier): legacy well-mixed layer; "
+                      << "lost ice is booked as non-ice volume (void counted as non-ice)" << std::endl;
+        }
 
         // Sputter mass accounting (PTM-642).
         if (sputterTransportActive()) {
@@ -2223,6 +2477,23 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             bool need_full_diurnal = force_cache_refresh ||
                 multiscale_evolution_->needsCacheRefresh(
                     *ice_layer_model_, *ice_layer_state_, face_areas_, epoch);
+            if (!need_full_diurnal && ice_layer_model_->usesLagBarrier()) {
+                // Lag barrier: the emission pattern moves without any albedo change
+                // (the barrier grows); refresh the transport once it has moved by more
+                // than the tolerance, so the deposition pattern follows its sources.
+                const double drift = multiscale_evolution_->lagSourcePatternDrift(
+                    *ice_layer_model_, *ice_layer_state_, face_areas_);
+                if (drift > lag_cfg_.source_refresh_tol) {
+                    need_full_diurnal = true;
+                    ++lag_source_refreshes_;
+                    if (show_progress_) {
+                        std::cout << "  [lag] emission pattern moved " << std::scientific << std::setprecision(3)
+                                  << drift << " (total variation) > " << lag_cfg_.source_refresh_tol
+                                  << std::fixed << " since the transport was cached: refresh"
+                                  << std::endl;
+                    }
+                }
+            }
 
             if (need_full_diurnal) {
                 // Run full diurnal cycle (expensive)
@@ -2234,6 +2505,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 multiscale_evolution_->cacheBaseFluxesUnscaled(
                     *ice_layer_model_, *ice_layer_state_, unscaled_sublimation_,
                     unscaled_sputtering_, face_areas_, epoch);
+                if (last_refresh_local_) {
+                    applyRepresentedSourceTotals();
+                    ++local_refresh_count_;
+                }
                 reportSputterAudit(("full diurnal, epoch " + std::to_string(epoch)).c_str());
                 if (final_state) final_pass_full_diurnal = true;
                 else full_diurnal_count++;
@@ -2241,6 +2516,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 // Use cached fluxes with ice availability scaling (fast, milliseconds)
                 multiscale_evolution_->applyScaledFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_);
                 if (!final_state) cached_epoch_count++;
+            }
+
+            if (ice_layer_model_->usesLagBarrier()) {
+                writeLagTimeseriesRow(epoch, static_cast<double>(epoch) * epoch_duration, epoch == 0);
             }
 
             // Export the state at t = epoch * epoch_duration (see the note above the loop).
@@ -2253,6 +2532,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     auto& exo_state = exosphere_model_->getMutableState();
                     const auto& diurnal_avg = multiscale_evolution_->getDiurnalAverages();
 
+                    // Lag barrier: the availability that scales the exported emission
+                    // (regime-aware), so vapor pressure and emission agree.
+                    std::vector<double> lag_as, lag_ap;
+                    if (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_ &&
+                        ice_layer_model_->usesLagBarrier()) {
+                        multiscale_evolution_->lagAvailabilities(*ice_layer_model_, *ice_layer_state_,
+                            diurnal_avg.base_sublimation_flux, diurnal_avg.base_sputtering_flux, lag_as, lag_ap);
+                    }
                     for (size_t i = 0; i < num_faces_; ++i) {
                         // Sync ice mass from ice layer state
                         if (ice_layer_enabled_ && ice_layer_state_) {
@@ -2267,7 +2554,8 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
                         // Recompute atmospheric properties from diurnal-averaged temperature
                         double T = std::max(50.0, diurnal_avg.avg_temperature[i]);
-                        double ice_avail = (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
+                        double ice_avail = !lag_as.empty() ? lag_as[i]
+                            : (ice_layer_enabled_ && ice_layer_model_ && ice_layer_state_)
                             ? ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i)
                             : 1.0;
                         exo_state.vapor_pressure[i] = VaporPressure::calculateVaporPressure(T) * ice_avail;
@@ -2303,8 +2591,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     }
 
                     if (max_step > 0) {
-                        safe_extra = multiscale_evolution_->computeSafeEpochCount(
-                            *ice_layer_state_, face_areas_, epoch_duration, max_step) - 1;
+                        safe_extra = (ice_layer_model_->usesLagBarrier()
+                            ? multiscale_evolution_->computeSafeEpochCountLag(
+                                  *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration, max_step)
+                            : multiscale_evolution_->computeSafeEpochCount(
+                                  *ice_layer_state_, face_areas_, epoch_duration, max_step)) - 1;
                         // -1 because computeSafeEpochCount returns total including the one we already did
                         safe_extra = std::max(0, safe_extra);
                     }
@@ -2323,26 +2614,63 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                         albedo_refresh_.seeded() && albedo_step_limit_) {
                         const auto t_lim0 = std::chrono::steady_clock::now();
                         const double thr = albedo_mapper_->getConfig().albedo_update_threshold;
-                        std::vector<double> c_pred, a_pred;
+                        std::vector<double> c_pred, a_pred, d_pred;
+                        const bool lag_on = ice_layer_state_->hasLag();
+                        double last_dev = 0.0;
                         auto exceeds = [&](int n) {
                             multiscale_evolution_->predictConcentrations(
-                                *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration * n, c_pred);
-                            albedo_mapper_->computeAlbedos(c_pred, a_pred);
-                            return albedo_refresh_.maxDeviation(a_pred) > thr;
+                                *ice_layer_model_, *ice_layer_state_, face_areas_, epoch_duration * n, c_pred,
+                                /*solve_deposition=*/false, lag_on ? &d_pred : nullptr);
+                            computeCompositionAlbedos(c_pred, lag_on ? &d_pred : nullptr, a_pred);
+                            last_dev = albedo_refresh_.maxDeviation(a_pred);
+                            return last_dev > thr;
                         };
-                        albedo_mapper_->computeAlbedos(ice_layer_state_->nonice_concentration, a_pred);
-                        if (albedo_refresh_.maxDeviation(a_pred) > thr) {
+                        computeCompositionAlbedos(ice_layer_state_->nonice_concentration,
+                                                  lag_on ? &ice_layer_state_->lag_thickness : nullptr, a_pred);
+                        const double dev0 = albedo_refresh_.maxDeviation(a_pred);  // at n = 0 (current)
+                        if (dev0 > thr) {
                             // The one-epoch step already passed the threshold: refresh next.
                             safe_extra = 0;
                             auto& st = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
                             ++st.steps_albedo_limited;
                         } else if (exceeds(safe_extra)) {
-                            // Smallest n in [1, safe_extra] with exceeds(n) (bisection; the
-                            // deviation grows with n over one step).
-                            int lo = 0, hi = safe_extra;   // exceeds(hi) true; lo = no-extra
+                            // Smallest n in [1, safe_extra] with exceeds(n); the deviation
+                            // grows with n over one step. Bracket [lo, hi] with exceeds(hi),
+                            // !exceeds(lo); the next trial interpolates the deviation linearly
+                            // to the threshold, with a bisection step whenever the bracket did
+                            // not halve (PTM-657). Same n as pure bisection for a monotone
+                            // deviation (checked with PTM657_CHECK_SEARCH=1).
+                            int lo = 0, hi = safe_extra;
+                            double dlo = dev0, dhi = last_dev;
+                            int width_before = hi - lo;
+                            bool use_interp = true;
                             while (hi - lo > 1) {
-                                const int mid = lo + (hi - lo) / 2;
-                                if (exceeds(mid)) hi = mid; else lo = mid;
+                                int mid;
+                                if (use_interp && dhi > dlo) {
+                                    const double x = lo + (thr - dlo) / (dhi - dlo) * (hi - lo);
+                                    mid = static_cast<int>(std::ceil(x));
+                                } else {
+                                    mid = lo + (hi - lo) / 2;
+                                }
+                                mid = std::min(hi - 1, std::max(lo + 1, mid));
+                                if (exceeds(mid)) { hi = mid; dhi = last_dev; }
+                                else { lo = mid; dlo = last_dev; }
+                                // Safeguard: interpolate only while it at least halves the bracket.
+                                const int width = hi - lo;
+                                use_interp = (2 * width <= width_before);
+                                width_before = width;
+                            }
+                            if (std::getenv("PTM657_CHECK_SEARCH")) {
+                                // Debug cross-check: pure bisection must give the same n.
+                                int blo = 0, bhi = safe_extra;
+                                while (bhi - blo > 1) {
+                                    const int bm = blo + (bhi - blo) / 2;
+                                    if (exceeds(bm)) bhi = bm; else blo = bm;
+                                }
+                                if (bhi != hi) {
+                                    throw std::logic_error("PTM-657 step-limiter search: interpolated n " +
+                                                           std::to_string(hi) + " != bisection n " + std::to_string(bhi));
+                                }
                             }
                             safe_extra = hi;
                             auto& st = const_cast<EvolutionStatistics&>(multiscale_evolution_->getStatistics());
@@ -2377,6 +2705,16 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             // Step 4: Update statistics (accounts for all epochs in this super-step)
             multiscale_evolution_->updateStatistics(*ice_layer_model_, *ice_layer_state_,
                                                      epoch_duration, step_size);
+            if (ice_layer_model_->usesLagBarrier() && !lag_warned_thickness_ &&
+                multiscale_evolution_->getStatistics().lag_faces_over_warn > 0) {
+                lag_warned_thickness_ = true;
+                const auto& st = multiscale_evolution_->getStatistics();
+                std::cerr << "\nWARNING [lag]: " << st.lag_faces_over_warn << " faces have a lag thicker than "
+                          << std::scientific << std::setprecision(3) << lag_cfg_.warn_thickness
+                          << " m (max " << st.lag_max_thickness << " m) at epoch " << (epoch + step_size)
+                          << "; the thermal inertia is NOT changed for the lag, so the thermal model no longer "
+                          << "describes these faces" << std::fixed << std::endl;
+            }
 
             // Progress reporting
             if (show_progress_) {
@@ -2405,6 +2743,12 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         {
             const auto& st = multiscale_evolution_->getStatistics();
             if (albedo_coupling_enabled_) {
+                std::cout << "    Albedo refresh (PTM-657): "
+                          << (localRefreshEnabled() ? "face-local" : "GLOBAL") << ", " << local_refresh_count_
+                          << " local refreshes updating " << local_sources_sub_ << " sublimation and "
+                          << local_sources_sput_ << " sputter sources in total (tolerance "
+                          << std::scientific << std::setprecision(1) << local_refresh_tol_ << std::fixed
+                          << ")" << std::endl;
                 std::cout << "    Albedo step limiter (PTM-640): " << (albedo_step_limit_ ? "on" : "OFF (legacy)")
                           << ", " << st.steps_albedo_limited << " steps limited, " << st.predictions
                           << " predictions (" << st.prediction_evaluations << " solver evaluations), "
@@ -2417,6 +2761,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         if (full_diurnal_count > 0) {
             double speedup = static_cast<double>(full_diurnal_count + cached_epoch_count) / full_diurnal_count;
             std::cout << "    Effective speedup: " << std::setprecision(1) << speedup << "x" << std::endl;
+        }
+        if (ice_layer_model_->usesLagBarrier()) {
+            std::cout << "    Lag barrier: " << lag_source_refreshes_ << " transport refreshes forced by the "
+                      << "emission pattern (tolerance " << std::scientific << std::setprecision(2)
+                      << lag_cfg_.source_refresh_tol << std::fixed << ")" << std::endl;
         }
         if (final_pass_full_diurnal) {
             std::cout << "    Plus 1 full diurnal computation at the final state for its snapshot "
@@ -2472,6 +2821,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Print final statistics
         multiscale_evolution_->getStatistics().print();
+        if (sputterTransportActive()) {
+            std::cout << "  Sputtered-H2O transport: " << std::fixed << std::setprecision(1)
+                      << sputter_transport_seconds_ << " s total ("
+                      << (sputter_operator_cache_ ? "cached operator, PTM-671"
+                                                  : "per-refresh kernel, --no-sputter-operator-cache")
+                      << ")" << std::endl;
+        }
 
         // Export summary
         exportEvolutionSummary();
@@ -2489,6 +2845,127 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Reset export mode flag
         multiscale_export_mode_ = false;
+    }
+
+    bool PTMExosphereIntegration::localRefreshEnabled() const {
+        return local_refresh_ && multiscale_evolution_ &&
+               multiscale_evolution_->getConfig().superstep_consistent_deposition &&
+               spatialSmoothingRadiusRad() == 0.0 &&
+               (!sputtering_enabled_ || sputterTransportActive());
+    }
+
+    void PTMExosphereIntegration::localTransportUpdate(TransportCache& cache,
+                                                       const std::vector<double>& T_new,
+                                                       const std::vector<double>& e_new,
+                                                       bool apply_jeans, bool private_index,
+                                                       bool temperature_dependent,
+                                                       std::vector<double>& deposition,
+                                                       long long& sources_updated,
+                                                       const FixedKernelTransportOperator* op) {
+        // PTM-657. The cache holds the raw (uncorrected) transport sums R and the
+        // calibration sums C of a source field (cache.src, cache.temp): exactly what
+        // a full computeTransportProduct call accumulates before its row-bias
+        // correction and mass fix. Both are sums over sources of per-source terms,
+        // so updating the sources in U changes them by
+        //   R += K(T_new) e_new - K(T_old) e_old,  C += K(T_new) a - K(T_old) a   (i in U),
+        // and finalizeTransport(R, C) then equals a full call on the updated source
+        // field to rounding. U is the smallest set of sources, taken in decreasing
+        // order of mismatch, such that the sources left out differ from the current
+        // field by at most tol of the total emission (emission mismatch plus emission
+        // x relative temperature change) and, for the temperature-dependent kernel,
+        // tol of the total area in area x relative temperature change (calibration).
+        // tol = 0 updates every source that changed at all (exact).
+        const size_t n = static_cast<size_t>(num_faces_);
+        const double tol = local_refresh_tol_;
+        std::vector<char> mask(n, 0);
+        auto select = [&](const std::vector<double>& metric, double budget) {
+            std::vector<size_t> idx;
+            idx.reserve(n);
+            double total = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (metric[i] > 0.0) { idx.push_back(i); total += metric[i]; }
+            }
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return metric[a] > metric[b]; });
+            double left = total;
+            for (size_t i : idx) {
+                if (left <= budget) break;
+                mask[i] = 1;
+                left -= metric[i];
+            }
+        };
+        std::vector<double> m_e(n, 0.0), m_c(n, 0.0);
+        double e_tot = 0.0, a_tot = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double Tc = cache.temp[i];
+            const double dT = (Tc > 0.0) ? std::abs(T_new[i] - Tc) / Tc : (T_new[i] != Tc ? 1.0 : 0.0);
+            m_e[i] = std::abs(e_new[i] - cache.src[i]) + e_new[i] * dT;
+            if (temperature_dependent) m_c[i] = face_areas_[i] * dT;
+            e_tot += e_new[i];
+            a_tot += face_areas_[i];
+        }
+        select(m_e, tol * e_tot);
+        if (temperature_dependent) select(m_c, tol * a_tot);
+        size_t count = 0;
+        for (size_t i = 0; i < n; ++i) count += mask[i] ? 1 : 0;
+        sources_updated += static_cast<long long>(count);
+        if (count > 0 && op) {
+            // PTM-671: fixed kernel, so R changes by K (e_new - e_old) over U, in
+            // one operator application; C is the operator's constant calibration.
+            std::vector<double> delta(n, 0.0), r_delta;
+            for (size_t i = 0; i < n; ++i) {
+                if (mask[i]) delta[i] = e_new[i] - cache.src[i];
+            }
+            op->applyRaw(delta, &mask, r_delta);
+            for (size_t j = 0; j < n; ++j) cache.raw[j] += r_delta[j];
+            for (size_t i = 0; i < n; ++i) {
+                if (mask[i]) { cache.src[i] = e_new[i]; cache.temp[i] = T_new[i]; }
+            }
+        } else if (count > 0) {
+            std::vector<double> r_new, r_old, c_new, c_old;
+            TransportCallOptions opt;
+            opt.apply_jeans_escape = apply_jeans;
+            opt.private_index_if_needed = private_index;
+            opt.source_mask = &mask;
+            opt.raw = true;
+            opt.raw_out = nullptr;
+            opt.calibration_out = temperature_dependent ? &c_new : nullptr;
+            exosphere_model_->computeTransportProduct(T_new, e_new, r_new, opt);
+            opt.calibration_out = temperature_dependent ? &c_old : nullptr;
+            exosphere_model_->computeTransportProduct(cache.temp, cache.src, r_old, opt);
+            for (size_t j = 0; j < n; ++j) cache.raw[j] += r_new[j] - r_old[j];
+            if (temperature_dependent) {
+                for (size_t j = 0; j < n; ++j) cache.cal[j] += c_new[j] - c_old[j];
+            }
+            for (size_t i = 0; i < n; ++i) {
+                if (mask[i]) { cache.src[i] = e_new[i]; cache.temp[i] = T_new[i]; }
+            }
+        }
+        exosphere_model_->finalizeTransport(cache.raw, cache.cal, deposition);
+        std::cout << "  [local refresh] updated " << count << " / " << n << " sources ("
+                  << (temperature_dependent ? "sublimation kernel" : "fixed-temperature kernel")
+                  << ", tolerance " << std::scientific << std::setprecision(1) << tol << std::fixed << ")"
+                  << std::endl;
+    }
+
+    void PTMExosphereIntegration::applyRepresentedSourceTotals() {
+        // PTM-657: after a local refresh the cached deposition is the transport of
+        // the represented source field (sub_cache_.src, sput_cache_.src), which
+        // differs from the current one by at most the tolerance. The PTM-644
+        // deposition scales must be relative to the represented totals.
+        auto& da = multiscale_evolution_->getMutableDiurnalAverages();
+        double s_sub = 0.0, s_sput = 0.0;
+        for (double v : sub_cache_.src) s_sub += v;
+        if (sputterTransportActive()) {
+            for (double v : sput_cache_.src) s_sput += v;
+        }
+        if (da.sputter_transport) {
+            da.total_base_sublimation = s_sub;
+            if (da.perFaceSputter()) da.total_base_sputter_transport = s_sput;
+            else if (da.sputter_transport_share > 0.0) da.total_base_sputter = s_sput / da.sputter_transport_share;
+        } else {
+            da.total_base_emission = s_sub;
+        }
+        multiscale_evolution_->applyScaledFluxes(*ice_layer_model_, *ice_layer_state_, face_areas_);
     }
 
     bool PTMExosphereIntegration::computeDiurnalAverages(double dt_seconds) {
@@ -2548,7 +3025,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // cycle so the multiscale step can use diurnal-mean per-face shares.
         const bool per_face_sputter = sputterTransportActive() &&
                                       !sputtering_model_->getConfig().legacyParams();
-        std::vector<double> sp_gross, sp_transport, sp_escape, sp_reservoir;
+        std::vector<double> sp_gross, sp_transport, sp_escape, sp_reservoir, sp_h2o;
+        // Garden mode (PTM-669): also the H2O-ejection part, for the sputter split.
+        const bool garden_split = per_face_sputter && ice_layer_model_ && ice_layer_model_->usesGardenMode();
+        if (garden_split) sp_h2o.assign(nf, 0.0);
         if (per_face_sputter) {
             sp_gross.assign(nf, 0.0);
             sp_transport.assign(nf, 0.0);
@@ -2581,6 +3061,7 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                         sp_transport[f] += sputtering_state_->redeposition_flux[f];
                         sp_escape[f] += sputtering_state_->total_mass_loss[f];
                         sp_reservoir[f] += sputtering_state_->reservoir_flux[f];
+                        if (garden_split) sp_h2o[f] += sputtering_state_->h2o_sputter_flux[f];
                     }
                 }
             }
@@ -2632,6 +3113,22 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 }
             }
         }
+        if (garden_split) {
+            // Per-face composition of the gross potential: H2O share w, and the fates of each
+            // part (radiolytic ice is 36/32 of the O2 mass; the engine already books it so).
+            auto& da = multiscale_evolution_->getMutableDiurnalAverages();
+            const auto& sc = sputtering_model_->getConfig();
+            const double ew = sc.h2oEscapeFraction();
+            da.sput_w.assign(nf, 0.0); da.sput_tw.assign(nf, 0.0);
+            da.sput_ew.assign(nf, ew); da.sput_er.assign(nf, 0.0);
+            for (size_t f = 0; f < nf; ++f) {
+                const double g = sp_gross[f], h = sp_h2o[f], r = g - h;
+                da.sput_w[f] = (g > 0.0) ? h / g : sc.h2o_fraction;
+                da.sput_tw[f] = (h > 0.0) ? sp_transport[f] / h : 1.0 - ew;
+                da.sput_er[f] = (r > 0.0) ? std::clamp((sp_escape[f] - ew * h) / r, 0.0, 1.0)
+                                          : sc.o2EscapeFraction();
+            }
+        }
         if (!saved_mass.empty()) {
             exosphere_model_->getMutableState().accumulated_mass = std::move(saved_mass);
         }
@@ -2660,6 +3157,27 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             unscaled_sublimation_ = diurnal_avg.avg_sublimation_flux;
             unscaled_sputtering_ = diurnal_avg.avg_sputtering_flux;
             double pure_total = 0.0, exposed_total = 0.0;
+            if (ice_layer_model_->usesLagBarrier()) {
+                // Lag barrier: sublimation (and its Jeans escape) sees the barrier,
+                // sputtering does not; recycling faces emit what lands on them.
+                std::vector<double> as, ap;
+                multiscale_evolution_->lagAvailabilities(*ice_layer_model_, *ice_layer_state_,
+                    diurnal_avg.avg_sublimation_flux, diurnal_avg.avg_sputtering_flux, as, ap);
+                if (ice_layer_model_->usesGardenMode()) {
+                    // The fate shares of the CURRENT gross (the shielded H2O part shrinks).
+                    multiscale_evolution_->setGardenSputterFractions(*ice_layer_model_, *ice_layer_state_,
+                        diurnal_avg.avg_sublimation_flux, diurnal_avg.avg_sputtering_flux);
+                }
+                for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                    const double fs = as[i];
+                    const double fp = ap[i];
+                    pure_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+                    diurnal_avg.avg_sublimation_flux[i] *= fs;
+                    diurnal_avg.avg_sputtering_flux[i] *= fp;
+                    diurnal_avg.avg_escape_flux[i] *= fs;
+                    exposed_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
+                }
+            } else
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 const double fa = ice_layer_model_->getIceAvailabilityFactor(*ice_layer_state_, i);
                 pure_total += diurnal_avg.avg_sublimation_flux[i] * face_areas_[i];
@@ -2702,8 +3220,29 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             }
         }
         std::vector<double> avg_dep;
-        exosphere_model_->computeTransportProduct(
-            diurnal_avg.emission_weighted_temperature, avg_emission, avg_dep);
+        // PTM-657: a refresh after the first reuses the raw transport sums and
+        // updates only the sources whose (emission, temperature) moved (see
+        // localTransportUpdate); the first computation fills the caches.
+        const bool local_now = localRefreshEnabled() && sub_cache_.valid &&
+                               (!sputterTransportActive() || sput_cache_.valid);
+        last_refresh_local_ = local_now;
+        if (local_now) {
+            localTransportUpdate(sub_cache_, diurnal_avg.emission_weighted_temperature, avg_emission,
+                                 true, false, true, avg_dep, local_sources_sub_);
+        } else {
+            TransportCallOptions o;
+            if (localRefreshEnabled()) {
+                o.raw_out = &sub_cache_.raw;
+                o.calibration_out = &sub_cache_.cal;
+            }
+            exosphere_model_->computeTransportProduct(
+                diurnal_avg.emission_weighted_temperature, avg_emission, avg_dep, o);
+            if (localRefreshEnabled()) {
+                sub_cache_.src = avg_emission;
+                sub_cache_.temp = diurnal_avg.emission_weighted_temperature;
+                sub_cache_.valid = true;
+            }
+        }
 
         for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
             diurnal_avg.avg_deposition_flux[i] = avg_dep[i] / face_areas_[i];
@@ -2730,7 +3269,58 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             TransportTotals tt;
             std::cout << "  Computing sputtered-H2O transport (launch " << std::fixed << std::setprecision(1)
                       << sc.launchTemperatureK() << " K, no Jeans escape)..." << std::endl;
-            exosphere_model_->computeTransportProduct(launch_T, sput_source, dep_sput, opt, &tt);
+            const auto t_sput_start = std::chrono::steady_clock::now();
+            if (sputter_operator_cache_ && spatialSmoothingRadiusRad() > 0.0) {
+                std::cerr << "WARNING [PTM-671]: EXO_DEP_SMOOTH_DEG spatial smoothing is on; the cached sputter "
+                          << "transport operator does not implement it, so this run uses the per-refresh kernel "
+                          << "(as --no-sputter-operator-cache)" << std::endl;
+                sputter_operator_cache_ = false;
+            }
+            if (sputter_operator_cache_) {
+                // PTM-671: one operator for the run (uniform launch temperature,
+                // fixed geometry); only the source vector changes.
+                const FixedKernelTransportOperator& op =
+                    exosphere_model_->fixedKernelOperator(sc.launchTemperatureK(), false);
+                const auto t_apply = std::chrono::steady_clock::now();
+                if (local_now) {
+                    localTransportUpdate(sput_cache_, launch_T, sput_source, false, true, false, dep_sput,
+                                         local_sources_sput_, &op);
+                } else {
+                    std::vector<double> raw;
+                    op.applyRaw(sput_source, nullptr, raw, &tt);
+                    exosphere_model_->finalizeTransport(raw, op.calibration(), dep_sput);
+                    if (localRefreshEnabled()) {
+                        sput_cache_.raw = raw;
+                        sput_cache_.cal = op.calibration();
+                        sput_cache_.src = sput_source;
+                        sput_cache_.temp = launch_T;
+                        sput_cache_.valid = true;
+                    }
+                }
+                const double s_apply =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_apply).count();
+                sputter_operator_seconds_ += s_apply;
+                std::cout << "  [sputter-operator] applied in " << std::fixed << std::setprecision(3) << s_apply
+                          << " s" << std::endl;
+            } else if (local_now) {
+                // The 683 K kernel does not depend on the thermal state, so only
+                // the emission changes; the calibration is constant.
+                localTransportUpdate(sput_cache_, launch_T, sput_source, false, true, false, dep_sput,
+                                     local_sources_sput_);
+            } else {
+                if (localRefreshEnabled()) {
+                    opt.raw_out = &sput_cache_.raw;
+                    opt.calibration_out = &sput_cache_.cal;
+                }
+                exosphere_model_->computeTransportProduct(launch_T, sput_source, dep_sput, opt, &tt);
+                if (localRefreshEnabled()) {
+                    sput_cache_.src = sput_source;
+                    sput_cache_.temp = launch_T;
+                    sput_cache_.valid = true;
+                }
+            }
+            sputter_transport_seconds_ +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sput_start).count();
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 diurnal_avg.avg_deposition_sputter_flux[i] = dep_sput[i] / face_areas_[i];
                 diurnal_avg.avg_deposition_flux[i] += diurnal_avg.avg_deposition_sputter_flux[i];
@@ -2943,12 +3533,35 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             file << "    Ice inventory vs booked fluxes: " << stats.total_inventory_error_mass
                  << " kg; max per step " << stats.max_inventory_error_rel << " relative\n";
             if (albedo_coupling_enabled_) {
+                file << "    Albedo refresh (PTM-657): " << (localRefreshEnabled() ? "face-local" : "GLOBAL")
+                     << "; local refreshes " << local_refresh_count_ << ", sources updated "
+                     << local_sources_sub_ << " (sublimation) + " << local_sources_sput_ << " (sputter), tolerance "
+                     << std::scientific << std::setprecision(1) << local_refresh_tol_ << "\n";
                 file << "    Albedo step limiter (PTM-640): " << (albedo_step_limit_ ? "on" : "OFF (legacy)")
                      << "; steps limited " << stats.steps_albedo_limited << ", predictions " << stats.predictions
                      << ", " << std::fixed << std::setprecision(1) << albedo_limit_seconds_ << " s\n";
                 file << "    Max albedo deviation at a refresh: " << std::scientific << std::setprecision(6)
                      << max_refresh_deviation_ << " (threshold " << albedo_mapper_->getConfig().albedo_update_threshold
                      << ")\n" << std::setprecision(3);
+            }
+            // PTM-671: written only when the cache is on, so a --no-sputter-operator-cache
+            // summary stays identical to 683f1cc (the run log says which path ran).
+            if (sputter_operator_cache_ && sputterTransportActive()) {
+                const FixedKernelTransportOperator* op = exosphere_model_->builtFixedKernelOperator();
+                if (op) {
+                    const std::ios_base::fmtflags flags = file.flags();
+                    const std::streamsize prec = file.precision();
+                    file << "    Sputter transport operator (PTM-671): built once in " << std::fixed
+                         << std::setprecision(1) << op->buildSeconds() << " s; " << op->applications()
+                         << " applications " << sputter_operator_seconds_ << " s; sputter transport total "
+                         << sputter_transport_seconds_ << " s; " << std::scientific << std::setprecision(2)
+                         << op->tableMaxRelError() << " max kernel-table error\n";
+                    file.flags(flags);
+                    file.precision(prec);
+                } else {
+                    file << "    Sputter transport operator (PTM-671): cache on, never built (no sputter "
+                         << "transport call)\n";
+                }
             }
             if (stats.step_solver_slope_fallbacks > 0 || stats.step_solver_loose > 0) {
                 file << "    Deposition solve: " << stats.step_solver_slope_fallbacks << " slope fallbacks, "
@@ -2959,6 +3572,63 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                  << stats.step_solver_max_iterations << "\n";
         }
         file << "\n";
+
+        if (stats.lag_active && ice_layer_model_ && ice_layer_state_) {
+            const auto& st = *ice_layer_state_;
+            const double ell = ice_layer_model_->getLagBarrierLength();
+            const auto& lc = ice_layer_model_->getLagConfig();
+            double a_tot = 0.0, a_cls[3] = {0, 0, 0};
+            for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                const double a = face_areas_[i];
+                a_tot += a;
+                a_cls[(st.frost_veneer[i] > 0.0) ? 1 : (st.lag_thickness[i] > 10.0 * ell ? 2 : 0)] += a;
+            }
+            const double net = stats.total_sublimated_mass + stats.total_sputtered_mass - stats.total_deposited_mass;
+            double resid = (stats.lag_inventory_mass - stats.lag_inventory_initial_mass) + net;
+            if (ice_layer_model_->usesGardenMode()) {   // out of line: see gardenAuditResidual
+                resid = gardenAuditResidual(stats.lag_inventory_mass, stats.lag_inventory_initial_mass, net,
+                                            stats.garden_entrained_mass);
+            }
+            file << "Lag-Layer Diffusion Barrier:\n" << std::scientific << std::setprecision(6);
+            file << "  Barrier length l: " << ell << " m" << (lc.barrier_length > 0.0 ? " (explicit)" : " (Knudsen)")
+                 << "; phi_lag " << lc.lag_porosity << ", grain radius " << lc.grain_radius << " m, tortuosity "
+                 << lc.tortuosity << ", delta_opt " << lc.optical_depth << " m\n";
+            file << "  Max lag thickness: " << stats.lag_max_thickness << " m; faces above "
+                 << lc.warn_thickness << " m: " << stats.lag_faces_over_warn << "\n";
+            file << "  Area fractions: mixed " << std::fixed << std::setprecision(6) << a_cls[0] / a_tot
+                 << ", frost veneer " << a_cls[1] / a_tot << ", lag-sealed (d > 10 l) " << a_cls[2] / a_tot << "\n";
+            file << std::scientific << std::setprecision(6);
+            file << "  Frost veneer mass: " << stats.lag_veneer_mass << " kg\n";
+            file << "  Ice inventory (substrate + veneer): initial " << stats.lag_inventory_initial_mass
+                 << " kg, final " << stats.lag_inventory_mass << " kg\n";
+            if (ice_layer_model_->usesGardenMode()) {
+                file << "  Garden mode (PTM-669): sputter shield " << (lc.sputter_shield ? "on" : "off")
+                     << ", gardening " << (lc.gardening ? "on" : "off") << ", v_m " << lc.gardening_rate * 365.25 * 86400.0
+                     << " m/yr, box depth " << lc.gardenBoxDepth(st.lag_time) << " m at t = " << st.lag_time << " s\n";
+                file << "  Gardening parameters: v_m " << lc.gardening_rate * 365.25 * 86400.0 * 1e6
+                     << " um/yr (Johnson et al. 2004 Table 20.2, citing Cooper et al. 2001); h_mm " << lc.box_depth0
+                     << " m; K99 " << lc.box_K99 * 365.25 * 86400.0 << " m^2/yr ("
+                     << (lc.garden_K99_explicit ? std::string("explicit")
+                         : std::string("Costello Case ") + lc.garden_case) << "); Costello h " << lc.garden_h
+                     << ", c " << lc.garden_c << " (UNVERIFIED); veneer gardening rho (1 - phi) v_m\n";
+                file << "  Ice entrained by the box growth: " << stats.garden_entrained_mass << " kg; "
+                     << "Spencer-absorbing faces (last step): " << stats.garden_absorbing_faces << "\n";
+                double cA = 0.0, c0A = 0.0, aT = 0.0;
+                for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
+                    cA += st.nonice_concentration[i] * face_areas_[i];
+                    c0A += st.box_c0[i] * face_areas_[i];
+                    aT += face_areas_[i];
+                }
+                file << "  Box non-ice c: area mean " << cA / aT << " (t = 0: " << c0A / aT << ")\n";
+            }
+            file << (ice_layer_model_->usesGardenMode()
+                     ? "    change + (sublimated + sputtered - deposited) - entrained = "
+                     : "    change + (sublimated + sputtered - deposited) = ") << resid << " kg ("
+                 << (stats.lag_inventory_initial_mass > 0.0 ? resid / stats.lag_inventory_initial_mass : 0.0)
+                 << " of the inventory)\n";
+            file << "  Transport refreshes forced by the emission pattern: " << lag_source_refreshes_
+                 << " (tolerance " << lc.source_refresh_tol << ")\n\n";
+        }
 
         // Latitude-dependent analysis of non-ice concentration
         file << "Latitude Distribution (final non-ice concentration):\n";

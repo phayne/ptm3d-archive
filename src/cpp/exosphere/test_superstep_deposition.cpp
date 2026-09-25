@@ -26,6 +26,7 @@
 //      the run completes (the audit throws otherwise) and evolution_summary.txt
 //      reports a residual <= 1e-6; the legacy step reports a larger one.
 
+#include "exosphere_physics.h"
 #include "multitimescale_evolution.h"
 #include "ice_layer_model.h"
 #include "composition_albedo.h"
@@ -495,8 +496,10 @@ static void test_end_to_end() {
 // pass the refresh threshold, so the refresh is never late by more than one epoch's
 // drift, and the answer no longer depends on the super-step size.
 static double kLimiterDT = -22.0;  // cooler body: one epoch moves the albedo by << threshold
-struct LimRun { bool ok = false; std::string err; double max_dev = NAN, max_c = NAN, sub = NAN; };
-static LimRun runLimiter(bool limit, int cap, int epochs) {
+struct LimRun { bool ok = false; std::string err; double max_dev = NAN, max_c = NAN, sub = NAN;
+                std::vector<double> conc; };
+static LimRun runLimiter(bool limit, int cap, int epochs, int local_mode = 0, double tol = 1e-3,
+                         double fraction = 0.0) {
     LimRun r;
     char tmpl[] = "/tmp/test_superstep_limiter_XXXXXX";
     const char* dd = mkdtemp(tmpl);
@@ -509,6 +512,7 @@ static LimRun runLimiter(bool limit, int cap, int epochs) {
     integ->setMesh(std::make_shared<ptm::Mesh>(mesh));
     integ->setAlbedoStepLimit(limit);
     if (cap > 0) integ->setMaxSuperstepEpochs(cap);
+    integ->setLocalAlbedoRefresh(local_mode != 0, tol, fraction);
     std::streambuf* old = std::cout.rdbuf();
     std::streambuf* olde = std::cerr.rdbuf();
     std::ostringstream sink;
@@ -533,7 +537,11 @@ static LimRun runLimiter(bool limit, int cap, int epochs) {
     r.max_dev = summaryValue(ss.str(), "Max albedo deviation at a refresh: ");
     r.sub = summaryValue(ss.str(), "Total sublimated: ");
     double c = 0.0;
-    for (size_t i = 0; i < mesh.faces.size(); ++i) c = std::max(c, 1.0 - integ->getIceAvailabilityFactor(static_cast<int>(i)));
+    for (size_t i = 0; i < mesh.faces.size(); ++i) {
+        const double ci = 1.0 - integ->getIceAvailabilityFactor(static_cast<int>(i));
+        r.conc.push_back(ci);
+        c = std::max(c, ci);
+    }
     r.max_c = c;
     fs::remove_all(root);
     return r;
@@ -561,6 +569,77 @@ static void test_albedo_step_limiter() {
           std::abs(on0.sub / on2.sub - 1.0), 0.01);
 }
 
+// (10) PTM-657: the transport is linear per source up to the row-bias correction
+// and mass fix, so masked raw updates reproduce a full call; and the face-local
+// refresh reproduces the global refresh (exactly at tolerance 0).
+static void test_local_refresh() {
+    std::printf("\n(10) face-local refresh (PTM-657)\n");
+    const double R = exo::constants::EUROPA_RADIUS;
+    const ptm::Mesh m = make_icosphere(3, R);
+    const size_t n = m.faces.size();
+    std::vector<std::array<double, 3>> ctr(n);
+    std::vector<double> area(n);
+    for (size_t f = 0; f < n; ++f) {
+        const auto& a = m.vertices[m.faces[f][0]];
+        const auto& b = m.vertices[m.faces[f][1]];
+        const auto& c = m.vertices[m.faces[f][2]];
+        for (int k = 0; k < 3; ++k) ctr[f][k] = (a[k] + b[k] + c[k]) / 3.0;
+        const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const double cx = e1[1] * e2[2] - e1[2] * e2[1], cy = e1[2] * e2[0] - e1[0] * e2[2], cz = e1[0] * e2[1] - e1[1] * e2[0];
+        area[f] = 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
+    }
+    std::vector<double> T1(n), e1(n), T2, e2;
+    for (size_t f = 0; f < n; ++f) {
+        T1[f] = 110.0 + 25.0 * std::cos(0.37 * f);
+        e1[f] = (f % 5 == 0) ? 0.0 : area[f] * 1e-12 * (1.0 + std::sin(0.11 * f));
+    }
+    T2 = T1; e2 = e1;
+    std::vector<char> mask(n, 0);
+    for (size_t f = 0; f < n; f += 7) { mask[f] = 1; T2[f] *= 1.03; e2[f] = e1[f] * 1.7 + area[f] * 1e-13; }
+    std::streambuf* old = std::cout.rdbuf();
+    std::ostringstream sink;
+    std::cout.rdbuf(sink.rdbuf());
+    exo::BallisticTransport bt;
+    std::vector<double> d_full2, d_full1, raw1, cal1, r_new, r_old, c_new, c_old, d_loc;
+    exo::TransportCallOptions o1;
+    o1.raw_out = &raw1;
+    o1.calibration_out = &cal1;
+    bt.computeTransportProduct(ctr, area, T1, e1, d_full1, 1e-10, o1);
+    bt.computeTransportProduct(ctr, area, T2, e2, d_full2, 1e-10);
+    exo::TransportCallOptions om;
+    om.source_mask = &mask;
+    om.raw = true;
+    om.calibration_out = &c_new;
+    bt.computeTransportProduct(ctr, area, T2, e2, r_new, 1e-10, om);
+    om.calibration_out = &c_old;
+    bt.computeTransportProduct(ctr, area, T1, e1, r_old, 1e-10, om);
+    std::cout.rdbuf(old);
+    for (size_t j = 0; j < n; ++j) { raw1[j] += r_new[j] - r_old[j]; cal1[j] += c_new[j] - c_old[j]; }
+    exo::BallisticTransport::finalizeTransport(area, raw1, cal1, d_loc);
+    double worst = 0.0, dmax = 0.0;
+    for (size_t j = 0; j < n; ++j) dmax = std::max(dmax, std::abs(d_full2[j]));
+    for (size_t j = 0; j < n; ++j) worst = std::max(worst, std::abs(d_loc[j] - d_full2[j]) / dmax);
+    check(worst < 1e-12, "masked raw update + finalize = full transport of the updated field", worst, 1e-12);
+
+    // End to end on the albedo-coupled synthetic body (limiter test body).
+    const int E = 3000;
+    LimRun g = runLimiter(true, 0, E, 0), l0 = runLimiter(true, 0, E, 1, 0.0, 0.0),
+           ld = runLimiter(true, 0, E, 1, 1e-2, 0.0);
+    check(g.ok && l0.ok && ld.ok, "global, local exact, local default runs complete" +
+          (g.err + l0.err + ld.err).substr(0, 120));
+    double d0 = 0.0, dd = 0.0;
+    for (size_t i = 0; i < g.conc.size() && i < l0.conc.size() && i < ld.conc.size(); ++i) {
+        d0 = std::max(d0, std::abs(l0.conc[i] - g.conc[i]));
+        dd = std::max(dd, std::abs(ld.conc[i] - g.conc[i]));
+    }
+    std::printf("    max |c_local - c_global|: exact (tol 0, fraction 0) %.3e, default (tol 1e-2, fraction 0) "
+                "%.3e (max c %.4f / %.4f)\n", d0, dd, g.max_c, ld.max_c);
+    check(d0 < 1e-9, "local refresh, tol 0 and fraction 0 = global refresh (final concentrations)", d0, 1e-9);
+    check(dd < 1e-3, "local refresh, defaults: final concentrations within 1e-3 of global", dd, 1e-3);
+    check(ld.max_dev < 1.5 * exo::CompositionAlbedoConfig().albedo_update_threshold,
+          "local refresh, defaults: every refresh within 1.5 x threshold", ld.max_dev / 0.01, 1.5);
+}
+
 int main() {
     std::printf("=== test_superstep_deposition ===\n");
     test_exact_linear_mean();
@@ -574,6 +653,7 @@ int main() {
     test_inventory();
     test_end_to_end();
     test_albedo_step_limiter();
+    test_local_refresh();
     std::printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);
     return g_fail == 0 ? 0 : 1;
 }

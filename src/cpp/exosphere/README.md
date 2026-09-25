@@ -436,11 +436,55 @@ before transport, and caches the unscaled potential as the base flux. So the ini
 composition sets the first-epoch sublimation, and a face that starts with no ice sublimates
 again once deposition gives it ice.
 
-**Assumptions:**
+**Assumptions (legacy well-mixed layer, `--no-lag-barrier`):**
 - Well-mixed layer (uniform concentration within skin depth)
 - Instantaneous vertical mixing
 - No grain size effects on sublimation rate
 - Lag deposit does not affect thermal conductivity (future work)
+
+**Lag-layer diffusion barrier (multiscale default).** The legacy layer books lost ice as
+non-ice volume (the void counts as dark material) and throttles sublimation only through
+the exposed ice area. By default `--multiscale` instead keeps the mixture at its $t = 0$
+non-ice fraction $x_n$ and grows a lag of porosity $\phi_{\mathrm{lag}}$ on top:
+$\Delta d = \beta \Delta M$, $\beta = x_n / [(1 - x_n) \rho_{\mathrm{ice}}(1 - \phi_{\mathrm{lag}})]$
+per net ice loss $\Delta M$. Sublimation crosses the lag by Knudsen diffusion
+(Schorghofer 2008, eq. 3), $J = J_0 f(x_n) / (1 + d/\ell)$ with
+$\ell = 1.128\thinspace [\phi_{\mathrm{lag}}/(1-\phi_{\mathrm{lag}})]\thinspace r/\tau$ = 4.23 µm at the
+defaults ($r$ = 5 µm, $\phi_{\mathrm{lag}}$ = 0.6, $\tau$ = 2). **Sputtering is not
+barriered** (energetic ions reach cm depths; Paul, 2026-09-24). Deposition offsets a
+face's net loss (the lag then tends to $d^* = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$,
+where the face stops being a net source); deposition above the free-frost loss builds an
+unbarriered frost veneer, which replaces the legacy off-book layer overflow; in between
+the face recycles what lands on it. Deposition never removes lag. The lag darkens the
+face, $A = A_{\mathrm{lag}} + (A_{\mathrm{mix}} - A_{\mathrm{lag}})\thinspace e^{-d/\delta_{\mathrm{opt}}}$
+($\delta_{\mathrm{opt}}$ = 10 µm; $A_{\mathrm{lag}}$ = the non-ice endmember). Each step is
+integrated in closed form ($d + d^2/2\ell = \beta J_0 f t$ without deposition). At $t = 0$
+($d = 0$) every availability and albedo equals the legacy value bit for bit (checked at
+startup). The thermal inertia is unchanged (WARNING above 5 mm of lag); the veneer is
+optically neutral. Snapshots add `lag_thickness_m`, `frost_veneer_kg_m2`,
+`substrate_ice_kg_m2`, `lag_nonice_mass_kg_m2`, `lag_class` (0 mixed, 1 frost veneer,
+2 sealed, $d > 10\ell$), `lag_regime` and `sublimation_availability`; `lag/lag_timeseries.csv`
+has one row per iteration. See Appendix D.6.5.
+
+**Gardening and the sputter split (PTM-669, multiscale default).** Paul's rulings
+(2026-09-24): H$_2$O sputter EJECTION is shielded by the lag (ions deposit their energy
+within ~0.1 to a few µm, Plainaki et al. 2010 p. 389; ejected H$_2$O below the top grains
+sticks, Johnson et al. 2004 pp. 494, 502 and Cassidy & Johnson 2005); radiolytic O$_2$ + H$_2$
+(36/32 of the O$_2$ mass in ice) stay unshielded (O$_2$ does not stick and diffuses out,
+Johnson et al. 2004, 2019; caveat: the O$_2$ source uses Teolis thin-layer ~28 Å yields).
+Micrometeoroid gardening at $v_m$ = 0.3 µm/yr (Johnson et al. 2004 Table 20.2, citing Cooper
+et al. 2001) mixes the lag back into the box:
+$\dot d = \beta_c[(a + p_w)/(1 + d/\ell) + p_r - B] - v_m$ for $d > 0$, $\beta_c$ from the
+CURRENT box $c$; $d = 0$ is absorbing where $\beta_c (a + p_w + p_r - B) \le v_m$ (Spencer
+criterion; the box then loses ice and its $c$ rises). The veneer is gardened into the box at
+$
+ho_{\mathrm{ice}}(1 - \phi) v_m$. The box deepens as $h_g = \sqrt{h_{\mathrm{mm}}^2 + K_{99} t}$
+($h_{\mathrm{mm}}$ = 1 cm; $K_{99}$ = 3.84e-9 m$^2$/yr, Costello et al. 2021 Eq. 1 Case B, 99%;
+$h$ = 0.04 and $c$ = 1 UNVERIFIED), entraining column material at the $t = 0$ composition
+(booked as an external supply in the mass audit). The box starts at 1 cm, so `ice_mass`
+at $t = 0$ differs from the legacy 5 cm layer; the composition does not. Snapshots add
+`box_nonice_volume_m3_m2` and `sputter_h2o_share`; `lag_regime` 4 = Spencer-absorbing.
+See Appendix D.6.6.
 
 ### Ice Crystallization
 
@@ -823,13 +867,48 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--cycles-per-epoch` $N_c$ | 100 | Diurnal cycles per epoch (~100 = 1 Earth year) |
 | `--export-interval` $N$ | 100 | Export every $N$ epochs, plus the final state (0 = the final state only; earlier builds wrote nothing for 0). Snapshot $L$ is the state after exactly $L$ epochs ($t = L\,\Delta t_{\mathrm{epoch}}$); the last is labeled `--epochs`. `time_steps.txt` lists one time per snapshot (PTM-636; earlier builds wrote state fields after the epoch's super-step, up to one interval past the label, and omitted the final snapshot from `time_steps.txt`) |
 | `--max-superstep-epochs` $N$ | none | Cap one super-step at $N$ epochs (step-size refinement checks; the physical bound is the emission-weighted availability change) |
+| `--albedo-refresh-global` | off | Recompute the full diurnal cycle and transport, and rescale every face, at each albedo refresh (pre-PTM-657). By default the refresh is face-local in the transport: every face whose albedo moved is rescaled as before, the diurnal cycle is recomputed (cheap), and the transport is updated source by source from cached raw sums, only for the sources whose emission or temperature moved beyond the tolerance (see below). Implied by `--sputter-legacy-escape-only` |
+| `--albedo-refresh-fraction` $F$ | 0 | Face-local refresh: rescale only faces whose albedo deviation exceeds $F$ × `--albedo-update-threshold`. The default 0 rescales every face that moved, as the global refresh does; $F > 0$ is faster but re-bases faces at different times, face-scale jitter that the albedo feedback amplifies (PTM-658) |
+| `--albedo-refresh-tolerance` $\epsilon$ | $10^{-2}$ | Face-local refresh: sources left un-updated may differ from the current source field by at most $\epsilon$ of the total emission (emission change plus emission × relative temperature change) and $\epsilon$ of the total area in relative temperature change (0 = update every source that changed; with $F = 0$ this reproduces the global refresh) |
+| `--no-sputter-operator-cache` | off | Recompute the sputtered-H$_2$O transport kernel (per-pair $K_0$, taper and spatial-index query) at every refresh, as builds up to 683f1cc did (byte-identical to them). By default the fixed-launch-temperature operator is built once per run and reused (PTM-671; see below) |
 | `--no-albedo-step-limit` | off | Pre-PTM-640 step: super-steps are not ended when a face's albedo would pass `--albedo-update-threshold`, so the temperature refresh can lag by a whole step and the answer depends on the step size. Implied by `--sputter-legacy-escape-only`. By default, with `--albedo-coupling`, each super-step ends at the first epoch count whose predicted albedo deviation (from the albedo the temperatures correspond to) exceeds the threshold (bisection on the closed-form step), so every refresh fires within one epoch of being due |
+| `--no-lag-barrier` | off | Legacy well-mixed layer (lost ice becomes non-ice volume; no diffusion barrier), for comparison. Implied, with a WARNING, by `--superstep-legacy-deposition` and `--sputter-legacy-escape-only` |
+| `--lag-barrier-length` $\ell$ | Knudsen value (4.23e-6 m) | Barrier length [m] directly |
+| `--lag-grain-radius` $r$ | 5e-6 | Non-ice grain radius [m] |
+| `--lag-porosity` $\phi_{\mathrm{lag}}$ | 0.6 | Lag porosity |
+| `--lag-tortuosity` $\tau$ | 2 | Lag tortuosity |
+| `--lag-optical-depth` $\delta_{\mathrm{opt}}$ | 1e-5 | Albedo e-folding lag thickness [m] |
+| `--no-gardening` | off | No micrometeoroid gardening ($v_m$ = 0) and the fixed 5 cm box (PTM-669) |
+| `--no-sputter-shield` | off | H$_2$O sputter ejection not barriered by the lag. With `--no-gardening` this is the PTM-659 model exactly |
+| `--gardening-rate` $v_m$ | 0.3 | Lag and veneer gardening rate [µm/yr] (arm 1.2) |
+| `--gardening-case` A\|B | B | Costello et al. 2021 secondary-crater rate for the box depth $h_g(t)$ |
+| `--gardening-box-depth` $h_{\mathrm{mm}}$ | 0.01 | Box depth at $t = 0$ [m] |
+| `--gardening-k99` $K_{99}$ | from the case | Box-deepening coefficient [m$^2$/yr] directly; overrides the case, $h$ and $c$ |
+| `--gardening-excavation-h` $h$ | 0.04 | Costello excavation depth / crater diameter (UNVERIFIED; not in Costello et al. 2021) |
+| `--gardening-overlap-c` $c$ | 1 | Costello overlap parameter (UNVERIFIED) |
+
+Every gardening value ($v_m$ with its citation, $h_{\mathrm{mm}}$, $K_{99}$ and its provenance, case, $h$, $c$) is echoed in the run log banner and in `evolution_summary.txt`, so a sweep over $v_m$ (or the box law) needs no code change.
+| `--lag-source-refresh-tol` $X$ | 0.02 | Refresh the transport when the emission pattern has moved by $X$ (total variation) since it was cached |
 | `--superstep-legacy-deposition` | off | Pre-PTM-644 step: deposition held at its start-of-step value while the sources follow the ice availability, and the trapezoid mean availability in the linear mode. Not mass-conserving; reproduces earlier products only. Implied by `--sputter-legacy-escape-only` |
 | `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
 | `--cache-refresh` $N$ | (refused) | Not implemented; the CLI exits with an error |
 
 **Deposition over a step (PTM-644).** Within a step, each face's emission follows its own ice availability, while deposition is the transport kernel's cached pattern times a global scale per source group (sublimation; sputtered H$_2$O). The scale is held at the value whose deposition equals what the kernel retains from the emission the step actually produced:
 $s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))$, solved by Newton on 1-2 scalars, with $\langle f_i \rangle$ the exact step-mean availability for that constant deposition. Each step then satisfies deposited $= \rho_k \times$ emitted per group ($\rho_{\mathrm{sub}} = 1 -$ Jeans/unscattered fraction; $\rho_{\mathrm{sput}}$ = the non-escaping H$_2$O share), and the run throws if a step departs from it by more than $10^{-6}$ relative. `evolution_summary.txt` reports the cumulative residual, the non-redeposited mass, deposition that overflows a pure-ice layer, and the ice inventory against the booked fluxes. Earlier builds held deposition at its start-of-step value, so a step in which availability fell deposited more than it emitted, by an amount that depended on the step size.
+
+**Face-local albedo refresh (PTM-657).** The matrix-free transport is a sum of per-source terms, $R_j = \sum_i e_i K_{ij}(T_i)$ and the calibration $C_j = \sum_i a_i K_{ij}(T_i)$, followed by a row-bias correction $B_j = a_j / C_j$ and a global mass fix; both corrections depend only on $R$ and $C$. The first diurnal computation stores $R$, $C$ and the source field $(e_i, T_i)$ they represent. A later refresh updates only the sources that moved, $R \mathrel{+}= K(T^{\mathrm{new}}) e^{\mathrm{new}} - K(T^{\mathrm{old}}) e^{\mathrm{old}}$ (and $C$ likewise), then applies the same corrections, so with tolerance 0 the result equals a full call to rounding. The deposition scales of the step solve (PTM-644) are taken relative to the totals of the represented source field, so the step audit is exact. The 683 K sputter kernel does not depend on the thermal state; only its source changes. With `--albedo-refresh-fraction` $F > 0$ temperatures are also refreshed per face (a face is rescaled only when its own albedo has moved by more than $F$ × threshold); every refresh still fires within one epoch of a face passing the threshold (the step limiter).
+
+**Sputter transport operator (PTM-671).** The non-escaping sputtered H$_2$O is launched from every face at the same temperature (677 K for $U = 0.054$ eV) on fixed geometry. So everything the transport derives from its kernel is fixed for the run: each source's normalization $n_i = (1 - \epsilon)/(s_i + \sum_j w_{ij})$, its self-cap weight $s_i$, and the calibration sums $C_j$ behind the row-bias correction. Only the source vector changes between refreshes. By default the run builds these once (two sweeps over all face pairs). It then replaces the per-pair evaluation of $K_0$, the taper and the spatial-index query by a lookup in a table of the same kernel on a uniform grid of $2^{18}$ angles. The neighbor set, the float cosines and the FastAcos angle are the same as in the per-call kernel. The only approximation is linear interpolation in the table, whose maximum relative error is measured at build and reported ($4.0 \times 10^{-7}$ on ico6). Each source still scatters exactly $(1 - \epsilon)$ of its emission, because $n_i$ is computed from the same tabulated weights, and the row-bias correction and global mass fix are applied to the raw sums as before. A face-local refresh (PTM-657) becomes one application, $R \mathrel{+}= K (e^{\mathrm{new}} - e^{\mathrm{old}})$ over the updated sources, with $C$ constant. Products are summed per target face in a fixed order, so the sputter transport no longer depends on the thread count. No $N^2$ matrix is stored (ico6: 5.9 MB; the dense matrix would be 53 GB).
+
+Measured on ico6 (81,920 faces) at 4 threads, the build takes 31 s and one full application 13.8 s (the per-call kernel: 53 s). On the albedo-map Cassidy BASE phase-0 run to 100 kyr ($\ell = 5$ µm, $v_m = 0.3$ µm/yr), the sputter transport fell from about 275 s to 79 s, and the wall time from 3072 s to 2768 s (1.11×). The rest of the wall is the lag and gardening step and the sublimation transport. Against the per-call kernel:
+
+- global totals (sublimation, deposition, net loss, sputtering, O$_2$) agree to $\le 3.1 \times 10^{-10}$ relative;
+- every output field agrees to within one float32 ulp;
+- the face-class budget agrees exactly in counts.
+
+`test_sputter_operator` checks the operator against the per-call kernel face by face, at 677 K (all pairs) and at 150 K with Jeans escape (a cutoff below $\pi$). The reference is the per-call kernel's own floating-point noise floor: the same call on a rigidly rotated mesh.
+
+The sublimation transport is not cached: its kernel depends on each source's emission-weighted temperature, which changes at every refresh. The run log and `evolution_summary.txt` report the build time, the number of applications, their time and the table error. With `EXO_DEP_SMOOTH_DEG` spatial smoothing (which the operator does not implement), the run warns and uses the per-call kernel.
 
 ### Ice Crystallization Options
 
@@ -896,6 +975,8 @@ $s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))$, solve
 | `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember; with `<mesh.ply> <map.bin>`, fill faces follow the thermal albedo (PTM-637) |
 | `test_multiscale_snapshot_time.cpp` | PTM-636: snapshot $L$ is the state after $L$ epochs (== a run stopped at $L$), same-state fields, complete `time_steps.txt` |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
+| `test_lag_gardening.cpp` | PTM-669: box depth vs `scripts/jwst/gardening.py`, Spencer criterion ($d = 0$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the PTM-659 step, global mass closure with entrainment, $t = 0$ invariance |
+| `test_lag_barrier.cpp` | Lag barrier: $d + d^2/2\ell = \beta J_0 f t$ (one step, many steps, engine), closed form vs RK4 with sputtering and deposition, veneer first then the barrier, recycling, global mass conservation, $t = 0$ bit-identity, $\ell$ and lag albedo |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 
 ---
@@ -919,5 +1000,19 @@ Marti, J. & Mauersberger, K. (1993). A survey and new measurements of ice vapor 
 Mitchell, E.H. et al. (2017). Porosity effects on crystallization kinetics of amorphous water ice: Implications for cold icy bodies in the outer Solar System. *Icarus*, 285, 291-299. doi:10.1016/j.icarus.2016.11.004
 
 Nordheim, T.A. et al. (2022). Magnetospheric Ion Bombardment of Europa's Surface. *Planet. Sci. J.*, 3, 5. doi:10.3847/PSJ/ac382a
+
+Cassidy, T.A. & Johnson, R.E. (2005). Monte Carlo model of sputtering and other ejection processes within a regolith. *Icarus*, 176, 499-507.
+
+Cooper, J.F. et al. (2001). Energetic ion and electron irradiation of the icy Galilean satellites. *Icarus*, 149, 133-159.
+
+Costello, E.S. et al. (2021). Impact gardening on Europa and repercussions for possible biosignatures. *Nat. Astron.*, 5, 951-956. doi:10.1038/s41550-021-01393-1
+
+Johnson, R.E. et al. (2004). Radiation effects on the surfaces of the Galilean satellites. In *Jupiter: The Planet, Satellites and Magnetosphere*, Ch. 20. Cambridge Univ. Press.
+
+Plainaki, C. et al. (2010). Neutral particle release from Europa's surface. *Icarus*, 210, 385-395.
+
+Schorghofer, N. (2008). The lifetime of ice on main belt asteroids. *Astrophys. J.*, 682, 697-705.
+
+Spencer, J.R. (1987). Thermal segregation of water ice on the Galilean satellites. *Icarus*, 69(2), 297-313. doi:10.1016/0019-1035(87)90107-2
 
 Teolis, B.D. et al. (2017). Plume and surface feature structure and compositional effects on Europa's global exosphere: Preliminary Europa flyby science. *Icarus*, 284, 18-29. doi:10.1016/j.icarus.2016.10.027

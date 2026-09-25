@@ -2911,6 +2911,12 @@ void BallisticTransport::computeTransportProduct(
         num_threads = omp_get_num_threads();
     }
 
+    const std::vector<char>* mask = options.source_mask;
+    if (mask && mask->size() != n) {
+        throw std::invalid_argument("computeTransportProduct: source_mask size mismatch");
+    }
+    const bool want_cal = !options.raw || options.calibration_out != nullptr;
+
     // Thread-local deposition + calibration arrays
     // Calibration: scatter uniform unit flux (face_areas[i]) alongside actual emission
     // to measure area bias for Sinkhorn-like row correction.
@@ -2935,8 +2941,10 @@ void BallisticTransport::computeTransportProduct(
 
         #pragma omp for schedule(dynamic)
         for (size_t i = 0; i < n; ++i) {
+            if (mask && !(*mask)[i]) continue;
             double e_i = emission[i];
             double T_i = temperatures[i];
+            if (!want_cal && !(e_i > 0.0)) continue;  // raw, no calibration: nothing to scatter
 
             // Skip faces with no physical temperature
             if (T_i <= 0.0) {
@@ -3005,7 +3013,7 @@ void BallisticTransport::computeTransportProduct(
             double scaled_a = face_areas[i] * norm_i;
 
             // Self-deposition (calibration always, actual only if emitting)
-            local_cal[i] += self_weight * scaled_a;
+            if (want_cal) local_cal[i] += self_weight * scaled_a;
             if (e_i > 0.0) {
                 if (norm_i == 0.0) unscattered_total += e_i;
                 else jeans_escaped_total += e_i * escape_frac;
@@ -3021,8 +3029,10 @@ void BallisticTransport::computeTransportProduct(
             }
 
             // Phase 2b: scatter calibration (always, for all faces with T > 0)
-            for (const auto& [j, w] : cached_weights) {
-                local_cal[j] += w * scaled_a;
+            if (want_cal) {
+                for (const auto& [j, w] : cached_weights) {
+                    local_cal[j] += w * scaled_a;
+                }
             }
         }
     }
@@ -3042,6 +3052,23 @@ void BallisticTransport::computeTransportProduct(
 
     auto end = std::chrono::high_resolution_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    (void)ms;
+    if (options.raw_out) *options.raw_out = deposition;
+    if (options.calibration_out) *options.calibration_out = calibration;
+    if (options.raw) {
+        if (totals) {
+            double src = 0.0, dep = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                if (!mask || (*mask)[i]) src += emission[i];
+                dep += deposition[i];
+            }
+            totals->source = src;
+            totals->deposited = dep;
+            totals->jeans_escaped = jeans_escaped_total;
+            totals->unscattered = unscattered_total;
+        }
+        return;  // raw sums only (PTM-657); no log line (called many times)
+    }
 
     // Pre-correction mass conservation
     double total_emission = 0.0, total_deposition = 0.0;
@@ -3164,6 +3191,43 @@ void BallisticTransport::computeTransportProduct(
               << std::endl;
 }
 
+double BallisticTransport::finalizeTransport(const std::vector<double>& face_areas,
+                                             const std::vector<double>& raw,
+                                             const std::vector<double>& calibration,
+                                             std::vector<double>& deposition) {
+    // Must match the correction in computeTransportProduct exactly (PTM-657).
+    if (spatialSmoothingRadiusRad() > 0.0) {
+        throw std::invalid_argument("finalizeTransport: the face-local refresh does not support "
+                                    "EXO_DEP_SMOOTH_DEG spatial smoothing");
+    }
+    const size_t n = raw.size();
+    bool disable_bias_correction = false;
+    if (const char* envp = std::getenv("EXO_DISABLE_BIAS_CORR")) {
+        disable_bias_correction = (std::atoi(envp) != 0);
+    }
+    std::vector<double> bias(n, 1.0);
+    double max_bias = 0.0;
+    for (size_t j = 0; j < n; ++j) {
+        if (calibration[j] > 1e-30) {
+            bias[j] = face_areas[j] / calibration[j];
+            max_bias = std::max(max_bias, std::abs(bias[j] - 1.0));
+        }
+    }
+    deposition = raw;
+    double total_deposition = 0.0;
+    for (size_t j = 0; j < n; ++j) total_deposition += raw[j];
+    if (!disable_bias_correction && max_bias > 0.01) {
+        for (size_t j = 0; j < n; ++j) deposition[j] *= bias[j];
+    }
+    double total_dep_corrected = 0.0;
+    for (size_t j = 0; j < n; ++j) total_dep_corrected += deposition[j];
+    if (total_dep_corrected > 1e-30 && total_deposition > 1e-30) {
+        const double mass_fix = total_deposition / total_dep_corrected;
+        for (size_t j = 0; j < n; ++j) deposition[j] *= mass_fix;
+    }
+    return max_bias;
+}
+
 // ExosphereModel wrapper for matrix-free transport product
 void ExosphereModel::computeTransportProduct(
     const std::vector<double>& temperatures,
@@ -3174,6 +3238,289 @@ void ExosphereModel::computeTransportProduct(
 {
     transport_->computeTransportProduct(
         face_centers_, face_areas_, temperatures, emission, deposition, 1e-10, options, totals);
+}
+
+// ---------------------------------------------------------------------------
+// PTM-671: fixed-temperature transport operator (see exosphere_physics.h).
+// The kernel, self-cap and escape formulas below are copies of the ones in
+// BallisticTransport::computeTransportProduct, kept separate on purpose: that
+// function is the legacy (--no-sputter-operator-cache) path and must keep its
+// exact code generation. test_sputter_operator checks the two against each other.
+// ---------------------------------------------------------------------------
+
+double FixedKernelTransportOperator::currentXiCutoff() {
+    double xi_cutoff = 15.0;
+    if (const char* envp = std::getenv("EXO_XI_CUTOFF")) {
+        double v = std::atof(envp);
+        if (v > 1.0 && v < 100.0) xi_cutoff = v;
+    }
+    return xi_cutoff;
+}
+
+inline double FixedKernelTransportOperator::kernelAt(float c) const {
+    // Branch-free so the pair loops vectorize. The angle is FastAcos::evaluate
+    // of the clamped float cosine, with the same table and arithmetic (at c = 1
+    // the last cell with frac = 1 gives tbl[M - 1] + (0 - tbl[M - 1]) = 0, as
+    // FastAcos's early return does). Pairs below the cosine cutoff get 0.
+    constexpr int A = kAcosCells;
+    const double x = static_cast<double>(std::max(-1.0f, std::min(1.0f, c)));
+    const double idx_f = (x + 1.0) * (A * 0.5);
+    const int ia = std::min(static_cast<int>(idx_f), A - 1);
+    const double fa = idx_f - ia;
+    const double* at = acos_tbl_.data();
+    const double theta = at[ia] + fa * (at[ia + 1] - at[ia]);
+    const double y = theta * inv_h_;
+    const int ik = std::min(static_cast<int>(y), table_cells_ - 1);
+    const double fk = y - ik;
+    const double* kt = table_.data();
+    const double kv = kt[ik] + fk * (kt[ik + 1] - kt[ik]);
+    return (c >= cos_cutoff_) ? kv : 0.0;
+}
+
+void FixedKernelTransportOperator::build(const std::vector<std::array<double, 3>>& face_centers,
+                                         const std::vector<double>& face_areas,
+                                         double temperature_K, bool apply_jeans_escape,
+                                         double body_radius, double threshold) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t n = face_centers.size();
+    if (n == 0 || face_areas.size() != n) {
+        throw std::invalid_argument("FixedKernelTransportOperator: empty mesh or area size mismatch");
+    }
+    if (!(temperature_K > 0.0)) {
+        throw std::invalid_argument("FixedKernelTransportOperator: the launch temperature must be > 0 K");
+    }
+    const double R = body_radius;
+    const double g = constants::EUROPA_GRAVITY;
+    temperature_K_ = temperature_K;
+    apply_jeans_ = apply_jeans_escape;
+    threshold_ = threshold;
+    xi_cutoff_ = currentXiCutoff();
+
+    const double sigma2 = constants::BOLTZMANN_K * temperature_K / constants::WATER_MOLECULAR_MASS;
+    const double sigma4 = sigma2 * sigma2;
+    const double theta_cutoff = std::min(2.0 * sigma2 * xi_cutoff_ / (g * R), M_PI);
+    cos_cutoff_ = static_cast<float>(std::cos(theta_cutoff));
+
+    const double vth = std::sqrt(2.0 * sigma2);
+    const double ratio = constants::EUROPA_ESCAPE_VELOCITY / vth;
+    escape_frac_ = 0.0;
+    if (apply_jeans_ && ratio < 5.0) {
+        escape_frac_ = std::exp(-ratio * ratio) * (1.0 + ratio * ratio) / (2.0 * ratio * ratio);
+    }
+
+    // Kernel p_density(d) * taper, as a function of the pair angle only.
+    const double xi_taper_start = 0.8 * xi_cutoff_;
+    const double xi_taper_range = xi_cutoff_ - xi_taper_start;
+    auto kernel_exact = [&](double theta) -> double {
+        const double d = R * theta;
+        if (d <= 0.0) return 0.0;
+        const double xi = g * d / (2.0 * sigma2);
+        if (xi > 50.0) return 0.0;
+        const double pd = (g * g * d / (4.0 * sigma4)) * besselK0(xi);
+        if (pd <= 0.0) return 0.0;
+        double taper = 1.0;
+        if (xi > xi_taper_start) {
+            taper = 0.5 * (1.0 + std::cos(M_PI * (xi - xi_taper_start) / xi_taper_range));
+        }
+        return pd * taper;
+    };
+    // Self-deposition: Gauss-Legendre quadrature over the face's spherical cap.
+    auto self_cap = [&](double A) -> double {
+        if (A <= 0.0) return 0.0;
+        constexpr int NG = 6;
+        static const double xG[NG] = {-0.9324695142031520, -0.6612093864662645, -0.2386191860831969,
+                                       0.2386191860831969,  0.6612093864662645,  0.9324695142031520};
+        static const double wG[NG] = {0.1713244923791704, 0.3607615730481386, 0.4679139345726910,
+                                      0.4679139345726910, 0.3607615730481386, 0.1713244923791704};
+        double theta_cap = std::sqrt(std::max(A, 0.0) / (M_PI * R * R));
+        theta_cap = std::min(theta_cap, 0.25);
+        const double a = 0, b = theta_cap;
+        double integ = 0;
+        for (int k = 0; k < NG; ++k) {
+            const double t = 0.5 * ((b - a) * xG[k] + (b + a));
+            const double d = R * t;
+            double pd = 0.0;
+            const double xi = g * d / (2.0 * sigma2);
+            if (d > 0.0 && xi <= 50.0) pd = (g * g * d / (4.0 * sigma4)) * besselK0(xi);
+            integ += wG[k] * pd * (2.0 * M_PI * R * R * std::sin(t)) * (0.5 * (b - a));
+        }
+        return integ;
+    };
+
+    // Table on a uniform angle grid over [0, pi] (FastAcos can return angles a
+    // little beyond the cutoff; those pairs are dropped by the cosine test).
+    constexpr size_t M = size_t(1) << 18;
+    table_cells_ = static_cast<int>(M);
+    inv_h_ = static_cast<double>(M) / M_PI;
+    table_.assign(M + 1, 0.0);
+    // FastAcos's table, rebuilt with the identical formula (it is private there).
+    acos_tbl_.resize(kAcosCells + 1);
+    for (int i = 0; i <= kAcosCells; ++i) {
+        const double x = -1.0 + 2.0 * i / kAcosCells;
+        acos_tbl_[i] = std::acos(std::max(-1.0, std::min(1.0, x)));
+    }
+    for (size_t k = 0; k <= M; ++k) table_[k] = kernel_exact(static_cast<double>(k) / inv_h_);
+    // Interpolation error at the cell midpoints, where it peaks, over the angles
+    // real pairs can have (>= a quarter of the mean face spacing) and where the
+    // kernel is >= 1e-6 of its peak.
+    {
+        double peak = 0.0;
+        for (double v : table_) peak = std::max(peak, v);
+        const double theta_lo = 0.25 * std::sqrt(4.0 * M_PI / static_cast<double>(n));
+        double worst = 0.0;
+        for (size_t k = 0; k < M; ++k) {
+            const double th = (static_cast<double>(k) + 0.5) / inv_h_;
+            if (th < theta_lo || th > theta_cutoff) continue;
+            const double ex = kernel_exact(th);
+            if (!(ex >= 1e-6 * peak)) continue;
+            const double ip = 0.5 * (table_[k] + table_[k + 1]);
+            worst = std::max(worst, std::abs(ip - ex) / ex);
+        }
+        table_max_rel_err_ = worst;
+    }
+
+    n_ = n;
+    ux_.resize(n); uy_.resize(n); uz_.resize(n);
+    for (size_t i = 0; i < n; ++i) {  // as SphericalSpatialIndex::build
+        const auto& fc = face_centers[i];
+        const double r = std::sqrt(fc[0]*fc[0] + fc[1]*fc[1] + fc[2]*fc[2]);
+        if (r > 0.0) {
+            const double inv_r = 1.0 / r;
+            ux_[i] = static_cast<float>(fc[0] * inv_r);
+            uy_[i] = static_cast<float>(fc[1] * inv_r);
+            uz_[i] = static_cast<float>(fc[2] * inv_r);
+        } else {
+            ux_[i] = 0.0f; uy_[i] = 0.0f; uz_[i] = 1.0f;
+        }
+    }
+    area_ = face_areas;
+    self_w_.resize(n);
+    for (size_t i = 0; i < n; ++i) self_w_[i] = self_cap(area_[i]);
+
+    // Per-source normalization: each source scatters exactly (1 - escape).
+    norm_.assign(n, 0.0);
+    const double target = 1.0 - escape_frac_;
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (size_t i = 0; i < n; ++i) {
+        const float xi_ = ux_[i], yi = uy_[i], zi = uz_[i];
+        double sum = self_w_[i];
+        const float* X = ux_.data(); const float* Y = uy_.data(); const float* Z = uz_.data();
+        const double* Ar = area_.data();
+        const double thr = threshold_;
+        auto row = [&](size_t j0, size_t j1) {
+            double acc = 0.0;
+            #pragma clang loop vectorize_width(8) interleave_count(2)
+            for (size_t j = j0; j < j1; ++j) {
+                const double k = kernelAt(xi_ * X[j] + yi * Y[j] + zi * Z[j]);
+                const double w = k * Ar[j];
+                acc += (k > 0.0 && w >= thr) ? w : 0.0;
+            }
+            sum += acc;
+        };
+        row(0, i);
+        row(i + 1, n);
+        norm_[i] = (sum > 0.0) ? target / sum : 0.0;
+    }
+
+    // Calibration: the raw deposition of a uniform unit flux (e_i = area_i).
+    applyRaw(area_, nullptr, calibration_, nullptr);
+    applications_ = 0;
+    build_seconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void FixedKernelTransportOperator::applyRaw(const std::vector<double>& emission, const std::vector<char>* mask,
+                                            std::vector<double>& raw, TransportTotals* totals) const {
+    const size_t n = n_;
+    if (emission.size() != n || (mask && mask->size() != n)) {
+        throw std::invalid_argument("FixedKernelTransportOperator::applyRaw: size mismatch");
+    }
+    ++applications_;
+    // Selected sources with a nonzero scaled emission, in index order.
+    std::vector<size_t> idx;
+    std::vector<float> sx, sy, sz;
+    std::vector<double> s;
+    std::vector<double> s_self(n, 0.0);
+    double src = 0.0, jeans = 0.0, unscattered = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        if (mask && !(*mask)[i]) continue;
+        const double e = emission[i];
+        src += e;
+        if (e > 0.0) {
+            if (norm_[i] == 0.0) unscattered += e;
+            else jeans += e * escape_frac_;
+        }
+        const double si = e * norm_[i];
+        if (si == 0.0) continue;
+        idx.push_back(i);
+        sx.push_back(ux_[i]); sy.push_back(uy_[i]); sz.push_back(uz_[i]);
+        s.push_back(si);
+        s_self[i] = si;
+    }
+    raw.assign(n, 0.0);
+    const size_t m = idx.size();
+    if (m > 0) {
+        const float* X = sx.data(); const float* Y = sy.data(); const float* Z = sz.data();
+        const double* S = s.data();
+        const double thr = threshold_;
+        // Per TARGET: each output is a sum over sources in a fixed order, so the
+        // product does not depend on the thread count.
+        #pragma omp parallel for schedule(static)
+        for (size_t j = 0; j < n; ++j) {
+            const float xj = ux_[j], yj = uy_[j], zj = uz_[j];
+            const double aj = area_[j];
+            // Skip the target itself: its self term is the cap quadrature.
+            const size_t split = static_cast<size_t>(std::lower_bound(idx.begin(), idx.end(), j) - idx.begin());
+            const size_t resume = (split < m && idx[split] == j) ? split + 1 : split;
+            double acc = 0.0;
+            auto part = [&](size_t k0, size_t k1) {
+                double a = 0.0;
+                #pragma clang loop vectorize_width(8) interleave_count(2)
+                for (size_t k = k0; k < k1; ++k) {
+                    const double kv = kernelAt(X[k] * xj + Y[k] * yj + Z[k] * zj);
+                    const double w = kv * aj;
+                    a += (kv > 0.0 && w >= thr) ? w * S[k] : 0.0;
+                }
+                acc += a;
+            };
+            part(0, split);
+            part(resume, m);
+            raw[j] = acc + self_w_[j] * s_self[j];
+        }
+    }
+    if (totals) {
+        double dep = 0.0;
+        for (size_t j = 0; j < n; ++j) dep += raw[j];
+        totals->source = src;
+        totals->deposited = dep;
+        totals->jeans_escaped = jeans;
+        totals->unscattered = unscattered;
+    }
+}
+
+size_t FixedKernelTransportOperator::memoryBytes() const {
+    return (table_.capacity() + acos_tbl_.capacity()) * sizeof(double) +
+           (ux_.capacity() + uy_.capacity() + uz_.capacity()) * sizeof(float) +
+           (area_.capacity() + self_w_.capacity() + norm_.capacity() + calibration_.capacity()) * sizeof(double);
+}
+
+const FixedKernelTransportOperator& ExosphereModel::fixedKernelOperator(double temperature_K, bool apply_jeans_escape) {
+    if (!fixed_op_) fixed_op_ = std::make_unique<FixedKernelTransportOperator>();
+    if (!fixed_op_->matches(face_centers_.size(), temperature_K, apply_jeans_escape)) {
+        if (fixed_op_->built()) {
+            std::cerr << "WARNING [PTM-671]: fixed-temperature transport operator rebuilt: it was built for "
+                      << fixed_op_->temperatureK() << " K and is now requested at " << temperature_K
+                      << " K (or EXO_XI_CUTOFF / the Jeans option changed)" << std::endl;
+        }
+        fixed_op_->build(face_centers_, face_areas_, temperature_K, apply_jeans_escape,
+                         transport_->bodyRadius(), 1e-10);
+        std::cout << "  [sputter-operator] fixed-temperature transport operator built once: " << face_centers_.size()
+                  << " faces at " << std::fixed << std::setprecision(1) << temperature_K << " K in "
+                  << fixed_op_->buildSeconds() << " s (normalization + calibration sweeps), " << std::setprecision(2)
+                  << (fixed_op_->memoryBytes() / 1048576.0) << " MB; kernel table " << fixed_op_->tableNodes()
+                  << " nodes, max interpolation error " << std::scientific << std::setprecision(2)
+                  << fixed_op_->tableMaxRelError() << " relative" << std::fixed << std::endl;
+    }
+    return *fixed_op_;
 }
 
 // Smooth a scalar field using the spatial index built by computeTransportProduct().

@@ -1821,8 +1821,18 @@ int main(int argc, char** argv)
     int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
     bool superstep_legacy_deposition = false;  // PTM-644: reproduce the pre-fix super-step
     bool no_albedo_step_limit = false;         // PTM-640: reproduce the unlimited super-step
+    bool albedo_refresh_global = false;        // PTM-657: full recompute at every refresh
+    double albedo_refresh_tol = 1e-2;          // PTM-657 face-local refresh tolerance
+    double albedo_refresh_fraction = 0.0;      // PTM-657 faces past this x threshold are rescaled
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
+    // Lag-layer diffusion barrier (multiscale; on by default, --no-lag-barrier = legacy).
+    ptm::exosphere::LagBarrierConfig lag_cfg;
+    bool no_lag_barrier = false;
+    bool no_gardening = false, no_sputter_shield = false;   // PTM-669
+    bool no_sputter_operator_cache = false;                  // PTM-671
+    std::string garden_param_flag;
+    std::string lag_param_flag;                // first lag parameter flag seen
 
     // Albedo-composition coupling options
     bool albedo_coupling_enabled = false;
@@ -1943,9 +1953,79 @@ int main(int argc, char** argv)
         else if (a == "--flux-convergence" && i+1 < argc) {
             flux_convergence_threshold = std::stod(argv[++i]);
         }
+        else if (a == "--albedo-refresh-global") {
+            albedo_refresh_global = true;
+            if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--albedo-refresh-tolerance" && i+1 < argc) {
+            albedo_refresh_tol = std::stod(argv[++i]);
+            if (!(albedo_refresh_tol >= 0.0 && albedo_refresh_tol < 0.1)) {
+                std::cerr << "Error: --albedo-refresh-tolerance must be in [0, 0.1)" << std::endl;
+                return 1;
+            }
+            if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--albedo-refresh-fraction" && i+1 < argc) {
+            albedo_refresh_fraction = std::stod(argv[++i]);
+            if (!(albedo_refresh_fraction >= 0.0 && albedo_refresh_fraction <= 1.0)) {
+                std::cerr << "Error: --albedo-refresh-fraction must be in [0, 1]" << std::endl;
+                return 1;
+            }
+            if (superstep_flag.empty()) superstep_flag = a;
+        }
         else if (a == "--no-albedo-step-limit") {
             no_albedo_step_limit = true;
             if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--no-lag-barrier") {
+            no_lag_barrier = true;
+        }
+        // Garden mode (PTM-669): on by default with the lag barrier.
+        else if (a == "--no-gardening") { no_gardening = true; }
+        else if (a == "--no-sputter-operator-cache") { no_sputter_operator_cache = true; }
+        else if (a == "--no-sputter-shield") { no_sputter_shield = true; }
+        else if ((a == "--gardening-rate" || a == "--gardening-box-depth" || a == "--gardening-k99" ||
+                  a == "--gardening-excavation-h" || a == "--gardening-overlap-c") && i+1 < argc) {
+            if (garden_param_flag.empty()) garden_param_flag = a;
+            const double v = std::stod(argv[++i]);
+            if (!(std::isfinite(v) && v > 0.0)) {
+                std::cerr << "Error: " << a << " must be > 0" << std::endl;
+                return 1;
+            }
+            if (a == "--gardening-rate") lag_cfg.gardening_rate = v * 1e-6 / (365.25 * 86400.0);  // um/yr
+            else if (a == "--gardening-box-depth") lag_cfg.box_depth0 = v;
+            else if (a == "--gardening-k99") {                                                  // m^2/yr
+                lag_cfg.box_K99 = v / (365.25 * 86400.0);
+                lag_cfg.garden_K99_explicit = true;
+            }
+            else if (a == "--gardening-excavation-h") lag_cfg.garden_h = v;
+            else lag_cfg.garden_c = v;
+        }
+        else if (a == "--gardening-case" && i+1 < argc) {
+            if (garden_param_flag.empty()) garden_param_flag = a;
+            const std::string v = argv[++i];
+            // K99 = u pi c^2 h^2 / (2 x 4.605) [m^2/yr], Costello et al. 2021 Eq. 1 (v = -4);
+            // u = 7.03e-12 (B) / 2.02e-12 (A) km^-2 yr^-1, h = 0.04, c = 1 (scripts/jwst/gardening.py).
+            if (v == "B" || v == "A") lag_cfg.garden_case = v[0];
+            else { std::cerr << "Error: --gardening-case must be A or B" << std::endl; return 1; }
+        }
+        else if ((a == "--lag-barrier-length" || a == "--lag-grain-radius" || a == "--lag-porosity" ||
+                  a == "--lag-tortuosity" || a == "--lag-optical-depth" || a == "--lag-source-refresh-tol")
+                 && i+1 < argc) {
+            if (lag_param_flag.empty()) lag_param_flag = a;
+            const double v = std::stod(argv[++i]);
+            bool ok = std::isfinite(v);
+            if (a == "--lag-barrier-length") { ok = ok && v > 0.0; lag_cfg.barrier_length = v; }
+            else if (a == "--lag-grain-radius") { ok = ok && v > 0.0; lag_cfg.grain_radius = v; }
+            else if (a == "--lag-porosity") { ok = ok && v > 0.0 && v < 1.0; lag_cfg.lag_porosity = v; }
+            else if (a == "--lag-tortuosity") { ok = ok && v >= 1.0; lag_cfg.tortuosity = v; }
+            else if (a == "--lag-optical-depth") { ok = ok && v > 0.0; lag_cfg.optical_depth = v; }
+            else { ok = ok && v > 0.0 && v < 1.0; lag_cfg.source_refresh_tol = v; }
+            if (!ok) {
+                std::cerr << "Error: " << a << " " << v << " is out of range (lengths [m] > 0; porosity in (0, 1); "
+                          << "tortuosity >= 1; refresh tolerance in (0, 1))" << std::endl;
+                return 1;
+            }
         }
         else if (a == "--superstep-legacy-deposition") {
             superstep_legacy_deposition = true;
@@ -2164,8 +2244,48 @@ int main(int argc, char** argv)
             std::cout << "  --flux-convergence T   Flux imbalance fraction for convergence (default: 0.01 = 1%%)\n";
             std::cout << "  --max-superstep-epochs N  Cap one super-step at N epochs (default: none; for\n";
             std::cout << "                         step-size refinement checks)\n";
+            std::cout << "  --albedo-refresh-global  Recompute the full transport at every albedo refresh\n";
+            std::cout << "                         (pre-PTM-657; slower). Default: face-local update of the\n";
+            std::cout << "                         sources whose emission/temperature moved\n";
+            std::cout << "  --albedo-refresh-tolerance T  Face-local refresh: sources left stale may differ\n";
+            std::cout << "                         from the current field by at most T of the totals\n";
+            std::cout << "                         (default 1e-2; 0 = update every changed source)\n";
+            std::cout << "  --albedo-refresh-fraction F  Face-local refresh: rescale the temperatures of faces\n";
+            std::cout << "                         whose albedo moved by more than F x the threshold (default\n";
+            std::cout << "                         0 = every face that moved, as the global refresh; F > 0 is\n";
+            std::cout << "                         faster but re-bases faces at different times, face-scale\n";
+            std::cout << "                         jitter that the albedo feedback amplifies)\n";
             std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
             std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
+            std::cout << "  --no-lag-barrier       Legacy well-mixed layer: lost ice becomes non-ice volume and\n";
+            std::cout << "                         nothing limits sublimation but the exposed ice area (for\n";
+            std::cout << "                         comparison; default: the lag-layer diffusion barrier)\n";
+            std::cout << "  Lag barrier (default on in --multiscale): sublimation J_0 f / (1 + d/l) through a lag\n";
+            std::cout << "  of thickness d left by the lost ice; sputtering is not barriered; deposition beyond\n";
+            std::cout << "  the face's loss builds an unbarriered frost veneer; the lag darkens the face,\n";
+            std::cout << "  A = A_lag + (A_mix - A_lag) exp(-d/delta_opt). Thermal inertia is unchanged.\n";
+            std::cout << "  --lag-barrier-length L  l [m] directly (default: Knudsen, 1.128 [phi/(1-phi)] r / tau,\n";
+            std::cout << "                         Schorghofer 2008 ApJ 682:697 eq. 3; 4.23e-6 m at the defaults)\n";
+            std::cout << "  --lag-grain-radius R   Non-ice grain radius r [m] (default 5e-6)\n";
+            std::cout << "  --lag-porosity P       Lag porosity phi_lag (default 0.6)\n";
+            std::cout << "  --lag-tortuosity T     Lag tortuosity tau (default 2)\n";
+            std::cout << "  --lag-optical-depth D  Albedo e-folding lag thickness delta_opt [m] (default 1e-5)\n";
+            std::cout << "  --no-gardening         No micrometeoroid gardening (v_m = 0, fixed 5 cm box)\n";
+            std::cout << "  --no-sputter-shield    H2O sputter ejection not barriered by the lag (PTM-659)\n";
+            std::cout << "  --no-sputter-operator-cache  Recompute the sputtered-H2O transport kernel at every\n";
+            std::cout << "                         refresh (683f1cc behavior). Default: build the fixed-launch-\n";
+            std::cout << "                         temperature operator once and reuse it (PTM-671)\n";
+            std::cout << "  --gardening-rate V     Lag/veneer gardening rate v_m [um/yr] (default 0.3; Johnson\n";
+            std::cout << "                         et al. 2004 Table 20.2, citing Cooper et al. 2001; arm 1.2)\n";
+            std::cout << "  --gardening-case A|B   Costello et al. 2021 secondary rate for the box depth\n";
+            std::cout << "                         h_g = sqrt(h_mm^2 + K99 t) (default B, 3.84e-9 m^2/yr)\n";
+            std::cout << "  --gardening-box-depth H  h_mm [m] (default 0.01)\n";
+            std::cout << "  --gardening-k99 K      Box-deepening coefficient K99 [m^2/yr] directly (overrides\n";
+            std::cout << "                         the case, h and c)\n";
+            std::cout << "  --gardening-excavation-h H  Costello excavation depth / diameter (default 0.04, UNVERIFIED)\n";
+            std::cout << "  --gardening-overlap-c C  Costello overlap parameter (default 1, UNVERIFIED)\n";
+            std::cout << "  --lag-source-refresh-tol X  Refresh the transport when the emission pattern has\n";
+            std::cout << "                         moved by X (total variation; default 0.02)\n";
             std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
             std::cout << "                         each super-step (pre-PTM-644; not mass-conserving;\n";
             std::cout << "                         reproduces earlier products only)\n";
@@ -2263,6 +2383,16 @@ int main(int argc, char** argv)
         albedo_coupling_enabled = true;
         ice_layer_enabled = true;
     }
+    if (!lag_param_flag.empty() && no_lag_barrier) {
+        std::cerr << "Error: " << lag_param_flag << " sets a lag-barrier parameter but --no-lag-barrier "
+                  << "switches the barrier off" << std::endl;
+        return 1;
+    }
+    if (!lag_param_flag.empty() && !multiscale_enabled) {
+        std::cerr << "Error: " << lag_param_flag << " requires --multiscale (the lag barrier is a "
+                  << "multiscale model)" << std::endl;
+        return 1;
+    }
     if (!superstep_flag.empty() && !multiscale_enabled) {
         std::cerr << "Error: " << superstep_flag << " requires --multiscale" << std::endl;
         return 1;
@@ -2332,6 +2462,11 @@ int main(int argc, char** argv)
 
     // Create integration instance
     ptm::exosphere::PTMExosphereIntegration integrator(output_dir);
+    integrator.setSputterOperatorCache(!no_sputter_operator_cache);
+    if (no_sputter_operator_cache) {
+        std::cout << "Sputter transport operator cache OFF (--no-sputter-operator-cache): the kernel is "
+                  << "recomputed at every refresh (683f1cc behavior)" << std::endl;
+    }
 
     // Let integrator use the mesh from MeshUtils or load from path using its public API
     if (!mesh_file.empty()) {
@@ -2577,7 +2712,46 @@ int main(int argc, char** argv)
                       << "on the step size). Reproduces earlier products only." << std::endl;
         }
         integrator.setAlbedoStepLimit(!no_albedo_step_limit);
+        if (sputtering_enabled && sputter_cfg.legacy_escape_only) albedo_refresh_global = true;
+        integrator.setLocalAlbedoRefresh(!albedo_refresh_global, albedo_refresh_tol, albedo_refresh_fraction);
+        if (!albedo_refresh_global && albedo_refresh_fraction > 0.0 && albedo_coupling_enabled) {
+            std::cerr << "WARNING [PTM-657]: --albedo-refresh-fraction " << albedo_refresh_fraction
+                      << ": faces are re-based at different times, which injects face-scale temperature "
+                      << "jitter; the albedo-sublimation feedback is linearly unstable on warm faces "
+                      << "(PTM-658) and amplifies it, so local extremes can differ from the coherent "
+                      << "refresh (phase 0 cosine case: max non-ice 35.9% vs 18.2%)." << std::endl;
+        }
         integrator.setMaxSuperstepEpochs(max_superstep_epochs);
+        // Lag-layer diffusion barrier (default on). The legacy reproduction modes imply
+        // --no-lag-barrier (they reproduce pre-fix products); say so.
+        if (!no_lag_barrier && (superstep_legacy_deposition ||
+                                (sputtering_enabled && sputter_cfg.legacy_escape_only))) {
+            if (!lag_param_flag.empty()) {
+                std::cerr << "Error: " << lag_param_flag << " needs the lag barrier, which the legacy reproduction "
+                          << "flags (--superstep-legacy-deposition, --sputter-legacy-escape-only) switch off"
+                          << std::endl;
+                return 1;
+            }
+            no_lag_barrier = true;
+            std::cerr << "WARNING [lag]: " << (superstep_legacy_deposition ? "--superstep-legacy-deposition"
+                                                                           : "--sputter-legacy-escape-only")
+                      << " implies --no-lag-barrier (reproduces pre-lag products)" << std::endl;
+        }
+        lag_cfg.enabled = !no_lag_barrier;
+        if (!garden_param_flag.empty() && (no_lag_barrier || no_gardening)) {
+            std::cerr << "Error: " << garden_param_flag << " needs gardening (not --no-gardening / --no-lag-barrier)"
+                      << std::endl;
+            return 1;
+        }
+        lag_cfg.gardening = lag_cfg.enabled && !no_gardening;
+        // Box deepening: an explicit --gardening-k99 wins; otherwise K99 from the case, h, c.
+        if (!lag_cfg.garden_K99_explicit) lag_cfg.box_K99 = lag_cfg.costelloK99();
+        lag_cfg.sputter_shield = lag_cfg.enabled && !no_sputter_shield && sputtering_enabled;
+        if (lag_cfg.enabled && !lag_cfg.gardenMode()) {
+            std::cerr << "WARNING [PTM-669]: --no-gardening --no-sputter-shield: the PTM-659 lag model "
+                      << "(no gardening, fixed 5 cm box, H2O ejection unbarriered)" << std::endl;
+        }
+        integrator.setLagBarrier(lag_cfg);
         if (diurnal_stride > 1) {
             integrator.setDiurnalStride(diurnal_stride);
             std::cout << "  Diurnal accumulation stride: " << diurnal_stride << std::endl;
@@ -2594,6 +2768,10 @@ int main(int argc, char** argv)
             return 1;
         }
     } else {
+        if (ice_layer_enabled && !no_lag_barrier) {
+            std::cerr << "WARNING [lag]: the lag-layer diffusion barrier is a --multiscale model; this "
+                      << "per-timestep run uses the legacy well-mixed ice layer" << std::endl;
+        }
         // Standard diurnal simulation
         std::cout << "\nRunning standard diurnal simulation..." << std::endl;
         integrator.runSimulation(3600.0, true);

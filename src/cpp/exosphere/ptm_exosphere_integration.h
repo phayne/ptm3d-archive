@@ -9,6 +9,7 @@
 #include <Eigen/Sparse>
 
 #include "albedo_refresh.h"
+#include "ice_layer_model.h"   // LagBarrierConfig (held by value)
 
 // Forward declarations
 namespace ptm {
@@ -18,6 +19,7 @@ namespace ptm {
 
         // Forward declaration so we can hold a unique_ptr in the header
         class ExosphereModel;
+        class FixedKernelTransportOperator;
         class SputteringModel;
         struct SputteringConfig;
         struct SputteringState;
@@ -231,7 +233,42 @@ namespace ptm {
             bool albedo_step_limit_ = true;                 // PTM-640
             double albedo_limit_seconds_ = 0.0;
             double max_refresh_deviation_ = 0.0;            // max |A - A_ref| when a refresh fired
+
+            // PTM-657 face-local refresh: raw transport sums of the represented source field.
+            struct TransportCache {
+                std::vector<double> raw, cal, src, temp;
+                bool valid = false;
+            };
+            TransportCache sub_cache_, sput_cache_;
+            bool local_refresh_ = true;
+            double local_refresh_tol_ = 1e-2;
+            double local_refresh_fraction_ = 0.0;   // rescale faces past this x threshold (0 = all that moved)
+            bool last_refresh_local_ = false;
+            long long local_refresh_count_ = 0, local_sources_sub_ = 0, local_sources_sput_ = 0;
+            bool localRefreshEnabled() const;
+            void localTransportUpdate(TransportCache& cache, const std::vector<double>& T_new,
+                                      const std::vector<double>& e_new, bool apply_jeans,
+                                      bool private_index, bool temperature_dependent, std::vector<double>& deposition,
+                                      long long& sources_updated,
+                                      const FixedKernelTransportOperator* op = nullptr);
+            // PTM-671: the sputtered-H2O transport reuses one fixed-temperature
+            // operator (default); false = the per-refresh kernel of 683f1cc.
+            bool sputter_operator_cache_ = true;
+            double sputter_operator_seconds_ = 0.0;  // applying it (build excluded)
+            double sputter_transport_seconds_ = 0.0; // sputtered-H2O transport, either path
+            void applyRepresentedSourceTotals();
             int max_superstep_epochs_ = 0;                  // 0 = no cap
+
+            // Lag-layer diffusion barrier (multiscale; see LagBarrierConfig in ice_layer_model.h).
+            LagBarrierConfig lag_cfg_;
+            long long lag_source_refreshes_ = 0;           // transport refreshes forced by the emission pattern
+            bool lag_warned_thickness_ = false;
+            std::vector<char> lag_top_decile_;             // faces in the top decile of t = 0 mean temperature
+            void enableLagBarrierState();                  // freeze x_n, verify the t = 0 invariance
+            void computeCompositionAlbedos(const std::vector<double>& nonice,
+                                           const std::vector<double>* lag_d,
+                                           std::vector<double>& out) const;
+            void writeLagTimeseriesRow(int epoch, double t_seconds, bool header);
 
             // Diurnal accumulation stride: use every Nth timestep for averaging.
             // stride=1 uses all timesteps (default), stride=4 uses every 4th (~4x faster).
@@ -626,6 +663,13 @@ namespace ptm {
              */
             void setSuperstepConsistentDeposition(bool on) { superstep_consistent_deposition_ = on; }
 
+            /**
+             * Lag-layer diffusion barrier for the multiscale evolution (cfg.enabled;
+             * the CLI default). Applied at the start of runMultiTimescaleSimulation.
+             */
+            void setLagBarrier(const LagBarrierConfig& cfg) { lag_cfg_ = cfg; }
+            const LagBarrierConfig& getLagBarrier() const { return lag_cfg_; }
+
             /** Upper bound on one multiscale super-step in epochs (0 = none; refinement checks). */
             void setMaxSuperstepEpochs(int n) { max_superstep_epochs_ = std::max(0, n); }
 
@@ -634,6 +678,24 @@ namespace ptm {
              * change (the temperature refresh can lag by a whole step).
              */
             void setAlbedoStepLimit(bool on) { albedo_step_limit_ = on; }
+
+            /**
+             * PTM-657. Face-local albedo refresh (default on): after the first full
+             * diurnal computation, a refresh updates the transport only for sources
+             * whose emission or temperature moved beyond `tol` of the totals (0 = every
+             * changed source; exact). false = the full (global) recompute.
+             */
+            /**
+             * PTM-671. Build the sputtered-H2O transport operator once and reuse it
+             * (default on). false = recompute the kernel at every refresh (683f1cc).
+             */
+            void setSputterOperatorCache(bool on) { sputter_operator_cache_ = on; }
+
+            void setLocalAlbedoRefresh(bool on, double tol, double fraction = 0.0) {
+                local_refresh_ = on;
+                local_refresh_tol_ = std::max(0.0, tol);
+                local_refresh_fraction_ = std::clamp(fraction, 0.0, 1.0);
+            }
 
             /**
              * Set diurnal accumulation stride for multi-timescale simulation
