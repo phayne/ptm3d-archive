@@ -470,7 +470,99 @@ public:
 
     // NEW: Print spatial index statistics
     void printSpatialIndexStats() const { spatial_index_.printStatistics(); }
+
+    double bodyRadius() const { return body_radius_; }
 }; // <-- ensure class ends with semicolon
+
+// PTM-671: the ballistic transport operator for ONE uniform launch temperature,
+// built once and applied to any number of source fields. The sputtered-H2O
+// transport launches every source at the same temperature on fixed geometry, so
+// everything computeTransportProduct derives from the kernel is invariant over
+// a run: each source's normalization (target / sum of its weights), its self
+// weight, and the calibration sums behind the row-bias correction. Only the
+// source vector changes between refreshes. This class computes those once, and
+// replaces the per-pair K0 / exp / taper evaluation (and the spatial-index
+// query) by a lookup into a table of the same kernel on a uniform angle grid.
+//
+// Relation to computeTransportProduct (same temperature for every source):
+//   - same neighbor set: every j != i with float cos(theta_ij) >= float
+//     cos(theta_cutoff), computed from the same float unit vectors;
+//   - same angle: FastAcos of the same float cosine;
+//   - kernel p_density(R theta) * taper(theta): linear interpolation in theta
+//     (the only approximation; its max relative error against the direct
+//     evaluation is measured at build and reported, see tableMaxRelError());
+//   - same self weight (Gauss-Legendre spherical cap), escape fraction,
+//     threshold, normalization and calibration definitions.
+// Every source still scatters exactly (1 - escape) of its emission, because
+// its normalization is computed from the same tabulated weights it scatters
+// with. The row-bias correction and the global mass fix (finalizeTransport)
+// are applied by the caller to the raw sums, exactly as for a direct call.
+//
+// Products are evaluated per TARGET face (each output entry is a sum over
+// sources in a fixed order), so the result does not depend on the thread
+// count, unlike the thread-local scatter of computeTransportProduct (PTM-660).
+// Memory is O(N) plus the table: no N^2 storage.
+class FixedKernelTransportOperator {
+public:
+    // Build for `temperature_K` (uniform over sources). `body_radius` is the
+    // transport's body radius; `threshold` the per-pair weight floor of
+    // computeTransportProduct (1e-10 through ExosphereModel).
+    void build(const std::vector<std::array<double, 3>>& face_centers,
+               const std::vector<double>& face_areas,
+               double temperature_K, bool apply_jeans_escape,
+               double body_radius, double threshold);
+
+    bool built() const { return n_ > 0; }
+    bool matches(size_t n, double temperature_K, bool apply_jeans_escape) const {
+        return n_ == n && temperature_K_ == temperature_K && apply_jeans_ == apply_jeans_escape &&
+               xi_cutoff_ == currentXiCutoff();
+    }
+
+    // raw[j] = sum over selected sources i of e_i norm_i K_ij (+ e_j norm_j self_j
+    // when j is selected): the raw (uncorrected) deposition of
+    // computeTransportProduct with options.raw. `emission` may be negative (a
+    // difference of two source fields). `mask` (optional) selects sources.
+    // Totals follow computeTransportProduct's conventions for e_i > 0.
+    void applyRaw(const std::vector<double>& emission, const std::vector<char>* mask,
+                  std::vector<double>& raw, TransportTotals* totals = nullptr) const;
+
+    // Calibration sums (uniform unit flux e_i = area_i from every source).
+    const std::vector<double>& calibration() const { return calibration_; }
+
+    size_t memoryBytes() const;
+    double buildSeconds() const { return build_seconds_; }
+    double tableMaxRelError() const { return table_max_rel_err_; }
+    size_t tableNodes() const { return table_.size(); }
+    double temperatureK() const { return temperature_K_; }
+    long long applications() const { return applications_; }
+
+    // EXO_XI_CUTOFF, parsed exactly as computeTransportProduct parses it.
+    static double currentXiCutoff();
+
+private:
+    // Tabulated kernel weight (without the target's area) at float cosine c;
+    // 0 where computeTransportProduct skips the pair on the kernel alone.
+    inline double kernelAt(float c) const;
+
+    size_t n_ = 0;
+    double temperature_K_ = 0.0;
+    bool apply_jeans_ = false;
+    double xi_cutoff_ = 0.0;
+    double threshold_ = 0.0;
+    double escape_frac_ = 0.0;
+    float cos_cutoff_ = -1.0f;
+    static constexpr int kAcosCells = 65536;    // FastAcos::TABLE_SIZE
+    std::vector<double> acos_tbl_;              // FastAcos's values
+    int table_cells_ = 0;
+    double inv_h_ = 0.0;                        // table nodes per radian
+    std::vector<double> table_;                 // kernel on theta_k = k / inv_h_, k = 0..M
+    std::vector<float> ux_, uy_, uz_;           // unit face centers (as the spatial index)
+    std::vector<double> area_, self_w_, norm_;  // per face
+    std::vector<double> calibration_;
+    double build_seconds_ = 0.0;
+    double table_max_rel_err_ = 0.0;
+    mutable long long applications_ = 0;
+};
 
 // Exosphere state
 struct ExosphereState {
@@ -512,6 +604,7 @@ private:
     
     std::vector<std::array<double, 3>> face_centers_;
     std::vector<double> face_areas_;
+    std::unique_ptr<FixedKernelTransportOperator> fixed_op_;  // PTM-671
     std::vector<double> face_latitudes_;
     std::vector<double> face_longitudes_;
     
@@ -611,6 +704,17 @@ public:
         std::vector<double>& deposition,
         const TransportCallOptions& options = TransportCallOptions(),
         TransportTotals* totals = nullptr);
+
+    /**
+     * PTM-671. The fixed-temperature transport operator for `temperature_K`,
+     * built on first use and reused while (temperature, Jeans option,
+     * EXO_XI_CUTOFF) are unchanged; a change rebuilds it (and says so).
+     */
+    const FixedKernelTransportOperator& fixedKernelOperator(double temperature_K, bool apply_jeans_escape);
+    /** The operator if it has been built, else nullptr (never builds). */
+    const FixedKernelTransportOperator* builtFixedKernelOperator() const {
+        return (fixed_op_ && fixed_op_->built()) ? fixed_op_.get() : nullptr;
+    }
 
     /** BallisticTransport::finalizeTransport with this model's face areas (PTM-657). */
     double finalizeTransport(const std::vector<double>& raw, const std::vector<double>& calibration,

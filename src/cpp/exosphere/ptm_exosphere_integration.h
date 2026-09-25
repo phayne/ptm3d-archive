@@ -19,6 +19,7 @@ namespace ptm {
 
         // Forward declaration so we can hold a unique_ptr in the header
         class ExosphereModel;
+        class FixedKernelTransportOperator;
         class SputteringModel;
         struct SputteringConfig;
         struct SputteringState;
@@ -248,7 +249,13 @@ namespace ptm {
             void localTransportUpdate(TransportCache& cache, const std::vector<double>& T_new,
                                       const std::vector<double>& e_new, bool apply_jeans,
                                       bool private_index, bool temperature_dependent, std::vector<double>& deposition,
-                                      long long& sources_updated);
+                                      long long& sources_updated,
+                                      const FixedKernelTransportOperator* op = nullptr);
+            // PTM-671: the sputtered-H2O transport reuses one fixed-temperature
+            // operator (default); false = the per-refresh kernel of 683f1cc.
+            bool sputter_operator_cache_ = true;
+            double sputter_operator_seconds_ = 0.0;  // applying it (build excluded)
+            double sputter_transport_seconds_ = 0.0; // sputtered-H2O transport, either path
             void applyRepresentedSourceTotals();
             int max_superstep_epochs_ = 0;                  // 0 = no cap
 
@@ -678,6 +685,12 @@ namespace ptm {
              * whose emission or temperature moved beyond `tol` of the totals (0 = every
              * changed source; exact). false = the full (global) recompute.
              */
+            /**
+             * PTM-671. Build the sputtered-H2O transport operator once and reuse it
+             * (default on). false = recompute the kernel at every refresh (683f1cc).
+             */
+            void setSputterOperatorCache(bool on) { sputter_operator_cache_ = on; }
+
             void setLocalAlbedoRefresh(bool on, double tol, double fraction = 0.0) {
                 local_refresh_ = on;
                 local_refresh_tol_ = std::max(0.0, tol);

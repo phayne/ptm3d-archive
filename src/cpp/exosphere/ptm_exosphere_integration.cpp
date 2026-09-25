@@ -2821,6 +2821,13 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
 
         // Print final statistics
         multiscale_evolution_->getStatistics().print();
+        if (sputterTransportActive()) {
+            std::cout << "  Sputtered-H2O transport: " << std::fixed << std::setprecision(1)
+                      << sputter_transport_seconds_ << " s total ("
+                      << (sputter_operator_cache_ ? "cached operator, PTM-671"
+                                                  : "per-refresh kernel, --no-sputter-operator-cache")
+                      << ")" << std::endl;
+        }
 
         // Export summary
         exportEvolutionSummary();
@@ -2853,7 +2860,8 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                                                        bool apply_jeans, bool private_index,
                                                        bool temperature_dependent,
                                                        std::vector<double>& deposition,
-                                                       long long& sources_updated) {
+                                                       long long& sources_updated,
+                                                       const FixedKernelTransportOperator* op) {
         // PTM-657. The cache holds the raw (uncorrected) transport sums R and the
         // calibration sums C of a source field (cache.src, cache.temp): exactly what
         // a full computeTransportProduct call accumulates before its row-bias
@@ -2900,7 +2908,19 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         size_t count = 0;
         for (size_t i = 0; i < n; ++i) count += mask[i] ? 1 : 0;
         sources_updated += static_cast<long long>(count);
-        if (count > 0) {
+        if (count > 0 && op) {
+            // PTM-671: fixed kernel, so R changes by K (e_new - e_old) over U, in
+            // one operator application; C is the operator's constant calibration.
+            std::vector<double> delta(n, 0.0), r_delta;
+            for (size_t i = 0; i < n; ++i) {
+                if (mask[i]) delta[i] = e_new[i] - cache.src[i];
+            }
+            op->applyRaw(delta, &mask, r_delta);
+            for (size_t j = 0; j < n; ++j) cache.raw[j] += r_delta[j];
+            for (size_t i = 0; i < n; ++i) {
+                if (mask[i]) { cache.src[i] = e_new[i]; cache.temp[i] = T_new[i]; }
+            }
+        } else if (count > 0) {
             std::vector<double> r_new, r_old, c_new, c_old;
             TransportCallOptions opt;
             opt.apply_jeans_escape = apply_jeans;
@@ -3249,7 +3269,40 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             TransportTotals tt;
             std::cout << "  Computing sputtered-H2O transport (launch " << std::fixed << std::setprecision(1)
                       << sc.launchTemperatureK() << " K, no Jeans escape)..." << std::endl;
-            if (local_now) {
+            const auto t_sput_start = std::chrono::steady_clock::now();
+            if (sputter_operator_cache_ && spatialSmoothingRadiusRad() > 0.0) {
+                std::cerr << "WARNING [PTM-671]: EXO_DEP_SMOOTH_DEG spatial smoothing is on; the cached sputter "
+                          << "transport operator does not implement it, so this run uses the per-refresh kernel "
+                          << "(as --no-sputter-operator-cache)" << std::endl;
+                sputter_operator_cache_ = false;
+            }
+            if (sputter_operator_cache_) {
+                // PTM-671: one operator for the run (uniform launch temperature,
+                // fixed geometry); only the source vector changes.
+                const FixedKernelTransportOperator& op =
+                    exosphere_model_->fixedKernelOperator(sc.launchTemperatureK(), false);
+                const auto t_apply = std::chrono::steady_clock::now();
+                if (local_now) {
+                    localTransportUpdate(sput_cache_, launch_T, sput_source, false, true, false, dep_sput,
+                                         local_sources_sput_, &op);
+                } else {
+                    std::vector<double> raw;
+                    op.applyRaw(sput_source, nullptr, raw, &tt);
+                    exosphere_model_->finalizeTransport(raw, op.calibration(), dep_sput);
+                    if (localRefreshEnabled()) {
+                        sput_cache_.raw = raw;
+                        sput_cache_.cal = op.calibration();
+                        sput_cache_.src = sput_source;
+                        sput_cache_.temp = launch_T;
+                        sput_cache_.valid = true;
+                    }
+                }
+                const double s_apply =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_apply).count();
+                sputter_operator_seconds_ += s_apply;
+                std::cout << "  [sputter-operator] applied in " << std::fixed << std::setprecision(3) << s_apply
+                          << " s" << std::endl;
+            } else if (local_now) {
                 // The 683 K kernel does not depend on the thermal state, so only
                 // the emission changes; the calibration is constant.
                 localTransportUpdate(sput_cache_, launch_T, sput_source, false, true, false, dep_sput,
@@ -3266,6 +3319,8 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     sput_cache_.valid = true;
                 }
             }
+            sputter_transport_seconds_ +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sput_start).count();
             for (size_t i = 0; i < static_cast<size_t>(num_faces_); ++i) {
                 diurnal_avg.avg_deposition_sputter_flux[i] = dep_sput[i] / face_areas_[i];
                 diurnal_avg.avg_deposition_flux[i] += diurnal_avg.avg_deposition_sputter_flux[i];
@@ -3488,6 +3543,25 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 file << "    Max albedo deviation at a refresh: " << std::scientific << std::setprecision(6)
                      << max_refresh_deviation_ << " (threshold " << albedo_mapper_->getConfig().albedo_update_threshold
                      << ")\n" << std::setprecision(3);
+            }
+            // PTM-671: written only when the cache is on, so a --no-sputter-operator-cache
+            // summary stays identical to 683f1cc (the run log says which path ran).
+            if (sputter_operator_cache_ && sputterTransportActive()) {
+                const FixedKernelTransportOperator* op = exosphere_model_->builtFixedKernelOperator();
+                if (op) {
+                    const std::ios_base::fmtflags flags = file.flags();
+                    const std::streamsize prec = file.precision();
+                    file << "    Sputter transport operator (PTM-671): built once in " << std::fixed
+                         << std::setprecision(1) << op->buildSeconds() << " s; " << op->applications()
+                         << " applications " << sputter_operator_seconds_ << " s; sputter transport total "
+                         << sputter_transport_seconds_ << " s; " << std::scientific << std::setprecision(2)
+                         << op->tableMaxRelError() << " max kernel-table error\n";
+                    file.flags(flags);
+                    file.precision(prec);
+                } else {
+                    file << "    Sputter transport operator (PTM-671): cache on, never built (no sputter "
+                         << "transport call)\n";
+                }
             }
             if (stats.step_solver_slope_fallbacks > 0 || stats.step_solver_loose > 0) {
                 file << "    Deposition solve: " << stats.step_solver_slope_fallbacks << " slope fallbacks, "

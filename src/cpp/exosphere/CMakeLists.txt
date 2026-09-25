@@ -732,3 +732,42 @@ set_target_properties(test_lag_gardening
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Fixed-temperature sputter transport operator vs the direct kernel (PTM-671)
+add_executable(test_sputter_operator
+    test_sputter_operator.cpp
+)
+target_include_directories(test_sputter_operator PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/constants
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh
+    ${EIGEN3_INCLUDE_DIR}
+)
+target_link_libraries(test_sputter_operator
+    PRIVATE
+    exosphere_core
+    constants
+    mesh_utils
+    Eigen3::Eigen
+)
+if(OpenMP_CXX_FOUND)
+    if(APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang"))
+        if(OpenMP_CXX_FLAGS)
+            string(REPLACE " " ";" OMP_FLAGS_LIST "${OpenMP_CXX_FLAGS}")
+            target_compile_options(test_sputter_operator PRIVATE ${OMP_FLAGS_LIST})
+        else()
+            target_compile_options(test_sputter_operator PRIVATE -Xpreprocessor -fopenmp)
+        endif()
+        if(OpenMP_omp_LIBRARY)
+            target_link_libraries(test_sputter_operator PRIVATE ${OpenMP_omp_LIBRARY})
+        elseif(LIBOMP_LIB)
+            target_link_libraries(test_sputter_operator PRIVATE ${LIBOMP_LIB})
+        endif()
+    else()
+        target_link_libraries(test_sputter_operator PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
+set_target_properties(test_sputter_operator
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

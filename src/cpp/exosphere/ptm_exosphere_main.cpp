@@ -1830,6 +1830,7 @@ int main(int argc, char** argv)
     ptm::exosphere::LagBarrierConfig lag_cfg;
     bool no_lag_barrier = false;
     bool no_gardening = false, no_sputter_shield = false;   // PTM-669
+    bool no_sputter_operator_cache = false;                  // PTM-671
     std::string garden_param_flag;
     std::string lag_param_flag;                // first lag parameter flag seen
 
@@ -1981,6 +1982,7 @@ int main(int argc, char** argv)
         }
         // Garden mode (PTM-669): on by default with the lag barrier.
         else if (a == "--no-gardening") { no_gardening = true; }
+        else if (a == "--no-sputter-operator-cache") { no_sputter_operator_cache = true; }
         else if (a == "--no-sputter-shield") { no_sputter_shield = true; }
         else if ((a == "--gardening-rate" || a == "--gardening-box-depth" || a == "--gardening-k99" ||
                   a == "--gardening-excavation-h" || a == "--gardening-overlap-c") && i+1 < argc) {
@@ -2270,6 +2272,9 @@ int main(int argc, char** argv)
             std::cout << "  --lag-optical-depth D  Albedo e-folding lag thickness delta_opt [m] (default 1e-5)\n";
             std::cout << "  --no-gardening         No micrometeoroid gardening (v_m = 0, fixed 5 cm box)\n";
             std::cout << "  --no-sputter-shield    H2O sputter ejection not barriered by the lag (PTM-659)\n";
+            std::cout << "  --no-sputter-operator-cache  Recompute the sputtered-H2O transport kernel at every\n";
+            std::cout << "                         refresh (683f1cc behavior). Default: build the fixed-launch-\n";
+            std::cout << "                         temperature operator once and reuse it (PTM-671)\n";
             std::cout << "  --gardening-rate V     Lag/veneer gardening rate v_m [um/yr] (default 0.3; Johnson\n";
             std::cout << "                         et al. 2004 Table 20.2, citing Cooper et al. 2001; arm 1.2)\n";
             std::cout << "  --gardening-case A|B   Costello et al. 2021 secondary rate for the box depth\n";
@@ -2457,6 +2462,11 @@ int main(int argc, char** argv)
 
     // Create integration instance
     ptm::exosphere::PTMExosphereIntegration integrator(output_dir);
+    integrator.setSputterOperatorCache(!no_sputter_operator_cache);
+    if (no_sputter_operator_cache) {
+        std::cout << "Sputter transport operator cache OFF (--no-sputter-operator-cache): the kernel is "
+                  << "recomputed at every refresh (683f1cc behavior)" << std::endl;
+    }
 
     // Let integrator use the mesh from MeshUtils or load from path using its public API
     if (!mesh_file.empty()) {
