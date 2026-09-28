@@ -20,6 +20,7 @@
 #include <numeric>
 #include <memory>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <limits>
 
@@ -31,6 +32,8 @@
 #include "composition_albedo.h"
 #include "spherical_index.h"
 #include "../mesh/mesh_utils.h"
+#include "diurnal_albedo_response.h"
+#include "thermal/thermal_model.h"
 
 // Physical constants used here
 namespace exo_const = ptm::exosphere::constants;
@@ -1783,6 +1786,143 @@ static void checkThermalConfigAlbedoMode(const std::string& ptm_dir, bool declar
               << std::endl;
 }
 
+// --albedo-response diurnal: the thermal engine's depth column for the body the
+// thermal run simulated. Only built-in Europa with the engine's DEFAULT column is
+// supported, and that is checked positively rather than inferred: the run's
+// command line must be `--config <file>` alone, and its config_used.yaml may hold
+// only the standard sections, with `thermal:` keys from a whitelist of solver
+// controls that do not change the column and `thermophysical:` limited to
+// albedo_override (a deep-grid or chi override would move
+// the surface energy balance too little for the prepare step's check to see).
+// The grid is thermal::generateAdaptiveGrid (the function Profile::Profile calls)
+// and kc/rho follow Profile::Profile (thermal_model.cpp): x(z) = x_d + (x_s - x_d) e^{-z/H}.
+// No thermal::Profile is constructed here, so no thermal-library object crosses
+// into this translation unit.
+static bool buildThermalColumnForRun(const std::string& ptm_dir, ptm::exosphere::ThermalColumn& col,
+                                     std::string& err) {
+    std::ifstream in(ptm_dir + "/provenance.txt");
+    if (!in) {
+        err = "no " + ptm_dir + "/provenance.txt to identify the thermal run's body";
+        return false;
+    }
+    std::string line, body, generic;
+    while (std::getline(in, line)) {
+        if (line.rfind("body=", 0) == 0) body = line.substr(5);
+        if (line.rfind("generic_body=", 0) == 0) generic = line.substr(13);
+    }
+    std::string lower = body;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (lower != "europa" || generic != "false") {
+        err = "the thermal run is body '" + body + "' (generic_body=" + generic + "); the diurnal response "
+              "supports only the built-in Europa column";
+        return false;
+    }
+    // Command line: `<exe> --config <file>` and nothing else (every other flag of
+    // ptm_thermal_sim is either a column/forcing override or unverifiable here).
+    {
+        in.clear();
+        in.seekg(0);
+        std::string cmd;
+        while (std::getline(in, line))
+            if (line.rfind("command_line=", 0) == 0) cmd = line.substr(13);
+        std::istringstream ss(cmd);
+        std::vector<std::string> tok;
+        for (std::string t; ss >> t;) tok.push_back(t);
+        if (tok.size() != 3 || tok[1] != "--config") {
+            err = "the thermal run's command line is not `ptm_thermal_sim --config <file>` (provenance.txt: '" +
+                  cmd + "'); its column cannot be verified";
+            return false;
+        }
+    }
+    // config_used.yaml: standard sections only; `thermal:` keys from the whitelist.
+    {
+        std::ifstream yc(ptm_dir + "/config_used.yaml");
+        if (!yc) {
+            err = "no " + ptm_dir + "/config_used.yaml to verify the thermal column";
+            return false;
+        }
+        static const std::vector<std::string> kSections = {"simulation", "mesh", "thermal", "illumination",
+                                                           "output", "advanced", "thermophysical"};
+        // thermophysical: only the albedo override (it does not touch the column; the
+        // albedo is verified against statistics/effective_albedo.bin in the prepare step).
+        static const std::vector<std::string> kThermophysicalKeys = {"albedo_override"};
+        static const std::vector<std::string> kThermalKeys = {
+            "run_thermal_mesh", "threads", "thermal_n", "equilibration_orbits", "equilibration_steps_per_day",
+            "equilibration_samples_per_diurnal_cycle", "equilibration_cycles", "equilibration_target_K",
+            "equilibration_stop_on_certificate", "eq_extrapolation", "compute_statistics", "use_gpu",
+            "gpu_devices", "gpu_device_ids", "gpu_batch_size", "gpu_inter_batch_pause_ms", "integration_days",
+            "integration_steps", "integration_offset_days", "integration_offset_steps", "initial_state_file",
+            "final_state_file", "state_restore_allow_mismatch", "checkpoint_lookahead_steps",
+            "checkpoint_every_output_steps", "batch_checkpoint", "batch_checkpoint_dir",
+            "batch_checkpoint_max_gib", "batch_checkpoint_flush_mib", "spinup_seed", "seed_anchor",
+            "seed_anchor_refuse_two_timescale", "analytic_seed_cycles", "compute_ice_stability",
+            "ice_stability", "indirect_mean_out_file"};
+        auto has = [](const std::vector<std::string>& v, const std::string& k) {
+            return std::find(v.begin(), v.end(), k) != v.end();
+        };
+        std::string section;
+        size_t child_indent = std::string::npos;
+        while (std::getline(yc, line)) {
+            const size_t hash = line.find('#');
+            if (hash != std::string::npos) line.erase(hash);
+            const size_t first = line.find_first_not_of(" \t");
+            if (first == std::string::npos) continue;
+            const size_t colon = line.find(':', first);
+            if (colon == std::string::npos) continue;
+            std::string key = line.substr(first, colon - first);
+            key.erase(key.find_last_not_of(" \t\"'") + 1);
+            key.erase(0, key.find_first_not_of(" \t\"'"));
+            if (first == 0) {
+                section = key;
+                child_indent = std::string::npos;
+                if (!has(kSections, key)) {
+                    err = "the thermal config has a '" + key + ":' section (" + ptm_dir + "/config_used.yaml); "
+                          "only simulation/mesh/thermal/illumination/output/advanced/thermophysical are verified";
+                    return false;
+                }
+                continue;
+            }
+            if (section != "thermal" && section != "thermophysical") continue;
+            if (child_indent == std::string::npos) child_indent = first;
+            if (first != child_indent) continue;   // nested under a whitelisted key
+            if (section == "thermophysical") {
+                if (!has(kThermophysicalKeys, key)) {
+                    err = "the thermal config sets thermophysical." + key + " (" + ptm_dir + "/config_used.yaml); "
+                          "only thermophysical.albedo_override is verified for the diurnal response";
+                    return false;
+                }
+                continue;
+            }
+            if (!has(kThermalKeys, key)) {
+                err = "the thermal config sets thermal." + key + " (" + ptm_dir + "/config_used.yaml), which "
+                      "may change the depth column or its forcing; the diurnal response is verified only "
+                      "for the engine's default Europa column";
+                return false;
+            }
+        }
+    }
+    thermal::Config cfg;
+    thermal::Planet planet("Europa");
+    const std::vector<double> z = thermal::generateAdaptiveGrid(planet, cfg, false);
+    col.z = z;
+    col.kc.resize(z.size());
+    col.rho.resize(z.size());
+    for (size_t i = 0; i < z.size(); ++i) {
+        const double df = std::exp(-z[i] / planet.H);
+        col.kc[i] = planet.kd + (planet.ks - planet.kd) * df;
+        col.rho[i] = planet.rhod + (planet.rhos - planet.rhod) * df;
+    }
+    col.emissivity = planet.emissivity;
+    col.sigma = cfg.sigma;
+    col.Qb = planet.Qb;
+    col.R350 = cfg.getR350();
+    col.cp0 = planet.cp0;
+    col.cpCoeff = planet.cpCoeff;
+    col.period_s = planet.day;
+    err = col.validate();
+    return err.empty();
+}
+
 int main(int argc, char** argv)
 {
     std::string ptm_dir;
@@ -1824,6 +1964,8 @@ int main(int argc, char** argv)
     bool albedo_refresh_global = false;        // PTM-657: full recompute at every refresh
     double albedo_refresh_tol = 1e-2;          // PTM-657 face-local refresh tolerance
     double albedo_refresh_fraction = 0.0;      // PTM-657 faces past this x threshold are rescaled
+    std::string albedo_response = "diurnal";   // temperature law at an albedo refresh
+    bool albedo_response_flag = false;         // --albedo-response given explicitly
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
     // Lag-layer diffusion barrier (multiscale; on by default, --no-lag-barrier = legacy).
@@ -1972,6 +2114,14 @@ int main(int argc, char** argv)
                 return 1;
             }
             if (superstep_flag.empty()) superstep_flag = a;
+        }
+        else if (a == "--albedo-response" && i+1 < argc) {
+            albedo_response = argv[++i];
+            albedo_response_flag = true;
+            if (albedo_response != "rescale" && albedo_response != "diurnal") {
+                std::cerr << "Error: --albedo-response must be rescale or diurnal" << std::endl;
+                return 1;
+            }
         }
         else if (a == "--no-albedo-step-limit") {
             no_albedo_step_limit = true;
@@ -2255,11 +2405,19 @@ int main(int argc, char** argv)
             std::cout << "                         0 = every face that moved, as the global refresh; F > 0 is\n";
             std::cout << "                         faster but re-bases faces at different times, face-scale\n";
             std::cout << "                         jitter that the albedo feedback amplifies)\n";
+            std::cout << "  --albedo-response L    Temperature law at an albedo refresh: diurnal (default) =\n";
+            std::cout << "                         per-face, per-timestep diurnal-shape response of the thermal\n";
+            std::cout << "                         column (thermal inertia: the change is concentrated at the\n";
+            std::cout << "                         daytime peak); rescale = legacy uniform ((1-A)/(1-A_ref))^(1/4)\n";
+            std::cout << "                         (exact only without thermal inertia; reproduces earlier products;\n";
+            std::cout << "                         implied by --no-albedo-step-limit, --superstep-legacy-deposition\n";
+            std::cout << "                         and --sputter-legacy-escape-only unless given)\n";
             std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
             std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
             std::cout << "  --no-lag-barrier       Legacy well-mixed layer: lost ice becomes non-ice volume and\n";
             std::cout << "                         nothing limits sublimation but the exposed ice area (for\n";
-            std::cout << "                         comparison; default: the lag-layer diffusion barrier)\n";
+            std::cout << "                         comparison; default: the lag-layer diffusion barrier). Products\n";
+            std::cout << "                         made before 2026-09-28 also used --albedo-response rescale\n";
             std::cout << "  Lag barrier (default on in --multiscale): sublimation J_0 f / (1 + d/l) through a lag\n";
             std::cout << "  of thickness d left by the lost ice; sputtering is not barriered; deposition beyond\n";
             std::cout << "  the face's loss builds an unbarriered frost veneer; the lag darkens the face,\n";
@@ -2662,6 +2820,39 @@ int main(int argc, char** argv)
             std::cerr << "Error: albedo coupling could not be enabled" << std::endl;
             return 1;
         }
+        // Temperature law at a refresh. The legacy reproduction flags imply the legacy
+        // law unless --albedo-response is given.
+        const bool legacy_repro = superstep_legacy_deposition || no_albedo_step_limit ||
+                                  (sputtering_enabled && sputter_cfg.legacy_escape_only);
+        if (legacy_repro && !albedo_response_flag && albedo_response == "diurnal") {
+            albedo_response = "rescale";
+            std::cerr << "WARNING [albedo-response]: "
+                      << (superstep_legacy_deposition ? "--superstep-legacy-deposition"
+                          : no_albedo_step_limit      ? "--no-albedo-step-limit"
+                                                      : "--sputter-legacy-escape-only")
+                      << " implies --albedo-response rescale (reproduces pre-fix products)" << std::endl;
+        }
+        if (albedo_response == "rescale") {
+            std::cout << "Albedo response: rescale (legacy uniform ((1-A)/(1-A_ref))^(1/4) law)" << std::endl;
+        } else if (!multiscale_enabled) {
+            std::cout << "Albedo response: diurnal (inert here: only --multiscale refreshes temperatures)" << std::endl;
+        } else {
+            ptm::exosphere::ThermalColumn column;
+            std::string col_err;
+            if (!buildThermalColumnForRun(ptm_dir, column, col_err)) {
+                std::cerr << "Error [albedo-response]: " << col_err << ". Use --albedo-response rescale for "
+                          << "this thermal run." << std::endl;
+                return 1;
+            }
+            std::cout << "\nAlbedo response: diurnal; thermal column " << column.layers() << " layers, top dz "
+                      << std::setprecision(6) << std::defaultfloat << (column.z[1] - column.z[0]) << " m, z_max "
+                      << column.z.back() << " m, emissivity " << column.emissivity << ", Qb " << column.Qb
+                      << " W/m^2, R350 " << column.R350 << ", period " << column.period_s << " s" << std::endl;
+            if (!integrator.prepareDiurnalAlbedoResponse(column, ptm_dir, ptm::exosphere::DiurnalResponseOptions())) {
+                std::cerr << "Error: the diurnal albedo response could not be built (see above)" << std::endl;
+                return 1;
+            }
+        }
         if (!multiscale_enabled) {
             std::cout << "WARNING: albedo coupling refreshes temperatures only in --multiscale mode. "
                       << "This standard-mode run exports bond_albedo but keeps the thermal-run "
@@ -2673,6 +2864,11 @@ int main(int argc, char** argv)
                   << " is used only with albedo coupling (--albedo-coupling or an "
                   << "--ice-fraction-from-albedo mode other than uniform)" << std::endl;
         return 1;
+    }
+
+    if (albedo_response_flag && !albedo_coupling_enabled) {
+        std::cerr << "WARNING: --albedo-response " << albedo_response << " is inert without albedo coupling "
+                  << "(the temperatures are never refreshed)" << std::endl;
     }
 
     // Run simulation based on mode

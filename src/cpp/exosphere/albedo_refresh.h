@@ -104,6 +104,36 @@ public:
         return r;
     }
 
+    /**
+     * update() with the temperature law supplied by the caller (--albedo-response
+     * diurnal, diurnal_albedo_response.h). The trigger, the face selection and the
+     * baseline bookkeeping are identical to update(); for each selected face,
+     * apply(f, current[f]) recomputes that face's temperatures and returns false
+     * if it cannot (the face then keeps its baseline and counts as singular).
+     * update() itself is left untouched so the legacy law stays byte-identical.
+     */
+    template <class Apply>
+    AlbedoRefreshResult updateWith(const std::vector<double>& current, size_t n_faces,
+                                   double threshold, double rescale_min, Apply&& apply) {
+        AlbedoRefreshResult r;
+        r.max_deviation = maxDeviation(current, &r.worst_face);
+        if (!(r.max_deviation > threshold)) return r;
+        r.fired = true;
+        const size_t n = std::min({current.size(), baseline_.size(), n_faces});
+        size_t rescaled = 0, singular = 0;
+        #pragma omp parallel for reduction(+:rescaled,singular)
+        for (size_t f = 0; f < n; ++f) {
+            if (current[f] == baseline_[f]) continue;
+            if (rescale_min > 0.0 && !(std::abs(current[f] - baseline_[f]) > rescale_min)) continue;
+            if (!apply(f, current[f])) { ++singular; continue; }
+            baseline_[f] = current[f];
+            ++rescaled;
+        }
+        r.faces_rescaled = rescaled;
+        r.faces_singular = singular;
+        return r;
+    }
+
 private:
     std::vector<double> baseline_;
 };
