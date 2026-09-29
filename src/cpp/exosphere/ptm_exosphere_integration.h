@@ -9,6 +9,7 @@
 #include <Eigen/Sparse>
 
 #include "albedo_refresh.h"
+#include "diurnal_albedo_response.h"
 #include "ice_layer_model.h"   // LagBarrierConfig (held by value)
 
 // Forward declarations
@@ -209,6 +210,18 @@ namespace ptm {
             // Unscaled (pure-ice potential) diurnal fluxes, the cache base (all modes).
             std::vector<double> unscaled_sublimation_;
             std::vector<double> unscaled_sputtering_;
+
+            // --albedo-response diurnal (diurnal_albedo_response.h): the t = 0 thermal
+            // curves and per-face, per-epoch log sensitivities, face-major (face x epoch).
+            // At every refresh a face's T(t) is recomputed from T0 against the albedo T0
+            // corresponds to (the seeded baseline), so nothing accumulates across refreshes.
+            bool diurnal_albedo_response_ = false;
+            std::vector<float> diurnal_T0_, diurnal_g1_, diurnal_g2_;
+            std::vector<double> diurnal_reference_albedo_;
+            std::vector<char> diurnal_fallback_;       // 1 = no response: 1/4-power law from T0
+            std::string diurnal_response_report_;      // evolution_summary lines
+            double diurnal_apply_seconds_ = 0.0;
+            long long albedo_refreshes_fired_ = 0;
 
             // Albedo coupling internal methods
             double updateAlbedoFromComposition();
@@ -571,6 +584,21 @@ namespace ptm {
              * anchored hapke-intimate fill faces may hold other values.
              */
             bool setThermalAlbedoUniform(double albedo, const std::string& source);
+
+            /**
+             * --albedo-response diurnal. Replace the uniform 1/4-power temperature
+             * rescale by the per-face diurnal-shape response (diurnal_albedo_response.h),
+             * computed once here from the loaded temperatures, the thermal run's
+             * illumination/ and primary_ir/ frames under thermal_dir, the thermal-run
+             * albedo, and `column` (the thermal engine's depth column for the body).
+             * Call after enableAlbedoCoupling() and before any refresh. Returns false,
+             * having said why, if the frames are missing, the output window is not one
+             * forcing period, or the column does not reproduce the thermal run's
+             * surface energy balance (median residual above 1.5% of the flux scale).
+             */
+            bool prepareDiurnalAlbedoResponse(const ThermalColumn& column, const std::string& thermal_dir,
+                                              const DiurnalResponseOptions& options);
+            bool diurnalAlbedoResponseActive() const { return diurnal_albedo_response_; }
             bool loadThermalAlbedoMap(const std::string& path);
             const std::vector<double>& getThermalFaceAlbedos() const { return thermal_face_albedos_; }
             /** Per-face albedo the current temperature array corresponds to. */

@@ -305,6 +305,16 @@ $$T_{\mathrm{new}}(i, t) = T_{\mathrm{old}}(i, t) \left(\frac{1 - A_{\mathrm{new
 
 This scaling is applied to all diurnal timesteps $t$ for each face $i$ where the albedo change exceeds a threshold $\Delta A_{\mathrm{min}} = 0.01$. The updated temperatures then produce modified sublimation and sputtering rates in the next epoch, closing the feedback loop.
 
+Equation D27 is exact only in radiative equilibrium. With thermal inertia, the response to an albedo change is concentrated at the daytime peak and damped at night. By default (`--albedo-response diurnal`), the exosphere therefore replaces D27 with a per-face, per-timestep diurnal-shape response. An albedo change multiplies the absorbed solar flux of the thermal run, $F_s(i,t) = (1 - A_{\mathrm{th},i}) \thinspace F_{\odot}(i,t)$ (direct plus Jupiter-reflected sunlight), by $r_i = (1 - A_{\mathrm{new},i})/(1 - A_{\mathrm{ref},i})$. The absorbed Jupiter infrared does not change. The periodic surface temperature is expanded to second order in $\epsilon = r - 1$,
+
+$$T(i,t) = T_0(i,t) + \epsilon \thinspace S_1(i,t) + \tfrac{1}{2}\epsilon^2 S_2(i,t), \tag{D27a}$$
+
+where $S_1$ and $S_2$ are the exact periodic first- and second-order responses of the thermal engine's own one-dimensional column. That column has a massless radiating surface, $k = k_c(z)(1 + \chi (T/350)^3)$, a temperature-dependent $c_p$, and the basal flux $Q_b$. $S_1$ solves the tangent-linear conduction problem forced by $F_s$. $S_2$ solves the same linear problem forced by the second derivatives of the radiation, conduction and enthalpy terms evaluated on $S_1$. Both are found from the monodromy of the linear stepper, so no spin-up is needed. The base state $T_0(z,t)$ is reconstructed from the thermal run's surface temperature. The response is applied in $\xi = \ln r$:
+
+$$\ln T(i,t) = \ln T_0(i,t) + \xi \thinspace g_1(i,t) + \tfrac{1}{2}\xi^2 g_2(i,t),\quad g_1 = S_1/T_0,\quad g_2 = (S_1 + S_2)/T_0 - g_1^2. \tag{D27b}$$
+
+This is the same second-order expansion, but it reproduces the radiative-equilibrium limit ($g_1 = 1/4$, $g_2 = 0$, i.e. Equation D27) exactly for any $r$. Every refresh evaluates D27b from the thermal run's own $T_0$, so nothing accumulates across refreshes. We compared it against true thermal re-solves on the evolved albedo map (Europa albedo-map BASE, phase 0, 50 kyr to 1 Myr). At 1 Myr, the 95th-percentile peak-temperature error falls from 1.22 K (Equation D27) to 0.011 K, and the global Hertz-Knudsen sublimation bias falls from −16.0% to +0.11%. `--albedo-response rescale` restores Equation D27.
+
 The thermal segregation feedback is self-reinforcing: darker surfaces absorb more sunlight, sublimate faster, concentrate more non-ice material, and darken further. This runaway process is ultimately limited by either complete ice depletion ($c = 1$) or by deposition of fresh ice from colder regions. The competition between these effects determines the steady-state spatial pattern of ice and lag deposits.
 
 ### D.6.5 Lag-Layer Diffusion Barrier
@@ -363,7 +373,7 @@ The diurnal cycle of sublimation and deposition has a period $P_{\mathrm{diurnal
 
 The evolution proceeds in four steps:
 
-**Step 0: Albedo update (optional).** If albedo-composition coupling is enabled (Section D.6.4), compute the current albedo $A(c_i)$ for each face from Equation D26. If the maximum albedo change across all faces exceeds the threshold $\Delta A_{\mathrm{min}}$, rescale the temperature field using Equation D27 and force a recomputation of the diurnal cycle (Step 1).
+**Step 0: Albedo update (optional).** If albedo-composition coupling is enabled (Section D.6.4), compute the current albedo $A(c_i)$ for each face from Equation D26. If the maximum albedo change across all faces exceeds the threshold $\Delta A_{\mathrm{min}}$, update the temperature field using Equation D27b (D27 with `--albedo-response rescale`) and force a recomputation of the diurnal cycle (Step 1).
 
 **Step 1: Diurnal averaging.** Run one complete diurnal cycle ($N_t$ timesteps) with the current surface state. Compute time-averaged fluxes at each face:
 
@@ -407,7 +417,7 @@ With default parameters: $N_c \times N_e = 10^5$ orbits $= 10^5 \times 3.5512$ d
 
 The operator-splitting approach assumes that diurnal-averaged fluxes are representative of the full diurnal cycle, and that surface temperatures do not change significantly within an epoch. The first assumption is well justified because the transport matrix, which depends on temperature, is slowly varying compared to the diurnal cycle. The second assumption requires that changes in non-ice concentration (which could alter albedo and hence temperature) be small over one epoch; this is enforced by the adaptive cache refresh, which triggers a recomputation of the diurnal cycle when the maximum concentration change exceeds a threshold. *Correction pending: the current code implements no such adaptive refresh; it recomputes the diurnal cycle only at the first epoch and when albedo coupling updates temperatures, and it rejects the `--cache-refresh` and `--no-analytical` options.*
 
-When albedo-composition coupling is enabled (Section D.6.4), the model self-consistently captures the thermal segregation feedback (Spencer 1987): as ice is removed and the lag deposit thickens, the surface albedo decreases, increasing temperatures and accelerating further ice loss. The temperature rescaling (Equation D27) uses a radiative equilibrium approximation, which is accurate for the slowly varying geological timescales but does not account for second-order effects such as changes in thermal inertia or emissivity with composition. These refinements are left for future work.
+When albedo-composition coupling is enabled (Section D.6.4), the model self-consistently captures the thermal segregation feedback (Spencer 1987): as ice is removed and the lag deposit thickens, the surface albedo decreases, increasing temperatures and accelerating further ice loss. The default diurnal-shape response (Equations D27a-b) accounts for the thermal inertia of the unchanged column. It does not account for changes in thermal inertia or emissivity with composition. These refinements are left for future work.
 
 ---
 

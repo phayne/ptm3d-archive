@@ -2032,9 +2032,36 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // local_refresh_fraction_ x threshold are rescaled (and re-based); the rest
         // keep their temperatures, which stay within the threshold by construction.
         const double rescale_min = localRefreshEnabled() ? local_refresh_fraction_ * threshold : 0.0;
-        const AlbedoRefreshResult r = albedo_refresh_.update(current_face_albedos_,
-                                                             surface_temperatures_, threshold, rescale_min);
+        AlbedoRefreshResult r;
+        if (diurnal_albedo_response_) {
+            // --albedo-response diurnal: recompute T(t) from the thermal run's own curve
+            // against the albedo it corresponds to (non-cumulative).
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t nt = surface_temperatures_.empty() ? 0 : surface_temperatures_[0].size();
+            r = albedo_refresh_.updateWith(current_face_albedos_, surface_temperatures_.size(), threshold,
+                                           rescale_min, [&](size_t f, double a_new) -> bool {
+                const double a_ref = diurnal_reference_albedo_[f];
+                if (1.0 - a_ref < 1e-10 || !(1.0 - a_new > 0.0)) return false;
+                const double ratio = (1.0 - a_new) / (1.0 - a_ref);
+                const float* T0 = &diurnal_T0_[f * nt];
+                std::vector<double>& T = surface_temperatures_[f];
+                if (diurnal_fallback_[f]) {
+                    const double s = std::pow(ratio, 0.25);
+                    for (size_t t = 0; t < nt; ++t) T[t] = static_cast<double>(T0[t]) * s;
+                } else {
+                    const float* g1 = &diurnal_g1_[f * nt];
+                    const float* g2 = &diurnal_g2_[f * nt];
+                    for (size_t t = 0; t < nt; ++t)
+                        T[t] = diurnalResponseTemperature(static_cast<double>(T0[t]), g1[t], g2[t], ratio);
+                }
+                return true;
+            });
+            diurnal_apply_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        } else {
+            r = albedo_refresh_.update(current_face_albedos_, surface_temperatures_, threshold, rescale_min);
+        }
         if (!r.fired) return false;
+        ++albedo_refreshes_fired_;
         max_refresh_deviation_ = std::max(max_refresh_deviation_, r.max_deviation);
 
         if (show_progress_) {
@@ -2045,7 +2072,9 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         }
         if (r.faces_singular > 0) {
             std::cerr << "WARNING: albedo coupling could not rescale " << r.faces_singular
-                      << " faces whose last-refresh albedo is ~1 (1 - A < 1e-10); their "
+                      << (diurnal_albedo_response_
+                              ? " faces whose reference or new albedo is ~1 (1 - A < 1e-10); their "
+                              : " faces whose last-refresh albedo is ~1 (1 - A < 1e-10); their ")
                       << "temperatures and baseline are unchanged" << std::endl;
         }
         return true;
@@ -3487,7 +3516,15 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 file << "  Ice endmember: " << acfg.albedo_ice << "\n";
                 file << "  Non-ice endmember: " << acfg.albedo_nonice << "\n";
             }
-            file << "  Temperature refreshes: " << stats.albedo_temp_refreshes << "\n\n";
+            file << "  Temperature refreshes: " << stats.albedo_temp_refreshes << "\n";
+            // Written only in the diurnal mode, so a --albedo-response rescale summary
+            // stays identical to the legacy one (the run log names the law either way).
+            if (diurnal_albedo_response_) {
+                std::ostringstream o;
+                o << std::fixed << std::setprecision(1) << diurnal_apply_seconds_;
+                file << diurnal_response_report_ << "    Applied at the refreshes in " << o.str() << " s\n";
+            }
+            file << "\n";
         }
         if (!fill_contribution_report_.empty()) {
             file << "Map-fill faces (reported separately; no valid map albedo):\n"

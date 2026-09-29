@@ -8,6 +8,7 @@ cmake_minimum_required(VERSION 3.12)
 add_library(exosphere_core STATIC
     exosphere_physics.cpp
     ptm_exosphere_integration.cpp
+    ptm_exosphere_albedo_response.cpp
     sputtering_model.cpp
 )
 
@@ -151,6 +152,7 @@ target_include_directories(ptm_exosphere PRIVATE
 target_link_libraries(ptm_exosphere
     PRIVATE
     exosphere_core
+    thermal          # --albedo-response diurnal: the thermal engine's depth grid
     mesh_utils
     fileio
     constants
@@ -458,6 +460,21 @@ if(OpenMP_CXX_FOUND)
     endif()
 endif()
 set_target_properties(test_albedo_refresh
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# --albedo-response diurnal unit test (always build; header-only code under test,
+# exit code 0 = pass): the diurnal-shape response against an independent nonlinear
+# periodic column, and AlbedoRefreshTracker::updateWith.
+add_executable(test_diurnal_albedo_response
+    test_diurnal_albedo_response.cpp
+)
+target_include_directories(test_diurnal_albedo_response PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/cpp
+)
+target_compile_features(test_diurnal_albedo_response PRIVATE cxx_std_17)
+set_target_properties(test_diurnal_albedo_response
     PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
