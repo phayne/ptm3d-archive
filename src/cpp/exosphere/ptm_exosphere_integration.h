@@ -218,10 +218,29 @@ namespace ptm {
             bool diurnal_albedo_response_ = false;
             std::vector<float> diurnal_T0_, diurnal_g1_, diurnal_g2_;
             std::vector<double> diurnal_reference_albedo_;
+            // PTM-675 trust region: the law is an expansion about an ANCHOR state (r_a,
+            // T_a(t), g1, g2), initially the thermal run itself (r_a = 1, T_a = T0). When
+            // |ln(r / r_a)| exceeds the trust radius the face is re-anchored by an exact
+            // periodic solve at r (solveDiurnalAnchor). Fs, Qir are kept for that.
+            std::vector<float> diurnal_Fs_, diurnal_Qir_, diurnal_Ta_;
+            std::vector<double> diurnal_ra_;
+            std::vector<double> diurnal_fail_ratio_;   // ratio of the last failed re-anchor (0 = none)
+            long long diurnal_reanchor_failures_reported_ = 0;
+            ThermalColumn diurnal_column_;
+            DiurnalResponseOptions diurnal_options_;
+            double diurnal_trust_ = 0.35;
+            long long diurnal_reanchors_ = 0, diurnal_reanchor_failures_ = 0;
+            std::vector<char> diurnal_reanchored_;     // face ever re-anchored
+            double diurnal_max_abs_log_r_ = 0.0, diurnal_reanchor_seconds_ = 0.0;
+            bool diurnal_reanchor_warned_ = false;
             std::vector<char> diurnal_fallback_;       // 1 = no response: 1/4-power law from T0
             std::string diurnal_response_report_;      // evolution_summary lines
             double diurnal_apply_seconds_ = 0.0;
             long long albedo_refreshes_fired_ = 0;
+
+            // PTM-675: re-anchor face f at absorbed-solar ratio `ratio` (thread-safe; called
+            // from the parallel refresh loop). On failure the old anchor is kept and counted.
+            void reanchorDiurnalFace(size_t f, double ratio);
 
             // Albedo coupling internal methods
             double updateAlbedoFromComposition();
@@ -271,6 +290,8 @@ namespace ptm {
             double sputter_transport_seconds_ = 0.0; // sputtered-H2O transport, either path
             void applyRepresentedSourceTotals();
             int max_superstep_epochs_ = 0;                  // 0 = no cap
+            double garden_subcycle_kappa_ = 0.1;            // PTM-676 (0 = off)
+            int garden_subcycle_cap_ = 1024;
 
             // Lag-layer diffusion barrier (multiscale; see LagBarrierConfig in ice_layer_model.h).
             LagBarrierConfig lag_cfg_;
@@ -599,6 +620,10 @@ namespace ptm {
             bool prepareDiurnalAlbedoResponse(const ThermalColumn& column, const std::string& thermal_dir,
                                               const DiurnalResponseOptions& options);
             bool diurnalAlbedoResponseActive() const { return diurnal_albedo_response_; }
+            /** PTM-675: trust radius in |ln(r / r_a)| (0 = never re-anchor: the 65cd8c5 law). */
+            void setDiurnalTrustRadius(double t) { diurnal_trust_ = t; }
+            /** PTM-676: garden-step subcycling kappa (0 = off) and substep cap. */
+            void setGardenSubcycle(double kappa, int cap) { garden_subcycle_kappa_ = kappa; garden_subcycle_cap_ = cap; }
             bool loadThermalAlbedoMap(const std::string& path);
             const std::vector<double>& getThermalFaceAlbedos() const { return thermal_face_albedos_; }
             /** Per-face albedo the current temperature array corresponds to. */

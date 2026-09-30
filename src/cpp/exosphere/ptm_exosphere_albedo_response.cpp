@@ -177,6 +177,13 @@ bool PTMExosphereIntegration::prepareDiurnalAlbedoResponse(const ThermalColumn& 
     diurnal_g1_.assign(nf * ntu, 0.0f);
     diurnal_g2_.assign(nf * ntu, 0.0f);
     diurnal_fallback_.assign(nf, 0);
+    diurnal_Fs_.assign(nf * ntu, 0.0f);
+    diurnal_Qir_.assign(nf * ntu, 0.0f);
+    diurnal_ra_.assign(nf, 1.0);
+    diurnal_fail_ratio_.assign(nf, 0.0);
+    diurnal_reanchored_.assign(nf, 0);
+    diurnal_column_ = column;
+    diurnal_options_ = options;
     std::vector<float> balance(nf, 0.0f);
     std::vector<char> warm(nf, 0);
     size_t n_bad_albedo = 0, n_failed = 0;
@@ -213,9 +220,15 @@ bool PTMExosphereIntegration::prepareDiurnalAlbedoResponse(const ThermalColumn& 
                 continue;
             }
             diurnalLogCoefficients(T0.data(), s1.data(), s2.data(), nt, &diurnal_g1_[f * ntu], &diurnal_g2_[f * ntu]);
+            for (size_t t = 0; t < ntu; ++t) {
+                diurnal_Fs_[f * ntu + t] = static_cast<float>(fs[t]);
+                diurnal_Qir_[f * ntu + t] = static_cast<float>(qi[t]);
+            }
             balance[f] = static_cast<float>(inf.balance_rms / std::max(1e-30, inf.balance_scale));
         }
     }
+
+    diurnal_Ta_ = diurnal_T0_;   // the first anchor is the thermal run itself (r_a = 1)
 
     // Energy-balance check: does this column reproduce the thermal run?
     std::vector<float> b_all, b_warm;
@@ -253,7 +266,9 @@ bool PTMExosphereIntegration::prepareDiurnalAlbedoResponse(const ThermalColumn& 
         << "    Energy balance of the thermal run on this column (rms / flux scale): median " << b_med
         << ", p99 " << b_p99 << ", max on T_max > 110 K faces " << bw_max << " (limit: median 0.015)\n"
         << "    Faces on the 1/4-power law (no response): " << (n_bad_albedo + n_failed) << " (thermal albedo "
-        << "outside [0, 1): " << n_bad_albedo << "; periodic solve failed: " << n_failed << ")\n";
+        << "outside [0, 1): " << n_bad_albedo << "; periodic solve failed: " << n_failed << ")\n"
+        << "    Trust region (PTM-675): re-anchor by an exact periodic solve when |ln(r / r_anchor)| > "
+        << diurnal_trust_ << (diurnal_trust_ > 0.0 ? "" : " (OFF: the 65cd8c5 law at every r)") << "\n";
     diurnal_response_report_ = rep.str();
     std::cout << "\nAlbedo response:\n" << diurnal_response_report_ << std::flush;
 
@@ -274,6 +289,45 @@ bool PTMExosphereIntegration::prepareDiurnalAlbedoResponse(const ThermalColumn& 
     }
     diurnal_albedo_response_ = true;
     return true;
+}
+
+void PTMExosphereIntegration::reanchorDiurnalFace(size_t f, double ratio) {
+    const auto t_start = std::chrono::steady_clock::now();
+    const size_t nt = surface_temperatures_[f].size();
+    thread_local DiurnalResponseWorkspace ws;
+    thread_local std::vector<double> T0, Fs, Qi, guess, out;
+    thread_local std::vector<float> g1, g2;
+    T0.resize(nt); Fs.resize(nt); Qi.resize(nt); guess.resize(nt); out.resize(nt); g1.resize(nt); g2.resize(nt);
+    const double rel = ratio / diurnal_ra_[f];
+    for (size_t t = 0; t < nt; ++t) {
+        T0[t] = diurnal_T0_[f * nt + t];
+        Fs[t] = diurnal_Fs_[f * nt + t];
+        Qi[t] = diurnal_Qir_[f * nt + t];
+        // Newton start: the current anchor's own law at this ratio.
+        guess[t] = diurnalResponseTemperature(static_cast<double>(diurnal_Ta_[f * nt + t]),
+                                              diurnal_g1_[f * nt + t], diurnal_g2_[f * nt + t], rel);
+    }
+    DiurnalAnchorInfo ai;
+    const bool ok = solveDiurnalAnchor(diurnal_column_, T0.data(), Fs.data(), Qi.data(), static_cast<int>(nt), ratio,
+                                       guess.data(), diurnal_options_, ws, out.data(), g1.data(), g2.data(), &ai);
+    if (ok) {
+        for (size_t t = 0; t < nt; ++t) {
+            diurnal_Ta_[f * nt + t] = static_cast<float>(out[t]);
+            diurnal_g1_[f * nt + t] = g1[t];
+            diurnal_g2_[f * nt + t] = g2[t];
+        }
+        diurnal_ra_[f] = ratio;
+        diurnal_reanchored_[f] = 1;
+        #pragma omp atomic
+        ++diurnal_reanchors_;
+    } else {
+        diurnal_fail_ratio_[f] = ratio;   // do not retry until r moves by another trust radius
+        #pragma omp atomic
+        ++diurnal_reanchor_failures_;
+    }
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    #pragma omp atomic
+    diurnal_reanchor_seconds_ += sec;
 }
 
 }  // namespace exosphere

@@ -315,6 +315,8 @@ $$\ln T(i,t) = \ln T_0(i,t) + \xi \thinspace g_1(i,t) + \tfrac{1}{2}\xi^2 g_2(i,
 
 This is the same second-order expansion, but it reproduces the radiative-equilibrium limit ($g_1 = 1/4$, $g_2 = 0$, i.e. Equation D27) exactly for any $r$. Every refresh evaluates D27b from the thermal run's own $T_0$, so nothing accumulates across refreshes. We compared it against true thermal re-solves on the evolved albedo map (Europa albedo-map BASE, phase 0, 50 kyr to 1 Myr). At 1 Myr, the 95th-percentile peak-temperature error falls from 1.22 K (Equation D27) to 0.011 K, and the global Hertz-Knudsen sublimation bias falls from −16.0% to +0.11%. `--albedo-response rescale` restores Equation D27.
 
+Equation D27b is an expansion about the thermal run's own state. Where a face's ratio has moved far from 1 (production reaches $r \approx 3$), the engine re-anchors it once $|\ln(r/r_a)| > 0.35$. The new anchor comes from an exact periodic solve of the same column at the current $r$, and D27b then continues about that anchor. This keeps the peak-temperature error at or below 0.1 K and the HK bias at or below 1% up to $r = 3.1$ (PTM-675).
+
 The thermal segregation feedback is self-reinforcing: darker surfaces absorb more sunlight, sublimate faster, concentrate more non-ice material, and darken further. This runaway process is ultimately limited by either complete ice depletion ($c = 1$) or by deposition of fresh ice from colder regions. The competition between these effects determines the steady-state spatial pattern of ice and lag deposits.
 
 ### D.6.5 Lag-Layer Diffusion Barrier

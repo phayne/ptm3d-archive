@@ -32,6 +32,14 @@
  * the radiative-equilibrium limit (g1 = 1/4, g2 = 0) is reproduced EXACTLY for any
  * r. The legacy rescale is therefore the special case g1 = 1/4, g2 = 0.
  *
+ * TRUST REGION (PTM-675). The expansion is about the thermal run's own state and
+ * was validated to |ln r| ~ 0.4; production reaches r ~ 3 (|ln r| 1.1), where it runs
+ * +0.5 K / +15% HK warm. The engine therefore treats it as an expansion about an
+ * ANCHOR (r_a, T_a, g1, g2): once |ln(r / r_a)| exceeds the trust radius (0.35), the
+ * face is re-anchored at its current r by solveDiurnalAnchor(), an exact periodic
+ * solve of the same column, and the law continues from there. Worst-point errors
+ * against true re-solves at r = 2-3: peak-T p95 <= 0.1 K, HK <= 1%.
+ *
  * The base state T0(z, t) the linearization needs is reconstructed per face by
  * driving the same column with the thermal run's own surface temperature
  * (Dirichlet) for `base_cycles` periods; only the material properties are read
@@ -99,6 +107,24 @@ struct ThermalColumn {
 struct DiurnalResponseOptions {
     int substeps = 4;       // conduction substeps per output interval
     int base_cycles = 3;    // Dirichlet base-state reconstruction periods
+};
+
+/**
+ * Optional variations of one computeDiurnalAlbedoResponse() call, used by the
+ * re-anchoring Newton solve (solveDiurnalAnchor). The default is the plain
+ * response and leaves that path unchanged.
+ */
+struct DiurnalSolveRequest {
+    // Surface-row forcing of the first-order solve at every substep level
+    // (nt * substeps + 1 values). Null: interp(Fs), i.e. S1.
+    const double* surf_levels = nullptr;
+    bool want_s2 = true;               // false: skip S2 (S2 is set to 0)
+    bool residual_only = false;        // stop after the base state (and the residual below)
+    // Out: Fs + Qir + k dT/dz|0 - eps sigma T^4 of the base state at every level.
+    std::vector<double>* residual_levels = nullptr;
+    // Newton: force the first-order solve with (residual - residual_target) at every
+    // level, i.e. solve for the surface correction that zeroes it (needs residual_levels).
+    const double* residual_target = nullptr;
 };
 
 /** Per-face diagnostics. */
@@ -179,7 +205,8 @@ inline void denseLuSolve(const std::vector<double>& LU, const std::vector<int>& 
 inline bool computeDiurnalAlbedoResponse(const ThermalColumn& col, const double* T0, const double* Fs,
                                          const double* Qir, int nt, const DiurnalResponseOptions& opt,
                                          DiurnalResponseWorkspace& w, double* S1, double* S2,
-                                         DiurnalResponseFaceInfo* info = nullptr) {
+                                         DiurnalResponseFaceInfo* info = nullptr,
+                                         const DiurnalSolveRequest& req = DiurnalSolveRequest()) {
     const size_t N = col.layers();
     const size_t Ni = N - 2;                         // interior (state) nodes
     const size_t E = N - 1;                          // interfaces
@@ -276,6 +303,16 @@ inline bool computeDiurnalAlbedoResponse(const ThermalColumn& col, const double*
         inf.balance_rms = std::sqrt(ss / static_cast<double>(ntu));
         inf.balance_scale = scale;
     }
+    if (req.residual_levels) {
+        req.residual_levels->resize(L);
+        for (size_t s = 0; s < L; ++s) {
+            const double* Tz = &w.Tb[s * N];
+            const double q = interp(Fs, s) + (Qir ? interp(Qir, s) : 0.0);
+            (*req.residual_levels)[s] = q + kOf(0, Tz[0]) * (Tz[1] - Tz[0]) / dz[0]
+                                        - es * Tz[0] * Tz[0] * Tz[0] * Tz[0];
+        }
+    }
+    if (req.residual_only) return true;
 
     // ---------------------------------------------------------------------------
     // 2. Per-level linearization coefficients on the base state.
@@ -379,7 +416,11 @@ inline bool computeDiurnalAlbedoResponse(const ThermalColumn& col, const double*
     const size_t nc = Ni + 1;
     w.X.assign(N * nc, 0.0);
     for (size_t k = 0; k < Ni; ++k) w.X[(k + 1) * nc + k] = 1.0;
-    auto surf1 = [&](size_t s, size_t k) { return (k == Ni) ? interp(Fs, s) : 0.0; };
+    auto force1 = [&](size_t s) {
+        if (req.residual_target) return (*req.residual_levels)[s] - req.residual_target[s];
+        return req.surf_levels ? req.surf_levels[s] : interp(Fs, s);
+    };
+    auto surf1 = [&](size_t s, size_t k) { return (k == Ni) ? force1(s) : 0.0; };
     completeBoundary(w.X.data(), nc, 0, surf1, zero2);
     for (size_t s = 0; s < nsteps; ++s) step(w.X, nc, s, surf1, zero2, zero3, zero3);
     w.IM.resize(Ni * Ni); w.b1.resize(Ni); w.b2.resize(Ni);
@@ -396,7 +437,7 @@ inline bool computeDiurnalAlbedoResponse(const ThermalColumn& col, const double*
     //    periodic state, and the output march.
     // ---------------------------------------------------------------------------
     w.S1t.resize(L * N);
-    auto surfS = [&](size_t s, size_t) { return interp(Fs, s); };
+    auto surfS = [&](size_t s, size_t) { return force1(s); };
     w.Y.assign(N, 0.0);
     for (size_t i = 0; i < Ni; ++i) w.Y[i + 1] = w.b1[i];
     completeBoundary(w.Y.data(), 1, 0, surfS, zero2);
@@ -406,6 +447,10 @@ inline bool computeDiurnalAlbedoResponse(const ThermalColumn& col, const double*
         std::copy(w.Y.begin(), w.Y.end(), w.S1t.begin() + (s + 1) * N);
     }
     const double* S1t = w.S1t.data();
+    if (!req.want_s2) {
+        for (size_t t = 0; t < ntu; ++t) { S1[t] = S1t[t * ns * N]; S2[t] = 0.0; }
+        return true;
+    }
     auto F2 = [&](size_t s, size_t i) {
         const double u = S1t[s * N + i], v = S1t[s * N + i + 1];
         return w.Fuu[s * E + i] * u * u + 2.0 * w.Fuv[s * E + i] * u * v;
@@ -457,6 +502,79 @@ inline void diurnalLogCoefficients(const double* T0, const double* S1, const dou
 inline double diurnalResponseTemperature(double T0, float g1, float g2, double r) {
     const double xi = std::log(r);
     return T0 * std::exp(xi * (static_cast<double>(g1) + 0.5 * xi * static_cast<double>(g2)));
+}
+
+/** Base-state reconstruction cycles of the re-anchoring solves (see solveDiurnalAnchor). */
+constexpr int kDiurnalAnchorBaseCycles = 16;
+
+/** Per-anchor diagnostics of solveDiurnalAnchor(). */
+struct DiurnalAnchorInfo {
+    bool ok = false;
+    int iterations = 0;          // Newton iterations used
+    double last_step_K = 0.0;    // max |correction| of the last iteration
+};
+
+/**
+ * RE-ANCHORING (large r; PTM-675). The second-order law is an expansion about the thermal
+ * run's own state and degrades as |ln r| grows (validated to |ln r| ~ 0.4). This
+ * solves the periodic problem EXACTLY at the absorbed-solar ratio r, on the same
+ * column, and returns the new base curve with the log coefficients about it; the
+ * caller then applies T = T_a exp(xi' g1 + xi'^2/2 g2), xi' = ln(r'/r).
+ *
+ * The equation solved is  residual(T; r) = residual(T0; 1)  at every substep
+ * level, where residual = r Fs + Qir + k dT/dz|0 - eps sigma T^4 on the base state
+ * reconstructed from the surface curve. The right side is the thermal run's own
+ * residual on this column (the engine/column discretization mismatch, ~0.6% of the
+ * flux scale), so the solution reproduces T0 EXACTLY at r = 1 and the mismatch
+ * cancels in T(r) - T0. Newton: each iteration solves the periodic tangent problem
+ * forced by the residual difference (one call). Starts from T_guess (e.g. the law's
+ * own prediction), so it converges in ~2 iterations.
+ */
+inline bool solveDiurnalAnchor(const ThermalColumn& col, const double* T0, const double* Fs,
+                               const double* Qir, int nt, double r, const double* T_guess,
+                               const DiurnalResponseOptions& opt, DiurnalResponseWorkspace& w,
+                               double* T_out, float* g1, float* g2, DiurnalAnchorInfo* ai = nullptr,
+                               int max_iter = 12, double tol_K = 1e-5) {
+    DiurnalAnchorInfo local;
+    DiurnalAnchorInfo& info = ai ? *ai : local;
+    info = DiurnalAnchorInfo();
+    const size_t ntu = static_cast<size_t>(nt);
+    // Far from the thermal run the base state's deep mean moves by several K, and the
+    // slow deep mode of a 3-cycle Dirichlet reconstruction is not converged: its error
+    // enters the residual difference. The anchor solves use >= 16 cycles (measured on the
+    // unit-test column at r = 3: worst-point error 0.148 / 0.071 / 0.046 K at 3 / 8 / 16).
+    DiurnalResponseOptions aopt = opt;
+    aopt.base_cycles = std::max(opt.base_cycles, kDiurnalAnchorBaseCycles);
+    std::vector<double> res1, res, Fr(ntu), S1(ntu), S2(ntu);
+    DiurnalSolveRequest q0;
+    q0.residual_only = true;
+    q0.residual_levels = &res1;
+    if (!computeDiurnalAlbedoResponse(col, T0, Fs, Qir, nt, aopt, w, S1.data(), S2.data(), nullptr, q0))
+        return false;
+    for (size_t t = 0; t < ntu; ++t) { Fr[t] = r * Fs[t]; T_out[t] = T_guess[t]; }
+    for (int it = 0; it < max_iter; ++it) {
+        DiurnalSolveRequest q;
+        q.residual_levels = &res;
+        q.residual_target = res1.data();
+        q.want_s2 = false;
+        if (!computeDiurnalAlbedoResponse(col, T_out, Fr.data(), Qir, nt, aopt, w, S1.data(), S2.data(), nullptr, q))
+            return false;
+        double step = 0.0;
+        for (size_t t = 0; t < ntu; ++t) {
+            T_out[t] += S1[t];
+            step = std::max(step, std::abs(S1[t]));
+            if (!std::isfinite(T_out[t]) || !(T_out[t] > 0.0)) return false;
+        }
+        info.iterations = it + 1;
+        info.last_step_K = step;
+        if (step < tol_K) break;
+    }
+    if (!(info.last_step_K < tol_K)) return false;
+    if (!computeDiurnalAlbedoResponse(col, T_out, Fr.data(), Qir, nt, aopt, w, S1.data(), S2.data()))
+        return false;
+    diurnalLogCoefficients(T_out, S1.data(), S2.data(), nt, g1, g2);
+    info.ok = true;
+    return true;
 }
 
 }  // namespace exosphere

@@ -1966,6 +1966,8 @@ int main(int argc, char** argv)
     double albedo_refresh_fraction = 0.0;      // PTM-657 faces past this x threshold are rescaled
     std::string albedo_response = "diurnal";   // temperature law at an albedo refresh
     bool albedo_response_flag = false;         // --albedo-response given explicitly
+    double albedo_response_trust = 0.35;       // PTM-675 trust radius in |ln(r / r_anchor)|
+    double garden_subcycle_kappa = 0.1;        // PTM-676 garden-step subcycling (0 = off)
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
     // Lag-layer diffusion barrier (multiscale; on by default, --no-lag-barrier = legacy).
@@ -2120,6 +2122,20 @@ int main(int argc, char** argv)
             albedo_response_flag = true;
             if (albedo_response != "rescale" && albedo_response != "diurnal") {
                 std::cerr << "Error: --albedo-response must be rescale or diurnal" << std::endl;
+                return 1;
+            }
+        }
+        else if (a == "--albedo-response-trust" && i+1 < argc) {
+            albedo_response_trust = std::stod(argv[++i]);
+            if (!(albedo_response_trust >= 0.0 && albedo_response_trust <= 2.0)) {
+                std::cerr << "Error: --albedo-response-trust must be in [0, 2] (0 = never re-anchor)" << std::endl;
+                return 1;
+            }
+        }
+        else if (a == "--garden-subcycle-kappa" && i+1 < argc) {
+            garden_subcycle_kappa = std::stod(argv[++i]);
+            if (!(garden_subcycle_kappa >= 0.0 && garden_subcycle_kappa <= 1.0)) {
+                std::cerr << "Error: --garden-subcycle-kappa must be in [0, 1] (0 = off)" << std::endl;
                 return 1;
             }
         }
@@ -2412,6 +2428,15 @@ int main(int argc, char** argv)
             std::cout << "                         (exact only without thermal inertia; reproduces earlier products;\n";
             std::cout << "                         implied by --no-albedo-step-limit, --superstep-legacy-deposition\n";
             std::cout << "                         and --sputter-legacy-escape-only unless given)\n";
+            std::cout << "  --albedo-response-trust X  Diurnal law trust radius in |ln(r / r_anchor)| (default 0.35):\n";
+            std::cout << "                         beyond it a face is re-anchored by an exact periodic solve at its\n";
+            std::cout << "                         current r (PTM-675). 0 = never (the 65cd8c5 law, degrades above\n";
+            std::cout << "                         |ln r| ~ 0.4: +0.5 K and +15% HK at r ~ 3)\n";
+            std::cout << "  --garden-subcycle-kappa K  Garden mode: integrate a face whose box ice turns over within\n";
+            std::cout << "                         the step in substeps of at most K x its turnover time, with the\n";
+            std::cout << "                         gardening entrainment inside the step (default 0.1; 0 = off,\n";
+            std::cout << "                         the pre-PTM-676 single call, whose equilibrium on such faces\n";
+            std::cout << "                         depends on the super-step length)\n";
             std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
             std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
             std::cout << "  --no-lag-barrier       Legacy well-mixed layer: lost ice becomes non-ice volume and\n";
@@ -2848,6 +2873,7 @@ int main(int argc, char** argv)
                       << std::setprecision(6) << std::defaultfloat << (column.z[1] - column.z[0]) << " m, z_max "
                       << column.z.back() << " m, emissivity " << column.emissivity << ", Qb " << column.Qb
                       << " W/m^2, R350 " << column.R350 << ", period " << column.period_s << " s" << std::endl;
+            integrator.setDiurnalTrustRadius(albedo_response_trust);
             if (!integrator.prepareDiurnalAlbedoResponse(column, ptm_dir, ptm::exosphere::DiurnalResponseOptions())) {
                 std::cerr << "Error: the diurnal albedo response could not be built (see above)" << std::endl;
                 return 1;
@@ -2918,6 +2944,11 @@ int main(int argc, char** argv)
                       << "refresh (phase 0 cosine case: max non-ice 35.9% vs 18.2%)." << std::endl;
         }
         integrator.setMaxSuperstepEpochs(max_superstep_epochs);
+        integrator.setGardenSubcycle(garden_subcycle_kappa, 1024);
+        if (garden_subcycle_kappa == 0.0) {
+            std::cerr << "WARNING [PTM-676]: --garden-subcycle-kappa 0: garden-step subcycling OFF (pre-PTM-676; "
+                      << "exhausted-box faces then depend on the super-step length)" << std::endl;
+        }
         // Lag-layer diffusion barrier (default on). The legacy reproduction modes imply
         // --no-lag-barrier (they reproduce pre-fix products); say so.
         if (!no_lag_barrier && (superstep_legacy_deposition ||

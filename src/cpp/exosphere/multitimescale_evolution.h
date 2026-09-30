@@ -573,6 +573,67 @@ inline GardenFaceStep solveGardenFaceStep(double Js, double Jw, double Jr, doubl
 }
 
 /**
+ * PTM-676: one garden face over dt in nsub substeps (see
+ * MultiTimescaleConfig::garden_subcycle_kappa). Each substep is one
+ * solveGardenFaceStep() call; between substeps the gardening entrainment of the box
+ * growth ((1 - c0) rho dh of ice, c0 dh of non-ice) is added and the box composition
+ * (c, f, beta) is recomputed, so a face whose box turns over within the step follows
+ * its own time scale. Emission integrals are summed. N_end, M_end: the box after the
+ * step INCLUDING the entrainment (the single call leaves that to the caller).
+ */
+inline GardenFaceStep solveGardenFaceSubcycled(const IceLayerModel& m, double Js, double Jw, double Jr, double B,
+                                               double d0, double mf0, double M0, double N0, double f0, double beta0,
+                                               double c0, double t0, double dt, int nsub,
+                                               double& N_end, double& M_end) {
+    const auto& lc = m.getLagConfig();
+    const double phi = lc.lag_porosity, rho = layer_constants::ICE_DENSITY, ell = m.getLagBarrierLength();
+    const double vm = lc.gardening ? lc.gardening_rate : 0.0;
+    const double gv = lc.gardening ? rho * (1.0 - lc.lag_porosity) * lc.gardening_rate : 0.0;
+    double d = d0, mf = mf0, M = M0, N = N0, f = f0, beta = beta0, t = t0;
+    const int n = std::max(1, nsub);
+    const double h = dt / n;
+    GardenFaceStep out;
+    for (int k = 0; k < n; ++k) {
+        const GardenFaceStep s = solveGardenFaceStep(Js, Jw, Jr, B, d, mf, M, f, beta, ell, vm, gv, h, lc.sputter_shield);
+        out.sub_int += s.sub_int; out.sputw_int += s.sputw_int; out.sputr_int += s.sputr_int;
+        out.box_gain += s.box_gain;
+        out.regime_end = s.regime_end; out.absorbing = s.absorbing;
+        const double dh = lc.gardening ? lc.gardenBoxDepth(t + h) - lc.gardenBoxDepth(t) : 0.0;
+        N = std::max(0.0, N - (1.0 - phi) * (s.d_end - d)) + c0 * dh;
+        M = s.M_end + (1.0 - c0) * rho * dh;
+        d = s.d_end; mf = s.mf_end; t += h;
+        double c;
+        m.boxCompositionOf(N, M, c, f, beta);
+    }
+    out.d_end = d; out.mf_end = mf; out.M_end = M;
+    N_end = N; M_end = M;
+    return out;
+}
+
+/**
+ * PTM-676: substeps a frost-free face with box ice M needs over dt. Subcycling applies
+ * only where the single call is step-size dependent: the box gardening entrains more
+ * than kappa x M of ice within the step (S dt > kappa M, S = entrainment rate), which
+ * the single call books after the step while the loss runs through it. Such a face gets
+ * substeps of at most kappa x its turnover time M / max(|E_S - B|, S). A face that
+ * merely drains within the step is left to the single call (its closed form handles the
+ * depletion; its exposed fraction is held over the step, as before). 1 = single call.
+ */
+inline int gardenSubcycleSubsteps(double kappa, int cap, double M, double mf, double ES, double B, double S,
+                                  double dt, bool* capped = nullptr) {
+    if (capped) *capped = false;
+    if (!(kappa > 0.0) || !(dt > 0.0) || !(M > 0.0) || mf > 0.0) return 1;
+    if (!(S * dt > kappa * M)) return 1;
+    const double rate = std::max(std::abs(ES - B), S);
+    if (!(rate > 0.0)) return 1;
+    const double n = std::ceil(dt * rate / (kappa * M));
+    if (!(n > 1.0)) return 1;
+    const double c = static_cast<double>(std::max(1, cap));
+    if (capped) *capped = n > c;   // the substeps would have been longer than kappa x tau
+    return static_cast<int>(std::min<double>(n, c));
+}
+
+/**
  * Garden mode: instantaneous availabilities, the first instant of solveGardenFaceStep.
  * as: sublimation; apw, apr: the H2O-ejection and radiolytic parts; ap: the gross sputter
  * (w apw + (1 - w) apr, w = H2O share of the gross potential). Without a deposition value
@@ -659,6 +720,16 @@ struct MultiTimescaleConfig {
     // Upper bound on one super-step, in epochs (0 = none). Used for step-size
     // refinement checks; the physical bound is computeSafeEpochCount().
     int max_superstep_epochs = 0;
+
+    // PTM-676: garden-step subcycling. A frost-free face whose box gardening entrains
+    // more than kappa of its box ice within the step is integrated in substeps of at
+    // most kappa x its turnover time (tau = M / max(|E_S - B|, entrainment rate)), with
+    // the entrainment and the box composition (c, f, beta) updated between substeps.
+    // Without it the equilibrium of such a face depends on the super-step length (the
+    // entrainment is booked after the step while the loss runs through it).
+    // 0 = off (the pre-PTM-676 single call).
+    double garden_subcycle_kappa = 0.1;
+    int garden_subcycle_cap = 1024;
 
     // Constructor with defaults
     MultiTimescaleConfig() = default;
@@ -1222,6 +1293,10 @@ struct EvolutionStatistics {
     //   inventory_now - inventory_0 = entrained - (sublimated + sputtered - deposited).
     double garden_entrained_mass = 0.0;        // [kg]
     size_t garden_absorbing_faces = 0;         // last step: Spencer-absorbing d = 0 faces
+    // PTM-676 subcycling (commits only; the evaluate/predict passes repeat it)
+    long long garden_subcycled_face_steps = 0; // face-steps integrated in substeps
+    int garden_subcycle_max = 0;               // most substeps in one face-step
+    long long garden_subcycle_capped = 0;      // face-steps that hit the substep cap
 
     // Albedo coupling statistics
     double max_albedo_change = 0.0;       // [dimensionless] max albedo change this epoch
@@ -2100,6 +2175,38 @@ private:
                                    st.lag_exposed_fraction[i], st.lag_beta[i], m.getLagBarrierLength(),
                                    lc.gardening ? lc.gardening_rate : 0.0, gardenVeneerRate(m), dt, lc.sputter_shield);
     }
+    // ---- PTM-676: garden-step subcycling --------------------------------------
+    // Number of substeps face i needs over dt (1 = the plain single call).
+    int gardenSubcycleCount(const IceLayerModel& m, const IceLayerState& st, size_t i, double B,
+                            double dt, bool* capped = nullptr) const {
+        if (capped) *capped = false;
+        if (!(config_.garden_subcycle_kappa > 0.0)) return 1;
+        const DiurnalAverages& d = *diurnal_avg_;
+        const auto& lc = m.getLagConfig();
+        const double w = d.hasSputterSplit() ? d.sput_w[i] : 1.0;
+        const double Js = d.base_sublimation_flux[i], Jp = d.base_sputtering_flux[i], f = st.lag_exposed_fraction[i];
+        const double ap = (Js + (lc.sputter_shield ? w * Jp : 0.0)) * f;
+        const double pu = ((1.0 - w) * Jp + (lc.sputter_shield ? 0.0 : w * Jp)) * f;
+        const double ES = ap / (1.0 + st.lag_thickness[i] / m.getLagBarrierLength()) + pu;
+        double S = 0.0;
+        if (lc.gardening && st.box_c0.size() == num_faces_ && dt > 0.0) {
+            const double dh = lc.gardenBoxDepth(st.lag_time + dt) - lc.gardenBoxDepth(st.lag_time);
+            S = (1.0 - st.box_c0[i]) * layer_constants::ICE_DENSITY * dh / dt;
+        }
+        return gardenSubcycleSubsteps(config_.garden_subcycle_kappa, config_.garden_subcycle_cap,
+                                      st.substrate_ice[i], st.frost_veneer[i], ES, B, S, dt, capped);
+    }
+    GardenFaceStep gardenStepSubcycled(const IceLayerModel& m, const IceLayerState& st, size_t i, double B,
+                                       double dt, int nsub, double& N_end, double& M_end) const {
+        const DiurnalAverages& dv = *diurnal_avg_;
+        const double w = dv.hasSputterSplit() ? dv.sput_w[i] : 1.0;
+        const double Jp = dv.base_sputtering_flux[i];
+        return solveGardenFaceSubcycled(m, dv.base_sublimation_flux[i], w * Jp, (1.0 - w) * Jp, B,
+                                        st.lag_thickness[i], st.frost_veneer[i], st.substrate_ice[i],
+                                        st.box_nonice_volume[i], st.lag_exposed_fraction[i], st.lag_beta[i],
+                                        st.box_c0[i], st.lag_time, dt, nsub, N_end, M_end);
+    }
+
     double gardenDepAt(size_t i, const double* sc, bool two) const {
         const DiurnalAverages& d = *diurnal_avg_;
         return two ? d.base_deposition_sublimation_flux[i] * sc[0] + d.base_deposition_sputter_flux[i] * sc[1]
@@ -2111,7 +2218,12 @@ private:
         const DiurnalAverages& d = *diurnal_avg_;
         #pragma omp parallel for
         for (size_t i = 0; i < num_faces_; ++i) {
-            const GardenFaceStep st = gardenStepAt(ice_model, ice_state, i, gardenDepAt(i, sc, two), epoch_duration);
+            const double B = gardenDepAt(i, sc, two);
+            const int ns = gardenSubcycleCount(ice_model, ice_state, i, B, epoch_duration);
+            double Nx, Mx;
+            const GardenFaceStep st = (ns > 1)
+                ? gardenStepSubcycled(ice_model, ice_state, i, B, epoch_duration, ns, Nx, Mx)
+                : gardenStepAt(ice_model, ice_state, i, B, epoch_duration);
             const double g1 = (per_face && d.hasSputterSplit()) ? st.sputw_int * d.sput_tw[i]
                                                                 : st.sputw_int + st.sputr_int;
             step_buffers_.emit_sub[i] = st.sub_int / epoch_duration * face_areas[i];
@@ -2124,7 +2236,21 @@ private:
         const double phi = ice_model.getLagConfig().lag_porosity;
         #pragma omp parallel for
         for (size_t i = 0; i < num_faces_; ++i) {
-            const GardenFaceStep st = gardenStepAt(ice_model, ice_state, i, gardenDepAt(i, s, two), epoch_duration);
+            const double B = gardenDepAt(i, s, two);
+            const int ns = gardenSubcycleCount(ice_model, ice_state, i, B, epoch_duration);
+            if (ns > 1) {
+                // The subcycled face's predicted c includes the step's entrainment: that is
+                // its actual step (PTM-676). The single call below leaves it out as before;
+                // for those faces the entrainment is < kappa of their box ice.
+                double Nx, Mx;
+                const GardenFaceStep sx = gardenStepSubcycled(ice_model, ice_state, i, B, epoch_duration, ns, Nx, Mx);
+                double c, fx, bx;
+                ice_model.boxCompositionOf(Nx, Mx, c, fx, bx);
+                c_out[i] = c;
+                if (d_out) (*d_out)[i] = sx.d_end;
+                continue;
+            }
+            const GardenFaceStep st = gardenStepAt(ice_model, ice_state, i, B, epoch_duration);
             const double N = ice_state.box_nonice_volume[i] - (1.0 - phi) * (st.d_end - ice_state.lag_thickness[i]);
             const double V = std::max(0.0, N) + st.M_end / layer_constants::ICE_DENSITY;
             c_out[i] = (V > 0.0) ? std::clamp(std::max(0.0, N) / V, 0.0, 1.0) : 1.0;
@@ -2152,23 +2278,39 @@ private:
             const double t0 = ice_state.lag_time, t1 = t0 + epoch_duration;
             const double dh = lc.gardenBoxDepth(t1) - lc.gardenBoxDepth(t0);   // entrained column [m]
             const double phi = lc.lag_porosity, rho = layer_constants::ICE_DENSITY;
-            #pragma omp parallel for
+            long long sub_n = 0, sub_capped = 0;
+            int sub_max = 0;
+            #pragma omp parallel for reduction(+:sub_n,sub_capped) reduction(max:sub_max)
             for (size_t i = 0; i < num_faces_; ++i) {
                 const double deposition = dep_at(i, s);
                 const double avail_before = ice_model.getSublimationAvailability(ice_state, i);
                 const double inv_before = ice_state.substrate_ice[i] + ice_state.frost_veneer[i];
                 const double d_before = ice_state.lag_thickness[i];
-                const GardenFaceStep st = gStep(i, deposition);
+                // PTM-676: a face whose box turns over within the step is integrated in substeps
+                // (entrainment and box composition inside the step); every other face takes the
+                // single call exactly as before.
+                bool capped = false;
+                const int ns = gardenSubcycleCount(ice_model, ice_state, i, deposition, epoch_duration, &capped);
+                double N_sub = 0.0, M_sub = 0.0;
+                const GardenFaceStep st = (ns > 1)
+                    ? gardenStepSubcycled(ice_model, ice_state, i, deposition, epoch_duration, ns, N_sub, M_sub)
+                    : gStep(i, deposition);
+                if (ns > 1) { ++sub_n; sub_max = std::max(sub_max, ns); if (capped) ++sub_capped; }
                 const double sput_int = st.sputw_int + st.sputr_int;
                 ice_state.lag_thickness[i] = st.d_end;
                 ice_state.frost_veneer[i] = st.mf_end;
                 // Box: non-ice moves between box and lag with the lag; gardening entrains
                 // column material at the t = 0 composition c_0 (external supply, booked).
                 const double c0 = ice_state.box_c0[i];
-                ice_state.box_nonice_volume[i] = std::max(0.0,
-                    ice_state.box_nonice_volume[i] - (1.0 - phi) * (st.d_end - d_before)) + c0 * dh;
                 const double entrained = (1.0 - c0) * rho * dh;
-                ice_state.substrate_ice[i] = st.M_end + entrained;
+                if (ns > 1) {
+                    ice_state.box_nonice_volume[i] = N_sub;
+                    ice_state.substrate_ice[i] = M_sub;
+                } else {
+                    ice_state.box_nonice_volume[i] = std::max(0.0,
+                        ice_state.box_nonice_volume[i] - (1.0 - phi) * (st.d_end - d_before)) + c0 * dh;
+                    ice_state.substrate_ice[i] = st.M_end + entrained;
+                }
                 garden_entrained_[i] = entrained * face_areas[i];
                 ice_model.updateBoxComposition(ice_state, i);
                 ice_model.updateIceMass(ice_state, i);
@@ -2197,6 +2339,9 @@ private:
                 step_buffers_.inventory_err[i] = std::abs((inv_after - inv_before) - booked) * face_areas[i];
             }
             ice_state.lag_time = t1;
+            stats_.garden_subcycled_face_steps += sub_n;
+            stats_.garden_subcycle_capped += sub_capped;
+            stats_.garden_subcycle_max = std::max(stats_.garden_subcycle_max, sub_max);
             double inv = 0.0, ven = 0.0, dmax = 0.0, ent = 0.0;
             size_t over = 0;
             size_t rc[4] = {0, 0, 0, 0};

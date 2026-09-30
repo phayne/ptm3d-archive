@@ -519,6 +519,22 @@ public:
             : 0.0;
     }
 
+    /**
+     * updateBoxComposition() for a box that is not (yet) in the state: the same
+     * c, f, beta from its non-ice volume N [m³/m²] and ice M [kg/m²]. Used by the
+     * garden-step subcycling (PTM-676) between substeps. updateBoxComposition() is
+     * deliberately left as it was (its -ffast-math rounding is part of the byte
+     * gates); test_diurnal_albedo_response checks that the two agree.
+     */
+    void boxCompositionOf(double N, double M, double& c, double& f, double& beta) const {
+        const double V = N + M / layer_constants::ICE_DENSITY;
+        c = (V > 0.0) ? std::clamp(N / V, 0.0, 1.0) : 1.0;
+        f = (c >= 1.0) ? 0.0 : (exposed_area_grain_ratio_ > 0.0 ? exposedAreaFraction(1.0 - c) : 1.0 - c);
+        beta = (c > 0.0 && c < 1.0)
+            ? c / ((1.0 - c) * layer_constants::ICE_DENSITY * (1.0 - lag_config_.lag_porosity))
+            : 0.0;
+    }
+
     bool usesLagBarrier() const { return lag_enabled_; }
     const LagBarrierConfig& getLagConfig() const { return lag_config_; }
     double getLagBarrierLength() const { return lag_length_; }
