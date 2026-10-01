@@ -643,6 +643,35 @@ An end-to-end check ran a diurnal-mode engine to 50 kyr and re-solved the therma
 
 The Hertz-Knudsen proxy overstates how much the engine's sublimation changes. At 50 kyr the engine's global sublimation rose only 1.4% (84.2 → 85.4 kg/s), against about 10% predicted by the proxy, and the net loss did not change. The lag barrier and the exposed-ice throttle damp the response of the darkened faces (+5.7%). About 70% of the sublimation also comes from faces whose albedo barely moved. The two runs evolved to different states, so this comparison is indicative, not a fixed-state counterfactual.
 
+**Large r: the trust region (PTM-675).** The law above is an expansion about the thermal run's own state. It was validated up to |ln r| ≈ 0.4, but production reaches r ≈ 3 (|ln r| 1.1): HIGH albedo-map runs have about 9.5% of their area outside that range at 1 Myr. There the expansion runs warm. At r = 2.5–3.1 it gives +0.49 K at peak and +15% HK against true re-solves. The ¼-power law there is −6.5 K and −86%, so the darkening of such faces is real physics, which the ¼-power law was suppressing.
+
+The engine therefore treats the law as an expansion about an anchor (r_a, T_a(t), g1, g2), initially the thermal run itself. When a face's |ln(r/r_a)| exceeds `--albedo-response-trust` (default 0.35), the face is re-anchored at its current r:
+- An exact periodic Newton solve of the same column (`solveDiurnalAnchor`) finds the new base curve. The target is the thermal run's own energy-balance residual on the column, so the solve returns T0 exactly at r = 1 and the engine–column mismatch cancels.
+- New g1 and g2 are then computed about that curve.
+
+The worst point of the trust region was tested against two true re-solves (HIGH phase 0 at 1 Myr; HIGH phase 2 at 850 kyr):
+- r = 2–3.1: peak-T p95 at most 0.095 K and HK at most 0.94%, against 0.28–0.58 K and 7–16% for the untrusted law.
+- Brightening faces (r < 0.8): 0.020 K and −0.55%.
+
+Each re-anchor costs about 10 ms of one thread. Re-anchors are counted in the summary, and the first one prints a WARNING. `--albedo-response-trust 0` reproduces the 65cd8c5 law.
+
+**Garden-step subcycling (PTM-676).** In the refresh loop of the HIGH albedo-map phase-2 and phase-6 runs, one full refresh fired per step from about 500 kyr, triggered by two faces. The cause was not the temperature law. Those faces started as pure ice and had exhausted their gardening box: about 3e-5 kg/m² of ice remained, against 3.7e-8 m³/m² of non-ice. So their c and albedo are set by a flow-through balance of entrainment, deposition and sublimation that turns over within one epoch.
+
+The single `solveGardenFaceStep` call books the entrainment after the step while the loss runs through it. Such a face therefore reaches a step-size-dependent equilibrium: in the engine's own step code, A = 0.395 / 0.398 / 0.433 / 0.503 for 0.25-, 1-, 3- and 9-epoch steps. The global limiter's variable step pattern makes it hop between those equilibria, and every hop trips the 0.01 refresh threshold.
+
+A frost-free face whose box gardening entrains more than `--garden-subcycle-kappa` (default 0.1) of its box ice within the step is now integrated in substeps of at most κ × its turnover time. Entrainment and the box composition (c, f, β) are updated between substeps, and the evaluate, predict and commit passes all use the same integration.
+
+Effect on the emulated face under the engine-like step pattern:
+
+| | Refreshes in 20 kyr | Final A |
+|---|---|---|
+| Single call | 3,225 | 0.49 ± 0.013 |
+| Subcycled | 0 | 0.3953 (= the fine-step limit) |
+
+Under-relaxing the temperature update instead (a bracketed-secant damping) made the loop worse, with 3,730 refreshes, which confirms it is not a temperature-law limit cycle. Only 71–361 faces qualify late in the albedo-map runs, and none in the uniform set. Counts go to the summary, and hitting the 1,024-substep cap prints a WARNING. `--garden-subcycle-kappa 0` gives the single call.
+
+A face that merely drains within a step is left to the single call. Its closed form handles the depletion but holds its exposed fraction f over the step. That approximation is pre-existing and filed as PTM-677.
+
 Requirements and cost:
 
 - The thermal run must be the built-in Europa column (checked from `provenance.txt`), and its output window must be one uniform forcing period (checked from `time_steps.txt`).
@@ -894,6 +923,8 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--export-interval` $N$ | 100 | Export every $N$ epochs, plus the final state (0 = the final state only; earlier builds wrote nothing for 0). Snapshot $L$ is the state after exactly $L$ epochs ($t = L\,\Delta t_{\mathrm{epoch}}$); the last is labeled `--epochs`. `time_steps.txt` lists one time per snapshot (PTM-636; earlier builds wrote state fields after the epoch's super-step, up to one interval past the label, and omitted the final snapshot from `time_steps.txt`) |
 | `--max-superstep-epochs` $N$ | none | Cap one super-step at $N$ epochs (step-size refinement checks; the physical bound is the emission-weighted availability change) |
 | `--albedo-response` $L$ | `diurnal` | Temperature law at an albedo refresh: `diurnal` = the per-face diurnal-shape response of the thermal column (see *Diurnal-shape albedo response*); `rescale` = the legacy uniform ¼-power law (reproduces earlier products) |
+| `--albedo-response-trust` $X$ | 0.35 | Trust radius of the diurnal law in $|\ln(r/r_a)|$: beyond it a face is re-anchored by an exact periodic solve at its current $r$ (PTM-675). 0 = never (the 65cd8c5 law, which runs +0.5 K / +15% HK warm at $r \approx 3$) |
+| `--garden-subcycle-kappa` $K$ | 0.1 | Garden mode: a frost-free face whose box entrains more than $K$ of its ice within a step is integrated in substeps of at most $K$ × its turnover time (PTM-676). 0 = the single call, whose equilibrium on exhausted-box faces depends on the super-step length |
 | `--albedo-refresh-global` | off | Recompute the full diurnal cycle and transport, and rescale every face, at each albedo refresh (pre-PTM-657). By default the refresh is face-local in the transport: every face whose albedo moved is rescaled as before, the diurnal cycle is recomputed (cheap), and the transport is updated source by source from cached raw sums, only for the sources whose emission or temperature moved beyond the tolerance (see below). Implied by `--sputter-legacy-escape-only` |
 | `--albedo-refresh-fraction` $F$ | 0 | Face-local refresh: rescale only faces whose albedo deviation exceeds $F$ × `--albedo-update-threshold`. The default 0 rescales every face that moved, as the global refresh does; $F > 0$ is faster but re-bases faces at different times, face-scale jitter that the albedo feedback amplifies (PTM-658) |
 | `--albedo-refresh-tolerance` $\epsilon$ | $10^{-2}$ | Face-local refresh: sources left un-updated may differ from the current source field by at most $\epsilon$ of the total emission (emission change plus emission × relative temperature change) and $\epsilon$ of the total area in relative temperature change (0 = update every source that changed; with $F = 0$ this reproduces the global refresh) |

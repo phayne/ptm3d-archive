@@ -2049,14 +2049,41 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                     const double s = std::pow(ratio, 0.25);
                     for (size_t t = 0; t < nt; ++t) T[t] = static_cast<double>(T0[t]) * s;
                 } else {
+                    // PTM-675: outside the trust region of the current anchor, re-anchor by an
+                    // exact periodic solve at this ratio (the law is an expansion about the anchor).
+                    if (diurnal_trust_ > 0.0 && std::abs(std::log(ratio / diurnal_ra_[f])) > diurnal_trust_ &&
+                        (diurnal_fail_ratio_[f] == 0.0 ||
+                         std::abs(std::log(ratio / diurnal_fail_ratio_[f])) > diurnal_trust_))
+                        reanchorDiurnalFace(f, ratio);
+                    const float* Ta = &diurnal_Ta_[f * nt];
                     const float* g1 = &diurnal_g1_[f * nt];
                     const float* g2 = &diurnal_g2_[f * nt];
+                    const double rel = ratio / diurnal_ra_[f];
                     for (size_t t = 0; t < nt; ++t)
-                        T[t] = diurnalResponseTemperature(static_cast<double>(T0[t]), g1[t], g2[t], ratio);
+                        T[t] = diurnalResponseTemperature(static_cast<double>(Ta[t]), g1[t], g2[t], rel);
                 }
                 return true;
             });
             diurnal_apply_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            // PTM-675 diagnostics: the largest |ln r| now in use, and the re-anchoring.
+            for (size_t f = 0; f < diurnal_reference_albedo_.size(); ++f) {
+                const double a_ref = diurnal_reference_albedo_[f], a = albedo_refresh_.baseline()[f];
+                if (1.0 - a_ref > 1e-10 && 1.0 - a > 0.0)
+                    diurnal_max_abs_log_r_ = std::max(diurnal_max_abs_log_r_, std::abs(std::log((1.0 - a) / (1.0 - a_ref))));
+            }
+            if (diurnal_reanchors_ > 0 && !diurnal_reanchor_warned_) {
+                diurnal_reanchor_warned_ = true;
+                std::cerr << "WARNING [albedo-response]: first re-anchoring of the diurnal law: a face's absorbed-solar "
+                          << "ratio left the trust region |ln(r / r_anchor)| <= " << diurnal_trust_ << " (max |ln r| so far "
+                          << diurnal_max_abs_log_r_ << "); it is re-solved exactly there. Counts are in the run summary."
+                          << std::endl;
+            }
+            if (diurnal_reanchor_failures_ > diurnal_reanchor_failures_reported_) {
+                diurnal_reanchor_failures_reported_ = diurnal_reanchor_failures_;
+                std::cerr << "WARNING [albedo-response]: " << diurnal_reanchor_failures_ << " re-anchoring solves failed so "
+                          << "far; those faces keep their previous anchor (the law is then extrapolated beyond its trust "
+                          << "region) and are retried only after r moves by another trust radius" << std::endl;
+            }
         } else {
             r = albedo_refresh_.update(current_face_albedos_, surface_temperatures_, threshold, rescale_min);
         }
@@ -2339,6 +2366,8 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             config.flux_convergence_threshold = flux_convergence_threshold_;
         }
         config.max_superstep_epochs = max_superstep_epochs_;
+        config.garden_subcycle_kappa = garden_subcycle_kappa_;
+        config.garden_subcycle_cap = garden_subcycle_cap_;
         config.superstep_consistent_deposition = superstep_consistent_deposition_;
         if (sputtering_enabled_ && sputtering_model_ && !sputterTransportActive() &&
             config.superstep_consistent_deposition) {
@@ -3523,6 +3552,14 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                 std::ostringstream o;
                 o << std::fixed << std::setprecision(1) << diurnal_apply_seconds_;
                 file << diurnal_response_report_ << "    Applied at the refreshes in " << o.str() << " s\n";
+                size_t n_re = 0;
+                for (char c : diurnal_reanchored_) n_re += c ? 1 : 0;
+                std::ostringstream q;
+                q << std::defaultfloat << std::setprecision(4) << "    Re-anchoring (PTM-675): " << diurnal_reanchors_
+                  << " solves on " << n_re << " faces, " << diurnal_reanchor_failures_ << " failed; max |ln r| "
+                  << diurnal_max_abs_log_r_ << "; " << std::fixed << std::setprecision(1) << diurnal_reanchor_seconds_
+                  << " s (thread time)\n";
+                file << q.str();
             }
             file << "\n";
         }
@@ -3607,6 +3644,21 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
             file << "    Steps: " << stats.steps_evolved << "; solver evaluations "
                  << stats.step_solver_evaluations << ", max Newton iterations "
                  << stats.step_solver_max_iterations << "\n";
+            // PTM-676: written only when a face was subcycled, so a summary with no
+            // subcycled face is unchanged.
+            if (stats.garden_subcycled_face_steps > 0) {
+                std::ostringstream o;
+                o << "    Garden-step subcycling (PTM-676): " << stats.garden_subcycled_face_steps
+                  << " face-steps in substeps (max " << stats.garden_subcycle_max << " substeps; "
+                  << stats.garden_subcycle_capped << " at the cap " << garden_subcycle_cap_ << "; kappa "
+                  << garden_subcycle_kappa_ << ")\n";
+                file << o.str();
+                if (stats.garden_subcycle_capped > 0) {
+                    std::cerr << "WARNING [PTM-676]: " << stats.garden_subcycle_capped << " face-steps needed more than "
+                              << "the " << garden_subcycle_cap_ << "-substep cap; those faces were integrated in substeps "
+                              << "of more than kappa x their turnover time" << std::endl;
+                }
+            }
         }
         file << "\n";
 
