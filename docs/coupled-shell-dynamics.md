@@ -8,6 +8,14 @@
 > polar-wander dynamics follow OSPW Eqs. 2.11, 2.18, 3.8–3.10 and 5.39; and the
 > pole is seeded with a physical offset $\psi_0$. The inputs are also March-2026 PTM3D
 > products. Regenerate before quoting any value.
+>
+> **2026-10-05 dynamics changes** (Fermi review of the dynamic TPW runs; each has a test in
+> `src/python/tests/test_ojakangas_stevenson.py` and an option that restores the old path):
+> the pole step includes the tidal torque from Jupiter (`tidal_torque`); the ψ₀ seed also
+> fires on a saddle (`seed_rearm`); the shell relaxes on the Stefan time ρLb/q (`relaxation_mode`);
+> the sub-Jovian meridian can follow the minimum-moment axis (`meridian_mode`); and
+> `albedo_mode='split'` adds the exogenic/intrinsic albedo split (§1.1). With all four
+> switches on their old paths the 2026-10-05 `run_tpw.py` runs reproduce bit for bit.
 
 A time-stepping simulation that closes the loop between trailing-hemisphere darkening,
 3-D-thermal surface temperature, O&S equilibrium shell thickness, local thermal-diffusion
@@ -37,12 +45,14 @@ Each step:
    `b = ln(T_M/T_s) / [(2/a₁)D + (H/a₁)²]^{1/2}`, with $C_R = 0.5$
    (`ojakangas_stevenson.shell_thickness`; `--thickness-method exact` integrates the first
    integral of Eqs. 2.4/2.5 instead). D is re-rotated when the pole drifts.
-4. **Relax at the local thermal-diffusion timescale** —
-   `b ← b_eq + (b−b_eq)·e^{−dt/τ_diff}`, `τ_diff(θ,λ) = b²/κ`, `κ = k/(ρ c_p)`, `c_p = 90 + 7.49 T` J kg⁻¹ K⁻¹,
-   `k = a₁/T + a₀` at the surface temperature. This is a one-time-constant approximation: the
-   slowest conductive mode decays on b²/(π²κ), κ is largest at the cold surface, and latent
-   heat at the ice–ocean interface and lateral heat flow are neglected. With
-   `c_p = 90 + 7.49 T`, τ_diff ≈ 0.8–3 Myr for b ≈ 24 km (paper constants).
+4. **Relax at the local Stefan time** (default, `relaxation_mode='stefan'`) —
+   `b ← b_eq + (b−b_eq)·e^{−dt/τ}`, `τ(θ,λ) = ρ L b / q = ρ L b² / F`, with L the latent heat of
+   fusion and `F = a₁ ln(T_M/T_s) + a₀ (T_M − T_s)` the conductive flux integral: a thickness
+   anomaly decays only as fast as the basal flux imbalance can melt or freeze ice. τ ≈ 13 Myr for
+   b = 30 km (modern k = 651/T), consistent with OSPW's τ_th ~ 10⁷ yr. Not included: sensible heat
+   (≈ +40%) and the change of internal tidal heating with b.
+   `relaxation_mode='diffusive'` keeps the earlier `τ_diff = b²/κ`, `κ = k/(ρ c_p)`,
+   `c_p = 90 + 7.49 T`, which is 4–5× too fast (no latent heat).
 5. **Reorient (OSPW Eq. 5.39)** — the physical inertia tensor is the Eq. 2.18 bottom-loaded
    (buoyantly compensated, iceberg-effect) tensor of the thickness field plus, optionally
    (`--fossil hydrostatic`), the body-fixed hydrostatic fossil bulge of Eqs. 3.8–3.10. The pole
@@ -50,7 +60,16 @@ Each step:
    between the moment about the target (maximum) axis and the moment about the spin axis and
    `C_f` from Eq. 5.15. When the spin axis stops being the maximum-moment axis, the pole is
    given a physical offset ψ₀ (`--psi0`; default 0.1° ≈ 1.75 × 10⁻³ rad, Europa's predicted
-   forced obliquity, Bills 2005) instead of waiting for round-off.
+   forced obliquity, Bills 2005) instead of waiting for round-off. The seed applies whenever the
+   pole sits within ψ₀ of any non-maximum axis, a saddle included (`seed_rearm='any_axis'`); it
+   re-arms after the pole has moved ≥ max(1°, 5ψ₀), so repeated kicks cannot become a drift.
+   The torque includes the **tidal torque** −3n²(I_j − I_k) (OSPW Eqs. 5.19–5.21), so the
+   overdamped flow is `ṡ = (n²/C_f)[I s − (s·I s) s + 3 (e·I s) e]` (e = sub-Jovian direction):
+   a tilt toward Jupiter is resisted with stiffness 4n²(C − A) (Eqs. 5.26/5.38), a tilt toward
+   the trailing apex with n²(C − B). Integrated with RK4 substeps (`overdamped_step_tidal`).
+   The sub-Jovian meridian is body x projected into the equatorial plane
+   (`meridian_mode='projection'`), or the minimum-moment axis in that plane
+   (`'min_moment'`, quasi-static libration under the tidal torque).
 6. The darkening apex and tidal heating **rotate with the new pole**; repeat.
 
 `--albedo-mode static_map` replaces the darkening with a **body-fixed** albedo field (the measured
@@ -58,6 +77,21 @@ eq36 map, or the uniform control) that moves with the shell as the pole wanders.
 temperature is then `T = [(1−A)F_A(θ_t)/σ]^{1/4} + ΔT(θ_t,λ_t) + R(θ,λ)`, with ΔT from the eq36
 uniform fields (tidal frame) and R a body-fixed residual that reproduces the measured eq36 field
 at the initial pole (`forcing_file`, built by `build_forcing.py`).
+
+### 1.1 Split albedo (`albedo_mode='split'`)
+
+`A(x,t) = clamp(A_intr(x_body) + A_exo(x,t), 0.3814, 0.80)`, with
+`∂A_exo/∂t = [A_exo^eq(θ_t, λ_t) − A_exo]/τ_exo` (`tau_exo_yr`: 0 = instantaneous tidal frame,
+∞ = body-fixed). The exogenic template `A_exo^eq = c₁ cos γ` (γ = angle from the trailing apex)
+is the Burnett & Hayne (2021) / Nelson et al. (1986) form; it is north–south symmetric and fitted
+to the measured eq36 map at t = 0 (tidal frame = body frame); its constant goes to A_intr, so
+`A_intr = A_meas − A_exo^eq(t=0)` and the full split reproduces the measured map at t = 0.
+`split_component` selects full, exogenic only (A_intr = uniform A_unif) or intrinsic only.
+Options `exo_template='apex_l2'` (adds P₂(cos γ)) and `'bh2021_zonal'` (adds a spin-frame
+P₂(cos θ_t) latitude term, not exogenic in origin) are for sensitivity tests.
+See `ojakangas_stevenson/exogenic_albedo.py`. Initial-condition modes for the hypothesis test:
+`init_b_mode` `uniform_equilibrium` / `equilibrium` / `blend`, `init_l2_perturb_km`, and
+`init_pole_offset_deg`.
 
 **Multi-rate stepping** keeps the 100-Myr-class run tractable: a fine step (τ_dark/20) during the
 short darkening ramp, a coarse step afterward, and an **adaptive cap** that limits the pole rotation

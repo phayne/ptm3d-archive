@@ -157,6 +157,9 @@ def ice_heat_capacity(T):
     """cp(T) = 90 + 7.49 T [J/(kg K)] (heat1d planets.py Europa cpCoeff)."""
     return ICE_CP_COEFFS[0] + ICE_CP_COEFFS[1] * np.asarray(T, dtype=float)
 WATER_DENSITY = 1000.0      # Density of liquid water [kg/m^3]
+# Latent heat of fusion of ice Ih at 273 K [J/kg] (333.55 kJ/kg, e.g.
+# Petrenko & Whitworth 1999). Used by the Stefan-limited shell relaxation.
+ICE_LATENT_HEAT = 3.3355e5
 
 # --- Maxwell rheology parameters (Section 3) ---
 ICE_RIGIDITY = 4.0e9        # mu [Pa] (= 4e10 dyn/cm^2)

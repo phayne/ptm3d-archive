@@ -17,6 +17,10 @@ Contents
 * Eq. 5.29  I_0, Eq. 5.15 C_f, Eq. 5.32 (t/tau)_equil, Eq. 5.34 epsilon,
             Eq. 5.41 tau_f, Eq. 4.22 undamped time scale
 * Eq. 5.39  overdamped reorientation (``overdamped_step``)
+* Eqs. 5.19-5.21 / 5.26 / 5.38  the same with the tidal torque from Jupiter
+            (``overdamped_step_tidal``; stiffness 4 n^2 eps toward Jupiter),
+            and the quasi-static sub-Jovian meridian (``meridian_min_moment``)
+* Stefan-limited shell relaxation time rho L b / q (``stefan_relaxation_time``)
 
 Conventions: body frame x toward Jupiter (sub-Jovian point), z along the
 spin axis at the epoch the fossil froze. C20, C22 are unnormalized
@@ -357,3 +361,153 @@ def overdamped_step(spin, I_dev, cf, dt_s):
         'unstable': bool(a != len(vals) - 1),
     }
     return new, info
+
+
+def projected_meridian(spin, reference=(1.0, 0.0, 0.0)):
+    """Unit vector of ``reference`` projected into the plane perpendicular to spin.
+
+    The pre-2026-10-05 sub-Jovian meridian: the body x axis carried into the
+    current equatorial plane. Falls back to body y when spin ~ reference.
+    """
+    s = np.asarray(spin, dtype=float)
+    r = np.asarray(reference, dtype=float)
+    e = r - (r @ s) * s
+    n = np.linalg.norm(e)
+    if n < 1e-10:
+        e = np.array([0.0, 1.0, 0.0]) - s[1] * s
+        n = np.linalg.norm(e)
+    return e / n
+
+
+def meridian_min_moment(I_dev, spin, reference, rel_tol=1e-12):
+    """Sub-Jovian direction = minimum-moment axis in the plane perpendicular to spin.
+
+    In synchronous rotation the tidal torque -3 n^2 (I_j - I_k) (OSPW
+    Eqs. 5.19-5.21) turns the shell about its spin axis until the smallest
+    in-plane moment faces Jupiter (stiffness 3 n^2 (B - A)). This returns that
+    axis, assuming the libration about the spin axis is quasi-static.
+
+    ``reference`` fixes the sign (continuity with the previous meridian:
+    sub-Jovian vs anti-Jovian, hence which hemisphere trails) and is
+    returned (projected) when the in-plane moments are degenerate to
+    ``rel_tol`` of the largest tensor element.
+    """
+    s = np.asarray(spin, dtype=float)
+    u = projected_meridian(s, reference)
+    v = np.cross(s, u)
+    I = np.asarray(I_dev, dtype=float)
+    M = np.array([[u @ I @ u, u @ I @ v], [v @ I @ u, v @ I @ v]])
+    vals, vecs = np.linalg.eigh(M)
+    if vals[1] - vals[0] <= rel_tol * max(np.abs(I).max(), 1e-300):
+        return u
+    a, b = vecs[:, 0]
+    e = a * u + b * v
+    if e @ u < 0:
+        e = -e
+    return e / np.linalg.norm(e)
+
+
+def _tidal_rhs(s, I, k, meridian_fn):
+    """s_dot of the overdamped flow with centrifugal and tidal torques.
+
+    Torque on the shell (body frame), for spin s and sub-Jovian unit vector
+    e (perpendicular to s):  tau = n^2 (I s) x s - 3 n^2 (I e) x e
+    (OSPW Eqs. 5.19-5.21: the rotational potential -(n^2/2) s.I.s plus the
+    tidal potential (3 n^2/2) e.I.e). Overdamped, C_f omega = tau, and
+    s_dot = s x omega gives
+        s_dot = (n^2/C_f) [I s - (s.I s) s + 3 (e.I s) e].
+    """
+    e = meridian_fn(s)
+    Is = I @ s
+    return k * (Is - (s @ Is) * s + 3.0 * (e @ Is) * e)
+
+
+def overdamped_step_tidal(spin, I_dev, cf, dt_s, meridian_fn, max_growth=0.1):
+    """Overdamped reorientation (Eq. 5.39) WITH the tidal torque from Jupiter.
+
+    ``overdamped_step`` keeps only the rotational (centrifugal) torque, so a
+    tilt of the pole toward Jupiter is resisted with stiffness n^2 (C - A)
+    instead of the 4 n^2 (C - A) of OSPW Eqs. 5.26/5.38. Here the torque is
+    the full one (see ``_tidal_rhs``); the tilt toward the trailing apex
+    keeps stiffness n^2 (C - B) (the tidal term vanishes for it).
+
+    ``meridian_fn(s)`` returns the sub-Jovian unit vector for pole s
+    (``projected_meridian`` or a frozen ``meridian_min_moment``).
+
+    Integration: classical RK4 with substeps chosen so that the largest
+    possible growth factor per substep, 4 k (I_max - I_min) dt_sub, is
+    <= max_growth (k = n^2/C_f), and renormalization after each substep.
+    No closed form exists because e depends on s.
+
+    Returns (new_spin, info) like ``overdamped_step``.
+    """
+    k = C.MEAN_MOTION**2 / cf
+    I = np.asarray(I_dev, dtype=float)
+    vals, vecs = np.linalg.eigh(I)
+    spread = vals[-1] - vals[0]
+    n_sub = max(1, int(np.ceil(4.0 * k * spread * dt_s / max_growth)))
+    h = dt_s / n_sub
+    s = np.asarray(spin, dtype=float).copy()
+    rate0 = np.linalg.norm(_tidal_rhs(s, I, k, meridian_fn))
+    for _ in range(n_sub):
+        k1 = _tidal_rhs(s, I, k, meridian_fn)
+        k2 = _tidal_rhs(_unit(s + 0.5 * h * k1), I, k, meridian_fn)
+        k3 = _tidal_rhs(_unit(s + 0.5 * h * k2), I, k, meridian_fn)
+        k4 = _tidal_rhs(_unit(s + h * k3), I, k, meridian_fn)
+        s = _unit(s + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4))
+    c = vecs.T @ np.asarray(spin, dtype=float)
+    a = int(np.argmax(np.abs(c)))
+    info = {
+        'eigenvalues': vals,
+        'axes': vecs,
+        'i_axis': a,
+        'I_spin': float(vals[a]),
+        'I_target': float(vals[-1]) if a != len(vals) - 1 else float(vals[a]),
+        'psi_dot': float(rate0),
+        'unstable': bool(a != len(vals) - 1),
+        'n_substeps': n_sub,
+    }
+    return s, info
+
+
+def _unit(v):
+    return v / np.linalg.norm(v)
+
+
+def tidal_frame_t20_2t22(I_shell, spin, sub_jovian, p, cw=None):
+    """Thickness-equivalent t20 + 2 t22 [m] of a shell tensor in the tidal frame.
+
+    (I_trail - I_spin) of the Eq. 2.18 shell tensor, with trail = spin x
+    sub_jovian, divided by M a^2 C_2m(1 m). Equals the harmonic t20 + 2 t22
+    when the tidal frame is the body frame (I_yy - I_zz = M a^2 (C20 + 2 C22))
+    and is defined for any pole, so it tracks the quantity of the Eq. 3.12
+    test along a polar-wander path.
+    """
+    s = np.asarray(spin, dtype=float)
+    e = projected_meridian(s, sub_jovian)
+    tr = np.cross(s, e)
+    d = tr @ I_shell @ tr - s @ I_shell @ s
+    return d / (p.mass * p.radius**2 * shell_c2m(1.0, p, cw))
+
+
+def stefan_relaxation_time(b, T_s, T_m=None, latent_heat=None, density=None):
+    """Stefan-limited relaxation time of the shell thickness, tau = rho L b / q [s].
+
+    A thickness anomaly decays only as fast as the basal flux imbalance can
+    melt or freeze ice: rho L db/dt = q_cond(b) - q_in, with the conductive
+    flux of the k = a1/T + a0 shell q_cond = F/b, F = a1 ln(T_m/T_s) +
+    a0 (T_m - T_s). Linearized about equilibrium, dq/db = -q/b, so the
+    e-folding time is rho L b / q = rho L b^2 / F. For b = 30 km, T_s = 100 K
+    and the modern k = 651/T: ~13 Myr, consistent with OSPW's tau_th ~ 1e7 yr
+    (p. 261) and ~4-5x slower than the conductive b^2/kappa.
+
+    Not included (documented, not silent): sensible heat (the profile must
+    also re-equilibrate; adds ~c_p (T_m - T_s)/2 ~ 0.4 L), and the change
+    of internal tidal heating with b, which modifies dq/db.
+    """
+    T_m = C.T_MELT if T_m is None else T_m
+    L = C.ICE_LATENT_HEAT if latent_heat is None else latent_heat
+    rho = C.ICE_DENSITY if density is None else density
+    T_s = np.asarray(T_s, dtype=float)
+    F = C.A1_CONDUCTIVITY * np.log(T_m / T_s) + C.A0_CONDUCTIVITY * (T_m - T_s)
+    return rho * L * np.asarray(b, dtype=float) ** 2 / F

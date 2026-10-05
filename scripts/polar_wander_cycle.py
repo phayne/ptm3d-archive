@@ -113,6 +113,22 @@ class PolarWanderConfig:
     psi0_rad: float = PSI0_OBLIQUITY_RAD
     thickness_method: str = 'eq28'           # 'eq28' or 'exact' (shell_thickness)
     D_update_threshold_deg: float = 0.0      # recompute tidal heating when the pole moves
+    # --- 2026-10-05 dynamics fixes (Fermi review of the dynamic TPW runs) ---
+    # Tidal torque -3 n^2 (I_j - I_k) from Jupiter (OSPW Eqs. 5.19-5.21):
+    # stiffness 4 n^2 eps toward Jupiter (Eqs. 5.26/5.38). False = the
+    # pre-2026-10-05 rotational torque only (legacy reproduction).
+    tidal_torque: bool = True
+    # psi0 re-seeding: 'any_axis' = whenever the pole sits within psi0 of a
+    # principal axis that is not the max-moment axis (saddles included);
+    # 'max_axis' = the pre-2026-10-05 rule (re-armed only on the max axis,
+    # so a pole could park on a saddle).
+    seed_rearm: str = 'any_axis'
+    seed_rearm_deg: float = 1.0       # 'any_axis': re-arm after the pole moves this far
+    # Sub-Jovian meridian once the pole has moved: 'projection' = body x
+    # projected into the equatorial plane (pre-2026-10-05); 'min_moment' =
+    # the minimum-moment axis in the plane perpendicular to the spin
+    # (quasi-static libration under the tidal torque; Fermi's option).
+    meridian_mode: str = 'projection'
     # --- B&H interior coupling (coupled mode) ---
     interior_gamma: float = 28.0             # C_i / C_s
     interior_triaxiality: float = 1e-5       # (B_i-A_i)/C_i for rocky interior
@@ -270,13 +286,17 @@ def _solar_flux_for_spin_pole(theta, lam, spin_pole, flux_func):
     return flux_func(theta_spin)
 
 
-def _tidal_coordinates(theta, lam, spin_pole):
+def _tidal_coordinates(theta, lam, spin_pole, sub_jovian=None):
     """Convert body-frame (theta, lam) grid to tidal/spin-frame coordinates.
 
     The O&S tidal strain formulas use theta = colatitude from the spin axis
     and lam = longitude from the sub-Jovian meridian, both measured in the
     spin frame.  When the spin pole is not aligned with the body-frame z-axis
     (i.e. during TPW), the tidal coordinates differ from body-frame coordinates.
+
+    ``sub_jovian``: body-frame direction of Jupiter (perpendicular to the
+    spin; projected and normalized here). None = body x projected into the
+    equatorial plane (meridian_mode 'projection').
 
     Returns (theta_tidal, lam_tidal) 2D arrays on the body-frame grid.
     """
@@ -291,7 +311,8 @@ def _tidal_coordinates(theta, lam, spin_pole):
     theta_t = np.arccos(np.clip(cos_theta_t, -1.0, 1.0))
 
     # Sub-Jovian direction projected onto equatorial plane of spin pole
-    sub_j = np.array([1.0, 0.0, 0.0])
+    sub_j = (np.array([1.0, 0.0, 0.0]) if sub_jovian is None
+             else np.asarray(sub_jovian, dtype=float))
     e_sub = sub_j - np.dot(sub_j, s) * s
     norm = np.linalg.norm(e_sub)
     if norm < 1e-10:
@@ -334,14 +355,14 @@ def _flow_law_D_table(case):
     return _D_TABLES[key]
 
 
-def _build_dissipation_for_spin_pole(case, theta, lam, spin_pole):
+def _build_dissipation_for_spin_pole(case, theta, lam, spin_pole, sub_jovian=None):
     """Compute D(theta, lam) in body frame for given spin pole direction.
 
     Maps body-frame grid to tidal coordinates, evaluates tidal strain
     there, then returns D on the body-frame grid. Maxwell cases are evaluated
     analytically; flow-law cases are interpolated from a tidal-frame table.
     """
-    theta_t, lam_t = _tidal_coordinates(theta, lam, spin_pole)
+    theta_t, lam_t = _tidal_coordinates(theta, lam, spin_pole, sub_jovian)
     rheology, H = table1_case(case)
     if case.startswith('maxwell'):
         return dissipation_field(rheology, theta_t, lam_t), H
@@ -513,6 +534,23 @@ class ShellEvolution:
         self._D_spin_pole = self.spin_pole.copy()
         self._D_update_threshold_deg = cfg.D_update_threshold_deg
 
+        # Sub-Jovian meridian in the body frame (cfg.meridian_mode). In
+        # 'projection' mode it is only recorded; the tidal-frame helpers get
+        # None and project body x themselves (the pre-2026-10-05 path).
+        if cfg.meridian_mode not in ('projection', 'min_moment'):
+            raise ValueError(f'meridian_mode must be projection or min_moment: '
+                             f'{cfg.meridian_mode!r}')
+        if cfg.meridian_mode == 'min_moment' and not self._supports_meridian:
+            raise ValueError(f"meridian_mode='min_moment' is not implemented for "
+                             f"{type(self).__name__} (its albedo model ignores the meridian)")
+        if cfg.seed_rearm not in ('any_axis', 'max_axis'):
+            raise ValueError(f'seed_rearm must be any_axis or max_axis: {cfg.seed_rearm!r}')
+        if cfg.tpw_model == 'coupled' and cfg.tidal_torque:
+            print("  WARNING: tidal_torque is not implemented for tpw_model='coupled'; "
+                  "that mode keeps the rotational torque only")
+        self.sub_jovian = np.array([1.0, 0.0, 0.0])
+        self._D_sub_jovian = self.sub_jovian.copy()
+
         # OSPW parameters (b_c = initial mean thickness unless fixed in cfg)
         self._ospw_p = _ospw_params(cfg, _area_mean(self.b, self.theta, self.lam))
         # Fossil bulge: BODY-FIXED hydrostatic figure x (1 - C_w), OSPW
@@ -531,6 +569,7 @@ class ShellEvolution:
         # zero). Armed while the pole sits on the max-moment axis; fires once
         # when that axis loses its status. See _apply_psi0_seed.
         self._seed_armed = True
+        self._last_seed_pole = None
         self.seed_events = []
 
         # B&H interior coupling state
@@ -561,6 +600,26 @@ class ShellEvolution:
         self._record()
 
     # -- physics helpers ---------------------------------------------------
+    _supports_meridian = False
+
+    def _meridian_arg(self):
+        """Sub-Jovian vector for the tidal-frame helpers (None = projection)."""
+        return None if self.cfg.meridian_mode == 'projection' else self.sub_jovian
+
+    def _meridian_fn(self, I_total):
+        """meridian(s) used inside the tidal-torque integrator."""
+        if self.cfg.meridian_mode == 'projection':
+            return PW.projected_meridian
+        ref = self.sub_jovian.copy()
+        return lambda s: PW.meridian_min_moment(I_total, s, ref)
+
+    def _update_meridian(self, I_total):
+        if self.cfg.meridian_mode == 'min_moment':
+            self.sub_jovian = PW.meridian_min_moment(I_total, self.spin_pole,
+                                                     self.sub_jovian)
+        else:
+            self.sub_jovian = PW.projected_meridian(self.spin_pole)
+
     def _b_eq(self, T_s):
         return _equilibrium_thickness(T_s, self.D, self.H,
                                       self.cfg.thickness_method, self.rheology)
@@ -580,9 +639,15 @@ class ShellEvolution:
         the "2.4 Myr" onset. OSPW take psi0 to be the angle when t/tau passes
         through zero. Here: when the axis the pole sits on stops being the
         max-moment axis (by more than SEED_GAP_REL * I_0), the pole is moved
-        to angle psi0 from that axis toward the max axis, once per episode,
-        and the event is logged. Nothing happens if it is already farther
-        than psi0.
+        to angle psi0 from that axis toward the max axis and the event is
+        logged. Nothing happens if it is already farther than psi0.
+
+        cfg.seed_rearm = 'any_axis' (default): this applies whenever the pole
+        sits within psi0 of ANY non-max principal axis, so a pole that
+        converges onto a saddle (the mid axis) later in the run is kicked
+        off it too. 'max_axis' (pre-2026-10-05): one kick, re-armed only
+        while the pole sits on the max axis; a pole could then park on a
+        saddle indefinitely (the flow n5.2 "settled at 90 deg" runs).
         """
         psi0 = self.cfg.psi0_rad
         vals, vecs = np.linalg.eigh(I_total)
@@ -593,16 +658,39 @@ class ShellEvolution:
             if a == 2:
                 self._seed_armed = True
             return
-        if not self._seed_armed or psi0 <= 0:
+        if psi0 <= 0:
             return
-        self._seed_armed = False
         psi = np.arccos(min(1.0, abs(c[a])))
-        if psi >= psi0:
-            return
+        if self.cfg.seed_rearm == 'max_axis':
+            # pre-2026-10-05: one kick per stay on the max axis. A pole that
+            # later converged onto a saddle (mid axis) was never re-seeded.
+            if not self._seed_armed:
+                return
+            self._seed_armed = False
+            if psi >= psi0:
+                return
+        else:
+            # 'any_axis': kick whenever the pole sits within psi0 of ANY
+            # non-max principal axis, including a saddle reached later. Armed
+            # on the max axis (above) or once the pole has moved more than
+            # max(seed_rearm_deg, 5 psi0) from the last kick, so a shell that
+            # re-centers on a kicked pole cannot turn repeated kicks into a
+            # drift of psi0 per step.
+            if not self._seed_armed:
+                last = self._last_seed_pole
+                lim = max(np.radians(self.cfg.seed_rearm_deg), 5.0 * psi0)
+                if last is None or np.arccos(np.clip(abs(last @ self.spin_pole), -1, 1)) <= lim:
+                    return
+                self._seed_armed = True
+            psi_acc = np.arctan2(np.linalg.norm(np.delete(c, a)), abs(c[a]))
+            if psi_acc >= psi0 * (1.0 - 1e-6):
+                return
+            self._seed_armed = False
         e_a = np.sign(c[a]) * vecs[:, a]
         e_t = vecs[:, 2] * (np.sign(c[2]) if c[2] != 0 else 1.0)
         self.spin_pole = np.cos(psi0) * e_a + np.sin(psi0) * e_t
         self.spin_pole /= np.linalg.norm(self.spin_pole)
+        self._last_seed_pole = self.spin_pole.copy()
         self.seed_events.append((self.t, psi, psi0, gap / self._ospw_I0))
         print(f'  psi0 seed at t={self.t/1e6:.3f} Myr: pole moved from {psi:.2e} '
               f'to {psi0:.2e} rad off the unstable axis '
@@ -680,10 +768,14 @@ class ShellEvolution:
             return
         cos_a = np.clip(np.dot(self.spin_pole, self._D_spin_pole), -1, 1)
         angle = np.degrees(np.arccos(cos_a))
-        if angle > self._D_update_threshold_deg and angle > 0.0:
+        mer = self._meridian_arg()
+        mer_moved = mer is not None and not np.array_equal(mer, self._D_sub_jovian)
+        if (angle > self._D_update_threshold_deg and angle > 0.0) or mer_moved:
             self.D, self.H = _build_dissipation_for_spin_pole(
-                self.cfg.rheology_case, self.theta, self.lam, self.spin_pole)
+                self.cfg.rheology_case, self.theta, self.lam, self.spin_pole, mer)
             self._D_spin_pole = self.spin_pole.copy()
+            if mer is not None:
+                self._D_sub_jovian = mer.copy()
 
     def step(self, dt):
         cfg = self.cfg
@@ -750,8 +842,13 @@ class ShellEvolution:
         """
         dt_s = dt * 365.25 * 86400.0
         old = self.spin_pole.copy()
-        self.spin_pole, info = PW.overdamped_step(self.spin_pole, I_total,
-                                                  self._ospw_Cf, dt_s)
+        if self.cfg.tidal_torque:
+            self.spin_pole, info = PW.overdamped_step_tidal(
+                self.spin_pole, I_total, self._ospw_Cf, dt_s, self._meridian_fn(I_total))
+        else:
+            self.spin_pole, info = PW.overdamped_step(self.spin_pole, I_total,
+                                                      self._ospw_Cf, dt_s)
+        self._update_meridian(I_total)
         d_angle = np.arccos(np.clip(np.dot(old, self.spin_pole), -1, 1))
         self._last_omega_deg_per_Myr = np.degrees(info['psi_dot']) * 1e6 * 365.25 * 86400
         return d_angle
