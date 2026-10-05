@@ -1723,8 +1723,10 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
         // A face is "fill" if its value is not a finite albedo in [0, 1], or if the
         // bilinear sample at its center puts nonzero weight on a FITS pixel that is
         // not a valid albedo (the -1 south-cap / seam fill is not the header's
-        // MISSING value, so the generator mixed it in), or if the baked value does
-        // not reproduce the FITS sample (registration check).
+        // MISSING value; generators before PTM-695 mixed it in, and the fixed
+        // generator renormalizes over the valid neighbors -- either way such a face
+        // is not a direct measurement), or if the baked value does not reproduce
+        // the FITS sample (registration check).
         std::vector<char> fill(n, 0);
         size_t n_invalid_value = 0, n_fill_mixed = 0, n_registration = 0;
         for (size_t i = 0; i < n; ++i) {
@@ -1745,6 +1747,11 @@ bool PTMExosphereIntegration::loadMesh(const std::string& mesh_file) {
                       << "flagged; bilinear fill mixing near the map's -1 fill enters the inversion"
                       << std::endl;
         } else {
+            // Loaded WITHOUT the Bond-albedo fill policy on purpose: this map is
+            // the fill detector, so it must see the raw pixels. Under the policy the
+            // seam columns would be healed by interpolation and stop counting as
+            // fill; here every pixel that is not a valid albedo, the -1.0 gaps
+            // included, is flagged by the loop below.
             SpatialMap src;
             if (!src.loadFromFITS(fits_path)) {
                 std::cerr << tag << "cannot load the fill-detection FITS map " << fits_path

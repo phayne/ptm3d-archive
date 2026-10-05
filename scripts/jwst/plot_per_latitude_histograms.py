@@ -19,6 +19,15 @@ Two figures are produced:
       runs assumed.
 
 Vertical lines mark each volatile's 1-Gyr stability temperature.
+
+Albedo map: Mergny, C., Schmidt, F., Andrieu, F., & Belgacem, I. (2025), A Bond
+albedo map of Europa, Astronomy & Astrophysics,
+https://doi.org/10.1051/0004-6361/202453058. The map's gaps are -1.0 (its header
+says MISSING = -9999). `load_albedo_map` below keeps only values strictly between
+0.02 and 0.98, which drops the gaps along with the 0.0 and 1.0 pixels. The engine
+samples 0.0 and 1.0 as data, but its baked per-face bins then replace faces outside
+[0.01, 0.99] with a neighbor average and floor at 0.01 (PTM-699), so neither filter
+is the engine's. See data/albedo_maps/README.md.
 """
 from __future__ import annotations
 

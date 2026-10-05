@@ -225,7 +225,7 @@ bool AlbedoManager::loadFITSMap(const std::string& filepath) {
         spatial_map_ = std::make_shared<SpatialMap>();
 
         std::cout << "[AlbedoManager] Loading FITS file: " << filepath << std::endl;
-        if (!spatial_map_->loadFromFITS(filepath)) {
+        if (!spatial_map_->loadFromFITS(filepath, MapFillPolicy::bondAlbedo())) {
             std::cerr << "[AlbedoManager] Failed to load FITS file: " << filepath << std::endl;
             std::cerr << "[AlbedoManager] Error: " << spatial_map_->getLastError() << std::endl;
             spatial_map_.reset();

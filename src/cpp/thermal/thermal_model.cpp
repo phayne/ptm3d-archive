@@ -480,7 +480,7 @@ bool Planet::loadAlbedoMap(const std::string& filename, bool verbose) {
     
     try {
         albedo_map = std::make_shared<ptm::SpatialMap>();
-        if (!albedo_map->loadFromFITS(filename)) {
+        if (!albedo_map->loadFromFITS(filename, ptm::MapFillPolicy::bondAlbedo())) {
             std::cerr << "Error loading albedo map: " << albedo_map->getLastError() << std::endl;
             albedo_map.reset();
             return false;

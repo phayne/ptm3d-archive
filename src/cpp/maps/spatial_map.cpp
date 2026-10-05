@@ -9,6 +9,13 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <mutex>
+#include <array>
+#include <cstddef>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace ptm {
 
@@ -177,7 +184,53 @@ inline void heal_cylindrical_seam(std::vector<double>& data,
 
 } // anonymous namespace
 
-bool SpatialMap::loadFromFITS(const std::string& filename) {
+void SpatialMap::applyFillPolicy(const std::vector<double>& declared_fill_values,
+                                 const MapFillPolicy& policy, bool single_precision) {
+    fill_counts_ = MapFillCounts();
+    auto same = [single_precision](double v, double s) {
+        return single_precision ? static_cast<float>(v) == static_cast<float>(s) : v == s;
+    };
+    auto in = [&same](const std::vector<double>& vals, double v) {
+        for (double s : vals) {
+            if (same(v, s)) return true;
+        }
+        return false;
+    };
+    for (double& v : data_) {
+        if (!std::isfinite(v)) {
+            ++fill_counts_.non_finite;
+        } else if (same(v, missing_value_) || in(declared_fill_values, v)) {
+            ++fill_counts_.declared;
+        } else if (in(policy.fill_values, v)) {
+            ++fill_counts_.configured;
+        } else if (v < policy.valid_min || v > policy.valid_max) {
+            ++fill_counts_.out_of_range;
+        } else {
+            continue;
+        }
+        v = missing_value_;
+    }
+}
+
+void SpatialMap::reportFillCounts(const std::string& label, const std::string& missing_source,
+                                  const MapFillPolicy& policy) const {
+    std::ostringstream msg;
+    msg << "[SpatialMap] " << label << ": " << fill_counts_.total() << " of " << data_.size()
+        << " pixels are fill (" << fill_counts_.declared << " at the declared missing value "
+        << missing_value_ << " [" << missing_source << "], " << fill_counts_.configured
+        << " at a configured sentinel, " << fill_counts_.out_of_range << " outside the valid range ["
+        << policy.valid_min << ", " << policy.valid_max << "], " << fill_counts_.non_finite
+        << " non-finite); fill is excluded from every sample";
+    std::cout << msg.str() << std::endl;
+    if (!data_.empty() && 2 * fill_counts_.total() > data_.size()) {
+        std::cout << "[SpatialMap] WARNING: " << label << ": more than half of the map is fill ("
+                  << fill_counts_.total() << " of " << data_.size() << " pixels). Check the map's "
+                  << "units and its fill value; every sample in a fill region falls back to the "
+                  << "caller's default." << std::endl;
+    }
+}
+
+bool SpatialMap::loadFromFITS(const std::string& filename, const MapFillPolicy& policy) {
     try {
         // Use the FITS reader to load data
         std::vector<double> fileData;
@@ -230,6 +283,11 @@ bool SpatialMap::loadFromFITS(const std::string& filename) {
         
         // Default to equirectangular projection unless specified otherwise
         projection_ = MapProjection::EQUIRECTANGULAR;
+
+        // Classify fill BEFORE the seam is healed, so the healing never
+        // interpolates from a fill pixel the header failed to declare.
+        applyFillPolicy(header.declared_fill_values, policy, header.single_precision);
+        reportFillCounts(filename, header.missing_value_source, policy);
 
         // Detect fill values in edge columns, then heal the seam
         {
@@ -329,7 +387,13 @@ bool SpatialMap::saveToCSV(const std::string& filename) const {
 }
 
 double SpatialMap::getValue(double lon, double lat) const {
+    return getValue(lon, lat, nullptr);
+}
+
+double SpatialMap::getValue(double lon, double lat, MapSampleInfo* info) const {
+    if (info) *info = MapSampleInfo();
     if (!isValid()) {
+        if (info) info->no_valid_support = true;
         return missing_value_;
     }
 
@@ -360,7 +424,7 @@ double SpatialMap::getValue(double lon, double lat) const {
     if (y < 0.0) y = 0.0;
     if (y > height_ - 1.0) y = height_ - 1.0;
 
-    return bilinearInterpolate(x, y);
+    return bilinearInterpolate(x, y, info);
 }
 
 double SpatialMap::getValue(int x, int y) const {
@@ -631,7 +695,8 @@ bool SpatialMap::initializeFromData(
     double lat_min,
     double lat_max,
     MapProjection proj,
-    double missing_val) {
+    double missing_val,
+    const MapFillPolicy& policy) {
     
     // Update member variables
     width_ = width;
@@ -648,6 +713,11 @@ bool SpatialMap::initializeFromData(
     for (int i = 0; i < width * height; ++i) {
         float v = data[i];
         data_[static_cast<size_t>(i)] = static_cast<double>(v);
+    }
+    // The input is float, so sentinels are matched at float precision.
+    applyFillPolicy({}, policy, /*single_precision=*/true);
+    if (fill_counts_.total() > 0) {
+        reportFillCounts("in-memory raster", "caller", policy);
     }
 
     // Detect fill values in edge columns, then heal the seam
@@ -799,7 +869,7 @@ int SpatialMap::getIndex(int x, int y) const {
     return y * width_ + x;
 }
 
-double SpatialMap::bilinearInterpolate(double x, double y) const {
+double SpatialMap::bilinearInterpolate(double x, double y, MapSampleInfo* info) const {
     // Clamp y into [0, H-1]
     if (y < 0.0) y = 0.0;
     if (y > height_ - 1.0) y = height_ - 1.0;
@@ -835,25 +905,37 @@ double SpatialMap::bilinearInterpolate(double x, double y) const {
     double v11 = getValue(x1, y1);
 
     // Standard bilinear if all valid
-    if (v00 != missing_value_ && v10 != missing_value_ &&
-        v01 != missing_value_ && v11 != missing_value_) {
+    if (!isFill(v00) && !isFill(v10) && !isFill(v01) && !isFill(v11)) {
         double i1 = v00 * (1.0 - xd) + v10 * xd;
         double i2 = v01 * (1.0 - xd) + v11 * xd;
         return i1 * (1.0 - yd) + i2 * yd;
     }
 
-    // Graceful fallback: weighted average of available neighbors
-    int nvalid = 0;
+    // Some corner is fill: never blend it in. Renormalize the bilinear weights
+    // over the valid corners (a corner with zero weight contributes nothing
+    // either way). The previous fallback summed the valid terms WITHOUT dividing
+    // by their weight, so a sample next to a gap was pulled toward zero.
     double acc = 0.0;
-    auto add_if = [&](double v, double w) {
-        if (v != missing_value_ && std::isfinite(v)) { acc += v * w; ++nvalid; }
+    double wsum = 0.0;
+    auto add = [&](double v, double w) {
+        if (w <= 0.0) return;
+        if (isFill(v)) {
+            if (info) { ++info->fill_corners; info->fill_weight += w; }
+            return;
+        }
+        acc += v * w;
+        wsum += w;
     };
-    add_if(v00, (1.0 - xd) * (1.0 - yd));
-    add_if(v10, xd * (1.0 - yd));
-    add_if(v01, (1.0 - xd) * yd);
-    add_if(v11, xd * yd);
-    return (nvalid > 0) ? acc : missing_value_;
+    add(v00, (1.0 - xd) * (1.0 - yd));
+    add(v10, xd * (1.0 - yd));
+    add(v01, (1.0 - xd) * yd);
+    add(v11, xd * yd);
+    if (wsum > 0.0) return acc / wsum;
+    if (info) info->no_valid_support = true;
+    return missing_value_;
 }
+
+
 
 size_t SpatialMap::hashTriangle(double lat1, double lon1, 
                                  double lat2, double lon2, 
