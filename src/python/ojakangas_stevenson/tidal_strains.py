@@ -186,8 +186,8 @@ def time_averaged_strain_squared_numerical(theta, lam, g2=None, g3=None,
     return total / n_samples
 
 
-def strain_squared_grid(n_theta=181, n_lam=361, g2=None, g3=None):
-    """Compute <e_ij * e_ij> on a regular (theta, lam) grid.
+def strain_squared_grid(n_theta=181, n_lam=360, g2=None, g3=None):
+    """Compute <e_ij * e_ij> on the periodic (theta, lam) grid (grid.periodic_grid).
 
     Returns
     -------
@@ -200,8 +200,8 @@ def strain_squared_grid(n_theta=181, n_lam=361, g2=None, g3=None):
     if g3 is None:
         g3 = C.g3()
 
-    theta = np.linspace(0.001, np.pi - 0.001, n_theta)
-    lam = np.linspace(-np.pi, np.pi, n_lam)
+    from .grid import periodic_grid
+    theta, lam = periodic_grid(n_theta, n_lam)
     THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
 
     eij2 = time_averaged_strain_squared(THETA, LAM, g2, g3)

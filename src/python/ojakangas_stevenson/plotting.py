@@ -26,9 +26,11 @@ def plot_strain_pattern(theta=None, lam=None, eij2=None, save_path=None):
     lam_deg = np.degrees(lam)
     theta_deg = np.degrees(theta)
 
-    # Normalize to units of 0.5*(n*gamma*e*C_R)^2
+    # Normalize to the Fig. 1 unit 0.5*(n*gamma*e*C_R)^2 (~1.2e-21 s^-2).
+    # (Before 2026-10 this used g2 = (45/88) gamma e C_R in place of
+    # gamma e C_R, which rescaled the contours by (88/45)^2.)
     from . import constants as C
-    norm_factor = 0.5 * (C.MEAN_MOTION * C.g2())**2
+    norm_factor = 0.5 * (C.MEAN_MOTION * C.gamma() * C.ECCENTRICITY * C.C_R)**2
     eij2_norm = eij2 * C.MEAN_MOTION**2 / norm_factor
 
     cs = ax.contourf(lam_deg, theta_deg, eij2_norm, levels=20, cmap='hot_r')
@@ -48,7 +50,7 @@ def plot_strain_pattern(theta=None, lam=None, eij2=None, save_path=None):
 
 
 def plot_shell_thickness_contour(model, title=None, save_path=None,
-                                  n_theta=181, n_lam=361):
+                                  n_theta=181, n_lam=360):
     """Contour plot of shell thickness b(theta, lam) (reproduces Figs 2-5).
 
     Parameters

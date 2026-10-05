@@ -17,6 +17,20 @@ thermal-inertia correction, held fixed in the tidal frame and rotated with the
 spin pole.  In Phase 1 dT_PTM is STATIC (from the existing europa_ico6_uniform-ice
 run); Phase 2 adds periodic full-PTM3D refresh (PTM3DRunner).
 
+Physics choices (project decisions of 2026-10-04, after the 2026-10-03 review):
+  * Surface-T statistic: the shell's top boundary is the ARITHMETIC time-mean
+    surface temperature <T> (not (<T^4>)^(1/4)); dT_PTM is built from it.
+  * Thickness: O&S Eq. 2.8 with C_R = 0.5 (ojakangas_stevenson.shell_thickness).
+  * Darkening: A_bright -> A_dark = 0.3814 (Hapke non-ice endmember);
+    tau_dark is free (--tau-dark), tested from 1e4 to 1e7 yr (the B&H 2021
+    Pwyll bound is >~1 Myr).
+  * Polar wander: OSPW Eq. 5.39, overdamped, driven by the PHYSICAL (Eq. 2.18
+    bottom-loaded) inertia tensor plus an optional body-fixed hydrostatic
+    fossil (Eqs. 3.8-3.10). The pole is seeded with a physical offset psi0
+    (--psi0) when it becomes unstable, not left to float round-off.
+  * Relaxation: tau_diff = b^2/kappa per location -- see _tau_diff_years for
+    what that approximation leaves out.
+
 Run (needs scipy/matplotlib -- use europa_py39; europa_viz for the animation):
     PY=/Users/paha3326/anaconda3/envs/europa_py39/bin/python
     $PY scripts/coupled_shell_simulation.py --smoke
@@ -25,6 +39,7 @@ Run (needs scipy/matplotlib -- use europa_py39; europa_viz for the animation):
 """
 import os
 import sys
+import json
 import argparse
 from dataclasses import dataclass
 
@@ -43,14 +58,17 @@ from ojakangas_stevenson.surface_temperature import OSSurfaceTemperature
 import polar_wander_cycle as pwc
 from polar_wander_cycle import (
     PolarWanderConfig, ShellEvolution, AlbedoDarkeningModel,
-    _tidal_coordinates, _equilibrium_thickness, _area_mean,
-    _compute_inertia_tensor, _find_principal_axes,
+    _tidal_coordinates, _area_mean, _ospw_params, _fossil_state,
 )
+from ojakangas_stevenson import polar_wander as PW
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 PLOTDIR = os.path.join(REPO, 'plots', 'coupled_shell')
-DT_PTM_CACHE = os.path.join(PLOTDIR, 'dT_ptm_static.npy')
+DT_PTM_CACHE = os.path.join(PLOTDIR, 'dT_ptm_static.npz')
+# The pre-2026-10 cache: a bare array on the legacy grid
+# linspace(0.001, pi-0.001, 361) x linspace(-pi, pi, 721) (both seam columns).
+DT_PTM_CACHE_LEGACY = os.path.join(PLOTDIR, 'dT_ptm_static.npy')
 
 
 # ---------------------------------------------------------------------------
@@ -60,12 +78,12 @@ DT_PTM_CACHE = os.path.join(PLOTDIR, 'dT_ptm_static.npy')
 class CoupledConfig(PolarWanderConfig):
     # --- darkening (firm user decisions) ---
     A_bright: float = 0.5
-    A_dark: float = 0.15
+    A_dark: float = 0.3814              # Hapke non-ice endmember (decision of 2026-10-04)
     darkening_power: float = 1.0
     darkening_mode: str = 'cosine'      # 'cosine' (apex spot) or 'sin' (regression)
-    tau_dark: float = 1e4
+    tau_dark: float = 1e4               # free; tested 1e4-1e7 yr
     # --- initial condition ---
-    use_fossil_bulge: bool = False
+    use_fossil_bulge: bool = False      # True: body-fixed hydrostatic fossil (Eqs. 3.8-3.10)
     init_b_mode: str = 'equilibrium_mean'  # 'equilibrium_mean' or 'constant'
     init_b_const_m: float = 20e3
     # --- reorientation ---
@@ -84,7 +102,7 @@ class CoupledConfig(PolarWanderConfig):
     ptm3d_max_calls: int = 40
     # --- grid & stepping (coarser than parent: only low-l harmonics matter) ---
     n_theta: int = 91
-    n_lam: int = 181
+    n_lam: int = 180                    # periodic grid (even, no seam column)
     t_max_years: float = 1e8
     dt_years: float = None              # fine-phase dt; auto = tau_dark/20
     n_coarse_steps: int = 3000          # coarse-phase step budget (post-darkening)
@@ -127,22 +145,35 @@ class CosineApexAlbedoModel(AlbedoDarkeningModel):
 # Static PTM3D-vs-O&S correction field (the surrogate)
 # ---------------------------------------------------------------------------
 def build_static_dT_ptm(cache=True):
-    """dT_PTM(theta,lam) = T_ptm(uniform A=0.5) - T_os(analytical), on the
-    eclipse-analysis grid (THETA1D, LAM1D), in the tidal frame.
+    """dT_PTM(theta,lam) = T_ptm(uniform A=0.5) - T_os(analytical), in the tidal frame.
 
-    Returns (THETA1D, LAM1D, dT). Cached to .npy after the first build.
+    T_ptm is the arithmetic time mean (eclipse_vs_albedo_analysis.gridded_temperature).
+    Returns (theta1d, lam1d, dT) with lam1d CLOSED (it includes both -pi and
+    +pi) so that a RegularGridInterpolator is periodic-safe. Cached as .npz
+    with its own coordinates. A legacy .npy cache (pre-2026-10 grid) is read
+    with its legacy coordinates and reported, never silently reinterpreted.
     """
     import eclipse_vs_albedo_analysis as eva
     if cache and os.path.exists(DT_PTM_CACHE):
         d = np.load(DT_PTM_CACHE)
-        return eva.THETA1D, eva.LAM1D, d
+        return d['theta'], d['lam'], d['dT']
+    if cache and os.path.exists(DT_PTM_CACHE_LEGACY):
+        dT = np.load(DT_PTM_CACHE_LEGACY)
+        th = np.linspace(0.001, np.pi - 0.001, dT.shape[0])
+        lm = np.linspace(-np.pi, np.pi, dT.shape[1])
+        print(f'  WARNING: using LEGACY dT_PTM cache {DT_PTM_CACHE_LEGACY} '
+              f'({dT.shape}, built 2026-06 from the March-2026 uniform-ice run); '
+              f'delete it to rebuild from current PTM3D output')
+        return th, lm, dT
     T_ptm = eva.gridded_temperature(eva.RUNS['no_darkening'])
     T_os = OSSurfaceTemperature(albedo=eva.ALBEDO).temperature_2d(eva.THETA1D, eva.LAM1D)
     dT = T_ptm - T_os
+    th, lm = eva.THETA1D, np.append(eva.LAM1D, np.pi)
+    dT = np.column_stack([dT, dT[:, 0]])            # close the seam
     if cache:
         os.makedirs(PLOTDIR, exist_ok=True)
-        np.save(DT_PTM_CACHE, dT)
-    return eva.THETA1D, eva.LAM1D, dT
+        np.savez(DT_PTM_CACHE, theta=th, lam=lm, dT=dT)
+    return th, lm, dT
 
 
 # ---------------------------------------------------------------------------
@@ -168,18 +199,25 @@ class CoupledEvolution(ShellEvolution):
                 (th1d, lm1d), dT, bounds_error=False, fill_value=None)
             self._dT_grid = (th1d, lm1d, dT)
 
-        # Initial condition: uniform b, no fossil, uniform albedo A=0.5.
+        # Initial condition: uniform b, uniform albedo A_bright, and the
+        # fossil chosen by cfg.use_fossil_bulge (default: none).
         self.f_dark = 0.0
-        self.b_fossil = np.zeros_like(self.b)
         A0 = self.model.albedo_field(0.0, spin_pole=self.spin_pole)
         T0 = self.surface_temperature_coupled(A0, self.spin_pole)
-        b_eq0 = _equilibrium_thickness(T0, self.D, self.H)
+        b_eq0 = self._b_eq(T0)
         if cfg.init_b_mode == 'constant':
             b0 = cfg.init_b_const_m
         else:
-            b0 = _area_mean(b_eq0, self.theta)
+            b0 = _area_mean(b_eq0, self.theta, self.lam)
         self.b = np.full_like(self.b, b0)
         self._b0_uniform = b0
+        # OSPW parameters for the uniform start (b_c = b0 unless fixed).
+        self._ospw_p = _ospw_params(cfg, b0)
+        self.I_fossil, self.fossil_t20, self.fossil_t22 = _fossil_state(cfg, self._ospw_p)
+        self._ospw_Cf = PW.dissipation_cf(self._ospw_p)
+        self._ospw_I0 = PW.moment_I0(self._ospw_p)
+        self._seed_armed = True
+        self.seed_events = []
 
         # PTM3D refresh bookkeeping (Phase 2).
         self._ptm3d_calls = 0
@@ -207,6 +245,23 @@ class CoupledEvolution(ShellEvolution):
 
     # -- per-location thermal diffusion timescale -------------------------
     def _tau_diff_years(self, b, T_s):
+        """Local relaxation time scale tau_diff = b^2 / kappa [yr].
+
+        Approximations (kept on purpose; document before relying on them):
+          * One e-folding time per location for the whole profile. The real
+            response of a conductive shell to a step in T_s or q is a sum of
+            modes; the slowest is ~b^2/(pi^2 kappa), so b^2/kappa is ~10x
+            longer than the fundamental mode and is an upper-end estimate.
+          * kappa = k/(rho c_p) is evaluated at the SURFACE temperature, where
+            k = a1/T + a0 is largest; the basal ice (T -> 273 K) diffuses
+            ~2.5x more slowly.
+          * Latent heat is ignored: the base of the shell moves only as fast
+            as the conductive flux imbalance can melt or freeze ice (a Stefan
+            problem), which can be slower than b^2/kappa.
+          * Lateral heat flow is ignored (thin-shell assumption, as in O&S).
+        The result is clipped to [tau_diff_floor_yr, tau_diff_cap_yr]; with
+        the defaults (1e3, 5e7 yr) the clip is inactive for 5-50 km shells.
+        """
         cfg = self.cfg
         k = C.A1_CONDUCTIVITY / T_s + C.A0_CONDUCTIVITY        # 488/T + 0.468
         cp = 7.49 * T_s if cfg.cp_mode == 'linear' else cfg.cp_const
@@ -224,28 +279,13 @@ class CoupledEvolution(ShellEvolution):
         # 2-3. Temperature (surrogate) and O&S equilibrium thickness
         A = self.model.albedo_field(self.f_dark, spin_pole=self.spin_pole)
         T_s = self.surface_temperature_coupled(A, self.spin_pole)
-        b_eq = _equilibrium_thickness(T_s, self.D, self.H)
+        b_eq = self._b_eq(T_s)
         # 4. Relax shell toward equilibrium at the LOCAL diffusion timescale
         tau_diff = self._tau_diff_years(self.b, T_s)
         self.b = b_eq + (self.b - b_eq) * np.exp(-dt / tau_diff)
-        # 5. (no fossil bulge)
-        # 6. Full-tensor OSPW reorientation
-        I_total = _compute_inertia_tensor(self.b, self.theta, self.lam)
-        if cfg.use_fossil_bulge:
-            I_total = I_total + _compute_inertia_tensor(
-                self.b_fossil, self.theta, self.lam)
-        pa = _find_principal_axes(I_total, self.spin_pole)
-        misalign_rad = np.radians(pa['misalignment_deg'])
-        if misalign_rad > 1e-6:
-            v_max = pa['v_max']
-            v_perp = v_max - np.dot(v_max, self.spin_pole) * self.spin_pole
-            v_perp_norm = np.linalg.norm(v_perp)
-            if v_perp_norm > 1e-10:
-                v_perp_hat = v_perp / v_perp_norm
-                d_angle = self._ospw_step(dt, misalign_rad, pa)
-                self.spin_pole = (self.spin_pole * np.cos(d_angle)
-                                  + v_perp_hat * np.sin(d_angle))
-                self.spin_pole /= np.linalg.norm(self.spin_pole)
+        # 5-6. Physical inertia tensor (Eq. 2.18 shell + body-fixed fossil)
+        #      and OSPW reorientation (Eq. 5.39, with the psi0 seed).
+        self._reorient(dt, self.total_inertia_tensor())
         self.t += dt
 
     # -- snapshots ---------------------------------------------------------
@@ -265,7 +305,8 @@ class CoupledEvolution(ShellEvolution):
         pole_drift = np.degrees(np.arccos(
             np.clip(np.dot(self.spin_pole, self._ptm3d_last_pole), -1, 1)))
         A_now = self.model.albedo_field(self.f_dark, spin_pole=self.spin_pole)
-        alb_rms = np.sqrt(_area_mean((A_now - self._ptm3d_last_albedo) ** 2, self.theta))
+        alb_rms = np.sqrt(_area_mean((A_now - self._ptm3d_last_albedo) ** 2,
+                                     self.theta, self.lam))
         if (pole_drift > self.cfg.ptm3d_refresh_pole_deg
                 or alb_rms > self.cfg.ptm3d_refresh_albedo_rms):
             self._refresh_dT_ptm(A_now)
@@ -291,8 +332,11 @@ class CoupledEvolution(ShellEvolution):
     def run(self):
         cfg = self.cfg
         t_dark_end = 10.0 * cfg.tau_dark            # darkening ~saturated
-        dt_fine = cfg.dt_years if cfg.dt_years else cfg.tau_dark / 20.0
-        dt_coarse = max(dt_fine, cfg.t_max_years / cfg.n_coarse_steps)
+        dt_coarse = cfg.t_max_years / cfg.n_coarse_steps
+        # Fine step resolves the darkening ramp, but is never coarser than the
+        # coarse step: for tau_dark ~ 1e6-1e7 yr, tau_dark/20 would otherwise
+        # exceed t_max/n_coarse_steps.
+        dt_fine = cfg.dt_years if cfg.dt_years else min(cfg.tau_dark / 20.0, dt_coarse)
         snap_dt = cfg.t_max_years / cfg.n_snapshots
         rec_dt = cfg.t_max_years / cfg.n_history
         next_snap, next_rec, next_check = snap_dt, rec_dt, 5e5
@@ -457,6 +501,10 @@ def produce_outputs(evo, hist, save_dir):
         snap_A=np.array([s['A'] for s in evo.map_snapshots]),
         snap_b=np.array([s['b'] for s in evo.map_snapshots]),
         snap_pole=np.array([s['spin_pole'] for s in evo.map_snapshots]),
+        parameter_set=json.dumps(C.active_parameter_set().as_dict()),
+        config=json.dumps({k: getattr(evo.cfg, k) for k in evo.cfg.__dataclass_fields__},
+                          default=str),
+        seed_events=np.array(evo.seed_events, dtype=float).reshape(-1, 4),
         **{f'h_{k}': hist[k] for k in hist if k != 'cycle_events'})
     fig_pole_timeseries(hist, evo.cfg, os.path.join(save_dir, 'pole_timeseries.png'))
     fig_map_snapshots(evo.map_snapshots, th, lm, 'A', 'gray', 'Bond albedo',
@@ -481,7 +529,17 @@ def produce_outputs(evo, hist, save_dir):
 # ---------------------------------------------------------------------------
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--tau-dark', type=float, default=1e4)
+    p.add_argument('--tau-dark', type=float, default=1e4,
+                   help='darkening e-folding time [yr]; tested 1e4-1e7')
+    p.add_argument('--A-dark', type=float, default=0.3814,
+                   help='dark endmember Bond albedo (Hapke non-ice endmember)')
+    p.add_argument('--psi0', type=float, default=1e-6,
+                   help='psi0 seed [rad] applied when the pole becomes unstable')
+    p.add_argument('--fossil', choices=('none', 'hydrostatic'), default='none',
+                   help='fossil bulge: none, or body-fixed hydrostatic (OSPW Eqs. 3.8-3.10)')
+    p.add_argument('--thickness-method', choices=('eq28', 'exact'), default='eq28')
+    p.add_argument('--parameter-set', default='paper', choices=sorted(C.PARAMETER_SETS),
+                   help="constants: 'paper' (validation) or 'modern' (science)")
     p.add_argument('--t-max', type=float, default=2e7)
     p.add_argument('--rheology', default='maxwell_h0')
     p.add_argument('--cp-mode', default='constant', choices=['constant', 'linear'])
@@ -492,21 +550,28 @@ def main():
     p.add_argument('--no-outputs', action='store_true', help='skip figures/animation')
     p.add_argument('--save-dir', default=None)
     args = p.parse_args()
+    C.use_parameter_set(args.parameter_set)
+    print(C.describe_active())
 
     cfg = CoupledConfig(
-        tau_dark=args.tau_dark, t_max_years=args.t_max, rheology_case=args.rheology,
+        tau_dark=args.tau_dark, A_dark=args.A_dark, psi0_rad=args.psi0,
+        use_fossil_bulge=(args.fossil == 'hydrostatic'),
+        thickness_method=args.thickness_method,
+        t_max_years=args.t_max, rheology_case=args.rheology,
         cp_mode=args.cp_mode, use_ptm3d_surrogate=not args.no_ptm3d,
         use_live_ptm3d=args.live_ptm3d, n_snapshots=args.n_snapshots,
         misalignment_threshold_deg=90.0)
     if args.smoke:
-        cfg.n_theta, cfg.n_lam = 46, 91
+        cfg.n_theta, cfg.n_lam = 46, 90
         cfg.t_max_years = 2e5
         cfg.n_snapshots = 12
 
-    tag = f'tau{cfg.tau_dark:.0e}_{cfg.rheology_case}'.replace('+', '')
+    tag = (f'tau{cfg.tau_dark:.0e}_{cfg.rheology_case}_{args.fossil}_'
+           f'psi{cfg.psi0_rad:.0e}_{args.parameter_set}').replace('+', '')
     save_dir = args.save_dir or os.path.join(PLOTDIR, tag)
     print(f'Coupled run: tau_dark={cfg.tau_dark:.0e} yr, t_max={cfg.t_max_years:.0e} yr, '
-          f'grid {cfg.n_theta}x{cfg.n_lam}, surrogate={cfg.use_ptm3d_surrogate}')
+          f'grid {cfg.n_theta}x{cfg.n_lam}, surrogate={cfg.use_ptm3d_surrogate}, '
+          f'A_dark={cfg.A_dark}, fossil={args.fossil}, psi0={cfg.psi0_rad:.1e} rad')
     import time
     t0 = time.time()
     evo = CoupledEvolution(cfg)
