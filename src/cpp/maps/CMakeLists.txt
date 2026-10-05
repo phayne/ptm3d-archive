@@ -35,6 +35,15 @@ set_target_properties(test_albedo_registration_check PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Standalone gate for FITS fill handling: undeclared sentinels, BLANK/MISSING/
+# NODATA keywords, renormalized bilinear weights, seam healing. Writes its own
+# small FITS files to the temp directory - no data files needed.
+add_executable(test_fits_fill_sentinel test_fits_fill_sentinel.cpp)
+target_link_libraries(test_fits_fill_sentinel PRIVATE spatial_maps)
+set_target_properties(test_fits_fill_sentinel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Add installation rules if needed
 install(TARGETS spatial_maps
     LIBRARY DESTINATION lib

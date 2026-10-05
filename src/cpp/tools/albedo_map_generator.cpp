@@ -9,6 +9,12 @@
 #include <atomic>
 #include <mutex>
 #include <cmath>
+#include <algorithm>
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <utility>
 #include <fitsio.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -93,7 +99,8 @@ bool validateFITSFile(const std::string& filename) {
     return true;
 }
 
-bool directLoadFITSToSpatialMap(SpatialMap& map, const std::string& filename) {
+bool directLoadFITSToSpatialMap(SpatialMap& map, const std::string& filename,
+                                const MapFillPolicy& policy) {
     fitsfile* fptr = nullptr;
     int status = 0;
     
@@ -241,7 +248,10 @@ bool directLoadFITSToSpatialMap(SpatialMap& map, const std::string& filename) {
         lon_min, 
         lon_max, 
         lat_min, 
-        lat_max
+        lat_max,
+        MapProjection::EQUIRECTANGULAR,
+        -9999.0,
+        policy
     );
     
     if (!success) {
@@ -254,7 +264,8 @@ bool directLoadFITSToSpatialMap(SpatialMap& map, const std::string& filename) {
 }
 
 // Function to safely load FITS file with error handling
-bool safelyLoadFITSFile(SpatialMap& map, const std::string& filename) {
+bool safelyLoadFITSFile(SpatialMap& map, const std::string& filename,
+                        const MapFillPolicy& policy) {
     try {
         // First validate the file
         if (!validateFITSFile(filename)) {
@@ -341,7 +352,7 @@ bool safelyLoadFITSFile(SpatialMap& map, const std::string& filename) {
         std::cout << "Validated FITS structure, now loading into SpatialMap..." << std::endl;
         
         // Try loading with verbose output for debugging
-        bool result = map.loadFromFITS(filename);
+        bool result = map.loadFromFITS(filename, policy);
         
         if (!result) {
             std::cerr << "Failed to load FITS file: " << map.getLastError() << std::endl;
@@ -373,18 +384,61 @@ bool safelyLoadFITSFile(SpatialMap& map, const std::string& filename) {
  * albedo for each face in meshes of different resolutions.
  */
 int main(int argc, char** argv) {
-    // Parse arguments
-    if (argc < 3) {
-        std::cout << "Usage: " << argv[0] << " <high_res_albedo.fits> <output_dir> [min_res] [max_res]" << std::endl;
+    // Parse arguments: positional <fits> <output_dir> [min_res] [max_res], plus
+    // any number of `--fill-value V` options anywhere on the line.
+    MapFillPolicy fill_policy = MapFillPolicy::bondAlbedo();
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--fill-value") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --fill-value needs a value" << std::endl;
+                return 1;
+            }
+            const std::string text = argv[++i];
+            size_t used = 0;
+            double v = 0.0;
+            try {
+                v = std::stod(text, &used);
+            } catch (const std::exception&) {
+                used = 0;
+            }
+            if (used == 0 || used != text.size()) {
+                std::cerr << "Error: --fill-value: not a number: '" << text << "'" << std::endl;
+                return 1;
+            }
+            fill_policy.fill_values.push_back(v);
+        } else if (arg.size() > 1 && arg[0] == '-' && arg[1] == '-') {
+            std::cerr << "Error: unknown option '" << arg << "' (the only option is "
+                      << "--fill-value V, as two separate arguments)" << std::endl;
+            return 1;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+    if (positional.size() < 2) {
+        std::cout << "Usage: " << argv[0] << " <high_res_albedo.fits> <output_dir> [min_res] [max_res]"
+                  << " [--fill-value V]..." << std::endl;
         std::cout << "  min_res: Minimum resolution level (default: 3)" << std::endl;
         std::cout << "  max_res: Maximum resolution level (default: 7)" << std::endl;
+        std::cout << "  --fill-value V: treat source pixels equal to V as fill (repeatable), for a" << std::endl;
+        std::cout << "      FITS whose header does not declare the sentinel it uses. Pixels at the" << std::endl;
+        std::cout << "      header's BLANK/MISSING/NODATA value and pixels outside the physical" << std::endl;
+        std::cout << "      Bond-albedo range [0, 1] are always fill." << std::endl;
         return 1;
     }
     
-    std::string input_map = argv[1];
-    std::string output_dir = argv[2];
-    int min_resolution = (argc > 3) ? std::stoi(argv[3]) : 3;
-    int max_resolution = (argc > 4) ? std::stoi(argv[4]) : 7;
+    std::string input_map = positional[0];
+    std::string output_dir = positional[1];
+    int min_resolution = 3;
+    int max_resolution = 7;
+    try {
+        if (positional.size() > 2) min_resolution = std::stoi(positional[2]);
+        if (positional.size() > 3) max_resolution = std::stoi(positional[3]);
+    } catch (const std::exception&) {
+        std::cerr << "Error: min_res and max_res must be integers" << std::endl;
+        return 1;
+    }
     
     // Create output directory if it doesn't exist
     std::filesystem::create_directories(output_dir);
@@ -395,19 +449,23 @@ int main(int argc, char** argv) {
 
     // Primary path: use SpatialMap::loadFromFITS (correct WCS via FITSReader)
     // Fallback: directLoadFITSToSpatialMap with manual WCS handling
-    if (!safelyLoadFITSFile(albedo_map, input_map)) {
+    if (!safelyLoadFITSFile(albedo_map, input_map, fill_policy)) {
         std::cout << "Standard FITS loading failed, trying direct approach..." << std::endl;
-        if (!directLoadFITSToSpatialMap(albedo_map, input_map)) {
+        if (!directLoadFITSToSpatialMap(albedo_map, input_map, fill_policy)) {
             std::cerr << "Fatal error: Could not load the albedo map. Exiting." << std::endl;
             return 1;
         }
     }
 
-    // Add additional validation after loading
-    if (albedo_map.getMin() < 0.0 || albedo_map.getMax() > 1.0) {
-        std::cout << "Warning: Albedo values outside expected range [0,1]." << std::endl;
-        std::cout << "Map range: " << albedo_map.getMin() << " to " << albedo_map.getMax() << std::endl;
-        std::cout << "Values will be clamped during processing." << std::endl;
+    // Fill accounting. Out-of-range pixels are already fill (the Bond-albedo
+    // policy), so getMin/getMax below report the valid data only.
+    {
+        const MapFillCounts& fc = albedo_map.getFillCounts();
+        std::cout << "Source fill pixels: " << fc.total() << " of "
+                  << albedo_map.getData().size() << " (declared " << fc.declared
+                  << ", configured --fill-value " << fc.configured << ", outside [0,1] "
+                  << fc.out_of_range << ", non-finite " << fc.non_finite
+                  << "); fill never enters a face sample" << std::endl;
     }
     
     std::cout << "Loaded map: " << albedo_map.getWidth() << "x" << albedo_map.getHeight() << " pixels" << std::endl;
@@ -429,12 +487,20 @@ int main(int argc, char** argv) {
         size_t num_faces = mesh->faces.size();
         std::cout << "Mesh has " << num_faces << " faces" << std::endl;
         
-        // Pre-calculate albedo for each face
+        // Pre-calculate albedo for each face. `sampled` records which faces got a
+        // value from the map; DEFAULT_ALBEDO is only a placeholder, never a marker
+        // (a face can genuinely sample exactly 0.5).
         std::vector<double> face_albedos(num_faces, DEFAULT_ALBEDO);
+        std::vector<char> sampled(num_faces, 0);
         int direct_averaging_count = 0;
         
-        // First pass: Try to get average albedo within each triangle
-        std::cout << "Performing triangle-based averaging..." << std::endl;
+        // Face-center bilinear sampling. (getAverageValueInTriangle exists but is
+        // not used here; every face is sampled once, at its center.) Fill pixels
+        // are excluded by renormalizing the bilinear weights over the valid
+        // corners; a face whose weighted corners are ALL fill gets no value here
+        // and is nearest-neighbor filled below.
+        std::cout << "Sampling the map at face centers (bilinear, fill excluded)..." << std::endl;
+        size_t renormalized_count = 0;
         
         // Thread-safe progress tracking
         std::atomic<size_t> completed(0);
@@ -448,13 +514,11 @@ int main(int argc, char** argv) {
             #pragma omp single
             direct_averaging_count = 0;
             
-            // Thread-local storage for face albedos
-            std::vector<double> local_face_albedos(num_faces, DEFAULT_ALBEDO);
-            
             // Get the number of faces in the mesh
             size_t num_faces = mesh->faces.size();
-            // Thread-local counter
+            // Thread-local counters
             int local_count = 0;
+            size_t local_renorm = 0;
             
             // Parallel loop over faces
             #pragma omp for schedule(dynamic, 100) nowait
@@ -486,13 +550,16 @@ int main(int argc, char** argv) {
                 // runtime sampling path (thermal ptm_thermal_sim.cpp, thermal_model.cpp,
                 // albedo_manager.cpp all use getValue(lon, +lat)). PTM-35: the previous
                 // getValue(lon, -lat) flipped the hemisphere in the baked per-face bins.
-                double map_albedo = albedo_map.getValue(lon, lat);
+                MapSampleInfo sample_info;
+                double map_albedo = albedo_map.getValue(lon, lat, &sample_info);
                 
                 // Store valid albedo values
                 if (map_albedo != albedo_map.getMissingValue() && 
                     map_albedo >= 0.0 && map_albedo <= 1.0) {
                     face_albedos[f] = map_albedo;
+                    sampled[f] = 1;
                     local_count++;
+                    if (sample_info.fill_corners > 0) local_renorm++;
                 }
                 
                 // Update progress
@@ -506,53 +573,30 @@ int main(int argc, char** argv) {
             // Combine local counts
             #pragma omp atomic
             direct_averaging_count += local_count;
+            #pragma omp atomic
+            renormalized_count += local_renorm;
         }
         
         std::cout << std::endl;  // End the progress bar line
         
         // Report statistics
-        std::cout << "Triangle-based averaging found valid albedos for " << direct_averaging_count 
+        std::cout << "Face-center sampling found valid albedos for " << direct_averaging_count
                   << " of " << num_faces << " faces ("
-                  << (100.0 * direct_averaging_count / num_faces) << "%)" << std::endl;
+                  << (100.0 * direct_averaging_count / num_faces) << "%); "
+                  << renormalized_count << " of them had a fill pixel in their bilinear support "
+                  << "and were renormalized over the valid neighbors" << std::endl;
         
-        // Second pass: For faces without valid averages, try bilinear interpolation at face centers
-        if (direct_averaging_count < num_faces) {
-            int interpolation_count = 0;
-            
-            std::cout << "Performing bilinear interpolation at face centers..." << std::endl;
-            for (size_t f = 0; f < num_faces; f++) {
-                if (face_albedos[f] == DEFAULT_ALBEDO) {
-                    // Get face center lat/lon (physical +latitude, north positive)
-                    double lat = mesh->latitudes[f];
-                    double lon = mesh->longitudes[f];
-
-                    // Normalize longitude to [0,360] range for map lookup
-                    while (lon < 0) lon += 360.0;
-                    while (lon >= 360.0) lon -= 360.0;
-
-                    // Get interpolated albedo value at the physical +latitude (PTM-35 fix)
-                    double map_albedo = albedo_map.getValue(lon, lat);
-                    
-                    // Use map value if physically valid (0-1 range)
-                    if (map_albedo != albedo_map.getMissingValue() && 
-                        map_albedo >= 0.0 && map_albedo <= 1.0) {
-                        face_albedos[f] = map_albedo;
-                        interpolation_count++;
-                    }
-                }
-            }
-            
-            std::cout << "Bilinear interpolation added albedos for " << interpolation_count 
-                      << " more faces" << std::endl;
-            
-            // Third pass: Fill remaining gaps with nearest neighbor values
-            int remaining_gaps = num_faces - direct_averaging_count - interpolation_count;
+        // Faces with no valid neighbor in their bilinear support: nearest-neighbor fill.
+        // (A former "second pass" re-ran the identical face-center sample and could never
+        // add a face; it is gone.)
+        if (direct_averaging_count < static_cast<int>(num_faces)) {
+            int remaining_gaps = num_faces - direct_averaging_count;
             if (remaining_gaps > 0) {
                 std::cout << "Filling remaining " << remaining_gaps << " gaps with nearest neighbors..." << std::endl;
                 
                 std::vector<bool> has_valid_albedo(num_faces);
                 for (size_t f = 0; f < num_faces; f++) {
-                    has_valid_albedo[f] = (face_albedos[f] != DEFAULT_ALBEDO);
+                    has_valid_albedo[f] = (sampled[f] != 0);
                 }
                 
                 int filled_count = 0;
@@ -591,7 +635,8 @@ int main(int argc, char** argv) {
                 }
                 
                 std::cout << "Nearest neighbor filling added albedos for " << filled_count 
-                          << " remaining faces" << std::endl;
+                          << " remaining faces (no valid source pixel in their bilinear support)"
+                          << std::endl;
             }
         }
         

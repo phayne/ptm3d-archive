@@ -3452,7 +3452,7 @@ static std::shared_ptr<ptm::SpatialMap> loadExplicitAlbedoMap(
     const std::string path = config.getProperty("albedo_map");
     if (path.empty()) return map;
     map = std::make_shared<ptm::SpatialMap>();
-    if (!map->loadFromFITS(path)) {
+    if (!map->loadFromFITS(path, ptm::MapFillPolicy::bondAlbedo())) {
         std::cout << tag << " Failed to load explicit albedo_map: " << path
                   << " (" << map->getLastError() << ")" << std::endl;
         map.reset();
@@ -3605,7 +3605,7 @@ bool AbsorbedFluxComposer::build(
             bool found = false;
             for (const auto& path : search_paths) {
                 std::cout << "Loading global albedo map from: " << path << std::endl;
-                if (global_albedo_map->loadFromFITS(path)) {
+                if (global_albedo_map->loadFromFITS(path, ptm::MapFillPolicy::bondAlbedo())) {
                     std::cout << "Successfully loaded global albedo map for " << body_name << std::endl;
                     std::cout << "Map dimensions: " << global_albedo_map->getWidth()
                             << "x" << global_albedo_map->getHeight() << std::endl;
@@ -5923,7 +5923,7 @@ bool runThermalModelsForAllFaces(
         
         if (!albedo_map_path.empty()) {
             albedo_map = std::make_shared<ptm::SpatialMap>();
-            if (albedo_map->loadFromFITS(albedo_map_path)) {
+            if (albedo_map->loadFromFITS(albedo_map_path, ptm::MapFillPolicy::bondAlbedo())) {
                 std::cout << "Using albedo map: " << albedo_map_path << std::endl;
                 
                 // Print some statistics about the map
@@ -10030,7 +10030,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         bool fits_loaded = false;
         std::string found_path;
         for (const auto& path : search_paths) {
-            if (albedo_map->loadFromFITS(path)) {
+            if (albedo_map->loadFromFITS(path, ptm::MapFillPolicy::bondAlbedo())) {
                 found_path = path;
                 fits_loaded = true;
                 break;

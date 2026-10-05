@@ -16,7 +16,17 @@ python3 scripts/fetch_data.py --dataset albedo-maps   # ~150 MB
 - **Moon:** normal-albedo mapping from LRO instruments (Diviner/LROC/LOLA
   heritage), converted to Bond albedo with the project's incidence-angle
   parametrization (Hayne et al. 2017, App.).
-- **Europa:** Voyager/Galileo-derived Bond albedo maps.
+- **Europa:** `Europa-0.5deg-BondAlbedo.fits` and `Europa-1deg-BondAlbedo.fits` are
+  the Bond albedo map of Mergny et al. (2025), derived from Voyager/Galileo imaging:
+
+  > Mergny, C., Schmidt, F., Andrieu, F., & Belgacem, I. (2025). A Bond albedo map of
+  > Europa. *Astronomy & Astrophysics*. https://doi.org/10.1051/0004-6361/202453058
+
+  The title, authors, journal and year were checked against the DOI's Crossref record
+  on 2026-10-05. That record carries no volume or article number, so neither is given
+  here. `scripts/jwst/plot_per_latitude_histograms.py` samples the same map ("Mergny et
+  al. Bond-albedo distribution"). The shipped `Europa_Albedo_res*.bin` are sampled from
+  the 0.5° file.
 - Original mission data: NASA PDS (public domain).
 
 ## Processing
@@ -27,6 +37,87 @@ Source maps are regridded to each icosphere's face centers by
 runtime sampler (`ptm_thermal_sim.cpp`, `thermal_model.cpp`, `albedo_manager.cpp`,
 the DEM sampler) and the photo-validated Moon camera bin. Each per-face binary is
 an 8-byte little-endian face count followed by one float64 (Bond albedo) per face.
+
+## Europa map gaps and how they are filled (PTM-695)
+
+The Europa FITS maps have gaps. Their pixels hold **−1.0**, but the header declares
+`MISSING = -9999`, a value that appears nowhere in the data. In the 0.5° map:
+
+| Pixels | Count (of 259,200) | Where | Treated as |
+|---|---|---|---|
+| −1.0 | 12,190 (4.70%) | every pixel south of −84.5°, a thinning annulus out to −77°, and the two seam columns at 0° and 359.5° E (all latitudes) | fill |
+| other negative values (−0.90 to −0.13) | 24 | 12 on the rim of the southern gap, 8 north of 88°, 4 between −80° and −60° | fill (outside the Bond-albedo range) |
+| exactly 0.0 | 128 | 114 of them north of 85° | data |
+| exactly 1.0 | 321 | all latitudes; 143 of them north of 85° | data |
+
+The 1° map has the same structure (3,304 at −1.0, 9 other negatives, 29 at 0.0, 101 at 1.0).
+
+**How fill is decided.** A pixel is fill if it equals a value the header declares (FITS
+`BLANK`, `MISSING` or `NODATA`, each read independently), equals a sentinel configured
+for the map (`albedo_map_generator --fill-value V`), lies outside the physical
+Bond-albedo range [0, 1], or is not finite. Every engine path that loads an albedo FITS
+applies the [0, 1] range, so the −1.0 gaps are fill even without `--fill-value`. The
+shipped Europa bins are generated with `--fill-value -1` anyway, so the log attributes
+them to the sentinel. Each load prints one line with the count in each category.
+
+**The 0.0 and 1.0 pixels are data.** Both values are pile-ups at the ends of a clipped
+range, not sentinels. 321 pixels sit at exactly 1.0, compared with 8 to 60 in each
+narrow bin just below it. The orphaned high-resolution Mergny FITS
+(19631 × 9816, quantized in steps of 0.0051, and also −1.0 where there are no data)
+piles up at 0 and 1 in the same way. Block-averaged onto the 0.5° grid, it does not
+show the 1.0 pixels as gaps. None of their blocks is fill (median fill fraction 0), the
+high-resolution mean there is ordinary terrain (median 0.646), and that mean is the same
+as for the 501 genuine pixels between 0.95 and 1.0 (median 0.644). Their 3 × 3
+neighborhoods are ordinary too (median 0.616). They behave as the noisy upper tail of
+the data, clipped at 1.0. The same holds when the 143 pixels north of 85° and the 178
+south of it are compared separately with their own 0.95-1.0 controls. The −1.0 pixels
+are the opposite case: 10,779 of the 12,190 fall in blocks that are entirely fill in the high-resolution map, which also confirms
+that the two maps are registered (correlation 0.815 with no shift; 0.73 at one pixel of
+shift and 0.35 with the rows flipped).
+
+**North of about 85° the 0.5° map is degraded, though not filled.** Its rows there
+repeat a few values (79% of the 89.5° row is a single value), and 832 pixels read below
+0.05 where the high-resolution map averages about 0.47. This is where most of the 0.0
+and 1.0 pixels are, and 8 of the negative ones. The rule above cannot catch it,
+because these are valid albedos in the wrong place (PTM-700).
+
+**The pipeline**, in `SpatialMap` (`src/cpp/maps/spatial_map.cpp`) and
+`albedo_map_generator`:
+
+1. **Load and classify.** The FITS is read and its rows flipped (row 0 = north). Every
+   fill pixel is rewritten to the map's single missing value.
+2. **Heal the longitude seam.** In each row where the two edge columns are fill and the
+   nearest interior columns are valid, the edge columns are filled by linear
+   interpolation across the seam (`heal_cylindrical_seam`). Before PTM-695 this step
+   never fired on Europa. The edge-column detector compares an edge column with its
+   neighbor, the neighbor contained −1.0 as well, and so −1.0 stayed in the map as data.
+3. **Sample each face at its center** by bilinear interpolation. If any weighted corner
+   is fill, the weights are renormalized over the valid corners. A fill pixel is never
+   blended in. `getAverageValueInTriangle` (a 7-point barycentric average) follows the
+   same rule but is not used by the generator.
+4. **Nearest-neighbor fill** applies only to faces with no valid corner in their
+   bilinear support. Each such face copies the nearest sampled face, by
+   latitude-longitude distance. The generator reports how many faces were renormalized
+   and how many were filled.
+5. **Post-processing that predates PTM-695.** Any face outside [0.01, 0.99] is replaced
+   by an inverse-distance mean of up to 12 neighbors within 30°, and values are then
+   floored at 0.01 (`fixOutOfRangeAlbedos`). This also smooths genuine faces next to the
+   1.0 pixels (PTM-699).
+
+Regenerate the Europa bins with:
+
+```bash
+build/bin/albedo_map_generator data/albedo_maps/Europa-0.5deg-BondAlbedo.fits \
+    data/albedo_maps 3 9 --fill-value -1
+```
+
+`scripts/jwst/plot_per_latitude_histograms.py` reads the 1° map directly and uses its
+own rule, keeping values strictly between 0.02 and 0.98. That rule also drops the 0.0
+and 1.0 pixels, along with the gaps.
+
+**The archive is out of date.** The v1 `albedo_maps.tar.gz` deposit carries the bins
+made before PTM-695. Until a corrected archive is published, regenerate the Europa bins
+locally with the command above. Moon bins are unaffected: they come out byte-identical.
 
 ## Lunar map registration (PTM-34 longitude, PTM-35 latitude — corrected)
 
@@ -61,9 +152,11 @@ build/bin/albedo_map_generator data/albedo_maps/Moon-BondAlbedo.fits \
     data/albedo_maps 3 9
 ```
 
-**Europa is unaffected.** Its runtime path samples the FITS live at +latitude and
-its shipped `Europa_Albedo_res*.bin` were already +latitude (regenerating with the
-fixed generator reproduces them); the Europa maps are unchanged.
+**Europa is unaffected by PTM-35.** Its runtime path samples the FITS live at +latitude
+and its shipped `Europa_Albedo_res*.bin` were already +latitude. (Regenerating them with
+the PTM-35 generator matched them everywhere except about 365 seam faces at res6, which
+an older seam treatment had produced. PTM-695 changes the Europa bins for a different
+reason, the gap fill; see above.)
 
 The distributed `albedo_maps.tar.gz` in this revision carries the corrected Moon
 FITS + regenerated Moon bins (Europa untouched); `data_manifest.json`'s sha256 and

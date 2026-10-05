@@ -7,6 +7,9 @@
 #include <array>
 #include <unordered_map>  // Add this include
 #include <mutex>
+#include <limits>
+#include <cmath>
+#include <cstddef>
 #include "fits_reader.h"
 
 namespace ptm {
@@ -15,6 +18,46 @@ enum class MapProjection {
     EQUIRECTANGULAR,  // Simple lat/lon grid
     SINUSOIDAL,       // Area-preserving projection
     CUSTOM            // User-defined projection
+};
+
+// Which raster values are fill (no data) beyond the value the file itself
+// declares (FITS BLANK/MISSING/NODATA). Applied once at load time: every pixel
+// it classifies as fill is rewritten to the map's missing value, so the seam
+// healing, the samplers and the statistics all see a single sentinel.
+struct MapFillPolicy {
+    // Exact-match sentinels configured for a particular map, for files whose
+    // header does not declare the value they actually use.
+    std::vector<double> fill_values;
+    // Physical range of the quantity. A value outside [valid_min, valid_max]
+    // cannot be data and is treated as fill. Unbounded by default.
+    double valid_min = -std::numeric_limits<double>::infinity();
+    double valid_max = std::numeric_limits<double>::infinity();
+
+    // A Bond albedo lies in [0, 1]. This is what catches the Europa
+    // Bond-albedo maps' -1.0 gap fill, which their headers misdeclare as
+    // MISSING = -9999 (see data/albedo_maps/README.md).
+    static MapFillPolicy bondAlbedo() {
+        MapFillPolicy p;
+        p.valid_min = 0.0;
+        p.valid_max = 1.0;
+        return p;
+    }
+};
+
+// Per-category pixel counts from applying a MapFillPolicy at load time.
+struct MapFillCounts {
+    size_t declared = 0;      // equal to a fill value the header declares
+    size_t configured = 0;    // equal to a MapFillPolicy::fill_values entry
+    size_t out_of_range = 0;  // outside [valid_min, valid_max]
+    size_t non_finite = 0;    // NaN or infinite
+    size_t total() const { return declared + configured + out_of_range + non_finite; }
+};
+
+// What a single interpolated sample drew on.
+struct MapSampleInfo {
+    int fill_corners = 0;        // bilinear corners with nonzero weight that were fill
+    double fill_weight = 0.0;    // their total bilinear weight (0 = clean sample)
+    bool no_valid_support = false;  // every weighted corner was fill: value is missing
 };
 
 class SpatialMap {
@@ -47,18 +90,26 @@ public:
         double lat_min,
         double lat_max,
         MapProjection proj = MapProjection::EQUIRECTANGULAR,
-        double missing_val = -9999.0);
+        double missing_val = -9999.0,
+        const MapFillPolicy& policy = MapFillPolicy());
     
-    // Load from file
-    bool loadFromFITS(const std::string& filename);
+    // Load from file. Fill pixels (header-declared, configured, out of the
+    // policy's physical range, or non-finite) are rewritten to the missing
+    // value and reported on stdout; getFillCounts() returns the tally.
+    bool loadFromFITS(const std::string& filename,
+                      const MapFillPolicy& policy = MapFillPolicy());
     bool loadFromBinary(const std::string& filename);
     
     // Save to file
     bool saveToFITS(const std::string& filename) const;
     bool saveToCSV(const std::string& filename) const;
     
-    // Get interpolated value at specific location
+    // Get interpolated value at specific location. Fill pixels never enter a
+    // sample: the bilinear weights are renormalized over the valid corners, and
+    // the missing value is returned when no weighted corner is valid. Pass
+    // `info` to learn whether (and how much) fill the sample had to skip.
     double getValue(double lon, double lat) const;
+    double getValue(double lon, double lat, MapSampleInfo* info) const;
     
     // Create a resampled version of the map
     std::shared_ptr<SpatialMap> resample(int new_width, int new_height) const;
@@ -72,6 +123,7 @@ public:
     double getLatMax() const { return lat_max_; }
     double getMissingValue() const { return missing_value_; }
     MapProjection getProjection() const { return projection_; }
+    const MapFillCounts& getFillCounts() const { return fill_counts_; }
     
     // Statistics
     double getMin() const;
@@ -102,7 +154,9 @@ public:
     // Set coordinates
     void setCoordinates(double lon_min, double lon_max, double lat_min, double lat_max);
 
-    // New method to get average value in a triangular mesh face
+    // Mean of a 7-point barycentric sample of a triangular face. Each point goes
+    // through getValue(), so fill is excluded the same way. Not used by
+    // albedo_map_generator, which samples face centers.
     double getAverageValueInTriangle(
         double lat1, double lon1,
         double lat2, double lon2,
@@ -125,6 +179,7 @@ private:
     double lat_max_;
     double missing_value_;
     MapProjection projection_;
+    MapFillCounts fill_counts_;
     mutable std::string last_error_;
     
     // Add these new members to support caching triangle calculations
@@ -141,7 +196,17 @@ private:
     void normalizeCoordinates(double& lon, double& lat) const;
     int getIndex(int x, int y) const;
     bool isValidIndex(int index) const;
-    double bilinearInterpolate(double x, double y) const;
+    bool isFill(double v) const { return !std::isfinite(v) || v == missing_value_; }
+    double bilinearInterpolate(double x, double y, MapSampleInfo* info = nullptr) const;
+    // Rewrite every fill pixel of data_ to missing_value_ and tally it.
+    // `single_precision`: the raster was stored as float, so sentinels are matched
+    // at float precision.
+    void applyFillPolicy(const std::vector<double>& declared_fill_values,
+                         const MapFillPolicy& policy, bool single_precision);
+    // One stdout line with the fill tally, and a WARNING when most of the map is
+    // fill (wrong units or sentinel): the load still succeeds, but never silently.
+    void reportFillCounts(const std::string& label, const std::string& missing_source,
+                          const MapFillPolicy& policy) const;
 };
 
 // This function is used outside the class

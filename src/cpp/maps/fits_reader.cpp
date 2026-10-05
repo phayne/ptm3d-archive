@@ -3,6 +3,8 @@
 #include <cmath>
 #include <sstream>
 #include <iostream>
+#include <string>
+#include <vector>
 
 namespace ptm {
 
@@ -40,6 +42,10 @@ bool FITSReader::read(const std::string& filename, std::vector<double>& data, FI
     }
     
     // Set basic header info
+    int equiv_type = 0;
+    int type_status = 0;
+    fits_get_img_equivtype(fptr, &equiv_type, &type_status);
+    header.single_precision = (type_status == 0 && equiv_type == FLOAT_IMG);
     header.width = static_cast<int>(naxes[0]);
     header.height = static_cast<int>(naxes[1]);
     
@@ -55,17 +61,26 @@ bool FITSReader::read(const std::string& filename, std::vector<double>& data, FI
         status = 0;
     }
     
-    // Check for BLANK or MISSING keyword
-    double blank_val;
-    char comment[FLEN_COMMENT];
-    if (fits_read_key(fptr, TDOUBLE, "BLANK", &blank_val, comment, &status) == 0 ||
-        fits_read_key(fptr, TDOUBLE, "MISSING", &blank_val, comment, &status) == 0 ||
-        fits_read_key(fptr, TDOUBLE, "NODATA", &blank_val, comment, &status) == 0) {
-        header.missing_value = blank_val;
-    } else {
-        header.missing_value = -9999.0;  // Default
-        status = 0; // Reset status
+    // Fill-value keywords. Each lookup gets its own status: CFITSIO calls are
+    // no-ops when entered with a nonzero status, so chaining them on one status
+    // (as this code once did) meant a file without BLANK never had MISSING or
+    // NODATA read at all.
+    header.missing_value = -9999.0;
+    header.missing_value_source = "default (no BLANK/MISSING/NODATA keyword)";
+    header.declared_fill_values.clear();
+    for (const char* key : {"BLANK", "MISSING", "NODATA"}) {
+        int key_status = 0;
+        double key_val = 0.0;
+        char comment[FLEN_COMMENT];
+        if (fits_read_key(fptr, TDOUBLE, key, &key_val, comment, &key_status) == 0) {
+            if (header.declared_fill_values.empty()) {
+                header.missing_value = key_val;
+                header.missing_value_source = key;
+            }
+            header.declared_fill_values.push_back(key_val);
+        }
     }
+    status = 0;
     
     // Read the image data
     if (!readImageData(fptr, data, header)) {
