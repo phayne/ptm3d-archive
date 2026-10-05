@@ -442,6 +442,45 @@ def test_tau_diff_uses_ice_heat_capacity():
     assert np.allclose(evo._tau_diff_years(b, T), expect, rtol=1e-12)
 
 
+def test_static_albedo_map_is_body_fixed(tmp_path=None):
+    """static_map: T = T_an(A) + dT(tidal) + R(body); A and R stay with the body."""
+    import tempfile
+    css, cfg = _small_coupled(t_max_years=1e3)
+    theta, lam = G.periodic_grid(cfg.n_theta, cfg.n_lam)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    A = 0.55 + 0.2 * np.sin(TH) * np.sin(LA)
+    R = 0.5 * np.cos(TH) * np.cos(LA)
+    th_t, lm_t = np.linspace(0, np.pi, 31), np.linspace(-np.pi, np.pi, 61)
+    dT = np.full((31, 61), 1.5)
+    path = os.path.join(tempfile.mkdtemp(), 'forcing.npz')
+    np.savez(path, theta=theta, lam=lam, A_meas=A, A_unif=0.55, R_meas=R,
+             R_unif=np.zeros_like(R), dT_theta=th_t, dT_lam=lm_t, dT=dT)
+    css2, cfg = _small_coupled(t_max_years=1e3, albedo_mode='static_map',
+                               forcing_file=path, init_b_mode='equilibrium')
+    cfg.use_ptm3d_surrogate = True
+    evo = css2.CoupledEvolution(cfg)
+    z = np.array([0.0, 0.0, 1.0])
+    T = evo.surface_temperature_coupled(evo.model.albedo_field(0.0, z), z)
+    T_an = ((1 - A) * OSSurfaceTemperature().annual_average_flux(TH) / C.STEFAN_BOLTZMANN) ** 0.25
+    assert np.allclose(T, T_an + R + 1.5, rtol=1e-12)
+    tilted = np.array([0.0, np.sin(0.3), np.cos(0.3)])
+    assert np.array_equal(evo.model.albedo_field(0.0, tilted), A)
+    assert np.allclose(evo.b, evo._b_eq(T), rtol=1e-12)            # equilibrium start
+    # a forcing file built on another grid is refused
+    cfg.n_theta = 26
+    try:
+        css2.CoupledEvolution(cfg)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('grid mismatch accepted')
+
+
+def test_psi0_default_is_obliquity():
+    import polar_wander_cycle as pwc
+    assert np.isclose(pwc.PolarWanderConfig().psi0_rad, np.radians(0.1))
+
+
 def test_coupled_initial_state_is_isotropic():
     css, cfg = _small_coupled(t_max_years=1e3)
     evo = css.CoupledEvolution(cfg)

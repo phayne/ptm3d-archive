@@ -63,6 +63,12 @@ CASE_STYLES = {
 }
 
 
+# Default psi0 (decision of 2026-10-05): Europa's predicted forced obliquity,
+# ~0.1 deg (Bills 2005, Icarus 175, 233-247). UNVERIFIED: the number has not
+# been checked against the paper in this repository.
+PSI0_OBLIQUITY_RAD = np.radians(0.1)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -93,7 +99,8 @@ class PolarWanderConfig:
     tpw_model: str = 'exponential'    # 'exponential', 'ospw', or 'coupled'
     # --- OSPW rheological parameters (ospw/coupled modes) ---
     ospw_shell_thickness: float = None       # b_c [m]; None = initial mean b
-    ospw_lithosphere_thickness: float = 2e3  # d [m]
+    ospw_lithosphere_thickness: float = 2e3  # d [m] (ignored if ospw_bc_over_d is set)
+    ospw_bc_over_d: float = None             # e.g. 10: d = b_c/10, as in OSPW Eq. 3.12
     ospw_melting_viscosity: float = 3e14     # eta_0 [Pa s]
     ospw_activation_param: float = 15.0      # l (dimensionless)
     ospw_fracture_base_temp: float = 124.0   # T_f [K] (OSPW p. 264)
@@ -101,7 +108,9 @@ class PolarWanderConfig:
     # --- Iceberg amplification ---
     use_iceberg_effect: bool = True          # Eq. 2.18 bottom loading (False: rigid load)
     # --- psi0 seed and thickness law ---
-    psi0_rad: float = 1e-6                   # physical seed offset (OSPW Eq. 5.41)
+    # psi0 = Europa's predicted forced obliquity, ~0.1 deg (Bills 2005, Icarus
+    # 175, 233; UNVERIFIED: value not checked against the paper). Bracket x0.1, x10.
+    psi0_rad: float = PSI0_OBLIQUITY_RAD
     thickness_method: str = 'eq28'           # 'eq28' or 'exact' (shell_thickness)
     D_update_threshold_deg: float = 0.0      # recompute tidal heating when the pole moves
     # --- B&H interior coupling (coupled mode) ---
@@ -123,6 +132,7 @@ class PolarWanderConfig:
 # t20 + 2 t22 (Eq. 5.32: (t/tau) ~ 1e-5 per km). Below it the principal axes
 # are set by round-off, not physics.
 SEED_GAP_REL = 1e-12
+
 
 
 def _build_dissipation_grid(case, theta, lam):
@@ -200,9 +210,11 @@ def _ospw_params(cfg, mean_b=None):
     if bc is None:
         raise ValueError('OSPW shell thickness unknown: set ospw_shell_thickness '
                          'or pass the mean thickness')
+    ratio = getattr(cfg, 'ospw_bc_over_d', None)
+    d = bc / ratio if ratio else cfg.ospw_lithosphere_thickness
     return PW.OSPWParams(
         shell_thickness=bc,
-        lithosphere_thickness=cfg.ospw_lithosphere_thickness,
+        lithosphere_thickness=d,
         melting_viscosity=cfg.ospw_melting_viscosity,
         activation_l=cfg.ospw_activation_param,
         fracture_temp=cfg.ospw_fracture_base_temp,
@@ -1392,7 +1404,7 @@ def main():
                         help='Quasi-static sweep for all 4 rheologies')
     parser.add_argument('--no-fossil-bulge', action='store_true',
                         help='Disable fossil bulge (original behavior)')
-    parser.add_argument('--psi0', type=float, default=1e-6,
+    parser.add_argument('--psi0', type=float, default=PSI0_OBLIQUITY_RAD,
                         help='psi0 seed [rad] applied when the pole becomes unstable')
     parser.add_argument('--thickness-method', choices=('eq28', 'exact'), default='eq28')
     parser.add_argument('--parameter-set', default='paper', choices=sorted(C.PARAMETER_SETS),

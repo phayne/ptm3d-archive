@@ -84,7 +84,7 @@ class CoupledConfig(PolarWanderConfig):
     tau_dark: float = 1e4               # free; tested 1e4-1e7 yr
     # --- initial condition ---
     use_fossil_bulge: bool = False      # True: body-fixed hydrostatic fossil (Eqs. 3.8-3.10)
-    init_b_mode: str = 'equilibrium_mean'  # 'equilibrium_mean' or 'constant'
+    init_b_mode: str = 'equilibrium_mean'  # 'equilibrium_mean', 'equilibrium' or 'constant'
     init_b_const_m: float = 20e3
     # --- reorientation ---
     tpw_model: str = 'ospw'
@@ -96,6 +96,16 @@ class CoupledConfig(PolarWanderConfig):
     # --- PTM3D surrogate / multi-rate ---
     use_ptm3d_surrogate: bool = True
     use_live_ptm3d: bool = False        # Phase 2: periodic full-PTM3D refresh
+    # --- forcing file (eq36-derived; see tpw_runs/build_forcing.py) ---
+    # npz with dT (tidal-frame table), A_meas / A_unif and R_meas / R_unif on
+    # the run grid. When set it replaces the legacy dT_PTM cache.
+    forcing_file: str = None
+    # 'darkening': spin-frame apex darkening (A_bright -> A_dark);
+    # 'static_map': body-fixed albedo field from forcing_file ('measured' or
+    # 'uniform'), constant in time, carried with the shell as the pole moves.
+    albedo_mode: str = 'darkening'
+    static_field: str = 'measured'
+    use_residual: bool = True           # add the body-fixed residual R (static_map)
     ptm3d_resolution: int = 5
     ptm3d_refresh_pole_deg: float = 10.0
     ptm3d_refresh_albedo_rms: float = 0.03
@@ -179,6 +189,27 @@ def build_static_dT_ptm(cache=True):
 # ---------------------------------------------------------------------------
 # Coupled evolution
 # ---------------------------------------------------------------------------
+class StaticAlbedoModel(AlbedoDarkeningModel):
+    """Body-fixed albedo field A(theta, lam), independent of time and pole."""
+
+    def __init__(self, cfg, A_grid):
+        super().__init__(cfg)
+        self.A_grid = np.asarray(A_grid, dtype=float)
+
+    def albedo_field(self, f_dark, spin_pole=None):
+        return self.A_grid
+
+
+def load_forcing(cfg, theta, lam):
+    """Read cfg.forcing_file and check it was built on this run's grid."""
+    d = np.load(cfg.forcing_file)
+    if not (d['theta'].shape == theta.shape and np.allclose(d['theta'], theta)
+            and d['lam'].shape == lam.shape and np.allclose(d['lam'], lam)):
+        raise ValueError(f'{cfg.forcing_file} was built on a different grid than '
+                         f'{len(theta)}x{len(lam)}')
+    return d
+
+
 class CoupledEvolution(ShellEvolution):
     """ShellEvolution with PTM3D-coupled temperature, per-location tau_diff
     relaxation, cosine-apex darkening, and a uniform / no-fossil initial state.
@@ -187,13 +218,36 @@ class CoupledEvolution(ShellEvolution):
     def __init__(self, cfg):
         # Parent sets up grid, D (spin pole = z), OSPW, history, and records.
         super().__init__(cfg)
-        # Swap in the cosine-apex darkening model.
-        self.model = CosineApexAlbedoModel(cfg)
         self._pole0 = self.spin_pole.copy()
+        self._R = None
+        self._dT_interp = None
+        forcing = load_forcing(cfg, self.theta, self.lam) if cfg.forcing_file else None
+        if cfg.albedo_mode == 'static_map':
+            if forcing is None:
+                raise ValueError("albedo_mode='static_map' needs forcing_file")
+            if cfg.static_field == 'measured':
+                A_grid, R = forcing['A_meas'], forcing['R_meas']
+            elif cfg.static_field == 'uniform':
+                A_grid = np.full((len(self.theta), len(self.lam)), float(forcing['A_unif']))
+                R = forcing['R_unif']
+            else:
+                raise ValueError(f'static_field must be measured or uniform: {cfg.static_field!r}')
+            self.model = StaticAlbedoModel(cfg, A_grid)
+            self._R = np.array(R) if cfg.use_residual else None
+        elif cfg.albedo_mode == 'darkening':
+            # Swap in the cosine-apex darkening model.
+            self.model = CosineApexAlbedoModel(cfg)
+        else:
+            raise ValueError(f'albedo_mode must be darkening or static_map: {cfg.albedo_mode!r}')
 
         # Build the temperature surrogate (dT_PTM interpolator).
-        self._dT_interp = None
-        if cfg.use_ptm3d_surrogate:
+        if forcing is not None:
+            if not cfg.use_ptm3d_surrogate:
+                raise ValueError('forcing_file given but use_ptm3d_surrogate is False')
+            self._dT_interp = RegularGridInterpolator(
+                (forcing['dT_theta'], forcing['dT_lam']), forcing['dT'])
+            self._dT_grid = (forcing['dT_theta'], forcing['dT_lam'], forcing['dT'])
+        elif cfg.use_ptm3d_surrogate:
             th1d, lm1d, dT = build_static_dT_ptm()
             self._dT_interp = RegularGridInterpolator(
                 (th1d, lm1d), dT, bounds_error=False, fill_value=None)
@@ -207,9 +261,16 @@ class CoupledEvolution(ShellEvolution):
         b_eq0 = self._b_eq(T0)
         if cfg.init_b_mode == 'constant':
             b0 = cfg.init_b_const_m
-        else:
+            self.b = np.full_like(self.b, b0)
+        elif cfg.init_b_mode == 'equilibrium_mean':
             b0 = _area_mean(b_eq0, self.theta, self.lam)
-        self.b = np.full_like(self.b, b0)
+            self.b = np.full_like(self.b, b0)
+        elif cfg.init_b_mode == 'equilibrium':
+            # the thermal-equilibrium shell for the initial pole
+            self.b = b_eq0.copy()
+            b0 = _area_mean(b_eq0, self.theta, self.lam)
+        else:
+            raise ValueError(f'unknown init_b_mode {cfg.init_b_mode!r}')
         self._b0_uniform = b0
         # OSPW parameters for the uniform start (b_c = b0 unless fixed).
         self._ospw_p = _ospw_params(cfg, b0)
@@ -236,6 +297,8 @@ class CoupledEvolution(ShellEvolution):
     # -- temperature surrogate --------------------------------------------
     def surface_temperature_coupled(self, A, spin_pole):
         T_solar = self.model.surface_temperature_for_pole(A, spin_pole)
+        if self._R is not None:
+            T_solar = T_solar + self._R          # body-fixed residual (static_map)
         if self._dT_interp is None:
             return T_solar
         theta_t, lam_t = _tidal_coordinates(self.theta, self.lam, spin_pole)
@@ -539,7 +602,7 @@ def main():
                    help='darkening e-folding time [yr]; tested 1e4-1e7')
     p.add_argument('--A-dark', type=float, default=0.3814,
                    help='dark endmember Bond albedo (Hapke non-ice endmember)')
-    p.add_argument('--psi0', type=float, default=1e-6,
+    p.add_argument('--psi0', type=float, default=pwc.PSI0_OBLIQUITY_RAD,
                    help='psi0 seed [rad] applied when the pole becomes unstable')
     p.add_argument('--fossil', choices=('none', 'hydrostatic'), default='none',
                    help='fossil bulge: none, or body-fixed hydrostatic (OSPW Eqs. 3.8-3.10)')

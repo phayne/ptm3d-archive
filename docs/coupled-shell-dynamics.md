@@ -49,8 +49,15 @@ Each step:
    moves by the overdamped law `ψ̇ = (t/τ)(n²I₀/2C_f) sin 2ψ`, with `(t/τ)I₀` the difference
    between the moment about the target (maximum) axis and the moment about the spin axis and
    `C_f` from Eq. 5.15. When the spin axis stops being the maximum-moment axis, the pole is
-   given a physical offset ψ₀ (`--psi0`, default 10⁻⁶ rad) instead of waiting for round-off.
+   given a physical offset ψ₀ (`--psi0`; default 0.1° ≈ 1.75 × 10⁻³ rad, Europa's predicted
+   forced obliquity, Bills 2005) instead of waiting for round-off.
 6. The darkening apex and tidal heating **rotate with the new pole**; repeat.
+
+`--albedo-mode static_map` replaces the darkening with a **body-fixed** albedo field (the measured
+eq36 map, or the uniform control) that moves with the shell as the pole wanders. The surface
+temperature is then `T = [(1−A)F_A(θ_t)/σ]^{1/4} + ΔT(θ_t,λ_t) + R(θ,λ)`, with ΔT from the eq36
+uniform fields (tidal frame) and R a body-fixed residual that reproduces the measured eq36 field
+at the initial pole (`forcing_file`, built by `build_forcing.py`).
 
 **Multi-rate stepping** keeps the 100-Myr-class run tractable: a fine step (τ_dark/20) during the
 short darkening ramp, a coarse step afterward, and an **adaptive cap** that limits the pole rotation
