@@ -45,14 +45,14 @@ Each step:
    `b = ln(T_M/T_s) / [(2/a₁)D + (H/a₁)²]^{1/2}`, with $C_R = 0.5$
    (`ojakangas_stevenson.shell_thickness`; `--thickness-method exact` integrates the first
    integral of Eqs. 2.4/2.5 instead). D is re-rotated when the pole drifts.
-4. **Relax at the local Stefan time** (default, `relaxation_mode='stefan'`) —
-   `b ← b_eq + (b−b_eq)·e^{−dt/τ}`, `τ(θ,λ) = ρ L b / q = ρ L b² / F`, with L the latent heat of
-   fusion and `F = a₁ ln(T_M/T_s) + a₀ (T_M − T_s)` the conductive flux integral: a thickness
-   anomaly decays only as fast as the basal flux imbalance can melt or freeze ice. τ ≈ 13 Myr for
-   b = 30 km (modern k = 651/T), consistent with OSPW's τ_th ~ 10⁷ yr. Not included: sensible heat
-   (≈ +40%) and the change of internal tidal heating with b.
-   `relaxation_mode='diffusive'` keeps the earlier `τ_diff = b²/κ`, `κ = k/(ρ c_p)`,
-   `c_p = 90 + 7.49 T`, which is 4–5× too fast (no latent heat).
+4. **Relax at the local Stefan time** (default, `relaxation_mode='stefan_sensible'`) —
+   `b ← b_eq + (b−b_eq)·e^{−dt/τ}`, `τ(θ,λ) = (1 + S/L) ρ L b / q = (1 + S/L) ρ L b² / F`, with L the
+   latent heat of fusion, `F = a₁ ln(T_M/T_s) + a₀ (T_M − T_s)` the conductive flux integral and S the
+   sensible heat of the steady conductive profile per unit mass, computed exactly per location
+   (`sensible_heat_ratio`; S/L = 0.53 / 0.50 / 0.48 at T_s = 90 / 100 / 110 K for k = 651/T,
+   c_p = 90 + 7.49 T). τ ≈ 20 Myr for b = 30 km at 100 K, within OSPW's "≲ a few × 10⁷ yr" (p. 247).
+   Not included: the change of internal tidal heating with b. Options: `'stefan'` (latent heat only,
+   ≈ 13 Myr) and `'diffusive'` (the earlier `τ_diff = b²/κ`, 4–5× too fast).
 5. **Reorient (OSPW Eq. 5.39)** — the physical inertia tensor is the Eq. 2.18 bottom-loaded
    (buoyantly compensated, iceberg-effect) tensor of the thickness field plus, optionally
    (`--fossil hydrostatic`), the body-fixed hydrostatic fossil bulge of Eqs. 3.8–3.10. The pole
@@ -78,6 +78,18 @@ temperature is then `T = [(1−A)F_A(θ_t)/σ]^{1/4} + ΔT(θ_t,λ_t) + R(θ,λ)
 uniform fields (tidal frame) and R a body-fixed residual that reproduces the measured eq36 field
 at the initial pole (`forcing_file`, built by `build_forcing.py`).
 
+### 1.0 Convection bracketing proxy (`conv_s`, `conv_fD`)
+
+The paper model stays the conductive O&S shell. The shell is near the onset of stagnant-lid
+convection (Fermi, 2026-10-05), so two knobs bracket its effect on the forced thickness anomaly:
+`conv_fD` reweights the tidal-heating (D) part of the equilibrium anomaly,
+`b_f = B(T_s, ⟨D⟩) + f_D [B(T_s, D) − B(T_s, ⟨D⟩)]`, leaving the surface-temperature response
+(the same per kelvin in a stagnant lid as in O&S) unchanged; `conv_s` damps the whole anomaly by
+steady basal flow, `b_eq = ⟨b_f⟩ + s (b_f − ⟨b_f⟩)`, so every degree ≥ 1 harmonic scales by s
+exactly. Bracket: s ∈ {1, 0.4, 0.1, 0.03}, f_D ∈ {1, 0.4}. The relaxation time is not changed
+(`conv_flow_tau` would also scale it by s; off, not ruled). With a fossil the Eq. 3.12 verdict
+flips at s* = threshold / (t₂₀ + 2t₂₂); without one it cannot flip for any s > 0 (only the rate scales).
+
 ### 1.1 Split albedo (`albedo_mode='split'`)
 
 `A(x,t) = clamp(A_intr(x_body) + A_exo(x,t), 0.3814, 0.80)`, with
@@ -89,6 +101,10 @@ to the measured eq36 map at t = 0 (tidal frame = body frame); its constant goes 
 `split_component` selects full, exogenic only (A_intr = uniform A_unif) or intrinsic only.
 Options `exo_template='apex_l2'` (adds P₂(cos γ)) and `'bh2021_zonal'` (adds a spin-frame
 P₂(cos θ_t) latitude term, not exogenic in origin) are for sensitivity tests.
+`exo_template='exo_file'` uses the exosphere-model forcing (`exo_profile_fit`): S(θ) about the spin
+pole plus T(γ) = Σ cₙ Pₙ(cos γ) in tidal coordinates (E1); E2 adds the B&H cos γ implantation term
+so the total cos γ coefficient equals the map's; E3 also takes the map's own zonal profile as
+spin-frame.
 See `ojakangas_stevenson/exogenic_albedo.py`. Initial-condition modes for the hypothesis test:
 `init_b_mode` `uniform_equilibrium` / `equilibrium` / `blend`, `init_l2_perturb_km`, and
 `init_pole_offset_deg`.

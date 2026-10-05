@@ -20,7 +20,8 @@ Contents
 * Eqs. 5.19-5.21 / 5.26 / 5.38  the same with the tidal torque from Jupiter
             (``overdamped_step_tidal``; stiffness 4 n^2 eps toward Jupiter),
             and the quasi-static sub-Jovian meridian (``meridian_min_moment``)
-* Stefan-limited shell relaxation time rho L b / q (``stefan_relaxation_time``)
+* Stefan-limited shell relaxation time (1 + S/L) rho L b / q, S/L exact
+            (``stefan_relaxation_time``, ``sensible_heat_ratio``)
 
 Conventions: body frame x toward Jupiter (sub-Jovian point), z along the
 spin axis at the epoch the fossil froze. C20, C22 are unnormalized
@@ -490,24 +491,64 @@ def tidal_frame_t20_2t22(I_shell, spin, sub_jovian, p, cw=None):
     return d / (p.mass * p.radius**2 * shell_c2m(1.0, p, cw))
 
 
-def stefan_relaxation_time(b, T_s, T_m=None, latent_heat=None, density=None):
-    """Stefan-limited relaxation time of the shell thickness, tau = rho L b / q [s].
+_GL_X, _GL_W = np.polynomial.legendre.leggauss(48)
 
+
+def sensible_heat_ratio(T_s, T_m=None, latent_heat=None):
+    """S/L for the steady conductive profile of a shell with surface T_s, exactly.
+
+    When the base advances by db the whole profile, which scales with b for
+    the k = a1/T + a0 shell without internal heating (z/b = int_Ts^T k dT / F),
+    must also be re-equilibrated. The energy per unit area to make a shell of
+    thickness b from melt at T_m is rho b [L + S], with
+        S = int_0^1 [h(T_m) - h(T(zeta))] dzeta
+          = (1/F) int_Ts^Tm [h(T_m) - h(T)] k(T) dT,   h(T) = int c_p dT,
+    c_p = 90 + 7.49 T (constants.ice_heat_capacity), F = int_Ts^Tm k dT.
+    Evaluated by 48-point Gauss-Legendre in T (smooth integrand; exact to
+    ~1e-12). Modern k = 651/T: S/L = 0.530 / 0.503 / 0.477 at T_s = 90 / 100
+    / 110 K (Fermi, 2026-10-05). Returns an array shaped like T_s.
+    """
+    T_m = C.T_MELT if T_m is None else T_m
+    L = C.ICE_LATENT_HEAT if latent_heat is None else latent_heat
+    Ts = np.asarray(T_s, dtype=float)
+    c0, c1 = C.ICE_CP_COEFFS
+    h = lambda T: c0 * T + 0.5 * c1 * T * T                     # noqa: E731
+    k = lambda T: C.A1_CONDUCTIVITY / T + C.A0_CONDUCTIVITY     # noqa: E731
+    half = 0.5 * (T_m - Ts)[..., None]
+    T = 0.5 * (T_m + Ts)[..., None] + half * _GL_X
+    num = np.sum(_GL_W * (h(T_m) - h(T)) * k(T), axis=-1) * half[..., 0]
+    F = C.A1_CONDUCTIVITY * np.log(T_m / Ts) + C.A0_CONDUCTIVITY * (T_m - Ts)
+    return num / F / L
+
+
+def stefan_relaxation_time(b, T_s, T_m=None, latent_heat=None, density=None,
+                           sensible='exact'):
+    """Stefan-limited relaxation time of the shell thickness [s].
+
+    tau = (1 + S/L) rho L b / q = (1 + S/L) rho L b^2 / F.
     A thickness anomaly decays only as fast as the basal flux imbalance can
-    melt or freeze ice: rho L db/dt = q_cond(b) - q_in, with the conductive
-    flux of the k = a1/T + a0 shell q_cond = F/b, F = a1 ln(T_m/T_s) +
-    a0 (T_m - T_s). Linearized about equilibrium, dq/db = -q/b, so the
-    e-folding time is rho L b / q = rho L b^2 / F. For b = 30 km, T_s = 100 K
-    and the modern k = 651/T: ~13 Myr, consistent with OSPW's tau_th ~ 1e7 yr
-    (p. 261) and ~4-5x slower than the conductive b^2/kappa.
+    melt or freeze ice and re-equilibrate the profile: rho (L + S) db/dt =
+    q_cond(b) - q_in, with the conductive flux of the k = a1/T + a0 shell
+    q_cond = F/b, F = a1 ln(T_m/T_s) + a0 (T_m - T_s). Linearized about
+    equilibrium, dq/db = -q/b, so the e-folding time is (L + S) rho b^2 / F.
+    S/L from ``sensible_heat_ratio`` (exact for the actual profile; ~0.50 at
+    100 K for modern k = 651/T and c_p = 90 + 7.49 T). For b = 30 km, T_s =
+    100 K, modern constants: ~20 Myr (latent heat alone: ~13 Myr), consistent
+    with OSPW's "<~ a few x 1e7 yr" (p. 247).
 
-    Not included (documented, not silent): sensible heat (the profile must
-    also re-equilibrate; adds ~c_p (T_m - T_s)/2 ~ 0.4 L), and the change
-    of internal tidal heating with b, which modifies dq/db.
+    ``sensible``: 'exact' (default since 2026-10-05, Paul's ruling) or 'none'
+    (latent heat only, the 679af84 form). Not included: the change of
+    internal tidal heating with b, which modifies dq/db.
     """
     T_m = C.T_MELT if T_m is None else T_m
     L = C.ICE_LATENT_HEAT if latent_heat is None else latent_heat
     rho = C.ICE_DENSITY if density is None else density
     T_s = np.asarray(T_s, dtype=float)
     F = C.A1_CONDUCTIVITY * np.log(T_m / T_s) + C.A0_CONDUCTIVITY * (T_m - T_s)
-    return rho * L * np.asarray(b, dtype=float) ** 2 / F
+    if sensible == 'exact':
+        fac = 1.0 + sensible_heat_ratio(T_s, T_m, L)
+    elif sensible == 'none':
+        fac = 1.0
+    else:
+        raise ValueError(f"sensible must be 'exact' or 'none', got {sensible!r}")
+    return fac * rho * L * np.asarray(b, dtype=float) ** 2 / F

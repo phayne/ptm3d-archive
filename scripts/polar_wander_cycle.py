@@ -124,6 +124,22 @@ class PolarWanderConfig:
     # so a pole could park on a saddle).
     seed_rearm: str = 'any_axis'
     seed_rearm_deg: float = 1.0       # 'any_axis': re-arm after the pole moves this far
+    # --- convection bracketing proxy (Paul 2026-10-05; Fermi's assessment) ---
+    # The shell stays conductive O&S; these knobs bracket a stagnant-lid
+    # convecting shell. In a stagnant lid the thickness response per kelvin of
+    # surface T is the same as in O&S, but basal flow damps the degree-2
+    # anomaly and the tidal heat goes to the convecting layer. So:
+    #   conv_fD: weight of the tidal-heating (D) contribution to the
+    #            equilibrium anomaly, b_f = B(T_s, <D>) + f_D [B(T_s, D) - B(T_s, <D>)]
+    #            (surface-T contribution unchanged);
+    #   conv_s:  steady-state flow damping of the whole anomaly,
+    #            b_eq = <b_f> + s (b_f - <b_f>)  (degree >= 1 scaled by s exactly).
+    # Fermi: s ~ tau_flow/(tau_flow + tau_th) ~ 0.4 (code rheology) to ~0.02
+    # (fine grains); f_D ~ 0.4. conv_flow_tau (option, off): also scale the
+    # relaxation time by s (the flow relaxes the anomaly faster); not ruled.
+    conv_s: float = 1.0
+    conv_fD: float = 1.0
+    conv_flow_tau: bool = False
     # Sub-Jovian meridian once the pole has moved: 'projection' = body x
     # projected into the equatorial plane (pre-2026-10-05); 'min_moment' =
     # the minimum-moment axis in the plane perpendicular to the spin
@@ -635,8 +651,26 @@ class ShellEvolution:
             self.sub_jovian = PW.projected_meridian(self.spin_pole)
 
     def _b_eq(self, T_s):
-        return _equilibrium_thickness(T_s, self.D, self.H,
-                                      self.cfg.thickness_method, self.rheology)
+        """O&S equilibrium thickness, with the convection proxy (conv_fD, conv_s).
+
+        conv_s = conv_fD = 1 returns the plain O&S field (bit-identical path).
+        """
+        cfg = self.cfg
+        b = _equilibrium_thickness(T_s, self.D, self.H, cfg.thickness_method, self.rheology)
+        s_, fD = getattr(cfg, 'conv_s', 1.0), getattr(cfg, 'conv_fD', 1.0)
+        if s_ == 1.0 and fD == 1.0:
+            return b
+        if not (0.0 < s_ <= 1.0 and 0.0 <= fD <= 1.0):
+            raise ValueError(f'conv_s must be in (0, 1] and conv_fD in [0, 1]: {s_}, {fD}')
+        if fD != 1.0:
+            D_ref = np.full_like(self.D, _area_mean(self.D, self.theta, self.lam))
+            b_ref = _equilibrium_thickness(T_s, D_ref, self.H, cfg.thickness_method,
+                                           self.rheology)
+            b = b_ref + fD * (b - b_ref)
+        if s_ != 1.0:
+            m = _area_mean(b, self.theta, self.lam)
+            b = m + s_ * (b - m)
+        return b
 
     def total_inertia_tensor(self):
         """Physical (Eq. 2.18) shell tensor + body-fixed fossil [kg m^2]."""

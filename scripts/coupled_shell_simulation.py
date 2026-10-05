@@ -114,9 +114,10 @@ class CoupledConfig(PolarWanderConfig):
     cp_const: float = 2000.0            # used only with cp_mode='constant'
     tau_diff_floor_yr: float = 1e3
     tau_diff_cap_yr: float = 5e7
-    # 'stefan' (default since 2026-10-05): tau = rho L b / q (latent heat);
-    # 'diffusive': b^2/kappa (the earlier, 4-5x too fast, relaxation).
-    relaxation_mode: str = 'stefan'
+    # 'stefan_sensible' (default, Paul 2026-10-05): tau = (1 + S/L) rho L b / q,
+    # S/L exact per location; 'stefan': rho L b / q (latent only, 679af84);
+    # 'diffusive': b^2/kappa (pre-2026-10-05, 4-5x too fast).
+    relaxation_mode: str = 'stefan_sensible'
     # --- PTM3D surrogate / multi-rate ---
     use_ptm3d_surrogate: bool = True
     use_live_ptm3d: bool = False        # Phase 2: periodic full-PTM3D refresh
@@ -136,7 +137,13 @@ class CoupledConfig(PolarWanderConfig):
     # 'intrinsic' (A_exo = 0; the control).
     split_component: str = 'full'
     tau_exo_yr: float = 1e6             # 0 = instantaneous tidal frame; inf = body-fixed
-    exo_template: str = 'bh2021'        # see exogenic_albedo.TEMPLATE_FORMS
+    exo_template: str = 'bh2021'        # see exogenic_albedo.TEMPLATE_FORMS, or 'exo_file'
+    # exo_template='exo_file': exosphere-derived template (exogenic_albedo.exo_profile_fit)
+    exo_forcing_file: str = None
+    exo_case: str = 'high_1M'
+    exo_variant: str = 'E2'
+    exo_scale_zonal: float = 1.0
+    exo_scale_odd: float = 1.0
     albedo_clamp: tuple = (0.3814, 0.80)  # Hapke non-ice endmember .. ice; None = off
     ptm3d_resolution: int = 5
     ptm3d_refresh_pole_deg: float = 10.0
@@ -345,7 +352,14 @@ class CoupledEvolution(ShellEvolution):
             if forcing is None:
                 raise ValueError("albedo_mode='split' needs forcing_file")
             A_meas = np.asarray(forcing['A_meas'], dtype=float)
-            self.exo_fit = EA.fit_template(A_meas, self.theta, self.lam, cfg.exo_template)
+            if cfg.exo_template == 'exo_file':
+                if not cfg.exo_forcing_file:
+                    raise ValueError("exo_template='exo_file' needs exo_forcing_file")
+                self.exo_fit = EA.exo_profile_fit(
+                    cfg.exo_forcing_file, cfg.exo_case, cfg.exo_variant, A_meas,
+                    self.theta, self.lam, cfg.exo_scale_zonal, cfg.exo_scale_odd)
+            else:
+                self.exo_fit = EA.fit_template(A_meas, self.theta, self.lam, cfg.exo_template)
             _, A_intr = EA.split_map(A_meas, self.theta, self.lam, self.exo_fit)
             comp = cfg.split_component
             if comp == 'full':
@@ -498,19 +512,24 @@ class CoupledEvolution(ShellEvolution):
     def _tau_relax_years(self, b, T_s):
         """Local shell relaxation time [yr] for cfg.relaxation_mode.
 
-        'stefan': rho L b / q (ojakangas_stevenson.polar_wander.
-        stefan_relaxation_time; latent heat included, ~13 Myr for 30 km).
-        'diffusive': _tau_diff_years (b^2/kappa). Both are clipped to
-        [tau_diff_floor_yr, tau_diff_cap_yr]; in 'stefan' mode a clip that
-        binds is reported once.
+        'stefan_sensible': (1 + S/L) rho L b / q with S/L exact for the local
+        T_s (ojakangas_stevenson.polar_wander.stefan_relaxation_time; ~20 Myr
+        for 30 km). 'stefan': rho L b / q (latent only, ~13 Myr).
+        'diffusive': _tau_diff_years (b^2/kappa). All are clipped to
+        [tau_diff_floor_yr, tau_diff_cap_yr]; in the Stefan modes a clip that
+        binds is reported once. cfg.conv_flow_tau multiplies the result by
+        conv_s (option; see PolarWanderConfig).
         """
         cfg = self.cfg
         if cfg.relaxation_mode == 'diffusive':
             return self._tau_diff_years(b, T_s)
-        if cfg.relaxation_mode != 'stefan':
-            raise ValueError(f"relaxation_mode must be 'stefan' or 'diffusive', "
-                             f"got {cfg.relaxation_mode!r}")
-        tau = PW.stefan_relaxation_time(b, T_s) / (365.25 * 86400.0)
+        if cfg.relaxation_mode not in ('stefan', 'stefan_sensible'):
+            raise ValueError(f"relaxation_mode must be 'stefan_sensible', 'stefan' or "
+                             f"'diffusive', got {cfg.relaxation_mode!r}")
+        sens = 'exact' if cfg.relaxation_mode == 'stefan_sensible' else 'none'
+        tau = PW.stefan_relaxation_time(b, T_s, sensible=sens) / (365.25 * 86400.0)
+        if cfg.conv_flow_tau:
+            tau = tau * cfg.conv_s
         out = np.clip(tau, cfg.tau_diff_floor_yr, cfg.tau_diff_cap_yr)
         if not self._warned_tau_clip and not np.array_equal(out, tau):
             self._warned_tau_clip = True

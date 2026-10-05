@@ -84,8 +84,67 @@ def fit_template(A, theta, lam, form='bh2021'):
             'r2': float(1.0 - r / tot), 'rms_residual': float(np.sqrt(r))}
 
 
+def _legendre(n, x):
+    return np.polynomial.legendre.legval(x, [0.0] * n + [1.0])
+
+
+def exo_profile_fit(path, case, variant, A_meas, theta, lam,
+                    scale_zonal=1.0, scale_odd=1.0):
+    """Exosphere-derived exogenic template (Halo, 2026-10-05), as a fit dict.
+
+    ``path``: exo_albedo_forcing_91x180.npz. It decomposes the exosphere
+    model's albedo change Delta A (uniform start, 8-phase mean) into
+    S(theta) about the SPIN pole (``<case>_dA_spin_theta``) and
+    T(gamma) = sum_n c_n P_n(cos gamma) in TIDAL coordinates
+    (``<case>_tidal_Pn_coeffs``, gamma from the trailing apex). Its body-fixed
+    residual is not exogenic and is left in A_intr.
+
+    case: e.g. 'base_1M', 'high_1M'. scale_zonal multiplies S and the even
+    c_n, scale_odd the odd c_n (e.g. a saturated-amplitude estimate).
+    variant:
+      'E1' exosphere only: S + T;
+      'E2' E1 plus the B&H cos(gamma) implantation term, amplitude chosen so
+           the total cos(gamma) coefficient equals the measured map's
+           (the bh2021 fit of A_meas, -0.124 for eq36);
+      'E3' E2 with the spin-frame part replaced by the MAP's own zonal profile
+           (``mergny_dA_spin_theta``) at its observed amplitude: the whole
+           observed zonal (bright-pole) term follows the spin pole. (Adding it
+           to S instead would double-count the model's share.)
+    S is made zero-mean (the global darkening changes <b>, not the driving).
+    """
+    d = np.load(path)
+    if not (np.allclose(d['theta'], theta) and np.allclose(d['lam'], lam)):
+        raise ValueError(f'{path} was built on a different grid')
+    S = np.asarray(d[f'{case}_dA_spin_theta'], dtype=float) * scale_zonal
+    c = np.asarray(d[f'{case}_tidal_Pn_coeffs'], dtype=float).copy()
+    c[1::2] *= scale_zonal                      # c2, c4 (even)
+    c[0::2] *= scale_odd                        # c1, c3 (odd)
+    c_impl = 0.0
+    if variant in ('E2', 'E3'):
+        c_map = fit_template(A_meas, theta, lam, 'bh2021')['coeffs'][0]
+        c_impl = c_map - c[0]
+        c[0] = c_map
+    elif variant != 'E1':
+        raise ValueError(f"variant must be E1, E2 or E3: {variant!r}")
+    if variant == 'E3':
+        S = np.asarray(d['mergny_dA_spin_theta'], dtype=float)
+    w = G.theta_weights(theta)
+    S = S - np.sum(S * w) / np.sum(w)
+    return {'form': 'exo_profiles', 'names': ['S(theta_spin)'] + [f'P{n}(cos gamma)' for n in range(1, 5)],
+            'coeffs': [float(x) for x in c], 'const': 0.0, 'theta_S': np.asarray(theta, float),
+            'S': S, 'c_impl': float(c_impl), 'case': case, 'variant': variant,
+            'scale_zonal': scale_zonal, 'scale_odd': scale_odd, 'source': str(path)}
+
+
 def template_field(fit, theta_t, lam_t):
     """A_exo^eq at tidal coordinates (zero area mean; no constant)."""
+    if fit['form'] == 'exo_profiles':
+        th = np.asarray(theta_t, dtype=float)
+        cos_g = np.sin(th) * np.sin(lam_t)
+        out = np.interp(th, fit['theta_S'], fit['S'])   # constant beyond the GL end nodes
+        for n, cn in enumerate(fit['coeffs'], start=1):
+            out = out + cn * _legendre(n, cos_g)
+        return out
     out = np.zeros(np.broadcast(theta_t, lam_t).shape)
     for c, f in zip(fit['coeffs'], basis(fit['form'], theta_t, lam_t)):
         out = out + c * f

@@ -643,17 +643,16 @@ def test_stefan_relaxation_time():
     """tau = rho L b / q = rho L b^2 / F, ~13 Myr for 30 km (modern k = 651/T);
     the coupled model uses it by default and 'diffusive' keeps b^2/kappa."""
     with C.parameter_set('modern'):
-        tau = PW.stefan_relaxation_time(30e3, 100.0) / PW.YEAR_S
+        tau = PW.stefan_relaxation_time(30e3, 100.0, sensible='none') / PW.YEAR_S
         F = C.A1_CONDUCTIVITY * np.log(273.0 / 100.0) + C.A0_CONDUCTIVITY * 173.0
         assert np.isclose(tau * PW.YEAR_S, 920.0 * 3.3355e5 * 30e3 ** 2 / F, rtol=1e-12)
         assert 12e6 < tau < 15e6, tau
-    css, cfg = _small_coupled(t_max_years=1e3)
-    assert cfg.relaxation_mode == 'stefan'
+    css, cfg = _small_coupled(t_max_years=1e3, relaxation_mode='stefan')
     evo = css.CoupledEvolution(cfg)
     T = np.full_like(evo.b, 100.0)
     b = np.full_like(evo.b, 20e3)
     st = evo._tau_relax_years(b, T)
-    assert np.allclose(st, PW.stefan_relaxation_time(b, T) / PW.YEAR_S, rtol=1e-12)
+    assert np.allclose(st, PW.stefan_relaxation_time(b, T, sensible='none') / PW.YEAR_S, rtol=1e-12)
     assert np.all(st > 3.0 * evo._tau_diff_years(b, T))      # slower than b^2/kappa
     evo.cfg.relaxation_mode = 'diffusive'
     assert np.array_equal(evo._tau_relax_years(b, T), evo._tau_diff_years(b, T))
@@ -841,6 +840,120 @@ def test_pole0_is_the_offset_pole():
     css, cfg = _small_coupled(t_max_years=1e3, init_pole_offset_deg=2.0, init_pole_azimuth_deg=30.0)
     evo = css.CoupledEvolution(cfg)
     assert np.array_equal(evo._pole0, evo.spin_pole) and evo.spin_pole[2] < 1.0
+
+
+
+# --------------------------------------------------------------------------- 2026-10-05 rulings: S/L, convection proxy, exosphere template
+def test_sensible_heat_ratio_exact():
+    """S/L for the steady conductive profile: Fermi's 0.53/0.50/0.48 at 90/100/110 K
+    (modern k = 651/T, c_p = 90 + 7.49 T), and the closed form for k = a1/T."""
+    with C.parameter_set('modern'):
+        r = PW.sensible_heat_ratio(np.array([90.0, 100.0, 110.0]))
+        assert np.allclose(r, [0.530, 0.503, 0.477], atol=1.5e-3), r
+        Ts, Tm, L = 100.0, 273.0, C.ICE_LATENT_HEAT
+        lnr = np.log(Tm / Ts)
+        h = lambda T: 90.0 * T + 3.745 * T * T                      # noqa: E731
+        closed = (h(Tm) - 90.0 * (Tm - Ts) / lnr - 3.745 * (Tm ** 2 - Ts ** 2) / (2 * lnr)) / L
+        assert np.isclose(PW.sensible_heat_ratio(Ts), closed, rtol=1e-10)
+        tau = PW.stefan_relaxation_time(30e3, 100.0)
+        assert np.isclose(tau / PW.stefan_relaxation_time(30e3, 100.0, sensible='none'),
+                          1.0 + closed, rtol=1e-10)
+    css, cfg = _small_coupled(t_max_years=1e3)
+    assert cfg.relaxation_mode == 'stefan_sensible'
+    evo = css.CoupledEvolution(cfg)
+    T = np.linspace(90.0, 130.0, evo.b.size).reshape(evo.b.shape)  # per location
+    b = np.full_like(evo.b, 25e3)
+    assert np.allclose(evo._tau_relax_years(b, T),
+                       PW.stefan_relaxation_time(b, T) / PW.YEAR_S, rtol=1e-12)
+
+
+def test_convection_proxy_knobs():
+    """conv_s scales every degree >= 1 of the equilibrium anomaly by s (mean kept);
+    conv_fD weights only the tidal (D) part; s = f_D = 1 is the plain O&S field."""
+    css, cfg = _small_coupled(t_max_years=1e3)
+    evo = css.CoupledEvolution(cfg)
+    TH, LA = np.meshgrid(evo.theta, evo.lam, indexing='ij')
+    T = 100.0 + 5.0 * np.sin(TH) * np.sin(LA) + 3.0 * np.cos(TH) ** 2
+    b1 = evo._b_eq(T)
+    import polar_wander_cycle as pwc
+    assert np.array_equal(b1, pwc._equilibrium_thickness(T, evo.D, evo.H, cfg.thickness_method,
+                                                         evo.rheology))
+    h1 = G.harmonics(b1, evo.theta, evo.lam)
+    for s_ in (0.4, 0.03):
+        evo.cfg.conv_s, evo.cfg.conv_fD = s_, 1.0
+        bs = evo._b_eq(T)
+        hs = G.harmonics(bs, evo.theta, evo.lam)
+        assert np.isclose(G.area_mean(bs, evo.theta, evo.lam), G.area_mean(b1, evo.theta, evo.lam))
+        for k in ('t20_2t22', 'b11s', 't22', 'b20'):
+            assert np.isclose(hs[k], s_ * h1[k], rtol=1e-9, atol=1e-9), k
+    # f_D = 0: no tidal contribution -> b depends on T only (D replaced by its mean)
+    evo.cfg.conv_s, evo.cfg.conv_fD = 1.0, 0.0
+    D_ref = np.full_like(evo.D, G.area_mean(evo.D, evo.theta, evo.lam))
+    assert np.allclose(evo._b_eq(T), pwc._equilibrium_thickness(T, D_ref, evo.H,
+                       cfg.thickness_method, evo.rheology), rtol=1e-12)
+    evo.cfg.conv_fD = 0.4
+    b_ref = pwc._equilibrium_thickness(T, D_ref, evo.H, cfg.thickness_method, evo.rheology)
+    assert np.allclose(evo._b_eq(T), b_ref + 0.4 * (b1 - b_ref), rtol=1e-12)
+    evo.cfg.conv_s = 0.0
+    try:
+        evo._b_eq(T)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('conv_s = 0 accepted')
+
+
+def _exo_npz(theta, lam):
+    import tempfile
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    S = -0.02 + 0.01 * (1.5 * np.cos(theta) ** 2 - 0.5)
+    c = np.array([-0.02, -0.01, -0.002, 0.003])
+    cg = np.sin(TH) * np.sin(LA)
+    T2 = sum(cn * np.polynomial.legendre.legval(cg, [0.0] * n + [1.0]) for n, cn in enumerate(c, 1))
+    path = os.path.join(tempfile.mkdtemp(), 'exo.npz')
+    np.savez(path, theta=theta, lam=lam, high_1M_dA_spin_theta=S, high_1M_tidal_Pn_coeffs=c,
+             high_1M_dA_spin_2d=np.broadcast_to(S[:, None], TH.shape), high_1M_dA_tidal_2d=T2,
+             mergny_dA_spin_theta=0.05 * (1.5 * np.cos(theta) ** 2 - 0.5))
+    return path, S, c, T2
+
+
+def test_exo_profile_template_variants():
+    """E1 at t=0 = S + T of the exosphere file (S zero-mean); E2 total cos(gamma)
+    coefficient = the map's; E3 spin part = the map's zonal profile; split stays exact."""
+    from ojakangas_stevenson import exogenic_albedo as EA
+    theta, lam = G.periodic_grid(24, 48)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    path, S, c, T2 = _exo_npz(theta, lam)
+    A = 0.55 - 0.12 * np.sin(TH) * np.sin(LA) + 0.04 * (1.5 * np.cos(TH) ** 2 - 0.5)
+    w = G.theta_weights(theta)
+    S0 = S - np.sum(S * w) / np.sum(w)
+    f1 = EA.exo_profile_fit(path, 'high_1M', 'E1', A, theta, lam)
+    assert np.allclose(EA.template_field(f1, TH, LA), S0[:, None] + T2, atol=1e-14)
+    f2 = EA.exo_profile_fit(path, 'high_1M', 'E2', A, theta, lam)
+    assert np.isclose(f2['coeffs'][0], -0.12, atol=1e-10) and np.isclose(f2['c_impl'], -0.10, atol=1e-10)
+    f3 = EA.exo_profile_fit(path, 'high_1M', 'E3', A, theta, lam)
+    M = 0.05 * (1.5 * np.cos(theta) ** 2 - 0.5)
+    assert np.allclose(f3['S'], M - np.sum(M * w) / np.sum(w))
+    fs = EA.exo_profile_fit(path, 'high_1M', 'E1', A, theta, lam, scale_zonal=2.0, scale_odd=3.0)
+    assert np.allclose(fs['coeffs'], [3 * c[0], 2 * c[1], 3 * c[2], 2 * c[3]])
+    for f in (f1, f2, f3):
+        exo, intr = EA.split_map(A, theta, lam, f)
+        assert np.allclose(exo + intr, A, atol=1e-15)
+        assert abs(G.area_mean(exo, theta, lam)) < 1e-3
+    # wired into the coupled model, following the spin pole and the tidal frame
+    path_f = _split_forcing(theta, lam, A)
+    css, cfg = _small_coupled(t_max_years=1e3, albedo_mode='split', forcing_file=path_f,
+                              split_component='exogenic', tau_exo_yr=0.0, init_b_mode='equilibrium',
+                              exo_template='exo_file', exo_forcing_file=path, exo_case='high_1M',
+                              exo_variant='E2')
+    cfg.use_ptm3d_surrogate = True
+    evo = css.CoupledEvolution(cfg)
+    assert np.allclose(evo.model.A_exo, EA.template_field(f2, TH, LA))
+    import polar_wander_cycle as pwc
+    tilt = np.array([0.0, np.sin(0.4), np.cos(0.4)])
+    evo.model.advance(1e3, tilt)
+    th_t, lm_t = pwc._tidal_coordinates(theta, lam, tilt)
+    assert np.allclose(evo.model.A_exo, EA.template_field(evo.exo_fit, th_t, lm_t))
 
 
 if __name__ == '__main__':
