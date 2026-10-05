@@ -540,6 +540,9 @@ class ShellEvolution:
         if cfg.meridian_mode not in ('projection', 'min_moment'):
             raise ValueError(f'meridian_mode must be projection or min_moment: '
                              f'{cfg.meridian_mode!r}')
+        if cfg.meridian_mode == 'min_moment' and cfg.tpw_model != 'ospw':
+            raise ValueError(f"meridian_mode='min_moment' needs tpw_model='ospw' "
+                             f"(got {cfg.tpw_model!r}; the meridian is updated in the OSPW step)")
         if cfg.meridian_mode == 'min_moment' and not self._supports_meridian:
             raise ValueError(f"meridian_mode='min_moment' is not implemented for "
                              f"{type(self).__name__} (its albedo model ignores the meridian)")
@@ -550,6 +553,7 @@ class ShellEvolution:
                   "that mode keeps the rotational torque only")
         self.sub_jovian = np.array([1.0, 0.0, 0.0])
         self._D_sub_jovian = self.sub_jovian.copy()
+        self.meridian_jumps = []          # (t, angle_deg) of min_moment jumps > 45 deg
 
         # OSPW parameters (b_c = initial mean thickness unless fixed in cfg)
         self._ospw_p = _ospw_params(cfg, _area_mean(self.b, self.theta, self.lam))
@@ -615,8 +619,18 @@ class ShellEvolution:
 
     def _update_meridian(self, I_total):
         if self.cfg.meridian_mode == 'min_moment':
+            old = PW.projected_meridian(self.spin_pole, self.sub_jovian)
             self.sub_jovian = PW.meridian_min_moment(I_total, self.spin_pole,
                                                      self.sub_jovian)
+            jump = np.degrees(np.arccos(np.clip(abs(old @ self.sub_jovian), 0, 1)))
+            if jump > 45.0:
+                # the in-plane moments swapped order: the new minimum axis is
+                # ~90 deg away and its sub- vs anti-Jovian sign (hence which
+                # hemisphere trails) is set by continuity alone
+                self.meridian_jumps.append((self.t, float(jump)))
+                print(f'  WARNING: min_moment meridian jumped {jump:.0f} deg at '
+                      f't={self.t/1e6:.2f} Myr (in-plane moments swapped; trailing '
+                      f'hemisphere chosen by sign continuity)')
         else:
             self.sub_jovian = PW.projected_meridian(self.spin_pole)
 

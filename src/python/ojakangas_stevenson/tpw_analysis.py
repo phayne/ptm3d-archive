@@ -41,12 +41,14 @@ def summarize(t_yr, spin, v_max, onset_deg=5.0, settle_misalign_deg=1.0,
       episodes        [(t_start_Myr, t_end_Myr, arc_deg)], runs of rate >
                       quiet_rate separated by > merge_gap_myr, arc >= min_episode_deg
       history         'none' | 'single' | 'episodic' (>= 2 episodes) |
-                      'continuous' (one episode still running at the end)
+                      'continuous' (one episode, still running at the last record)
       final_colat_deg, final_lon_deg   final pole, body frame (lon east of body x)
     """
     t = np.asarray(t_yr, dtype=float) / 1e6
     s = np.asarray(spin, dtype=float)
     vm = np.asarray(v_max, dtype=float)
+    if len(t) < 2:
+        raise ValueError('summarize needs at least two records')
     from0 = axis_angle_deg(s, s[0])
     step = axis_angle_deg(s[1:], s[:-1])
     dt = np.diff(t)
@@ -92,7 +94,10 @@ def summarize(t_yr, spin, v_max, onset_deg=5.0, settle_misalign_deg=1.0,
     if not episodes:
         history = 'none'
     elif len(episodes) == 1:
-        history = 'continuous' if final_state == 'moving' else 'single'
+        # 'continuous' only if the one episode is still running at the end;
+        # a slow sub-episode drift after it ended stays 'single' (final_state
+        # then reports 'moving')
+        history = 'continuous' if episodes[0][1] >= t[-1] else 'single'
     else:
         history = 'episodic'
     onset = float(t[np.argmax(from0 > onset_deg)]) if (from0 > onset_deg).any() else None

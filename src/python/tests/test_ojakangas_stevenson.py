@@ -775,6 +775,74 @@ def test_tidal_frame_t20_2t22_matches_harmonics():
     assert np.isclose(val, h['t20_2t22'], rtol=1e-9), (val, h['t20_2t22'])
 
 
+
+# --------------------------------------------------------------------------- review fixes (2026-10-05)
+def test_uniform_equilibrium_ic_uses_uniform_residual():
+    """static_map 'measured' + uniform_equilibrium: the uniform-albedo shell must
+    use R_unif, not the measured-map residual R_meas."""
+    theta, lam = G.periodic_grid(24, 48)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    A = 0.55 - 0.12 * np.sin(TH) * np.sin(LA)
+    import tempfile
+    path = os.path.join(tempfile.mkdtemp(), 'forcing.npz')
+    R_meas = 3.0 * np.cos(TH)                                # large, N-S antisymmetric
+    np.savez(path, theta=theta, lam=lam, A_meas=A, A_unif=0.55, R_meas=R_meas,
+             R_unif=np.zeros_like(A), dT_theta=np.linspace(0, np.pi, 31),
+             dT_lam=np.linspace(-np.pi, np.pi, 61), dT=np.zeros((31, 61)))
+    css, cfg = _small_coupled(t_max_years=1e3, albedo_mode='static_map', static_field='measured',
+                              forcing_file=path, init_b_mode='uniform_equilibrium')
+    cfg.use_ptm3d_surrogate = True
+    evo = css.CoupledEvolution(cfg)
+    T_u = ((1 - 0.55) * OSSurfaceTemperature().annual_average_flux(TH) / C.STEFAN_BOLTZMANN) ** 0.25
+    assert np.allclose(evo.b, evo._b_eq(T_u), rtol=1e-12)
+    assert evo._R is not None and np.array_equal(evo._R, R_meas)   # the run keeps R_meas
+
+
+def test_min_moment_meridian_jump_is_reported():
+    css, cfg = _small_coupled(t_max_years=1e3, meridian_mode='min_moment')
+    evo = css.CoupledEvolution(cfg)
+    I0 = evo._ospw_I0
+    evo._update_meridian(np.diag([-1e-6, 0.0, 1e-6]) * I0)       # x is the in-plane min
+    assert not evo.meridian_jumps and np.allclose(evo.sub_jovian, [1, 0, 0])
+    evo._update_meridian(np.diag([0.0, -1e-6, 1e-6]) * I0)       # now y: a 90 deg jump
+    assert len(evo.meridian_jumps) == 1 and abs(evo.meridian_jumps[0][1] - 90.0) < 1e-6
+
+
+def test_min_moment_requires_ospw():
+    for model in ('exponential', 'coupled'):
+        css, cfg = _small_coupled(t_max_years=1e3, meridian_mode='min_moment', tpw_model=model)
+        try:
+            css.CoupledEvolution(cfg)
+        except ValueError:
+            continue
+        raise AssertionError(f'min_moment accepted with tpw_model={model}')
+
+
+def test_continuous_only_if_episode_runs_to_the_end():
+    from ojakangas_stevenson import tpw_analysis as TA
+    t = np.linspace(0, 3e7, 301)
+    psi = np.radians(np.clip((t - 1e6) / 9e6, 0, 1) * 30.0)         # 30 deg by 10 Myr
+    psi = psi + np.radians(np.clip((t - 2.7e7) / 3e6, 0, 1) * 4.0)  # 4 deg drift, 1.3 deg/Myr
+    spin = np.stack([np.zeros_like(t), np.sin(psi), np.cos(psi)], 1)
+    r = TA.summarize(t, spin, spin)
+    assert r['n_episodes'] == 1 and r['history'] == 'single' and r['final_state'] == 'moving', r
+    psi2 = np.radians(np.clip((t - 1e6) / 2.9e7, 0, 1) * 60.0)     # one episode to the end
+    spin2 = np.stack([np.zeros_like(t), np.sin(psi2), np.cos(psi2)], 1)
+    assert TA.summarize(t, spin2, spin2)['history'] == 'continuous'
+    try:
+        TA.summarize(t[:1], spin[:1], spin[:1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('one-record track accepted')
+
+
+def test_pole0_is_the_offset_pole():
+    css, cfg = _small_coupled(t_max_years=1e3, init_pole_offset_deg=2.0, init_pole_azimuth_deg=30.0)
+    evo = css.CoupledEvolution(cfg)
+    assert np.array_equal(evo._pole0, evo.spin_pole) and evo.spin_pole[2] < 1.0
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

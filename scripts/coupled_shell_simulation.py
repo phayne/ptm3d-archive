@@ -398,8 +398,16 @@ class CoupledEvolution(ShellEvolution):
             # or a partial relaxation toward the forced equilibrium. b_c is
             # the forced-equilibrium mean for every initial condition, so the
             # OSPW parameters do not change with the initial condition.
+            # T for the uniform albedo takes the uniform-field residual: with
+            # static_map 'measured', self._R is R_meas, which belongs to the map.
             A_u = np.full_like(A0, self._A_unif)
-            b_u = self._b_eq(self.surface_temperature_coupled(A_u, self.spin_pole))
+            R_run = self._R
+            if forcing is not None:
+                self._R = np.array(forcing['R_unif']) if cfg.use_residual else None
+            try:
+                b_u = self._b_eq(self.surface_temperature_coupled(A_u, self.spin_pole))
+            finally:
+                self._R = R_run
             f = 0.0 if cfg.init_b_mode == 'uniform_equilibrium' else cfg.init_blend_frac
             self.b = (1.0 - f) * b_u + f * b_eq0
             b0 = _area_mean(b_eq0, self.theta, self.lam)
@@ -425,6 +433,7 @@ class CoupledEvolution(ShellEvolution):
         if cfg.init_pole_offset_deg:
             d, az = np.radians(cfg.init_pole_offset_deg), np.radians(cfg.init_pole_azimuth_deg)
             self.spin_pole = np.array([np.sin(d) * np.cos(az), np.sin(d) * np.sin(az), np.cos(d)])
+            self._pole0 = self.spin_pole.copy()
 
         # PTM3D refresh bookkeeping (Phase 2).
         self._ptm3d_calls = 0
