@@ -89,8 +89,8 @@ class CoupledConfig(PolarWanderConfig):
     # --- reorientation ---
     tpw_model: str = 'ospw'
     # --- per-location thermal diffusion ---
-    cp_mode: str = 'constant'           # 'constant' or 'linear' (7.49*T)
-    cp_const: float = 2000.0
+    cp_mode: str = 'ice'                # 'ice': cp = 90 + 7.49 T (heat1d planets.py); 'constant'
+    cp_const: float = 2000.0            # used only with cp_mode='constant'
     tau_diff_floor_yr: float = 1e3
     tau_diff_cap_yr: float = 5e7
     # --- PTM3D surrogate / multi-rate ---
@@ -252,7 +252,8 @@ class CoupledEvolution(ShellEvolution):
             response of a conductive shell to a step in T_s or q is a sum of
             modes; the slowest is ~b^2/(pi^2 kappa), so b^2/kappa is ~10x
             longer than the fundamental mode and is an upper-end estimate.
-          * kappa = k/(rho c_p) is evaluated at the SURFACE temperature, where
+          * kappa = k/(rho c_p), with c_p = 90 + 7.49 T (cp_mode='ice'), is
+            evaluated at the SURFACE temperature, where
             k = a1/T + a0 is largest; the basal ice (T -> 273 K) diffuses
             ~2.5x more slowly.
           * Latent heat is ignored: the base of the shell moves only as fast
@@ -264,7 +265,12 @@ class CoupledEvolution(ShellEvolution):
         """
         cfg = self.cfg
         k = C.A1_CONDUCTIVITY / T_s + C.A0_CONDUCTIVITY        # 488/T + 0.468
-        cp = 7.49 * T_s if cfg.cp_mode == 'linear' else cfg.cp_const
+        if cfg.cp_mode == 'ice':
+            cp = C.ice_heat_capacity(T_s)
+        elif cfg.cp_mode == 'constant':
+            cp = cfg.cp_const
+        else:
+            raise ValueError(f"cp_mode must be 'ice' or 'constant', got {cfg.cp_mode!r}")
         kappa = k / (C.ICE_DENSITY * cp)                       # m^2 / s
         tau_s = b ** 2 / kappa
         tau_yr = tau_s / (365.25 * 86400.0)
@@ -542,7 +548,8 @@ def main():
                    help="constants: 'paper' (validation) or 'modern' (science)")
     p.add_argument('--t-max', type=float, default=2e7)
     p.add_argument('--rheology', default='maxwell_h0')
-    p.add_argument('--cp-mode', default='constant', choices=['constant', 'linear'])
+    p.add_argument('--cp-mode', default='ice', choices=['ice', 'constant'],
+                   help="'ice': cp = 90 + 7.49 T (heat1d planets.py); 'constant': cp_const")
     p.add_argument('--no-ptm3d', action='store_true', help='disable surrogate (dT=0)')
     p.add_argument('--live-ptm3d', action='store_true', help='Phase 2 PTM3D refresh')
     p.add_argument('--smoke', action='store_true', help='fast tiny-grid smoke test')

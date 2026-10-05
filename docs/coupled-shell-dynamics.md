@@ -38,11 +38,11 @@ Each step:
    (`ojakangas_stevenson.shell_thickness`; `--thickness-method exact` integrates the first
    integral of Eqs. 2.4/2.5 instead). D is re-rotated when the pole drifts.
 4. **Relax at the local thermal-diffusion timescale** —
-   `b ← b_eq + (b−b_eq)·e^{−dt/τ_diff}`, `τ_diff(θ,λ) = b²/κ`, `κ = k/(ρ c_p)`,
+   `b ← b_eq + (b−b_eq)·e^{−dt/τ_diff}`, `τ_diff(θ,λ) = b²/κ`, `κ = k/(ρ c_p)`, `c_p = 90 + 7.49 T` J kg⁻¹ K⁻¹,
    `k = a₁/T + a₀` at the surface temperature. This is a one-time-constant approximation: the
    slowest conductive mode decays on b²/(π²κ), κ is largest at the cold surface, and latent
-   heat at the ice–ocean interface and lateral heat flow are neglected. Typically
-   τ_diff ≈ 3–7 Myr for b ≈ 20–25 km.
+   heat at the ice–ocean interface and lateral heat flow are neglected. With
+   `c_p = 90 + 7.49 T`, τ_diff ≈ 0.8–3 Myr for b ≈ 24 km (paper constants).
 5. **Reorient (OSPW Eq. 5.39)** — the physical inertia tensor is the Eq. 2.18 bottom-loaded
    (buoyantly compensated, iceberg-effect) tensor of the thickness field plus, optionally
    (`--fossil hydrostatic`), the body-fixed hydrostatic fossil bulge of Eqs. 3.8–3.10. The pole

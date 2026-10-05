@@ -429,6 +429,19 @@ def test_flow_law_D_table_matches_direct_evaluation():
     assert np.max(np.abs(D_tab / D_dir - 1)) < 5e-3
 
 
+def test_tau_diff_uses_ice_heat_capacity():
+    """cp(T) = 90 + 7.49 T (heat1d planets.py Europa cpCoeff) in kappa = k/(rho cp)."""
+    assert np.isclose(C.ice_heat_capacity(100.0), 839.0)
+    css, cfg = _small_coupled(t_max_years=1e3)
+    assert cfg.cp_mode == 'ice'
+    evo = css.CoupledEvolution(cfg)
+    T = np.full_like(evo.b, 100.0)
+    b = np.full_like(evo.b, 20e3)
+    k = C.A1_CONDUCTIVITY / 100.0 + C.A0_CONDUCTIVITY
+    expect = b ** 2 / (k / (C.ICE_DENSITY * 839.0)) / (365.25 * 86400.0)
+    assert np.allclose(evo._tau_diff_years(b, T), expect, rtol=1e-12)
+
+
 def test_coupled_initial_state_is_isotropic():
     css, cfg = _small_coupled(t_max_years=1e3)
     evo = css.CoupledEvolution(cfg)

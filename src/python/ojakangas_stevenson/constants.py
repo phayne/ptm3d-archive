@@ -94,8 +94,9 @@ PAPER = ParameterSet(
 #         as 0.0094 (JPL SSD mean elements).
 #   k   = 651/T W/(m K): Petrenko & Whitworth (1999), "Physics of Ice", OUP.
 #         Option 567/T: Klinger (1980), J. Glaciol. 25, 179-186.
-#         UNVERIFIED: neither coefficient was checked against its source in
-#         this session; both are the values adopted on 2026-10-04.
+#         Approved as the science default (651/T) and option (567/T) on
+#         2026-10-04. Neither coefficient has been checked against its
+#         printed source here. PTM3D itself has no solid-ice k(T) yet.
 _MODERN_GM = 3.202738774922892e12      # m^3/s^2 (gm_de431.tpc, BODY502_GM)
 _MODERN_RADIUS = 1.5608e6
 _MODERN_SOURCES = (
@@ -115,7 +116,7 @@ MODERN = ParameterSet(
     a0_conductivity=0.0,
     mass=_MODERN_GM / G_GRAV,
     sources=_MODERN_SOURCES + (
-        ('k', 'Petrenko & Whitworth 1999: k = 651/T', 'UNVERIFIED'),),
+        ('k', 'Petrenko & Whitworth 1999: k = 651/T', 'approved 2026-10-04; source not re-checked'),),
 )
 MODERN_KLINGER = ParameterSet(
     name='modern-klinger',
@@ -127,7 +128,7 @@ MODERN_KLINGER = ParameterSet(
     a0_conductivity=0.0,
     mass=MODERN.mass,
     sources=_MODERN_SOURCES + (
-        ('k', 'Klinger 1980: k = 567/T', 'UNVERIFIED'),),
+        ('k', 'Klinger 1980: k = 567/T', 'approved option 2026-10-04; source not re-checked'),),
 )
 
 PARAMETER_SETS = {s.name: s for s in (PAPER, MODERN, MODERN_KLINGER)}
@@ -145,6 +146,16 @@ MEAN_MOTION = 2.0 * np.pi / ORBITAL_PERIOD  # n [rad/s] ~ 2.048e-5
 JUPITER_MASS = 1.8982e27    # Mass of Jupiter [kg]
 
 ICE_DENSITY = 920.0         # Density of ice [kg/m^3]
+# Ice heat capacity cp(T) = 90 + 7.49 T [J/(kg K)]: the Europa cpCoeff of
+# heat1d planets.py ([90.0, 7.49]; adopted 2026-10-04 for every cp the shell
+# code needs). Note: PTM3D's planetary_properties.h uses cp0 = 0 with
+# cpCoeff {7.49}, i.e. 7.49 T without the 90 J/(kg K) offset.
+ICE_CP_COEFFS = (90.0, 7.49)
+
+
+def ice_heat_capacity(T):
+    """cp(T) = 90 + 7.49 T [J/(kg K)] (heat1d planets.py Europa cpCoeff)."""
+    return ICE_CP_COEFFS[0] + ICE_CP_COEFFS[1] * np.asarray(T, dtype=float)
 WATER_DENSITY = 1000.0      # Density of liquid water [kg/m^3]
 
 # --- Maxwell rheology parameters (Section 3) ---
