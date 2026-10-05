@@ -1,5 +1,14 @@
 # Eclipse Cooling vs. Albedo Darkening in Europa's Ice Shell
 
+> **Status (2026-10-04): the numbers in this document are superseded.** They were
+> computed before the 2026-10 corrections to the shell and polar-wander code: the
+> thickness law is now O&S Eq. 2.8 with $C_R = 0.5$ (the earlier solver dropped a
+> factor of 2 and was tuned to $C_R = 0.85$); every harmonic projection and inertia sum
+> now uses a periodic grid (the earlier grids counted the λ = ±180° meridian twice); the
+> polar-wander dynamics follow OSPW Eqs. 2.11, 2.18, 3.8–3.10 and 5.39; and the
+> pole is seeded with a physical offset $\psi_0$. The inputs are also March-2026 PTM3D
+> products. Regenerate before quoting any value.
+
 **Separating the sub-Jovian eclipse-cooling contribution to ice-shell thickness from the
 trailing-hemisphere albedo (darkening) contribution, and estimating the shell in the
 hypothetical absence of any darkening process.**

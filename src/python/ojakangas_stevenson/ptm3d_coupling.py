@@ -12,6 +12,10 @@ import numpy as np
 class PTM3DSurfaceTemperature:
     """Adapter using PTM3D surface temperatures in the O&S shell model.
 
+    The per-face temperature is the ARITHMETIC time mean of the snapshots
+    (see from_binary_files); a ``statistics/temperature_avg.bin`` product
+    is the same statistic.
+
     Provides the same interface as OSSurfaceTemperature:
       - temperature(theta)     -> zonally-averaged T_s at colatitude theta
       - temperature_2d(theta, lam)  -> interpolated onto regular grid
@@ -67,9 +71,14 @@ class PTM3DSurfaceTemperature:
             raise FileNotFoundError(
                 f"No temperature_*.bin files found in {temperature_dir}")
 
-        # Accumulate for mean
+        # Accumulate the ARITHMETIC time mean <T>. This is the shell's top
+        # boundary condition by project decision (2026-10-04): the conductive
+        # shell responds to the time-mean temperature, not to the
+        # radiative-equivalent (<T^4>)^(1/4), which is warmer and shifts
+        # t20 + 2 t22 by ~0.28 km (physics review, 2026-10-03).
         temp_sum = np.zeros(n_faces, dtype=np.float64)
         count = 0
+        unreadable = []
 
         for fname in temp_files:
             fpath = os.path.join(temperature_dir, fname)
@@ -77,9 +86,15 @@ class PTM3DSurfaceTemperature:
             if data is not None:
                 temp_sum += data.astype(np.float64)
                 count += 1
+            else:
+                unreadable.append(fname)
 
         if count == 0:
             raise RuntimeError("No valid temperature files could be read")
+        if unreadable:
+            print(f"  WARNING: {len(unreadable)} of {len(temp_files)} temperature "
+                  f"files unreadable or wrong size and EXCLUDED from the mean "
+                  f"(first: {unreadable[0]})")
 
         obj._face_temp = (temp_sum / count).astype(np.float64)
         print(f"Loaded {count} timesteps, {n_faces} faces")
@@ -191,8 +206,20 @@ class PTM3DSurfaceTemperature:
         self._zonal_theta = bin_centers
         self._zonal_temp = bin_temps
 
-    def temperature_2d(self, theta, lam):
-        """Interpolated temperature on a (theta, lam) grid.
+    def temperature_2d(self, theta, lam, seam_pad_deg=30.0):
+        """Interpolate the per-face temperature onto a (theta, lam) grid.
+
+        Linear (Delaunay) interpolation in (colatitude, longitude) is not
+        periodic in longitude: without help, grid points within about one
+        face of lam = +-180 deg are interpolated across the whole sphere or
+        fall back to nearest neighbor (the "seam" artifact, about -0.006 km
+        in b11c; physics review 2026-10-03). Faces within ``seam_pad_deg`` of
+        the seam are therefore replicated at lon -/+ 360 deg before the
+        triangulation, so every caller gets a seam-free field.
+
+        Points still outside the convex hull (only the polar caps beyond the
+        outermost face centers) are filled by nearest neighbor; the count is
+        reported, never silent.
 
         Parameters
         ----------
@@ -200,46 +227,39 @@ class PTM3DSurfaceTemperature:
             Colatitude [rad].
         lam : ndarray, shape (n_lam,)
             Longitude [rad].
+        seam_pad_deg : float
+            Width of the periodic padding band on each side of the seam.
 
         Returns
         -------
         ndarray, shape (n_theta, n_lam)
             Interpolated surface temperature [K].
         """
-        try:
-            from scipy.interpolate import griddata
-        except ImportError:
-            # Fall back to zonal average (no lon dependence)
-            T_zonal = self.temperature(theta)
-            return np.broadcast_to(T_zonal[:, np.newaxis],
-                                   (len(theta), len(lam)))
+        from scipy.interpolate import griddata
 
-        # Convert face coordinates to radians
         face_colat = self._face_colat
-        face_lon_rad = np.radians(self._face_lon)
-        # Wrap longitude to [-pi, pi] for consistency
-        face_lon_rad = ((face_lon_rad + np.pi) % (2 * np.pi)) - np.pi
+        face_lon = ((np.radians(self._face_lon) + np.pi) % (2 * np.pi)) - np.pi
+        T = self._face_temp
+        pad = np.radians(seam_pad_deg)
+        east = face_lon > np.pi - pad      # replicate at lon - 2 pi
+        west = face_lon < -np.pi + pad     # replicate at lon + 2 pi
+        pts_colat = np.concatenate([face_colat, face_colat[east], face_colat[west]])
+        pts_lon = np.concatenate([face_lon, face_lon[east] - 2 * np.pi,
+                                  face_lon[west] + 2 * np.pi])
+        vals = np.concatenate([T, T[east], T[west]])
 
         THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
-        grid_T = griddata(
-            (face_colat, face_lon_rad),
-            self._face_temp,
-            (THETA, LAM),
-            method='linear',
-            fill_value=np.nan
-        )
-
-        # Fill NaN with nearest neighbor
+        grid_T = griddata((pts_colat, pts_lon), vals, (THETA, LAM),
+                          method='linear', fill_value=np.nan)
         nan_mask = np.isnan(grid_T)
         if np.any(nan_mask):
-            grid_T_nn = griddata(
-                (face_colat, face_lon_rad),
-                self._face_temp,
-                (THETA, LAM),
-                method='nearest'
-            )
+            grid_T_nn = griddata((pts_colat, pts_lon), vals, (THETA, LAM),
+                                 method='nearest')
             grid_T[nan_mask] = grid_T_nn[nan_mask]
-
+            rows = np.unique(np.where(nan_mask)[0])
+            print(f"  temperature_2d: {int(nan_mask.sum())} grid points outside the "
+                  f"face hull filled by nearest neighbor (rows {rows.min()}-{rows.max()} "
+                  f"of {len(theta)})")
         return grid_T
 
     def temperature_per_face(self):

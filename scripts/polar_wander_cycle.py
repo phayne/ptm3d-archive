@@ -28,14 +28,11 @@ from matplotlib import cm, colors
 from matplotlib.gridspec import GridSpec
 
 from ojakangas_stevenson import constants as C
+from ojakangas_stevenson import grid as G
+from ojakangas_stevenson import polar_wander as PW
 from ojakangas_stevenson.surface_temperature import OSSurfaceTemperature
-from ojakangas_stevenson.rheology import MaxwellRheology, FlowLawRheology
-from ojakangas_stevenson.tidal_strains import (
-    time_averaged_strain_squared, time_averaged_strain_power)
-
-from ospw_polar_wander import (
-    OSPWConfig, compute_Cw, compute_Cf, compute_I0, compute_tau_f,
-)
+from ojakangas_stevenson.shell_thickness import (
+    equilibrium_thickness, dissipation_field, table1_case)
 
 # ---------------------------------------------------------------------------
 # Style (matches plot_ice_shell.py)
@@ -66,6 +63,12 @@ CASE_STYLES = {
 }
 
 
+# Default psi0 (decision of 2026-10-05): Europa's predicted forced obliquity,
+# ~0.1 deg (Bills 2005, Icarus 175, 233-247). UNVERIFIED: the number has not
+# been checked against the paper in this repository.
+PSI0_OBLIQUITY_RAD = np.radians(0.1)
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -73,7 +76,7 @@ CASE_STYLES = {
 class PolarWanderConfig:
     """Parameters for the polar wander cycle simulation."""
     A_bright: float = 0.55
-    A_dark: float = 0.15
+    A_dark: float = 0.3814           # Hapke non-ice endmember (decision of 2026-10-04)
     darkening_power: float = 1.0
     tau_dark: float = 1e4
     tau_shell: float = 1e7
@@ -81,29 +84,35 @@ class PolarWanderConfig:
     reorient_albedo_reset: float = 1.0
     rheology_case: str = 'maxwell_h0'
     n_theta: int = 181
-    n_lam: int = 361
+    n_lam: int = 360                 # periodic grid: no duplicated +-180 column
     dt_years: float = 1e3
     t_max_years: float = 1e8
     n_cycles_max: int = 10
     n_darkening_steps: int = 50
+    # Fossil bulge: True = BODY-FIXED hydrostatic bulge x (1 - C_w), OSPW
+    # Eqs. 3.8-3.10; False = no fossil. (Replaces the unphysical alpha factor.)
     use_fossil_bulge: bool = True
-    fossil_bulge_factor: float = 1.5
-    tau_visc: float = 3e7
     use_full_inertia: bool = True
     misalignment_threshold_deg: float = 5.0
     tau_tpw: float = 1e5              # TPW relaxation timescale [years]
     # --- TPW dynamics model ---
     tpw_model: str = 'exponential'    # 'exponential', 'ospw', or 'coupled'
     # --- OSPW rheological parameters (ospw/coupled modes) ---
-    ospw_shell_thickness: float = 20e3       # b_c [m]
-    ospw_lithosphere_thickness: float = 2e3  # d [m]
+    ospw_shell_thickness: float = None       # b_c [m]; None = initial mean b
+    ospw_lithosphere_thickness: float = 2e3  # d [m] (ignored if ospw_bc_over_d is set)
+    ospw_bc_over_d: float = None             # e.g. 10: d = b_c/10, as in OSPW Eq. 3.12
     ospw_melting_viscosity: float = 3e14     # eta_0 [Pa s]
     ospw_activation_param: float = 15.0      # l (dimensionless)
-    ospw_fracture_base_temp: float = 130.0   # T_f [K]
+    ospw_fracture_base_temp: float = 124.0   # T_f [K] (OSPW p. 264)
     ospw_surface_temp: float = 100.0         # T_s [K]
     # --- Iceberg amplification ---
-    use_iceberg_effect: bool = True          # OSPW bottom-loading amplification
-    iceberg_amplification: float = 0.0       # 0 = auto-compute; >0 = override
+    use_iceberg_effect: bool = True          # Eq. 2.18 bottom loading (False: rigid load)
+    # --- psi0 seed and thickness law ---
+    # psi0 = Europa's predicted forced obliquity, ~0.1 deg (Bills 2005, Icarus
+    # 175, 233; UNVERIFIED: value not checked against the paper). Bracket x0.1, x10.
+    psi0_rad: float = PSI0_OBLIQUITY_RAD
+    thickness_method: str = 'eq28'           # 'eq28' or 'exact' (shell_thickness)
+    D_update_threshold_deg: float = 0.0      # recompute tidal heating when the pole moves
     # --- B&H interior coupling (coupled mode) ---
     interior_gamma: float = 28.0             # C_i / C_s
     interior_triaxiality: float = 1e-5       # (B_i-A_i)/C_i for rocky interior
@@ -113,61 +122,38 @@ class PolarWanderConfig:
 # ---------------------------------------------------------------------------
 # Physics helpers
 # ---------------------------------------------------------------------------
+# The thickness law, the quadrature and the OSPW physics live in the
+# ojakangas_stevenson package (shell_thickness, grid, polar_wander). The
+# helpers below are thin adapters kept for this script's callers and for
+# coupled_shell_simulation.py.
+
+# Smallest principal-moment gap that counts as a real instability when
+# seeding psi0, as a fraction of I_0: 1e-12 corresponds to ~0.1 mm of
+# t20 + 2 t22 (Eq. 5.32: (t/tau) ~ 1e-5 per km). Below it the principal axes
+# are set by round-off, not physics.
+SEED_GAP_REL = 1e-12
+
+
 
 def _build_dissipation_grid(case, theta, lam):
-    """Pre-compute dissipation integral D(θ,λ) for the chosen rheology."""
+    """Dissipation integral D(theta, lam) and basal flux H for a Table I case."""
+    rheology, H = table1_case(case)
     THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
-    g2, g3 = C.g2(), C.g3()
-
-    if case.startswith('maxwell'):
-        maxwell = MaxwellRheology()
-        eij2 = time_averaged_strain_squared(THETA, LAM, g2, g3)
-        D = maxwell.dissipation_integral(C.MEAN_MOTION**2 * eij2)
-    elif case == 'flow_ng3':
-        flow = FlowLawRheology(n_G=C.GLEN_EXPONENT_1, n_A=C.ARRHENIUS_EXPONENT,
-                                A0_cgs=C.A0_FLOW_1_CGS)
-        exp = flow.strain_exponent
-        sp = time_averaged_strain_power(THETA, LAM, exp, g2, g3, n_samples=360)
-        D = flow.dissipation_integral(C.MEAN_MOTION**(2*exp) * sp)
-    elif case == 'flow_ng52':
-        flow = FlowLawRheology(n_G=C.GLEN_EXPONENT_2, n_A=C.ARRHENIUS_EXPONENT,
-                                A0_cgs=C.A0_FLOW_2_CGS)
-        exp = flow.strain_exponent
-        sp = time_averaged_strain_power(THETA, LAM, exp, g2, g3, n_samples=360)
-        D = flow.dissipation_integral(C.MEAN_MOTION**(2*exp) * sp)
-    else:
-        raise ValueError(f'Unknown rheology: {case}')
-
-    H = C.H_FLUX_10 if case == 'maxwell_h10' else 0.0
-    return D, H
+    return dissipation_field(rheology, THETA, LAM), H
 
 
-def _equilibrium_thickness(T_s, D, H):
-    """O&S Eq 2.8 equilibrium shell thickness [m]."""
-    a1, T_M = C.A1_CONDUCTIVITY, C.T_MELT
-    ln_r = np.log(T_M / T_s)
-    A = D / ln_r
-    disc = H**2 + 4 * A * a1 * ln_r
-    return np.clip((-H + np.sqrt(disc)) / (2 * A), 0, 200e3)
+def _equilibrium_thickness(T_s, D, H, method='eq28', rheology=None):
+    """O&S Eq. 2.8 equilibrium shell thickness [m] (package implementation)."""
+    return equilibrium_thickness(T_s, D, H, method=method, rheology=rheology)
 
 
 def _compute_moments(b, theta, lam):
-    """Compute MoI quantities from thickness field b(θ,λ) [m]."""
-    dt = theta[1] - theta[0]
-    dl = lam[1] - lam[0]
-    ct, st = np.cos(theta), np.sin(theta)
-    P20 = 0.5 * (3 * ct**2 - 1)
-    P22 = 3 * st**2
-    c2l = np.cos(2 * lam)
-
-    t20 = 5 / (4 * np.pi) * np.sum(b * P20[:, None] * st[:, None]) * dt * dl
-    t22 = 5 / (48 * np.pi) * np.sum(b * P22[:, None] * c2l[None, :] * st[:, None]) * dt * dl
-
-    t20_km = t20 / 1000
-    t22_km = t22 / 1000
+    """Degree-2 thickness harmonics of b(theta, lam) [m] (periodic quadrature)."""
+    h = G.harmonics(b, theta, lam)
+    t20_km, t22_km = h['t20'] / 1000, h['t22'] / 1000
     return {
-        't20': t20,
-        't22': t22,
+        't20': h['t20'],
+        't22': h['t22'],
         't20_km': t20_km,
         't22_km': t22_km,
         '4t22_km': 4 * t22_km,
@@ -177,42 +163,24 @@ def _compute_moments(b, theta, lam):
     }
 
 
-def _area_mean(field, theta):
-    """Area-weighted mean of a field on (θ, λ) grid."""
-    dt = theta[1] - theta[0]
-    dl = 2 * np.pi / (field.shape[1] - 1)
-    return np.sum(field * np.sin(theta)[:, None]) * dt * dl / (4 * np.pi)
+def _periodic_lam(n_lam):
+    return G.periodic_grid(2, n_lam)[1]
+
+
+def _area_mean(field, theta, lam=None):
+    """Area-weighted mean of a field on the periodic (theta, lam) grid."""
+    if lam is None:
+        lam = _periodic_lam(field.shape[1])
+    return G.area_mean(field, theta, lam)
 
 
 def _compute_inertia_tensor(b, theta, lam):
-    """Full 3x3 inertia tensor of thin shell b(theta,lam) at radius R.
+    """Geometric 3x3 inertia tensor of a thin shell b(theta, lam), I/(rho R^4) [m sr].
 
-    Returns I / (rho * R^4) so eigenvalue differences are in units of [m·sr].
-    The isotropic part is ~(8pi/3)*<b>; anomalies from thickness variations
-    are typically 1e-3 to 1e-2 of this.
-
-    Uses trapezoidal weights for the periodic longitude direction (lambda=-pi
-    and lambda=+pi are the same point) to eliminate quadrature anisotropy.
+    Uncompensated (rigidly supported) load; see _physical_inertia_tensor for
+    the Eq. 2.18 tensor that drives polar wander.
     """
-    dt = theta[1] - theta[0]
-    dl = lam[1] - lam[0]
-    THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
-    st, ct = np.sin(THETA), np.cos(THETA)
-    sl, cl = np.sin(LAM), np.cos(LAM)
-    x, y, z = st * cl, st * sl, ct
-    # Trapezoidal weights: half-weight at duplicate longitude endpoints
-    lam_w = np.ones(len(lam))
-    lam_w[0] = lam_w[-1] = 0.5
-    w = b * st * dt * dl * lam_w[None, :]
-
-    I = np.zeros((3, 3))
-    I[0, 0] = np.sum((1 - x**2) * w)
-    I[1, 1] = np.sum((1 - y**2) * w)
-    I[2, 2] = np.sum((1 - z**2) * w)
-    I[0, 1] = I[1, 0] = -np.sum(x * y * w)
-    I[0, 2] = I[2, 0] = -np.sum(x * z * w)
-    I[1, 2] = I[2, 1] = -np.sum(y * z * w)
-    return I
+    return G.thin_shell_inertia_tensor(b, theta, lam)
 
 
 def _find_principal_axes(I_tensor, spin_pole):
@@ -235,33 +203,57 @@ def _find_principal_axes(I_tensor, spin_pole):
     }
 
 
-def _compute_ospw_epsilon_correction(cfg):
-    """OSPW correction factor for converting geometric inertia anomaly to
-    physical epsilon.
-
-    Our geometric inertia tensor treats the shell as uncompensated ice at
-    radius R.  OSPW Eq 2.18 shows the correct inertia anomaly for a
-    bottom-loaded, isostatically compensated shell is smaller by factor:
-
-        correction = (delta_rho / rho_ice) * bracket
-
-    where bracket = -(1-C_w) + 4*C_w*(b_c/a)*(rho_c/delta_rho).
-
-    For Europa: correction ~ 0.048.  The geometric tensor gives the correct
-    principal axis directions (eigenvectors are scale-invariant), but the
-    driving torque for TPW must use the corrected epsilon.
-    """
-    ospw_cfg = OSPWConfig(
-        shell_thickness=cfg.ospw_shell_thickness,
-        lithosphere_thickness=cfg.ospw_lithosphere_thickness,
+def _ospw_params(cfg, mean_b=None):
+    """OSPWParams for this run. b_c = cfg.ospw_shell_thickness, or the current
+    area-mean thickness when that is None."""
+    bc = cfg.ospw_shell_thickness if cfg.ospw_shell_thickness else mean_b
+    if bc is None:
+        raise ValueError('OSPW shell thickness unknown: set ospw_shell_thickness '
+                         'or pass the mean thickness')
+    ratio = getattr(cfg, 'ospw_bc_over_d', None)
+    d = bc / ratio if ratio else cfg.ospw_lithosphere_thickness
+    return PW.OSPWParams(
+        shell_thickness=bc,
+        lithosphere_thickness=d,
+        melting_viscosity=cfg.ospw_melting_viscosity,
+        activation_l=cfg.ospw_activation_param,
+        fracture_temp=cfg.ospw_fracture_base_temp,
+        surface_temp=cfg.ospw_surface_temp,
     )
-    Cw = compute_Cw(ospw_cfg)
-    rho_c = C.ICE_DENSITY
-    delta_rho = C.WATER_DENSITY - C.ICE_DENSITY
-    a = C.EUROPA_RADIUS
-    bc = cfg.ospw_shell_thickness
-    bracket = -(1.0 - Cw) + 4.0 * Cw * (bc / a) * (rho_c / delta_rho)
-    return (delta_rho / rho_c) * bracket
+
+
+def _compute_ospw_epsilon_correction(cfg, mean_b=None):
+    """Eq. 2.18 factor converting the geometric (uncompensated) inertia of a
+    thickness anomaly to the bottom-loaded, buoyantly compensated value.
+
+    = (drho/rho_c) [-(1 - C_w) + 4 (b_c/a)(1 - (drho/rho_m) C_w)], C_w from
+    Eq. 2.11; ~0.0035 for b_c = 20 km. (Before 2026-10 this multiplied the
+    iceberg term by rho_c/drho and used the membrane C_w: 14-21x too large.)
+    """
+    return PW.compensation_factor(_ospw_params(cfg, mean_b))
+
+
+def _physical_inertia_tensor(b, theta, lam, cfg, p):
+    """Deviatoric inertia tensor of the shell thickness field [kg m^2].
+
+    With cfg.use_iceberg_effect (default) this is the Eq. 2.18
+    bottom-loading tensor; otherwise the uncompensated ice-load tensor.
+    """
+    if cfg.use_iceberg_effect:
+        return PW.shell_inertia_tensor(b, theta, lam, p)
+    geo = G.thin_shell_inertia_tensor(b, theta, lam) * C.ICE_DENSITY * p.radius**4
+    return G.deviatoric(geo)
+
+
+def _fossil_state(cfg, p):
+    """Body-fixed hydrostatic fossil (Eqs. 3.8-3.10): physical tensor and its
+    thickness-equivalent (t20, t22) [m] (the t2m whose Eq. 2.18 C2m equals the
+    fossil's). Zero when cfg.use_fossil_bulge is False."""
+    if not cfg.use_fossil_bulge:
+        return np.zeros((3, 3)), 0.0, 0.0
+    c20, c22 = PW.fossil_c20_c22(p)
+    per_m = PW.shell_c2m(1.0, p)
+    return PW.fossil_inertia_tensor(p), c20 / per_m, c22 / per_m
 
 
 def _solar_flux_for_spin_pole(theta, lam, spin_pole, flux_func):
@@ -323,38 +315,38 @@ def _tidal_coordinates(theta, lam, spin_pole):
     return theta_t, lam_t
 
 
+_D_TABLES = {}
+
+
+def _flow_law_D_table(case):
+    """D(theta_t, lam_t) of a flow-law case on a closed 0.5-degree tidal-frame
+    table (the flow-law time average is numerical and too slow to repeat every
+    step). Cached per case and parameter set."""
+    from scipy.interpolate import RegularGridInterpolator
+    key = (case, C.active_parameter_set().name, C.C_R)
+    if key not in _D_TABLES:
+        rheology, _ = table1_case(case)
+        th = np.linspace(0.0, np.pi, 361)
+        lm = np.linspace(-np.pi, np.pi, 721)          # closed: includes both seams
+        TH, LM = np.meshgrid(th, lm, indexing='ij')
+        _D_TABLES[key] = RegularGridInterpolator(
+            (th, lm), dissipation_field(rheology, TH, LM), method='linear')
+    return _D_TABLES[key]
+
+
 def _build_dissipation_for_spin_pole(case, theta, lam, spin_pole):
     """Compute D(theta, lam) in body frame for given spin pole direction.
 
     Maps body-frame grid to tidal coordinates, evaluates tidal strain
-    there, then returns D on the body-frame grid.
+    there, then returns D on the body-frame grid. Maxwell cases are evaluated
+    analytically; flow-law cases are interpolated from a tidal-frame table.
     """
     theta_t, lam_t = _tidal_coordinates(theta, lam, spin_pole)
-    g2, g3 = C.g2(), C.g3()
-
+    rheology, H = table1_case(case)
     if case.startswith('maxwell'):
-        maxwell = MaxwellRheology()
-        eij2 = time_averaged_strain_squared(theta_t, lam_t, g2, g3)
-        D = maxwell.dissipation_integral(C.MEAN_MOTION**2 * eij2)
-    elif case == 'flow_ng3':
-        flow = FlowLawRheology(n_G=C.GLEN_EXPONENT_1, n_A=C.ARRHENIUS_EXPONENT,
-                                A0_cgs=C.A0_FLOW_1_CGS)
-        exp = flow.strain_exponent
-        sp = time_averaged_strain_power(theta_t, lam_t, exp, g2, g3,
-                                         n_samples=360)
-        D = flow.dissipation_integral(C.MEAN_MOTION**(2*exp) * sp)
-    elif case == 'flow_ng52':
-        flow = FlowLawRheology(n_G=C.GLEN_EXPONENT_2, n_A=C.ARRHENIUS_EXPONENT,
-                                A0_cgs=C.A0_FLOW_2_CGS)
-        exp = flow.strain_exponent
-        sp = time_averaged_strain_power(theta_t, lam_t, exp, g2, g3,
-                                         n_samples=360)
-        D = flow.dissipation_integral(C.MEAN_MOTION**(2*exp) * sp)
-    else:
-        raise ValueError(f'Unknown rheology: {case}')
-
-    H = C.H_FLUX_10 if case == 'maxwell_h10' else 0.0
-    return D, H
+        return dissipation_field(rheology, theta_t, lam_t), H
+    pts = np.stack([theta_t.ravel(), lam_t.ravel()], axis=-1)
+    return _flow_law_D_table(case)(pts).reshape(theta_t.shape), H
 
 
 def _darkening_weight_for_spin_pole(theta, lam, spin_pole, power=1.0):
@@ -396,8 +388,7 @@ class AlbedoDarkeningModel:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.theta = np.linspace(0.001, np.pi - 0.001, cfg.n_theta)
-        self.lam = np.linspace(-np.pi, np.pi, cfg.n_lam)
+        self.theta, self.lam = G.periodic_grid(cfg.n_theta, cfg.n_lam)
         # Trailing hemisphere weight: peaks at λ = +π/2 (90° E)
         w = np.maximum(0, np.sin(self.lam)) ** cfg.darkening_power
         self.w = w / np.max(w)
@@ -435,9 +426,15 @@ class AlbedoDarkeningModel:
 # ---------------------------------------------------------------------------
 
 def quasi_static_sweep(cfg):
-    """Sweep darkening fraction 0→1, compute equilibrium MoI at each step."""
+    """Sweep darkening fraction 0 -> 1, compute equilibrium MoI at each step.
+
+    The fossil bulge (cfg.use_fossil_bulge) is the body-fixed hydrostatic
+    bulge of OSPW Eqs. 3.8-3.10. Totals ('t20_km', 't20_2t22_km', ...) add
+    its thickness-equivalent harmonics to the shell's.
+    """
     model = AlbedoDarkeningModel(cfg)
     D, H = _build_dissipation_grid(cfg.rheology_case, model.theta, model.lam)
+    rheology, _ = table1_case(cfg.rheology_case)
     spin_pole = np.array([0.0, 0.0, 1.0])
 
     f_values = np.linspace(0, 1, cfg.n_darkening_steps)
@@ -447,85 +444,37 @@ def quasi_static_sweep(cfg):
             'misalignment_deg', 'I_max', 'I_mid', 'I_min']
     results = {k: np.zeros(len(f_values)) for k in keys}
 
-    # Fossil bulge initialization
-    fossil_t20, fossil_t22 = 0.0, 0.0
-    b_fossil = None
     A0 = model.albedo_field(0.0)
-    T_s0 = model.surface_temperature(A0)
-    b0 = _equilibrium_thickness(T_s0, D, H)
-
-    if cfg.use_fossil_bulge:
-        if cfg.use_full_inertia:
-            b_anomaly = b0 - _area_mean(b0, model.theta)
-            b_fossil = (cfg.fossil_bulge_factor - 1.0) * b_anomaly
-        else:
-            mom0 = _compute_moments(b0, model.theta, model.lam)
-            fossil_t20 = -mom0['t20']
-            fossil_t22 = -mom0['t22']
+    b0 = _equilibrium_thickness(model.surface_temperature(A0), D, H,
+                                cfg.thickness_method, rheology)
+    p = _ospw_params(cfg, _area_mean(b0, model.theta, model.lam))
+    I_fossil, fossil_t20, fossil_t22 = _fossil_state(cfg, p)
 
     for i, f in enumerate(f_values):
-        if cfg.use_full_inertia:
-            A = model.albedo_field(f, spin_pole=spin_pole)
-        else:
-            A = model.albedo_field(f)
-        T_s = model.surface_temperature(A)
-        b_eq = _equilibrium_thickness(T_s, D, H)
+        A = model.albedo_field(f, spin_pole=spin_pole) if cfg.use_full_inertia \
+            else model.albedo_field(f)
+        b_eq = _equilibrium_thickness(model.surface_temperature(A), D, H,
+                                      cfg.thickness_method, rheology)
         mom = _compute_moments(b_eq, model.theta, model.lam)
-
         results['f_dark'][i] = f
         results['shell_delta_BC_A'][i] = mom['delta_BC_A']
-        results['A_mean'][i] = _area_mean(A, model.theta)
-        results['b_avg_km'][i] = _area_mean(b_eq, model.theta) / 1000
-
+        results['A_mean'][i] = _area_mean(A, model.theta, model.lam)
+        results['b_avg_km'][i] = _area_mean(b_eq, model.theta, model.lam) / 1000
+        results['fossil_t20_km'][i] = fossil_t20 / 1000
+        results['fossil_t22_km'][i] = fossil_t22 / 1000
+        tot_t20_km = (mom['t20'] + fossil_t20) / 1000
+        tot_t22_km = (mom['t22'] + fossil_t22) / 1000
+        results['t20_km'][i] = tot_t20_km
+        results['t22_km'][i] = tot_t22_km
+        results['t20_2t22_km'][i] = tot_t20_km + 2 * tot_t22_km
+        results['4t22_km'][i] = 4 * tot_t22_km
+        results['delta_BC_A'][i] = 1e-7 * (tot_t20_km + 2 * tot_t22_km)
+        results['delta_BA_C'][i] = 1e-7 * 4 * tot_t22_km
         if cfg.use_full_inertia:
-            I_shell = _compute_inertia_tensor(b_eq, model.theta, model.lam)
-            if b_fossil is not None:
-                I_fossil = _compute_inertia_tensor(
-                    b_fossil, model.theta, model.lam)
-                I_total = I_shell + I_fossil
-            else:
-                I_total = I_shell
+            I_total = _physical_inertia_tensor(b_eq, model.theta, model.lam, cfg, p) + I_fossil
             pa = _find_principal_axes(I_total, spin_pole)
             results['misalignment_deg'][i] = pa['misalignment_deg']
-            results['I_min'][i] = pa['eigenvalues'][0]
-            results['I_mid'][i] = pa['eigenvalues'][1]
-            results['I_max'][i] = pa['eigenvalues'][2]
-            # Also compute l=2 for comparison
-            if b_fossil is not None:
-                mom_f = _compute_moments(b_fossil, model.theta, model.lam)
-                results['fossil_t20_km'][i] = mom_f['t20_km']
-                results['fossil_t22_km'][i] = mom_f['t22_km']
-                tot_t20_km = mom['t20_km'] + mom_f['t20_km']
-                tot_t22_km = mom['t22_km'] + mom_f['t22_km']
-            else:
-                tot_t20_km = mom['t20_km']
-                tot_t22_km = mom['t22_km']
-            results['delta_BC_A'][i] = 1e-7 * (tot_t20_km + 2 * tot_t22_km)
-            results['delta_BA_C'][i] = 1e-7 * 4 * tot_t22_km
-            results['t20_km'][i] = tot_t20_km
-            results['t22_km'][i] = tot_t22_km
-            results['t20_2t22_km'][i] = tot_t20_km + 2 * tot_t22_km
-            results['4t22_km'][i] = 4 * tot_t22_km
-        else:
-            results['fossil_t20_km'][i] = fossil_t20 / 1000
-            results['fossil_t22_km'][i] = fossil_t22 / 1000
-            if cfg.use_fossil_bulge:
-                tot_t20_km = (mom['t20'] + fossil_t20) / 1000
-                tot_t22_km = (mom['t22'] + fossil_t22) / 1000
-                results['delta_BC_A'][i] = 1e-7 * (tot_t20_km + 2 * tot_t22_km)
-                results['delta_BA_C'][i] = 1e-7 * 4 * tot_t22_km
-                results['t20_km'][i] = tot_t20_km
-                results['t22_km'][i] = tot_t22_km
-                results['t20_2t22_km'][i] = tot_t20_km + 2 * tot_t22_km
-                results['4t22_km'][i] = 4 * tot_t22_km
-            else:
-                results['delta_BC_A'][i] = mom['delta_BC_A']
-                results['delta_BA_C'][i] = mom['delta_BA_C']
-                results['t20_km'][i] = mom['t20_km']
-                results['t22_km'][i] = mom['t22_km']
-                results['t20_2t22_km'][i] = mom['t20_2t22_km']
-                results['4t22_km'][i] = mom['4t22_km']
-
+            results['I_min'][i], results['I_mid'][i], results['I_max'][i] = pa['eigenvalues']
     return results
 
 
@@ -541,66 +490,54 @@ class ShellEvolution:
         self.model = AlbedoDarkeningModel(cfg)
         self.theta = self.model.theta
         self.lam = self.model.lam
+        self.rheology, _ = table1_case(cfg.rheology_case)
         self.D, self.H = _build_dissipation_grid(
             cfg.rheology_case, self.theta, self.lam)
 
         # Initial state: uniform bright albedo, equilibrium thickness
         A_init = self.model.albedo_field(0.0)
         T_s_init = self.model.surface_temperature(A_init)
-        self.b = _equilibrium_thickness(T_s_init, self.D, self.H)
+        self.b = self._b_eq(T_s_init)
         self.f_dark = 0.0
         self.t = 0.0
 
         # Spin pole direction in body frame (initially along z-hat)
         self.spin_pole = np.array([0.0, 0.0, 1.0])
 
-        # Cache the spin pole direction used for the current D grid.
-        # D is recomputed when the pole moves > _D_update_threshold_deg.
+        # Spin pole direction used for the current D grid. D is recomputed
+        # whenever the pole has moved (threshold cfg.D_update_threshold_deg,
+        # default 0). A 1-degree threshold (the pre-2026-10 value) held the
+        # tidal heating body-fixed for small tilts while insolation and
+        # darkening followed the pole; that inconsistency drove a spurious
+        # ~3 Myr pole oscillation in slow-instability runs.
         self._D_spin_pole = self.spin_pole.copy()
-        self._D_update_threshold_deg = 1.0
+        self._D_update_threshold_deg = cfg.D_update_threshold_deg
 
-        # Fossil bulge
-        self.fossil_t20 = 0.0  # [m] (l=2 mode, for backward compat)
-        self.fossil_t22 = 0.0  # [m]
-        self.b_fossil = np.zeros_like(self.b)  # 2D field [m]
-        if cfg.use_fossil_bulge:
-            if cfg.use_full_inertia:
-                # fossil = (alpha-1) * anomaly: REINFORCES the shell's stable
-                # pattern (C > B > A).  alpha=1 → no fossil; alpha=1.5 → 50%
-                # extra stability margin; alpha=2 → double margin.
-                b_anomaly = self.b - _area_mean(self.b, self.theta)
-                self.b_fossil = (cfg.fossil_bulge_factor - 1.0) * b_anomaly
-            else:
-                mom0 = _compute_moments(self.b, self.theta, self.lam)
-                self.fossil_t20 = -mom0['t20']
-                self.fossil_t22 = -mom0['t22']
+        # OSPW parameters (b_c = initial mean thickness unless fixed in cfg)
+        self._ospw_p = _ospw_params(cfg, _area_mean(self.b, self.theta, self.lam))
+        # Fossil bulge: BODY-FIXED hydrostatic figure x (1 - C_w), OSPW
+        # Eqs. 3.8-3.10, frozen with x toward Jupiter and z along the initial
+        # spin axis. It rotates with the shell; nothing relaxes it.
+        self.I_fossil, self.fossil_t20, self.fossil_t22 = _fossil_state(cfg, self._ospw_p)
 
         # OSPW dynamics state
-        self._ospw_cfg = None
-        if cfg.tpw_model in ('ospw', 'coupled'):
-            self._ospw_cfg = OSPWConfig(
-                shell_thickness=cfg.ospw_shell_thickness,
-                lithosphere_thickness=cfg.ospw_lithosphere_thickness,
-                melting_viscosity=cfg.ospw_melting_viscosity,
-                activation_param=cfg.ospw_activation_param,
-                fracture_base_temp=cfg.ospw_fracture_base_temp,
-                surface_temp=cfg.ospw_surface_temp,
-            )
-            self._ospw_Cf = compute_Cf(self._ospw_cfg)
-            self._ospw_I0 = compute_I0(self._ospw_cfg)
-            self._ospw_n = C.MEAN_MOTION
-            # Correction factor: geometric ε → OSPW ε (accounts for
-            # isostatic compensation + iceberg effect)
-            if cfg.use_iceberg_effect:
-                self._ospw_eps_correction = _compute_ospw_epsilon_correction(cfg)
-            else:
-                self._ospw_eps_correction = 1.0
+        self._ospw_Cf = PW.dissipation_cf(self._ospw_p)
+        self._ospw_I0 = PW.moment_I0(self._ospw_p)
+        self._ospw_n = C.MEAN_MOTION
+        self._ospw_eps_correction = (PW.compensation_factor(self._ospw_p)
+                                     if cfg.use_iceberg_effect else 1.0)
+
+        # psi0 seed (OSPW: psi0 is the value of psi when t/tau passes through
+        # zero). Armed while the pole sits on the max-moment axis; fires once
+        # when that axis loses its status. See _apply_psi0_seed.
+        self._seed_armed = True
+        self.seed_events = []
 
         # B&H interior coupling state
         if cfg.tpw_model == 'coupled':
             self.interior_pole = np.array([0.0, 0.0, 1.0])
-            # K_G* = (3/2)(B_i-A_i) n² where (B_i-A_i) = eps_i * C_i
-            # C_i = gamma * I_0 (interior MoI ≈ gamma × shell MoI)
+            # K_G* = (3/2)(B_i-A_i) n^2 with (B_i-A_i) = eps_i C_i,
+            # C_i = gamma_i I_0. Torque on the shell ~ K_G sin(2 delta).
             self._C_interior = cfg.interior_gamma * self._ospw_I0
             B_minus_A_interior = cfg.interior_triaxiality * self._C_interior
             KG_star = 1.5 * B_minus_A_interior * C.MEAN_MOTION**2
@@ -613,7 +550,7 @@ class ShellEvolution:
             'fossil_t20_km', 'fossil_t22_km',
             'total_t20_km', 'total_t22_km',
             'misalignment_deg', 'spin_pole_theta', 'spin_pole_phi',
-            'I_max', 'I_mid', 'I_min', 'fossil_rms_km']
+            'I_max', 'I_mid', 'I_min', 't_over_tau']
         if cfg.tpw_model in ('ospw', 'coupled'):
             hist_keys.append('tpw_omega_deg_per_Myr')
         if cfg.tpw_model == 'coupled':
@@ -623,64 +560,94 @@ class ShellEvolution:
         self.history['cycle_events'] = []
         self._record()
 
+    # -- physics helpers ---------------------------------------------------
+    def _b_eq(self, T_s):
+        return _equilibrium_thickness(T_s, self.D, self.H,
+                                      self.cfg.thickness_method, self.rheology)
+
+    def total_inertia_tensor(self):
+        """Physical (Eq. 2.18) shell tensor + body-fixed fossil [kg m^2]."""
+        return (_physical_inertia_tensor(self.b, self.theta, self.lam,
+                                         self.cfg, self._ospw_p)
+                + self.I_fossil)
+
+    def _apply_psi0_seed(self, I_total):
+        """Give the pole a physical offset psi0 when it becomes unstable.
+
+        A pole exactly on a principal axis stays there under Eq. 5.39 (the
+        pendulum balanced at the top); before 2026-10 the code waited for
+        float round-off (~1e-12 rad in the eigenvectors) to grow, which set
+        the "2.4 Myr" onset. OSPW take psi0 to be the angle when t/tau passes
+        through zero. Here: when the axis the pole sits on stops being the
+        max-moment axis (by more than SEED_GAP_REL * I_0), the pole is moved
+        to angle psi0 from that axis toward the max axis, once per episode,
+        and the event is logged. Nothing happens if it is already farther
+        than psi0.
+        """
+        psi0 = self.cfg.psi0_rad
+        vals, vecs = np.linalg.eigh(I_total)
+        c = vecs.T @ self.spin_pole
+        a = int(np.argmax(np.abs(c)))
+        gap = vals[-1] - vals[a]
+        if a == 2 or gap <= SEED_GAP_REL * self._ospw_I0:
+            if a == 2:
+                self._seed_armed = True
+            return
+        if not self._seed_armed or psi0 <= 0:
+            return
+        self._seed_armed = False
+        psi = np.arccos(min(1.0, abs(c[a])))
+        if psi >= psi0:
+            return
+        e_a = np.sign(c[a]) * vecs[:, a]
+        e_t = vecs[:, 2] * (np.sign(c[2]) if c[2] != 0 else 1.0)
+        self.spin_pole = np.cos(psi0) * e_a + np.sin(psi0) * e_t
+        self.spin_pole /= np.linalg.norm(self.spin_pole)
+        self.seed_events.append((self.t, psi, psi0, gap / self._ospw_I0))
+        print(f'  psi0 seed at t={self.t/1e6:.3f} Myr: pole moved from {psi:.2e} '
+              f'to {psi0:.2e} rad off the unstable axis '
+              f'((I_max - I_spin)/I_0 = {gap/self._ospw_I0:.2e})')
+
     def _record(self):
         mom = _compute_moments(self.b, self.theta, self.lam)
         A = self.model.albedo_field(self.f_dark)
         self.history['t_years'].append(self.t)
         self.history['f_dark'].append(self.f_dark)
-        self.history['A_mean'].append(_area_mean(A, self.theta))
-        self.history['b_avg_km'].append(_area_mean(self.b, self.theta) / 1000)
+        self.history['A_mean'].append(_area_mean(A, self.theta, self.lam))
+        self.history['b_avg_km'].append(_area_mean(self.b, self.theta, self.lam) / 1000)
 
         # Shell-only harmonics
         self.history['shell_delta_BC_A'].append(mom['delta_BC_A'])
         self.history['shell_t20_km'].append(mom['t20_km'])
         self.history['shell_t22_km'].append(mom['t22_km'])
+        self.history['fossil_t20_km'].append(self.fossil_t20 / 1000)
+        self.history['fossil_t22_km'].append(self.fossil_t22 / 1000)
 
-        # Full inertia tensor path
+        I_total = self.total_inertia_tensor()
         if self.cfg.use_full_inertia:
-            I_shell = _compute_inertia_tensor(self.b, self.theta, self.lam)
-            I_fossil = _compute_inertia_tensor(self.b_fossil, self.theta, self.lam)
-            I_total = I_shell + I_fossil
             pa = _find_principal_axes(I_total, self.spin_pole)
             self.history['misalignment_deg'].append(pa['misalignment_deg'])
             vals = pa['eigenvalues']
             self.history['I_min'].append(vals[0])
             self.history['I_mid'].append(vals[1])
             self.history['I_max'].append(vals[2])
-            # Spin pole direction (spherical coords in body frame)
             sp_theta = np.arccos(np.clip(self.spin_pole[2], -1, 1))
             sp_phi = np.arctan2(self.spin_pole[1], self.spin_pole[0])
             self.history['spin_pole_theta'].append(np.degrees(sp_theta))
             self.history['spin_pole_phi'].append(np.degrees(sp_phi))
-            # Fossil RMS
-            fossil_rms = np.sqrt(_area_mean(self.b_fossil**2, self.theta))
-            self.history['fossil_rms_km'].append(fossil_rms / 1000)
-            # Also compute l=2 fossil harmonics for comparison
-            mom_f = _compute_moments(self.b_fossil, self.theta, self.lam)
-            self.history['fossil_t20_km'].append(mom_f['t20_km'])
-            self.history['fossil_t22_km'].append(mom_f['t22_km'])
-            # Total l=2 harmonics
-            tot_t20_km = mom['t20_km'] + mom_f['t20_km']
-            tot_t22_km = mom['t22_km'] + mom_f['t22_km']
         else:
-            self.history['misalignment_deg'].append(0.0)
-            self.history['I_min'].append(0.0)
-            self.history['I_mid'].append(0.0)
-            self.history['I_max'].append(0.0)
-            self.history['spin_pole_theta'].append(0.0)
-            self.history['spin_pole_phi'].append(0.0)
-            self.history['fossil_rms_km'].append(0.0)
-            # Fossil bulge harmonics (l=2 path)
-            self.history['fossil_t20_km'].append(self.fossil_t20 / 1000)
-            self.history['fossil_t22_km'].append(self.fossil_t22 / 1000)
-            # Total (shell + fossil)
-            if self.cfg.use_fossil_bulge:
-                tot_t20_km = (mom['t20'] + self.fossil_t20) / 1000
-                tot_t22_km = (mom['t22'] + self.fossil_t22) / 1000
-            else:
-                tot_t20_km = mom['t20_km']
-                tot_t22_km = mom['t22_km']
+            for k in ('misalignment_deg', 'I_min', 'I_mid', 'I_max',
+                      'spin_pole_theta', 'spin_pole_phi'):
+                self.history[k].append(0.0)
+        # (t/tau) of the moment pair that drives Eq. 5.39: max-moment axis
+        # minus the moment about the spin axis, over I_0.
+        Is = self.spin_pole @ I_total @ self.spin_pole
+        self.history['t_over_tau'].append(
+            (np.linalg.eigvalsh(I_total)[-1] - Is) / self._ospw_I0)
 
+        # Total (shell + fossil, thickness-equivalent) l=2 harmonics
+        tot_t20_km = (mom['t20'] + self.fossil_t20) / 1000
+        tot_t22_km = (mom['t22'] + self.fossil_t22) / 1000
         self.history['total_t20_km'].append(tot_t20_km)
         self.history['total_t22_km'].append(tot_t22_km)
         self.history['delta_BC_A'].append(1e-7 * (tot_t20_km + 2 * tot_t22_km))
@@ -688,10 +655,7 @@ class ShellEvolution:
         self.history['t20_2t22_km'].append(tot_t20_km + 2 * tot_t22_km)
         self.history['4t22_km'].append(4 * tot_t22_km)
 
-        # OSPW/coupled mode diagnostics
         if self.cfg.tpw_model in ('ospw', 'coupled'):
-            # Record 0 for angular velocity at recording time (actual value
-            # is computed during step(); this placeholder keeps arrays aligned)
             self.history['tpw_omega_deg_per_Myr'].append(
                 getattr(self, '_last_omega_deg_per_Myr', 0.0))
         if self.cfg.tpw_model == 'coupled':
@@ -708,15 +672,15 @@ class ShellEvolution:
         """Recompute D(theta, lam) if the spin pole has drifted significantly.
 
         Tidal heating depends on spin-frame coordinates (O&S Appendix B), so D
-        must be recalculated when the spin pole moves.  To avoid recomputing
-        every timestep, D is cached and only updated when the pole has moved
-        by more than _D_update_threshold_deg since the last computation.
+        must be recalculated when the spin pole moves; it is updated whenever
+        the pole has moved by more than _D_update_threshold_deg (default 0:
+        every step on which the pole moved at all).
         """
         if not self.cfg.use_full_inertia:
             return
         cos_a = np.clip(np.dot(self.spin_pole, self._D_spin_pole), -1, 1)
         angle = np.degrees(np.arccos(cos_a))
-        if angle > self._D_update_threshold_deg:
+        if angle > self._D_update_threshold_deg and angle > 0.0:
             self.D, self.H = _build_dissipation_for_spin_pole(
                 self.cfg.rheology_case, self.theta, self.lam, self.spin_pole)
             self._D_spin_pole = self.spin_pole.copy()
@@ -734,158 +698,96 @@ class ShellEvolution:
         else:
             A = self.model.albedo_field(self.f_dark)
             T_s = self.model.surface_temperature(A)
-        b_eq = _equilibrium_thickness(T_s, self.D, self.H)
+        b_eq = self._b_eq(T_s)
         # 4. Exponential relaxation of shell toward equilibrium
         self.b = b_eq + (self.b - b_eq) * np.exp(-dt / cfg.tau_shell)
-        # 5. Fossil bulge evolution (full inertia path)
-        # The fossil relaxes toward (alpha-1)*current_equilibrium_anomaly on
-        # timescale tau_visc.  This models continuous lithospheric freezing:
-        # the fossil gradually adapts to reinforce the current shell pattern.
-        # During stable periods: fossil forms and strengthens stability.
-        # After TPW: fossil is "out of date" and evolves toward new target.
-        # The lag between darkening (tau_dark) and fossil adaptation (tau_visc)
-        # drives the instability-reorientation cycle.
-        if cfg.use_fossil_bulge and cfg.use_full_inertia:
-            b_eq_anomaly = b_eq - _area_mean(b_eq, self.theta)
-            b_target = (cfg.fossil_bulge_factor - 1.0) * b_eq_anomaly
-            decay = np.exp(-dt / cfg.tau_visc)
-            self.b_fossil = b_target + (self.b_fossil - b_target) * decay
-        # 6. Continuous polar wander (full inertia path)
-        # The spin pole drifts toward v_max (eigenvector of maximum MoI).
-        # Three dynamics models:
-        #   exponential: free-parameter relaxation on tau_tpw
-        #   ospw: overdamped viscous dissipation from OSPW shell rheology
-        #   coupled: ospw + B&H gravity-gradient shell-interior coupling
+        # 5. The fossil bulge is body-fixed and constant (Eqs. 3.8-3.10).
+        # 6. Polar wander (full inertia path)
         if cfg.use_full_inertia:
-            I_shell = _compute_inertia_tensor(self.b, self.theta, self.lam)
-            I_fossil = _compute_inertia_tensor(self.b_fossil, self.theta, self.lam)
-            I_total = I_shell + I_fossil
-            pa = _find_principal_axes(I_total, self.spin_pole)
-            misalign_rad = np.radians(pa['misalignment_deg'])
-            if misalign_rad > 1e-6:
-                v_max = pa['v_max']
-                dot = np.dot(v_max, self.spin_pole)
-                v_perp = v_max - dot * self.spin_pole
-                v_perp_norm = np.linalg.norm(v_perp)
-                if v_perp_norm > 1e-10:
-                    v_perp_hat = v_perp / v_perp_norm
-                    if cfg.tpw_model == 'coupled':
-                        # coupled mode updates spin_pole directly
-                        # (2D vector sum of driving + coupling forces)
-                        self._coupled_step(
-                            dt, misalign_rad, pa, v_perp_hat)
-                    else:
-                        if cfg.tpw_model == 'exponential':
-                            d_angle = misalign_rad * (
-                                1.0 - np.exp(-dt / cfg.tau_tpw))
-                        elif cfg.tpw_model == 'ospw':
-                            d_angle = self._ospw_step(
-                                dt, misalign_rad, pa)
-                        else:
-                            raise ValueError(
-                                f'Unknown tpw_model: {cfg.tpw_model}')
-                        self.spin_pole = (
-                            self.spin_pole * np.cos(d_angle) +
-                            v_perp_hat * np.sin(d_angle))
-                        self.spin_pole /= np.linalg.norm(
-                            self.spin_pole)
+            self._reorient(dt, self.total_inertia_tensor())
         self.t += dt
+
+    def _reorient(self, dt, I_total):
+        """Move the spin pole for one step under the chosen TPW model."""
+        cfg = self.cfg
+        if cfg.tpw_model == 'ospw':
+            self._apply_psi0_seed(I_total)
+            self._ospw_step(dt, I_total)
+            return
+        if cfg.tpw_model == 'coupled':
+            self._apply_psi0_seed(I_total)
+            self._coupled_step(dt, I_total)
+            return
+        if cfg.tpw_model != 'exponential':
+            raise ValueError(f'Unknown tpw_model: {cfg.tpw_model}')
+        # exponential: free-parameter relaxation toward v_max on tau_tpw
+        pa = _find_principal_axes(I_total, self.spin_pole)
+        misalign_rad = np.radians(pa['misalignment_deg'])
+        if misalign_rad <= 1e-6:
+            return
+        v_max = pa['v_max']
+        v_perp = v_max - np.dot(v_max, self.spin_pole) * self.spin_pole
+        v_perp_norm = np.linalg.norm(v_perp)
+        if v_perp_norm <= 1e-10:
+            return
+        d_angle = misalign_rad * (1.0 - np.exp(-dt / cfg.tau_tpw))
+        self.spin_pole = (self.spin_pole * np.cos(d_angle)
+                          + v_perp / v_perp_norm * np.sin(d_angle))
+        self.spin_pole /= np.linalg.norm(self.spin_pole)
 
     # ------------------------------------------------------------------
     #  TPW dynamics methods
     # ------------------------------------------------------------------
 
-    def _ospw_step(self, dt, misalign_rad, pa):
-        """OSPW overdamped torque-balance TPW step.
+    def _ospw_step(self, dt, I_total):
+        """OSPW overdamped reorientation, Eq. 5.39 (exact for the frozen tensor).
 
-        In the overdamped limit (ψ̈ ≈ 0):
-            ω = driving / damping = 2ε²n²I₀/C_f · sin(2ψ)
-        where ε is the OSPW-corrected triaxiality parameter.
-
-        The OSPW correction accounts for isostatic compensation and the
-        iceberg effect: ε_OSPW = ε_geometric × (Δρ/ρ_ice) × bracket.
-        Without the correction, the geometric ε overestimates the driving
-        torque by ~20× (the geometric tensor doesn't account for ocean
-        displacement beneath thicker shell regions).
+        psi_dot = (t/tau)(n^2 I_0 / 2 C_f) sin 2psi, (t/tau) I_0 = I_target - I_spin,
+        in vector form s_dot = (n^2/C_f)[I s - (s.I s) s]; see
+        ojakangas_stevenson.polar_wander.overdamped_step. I_total is the
+        physical (Eq. 2.18 + fossil) tensor, so the rate needs no epsilon
+        correction. Returns the rotation angle [rad].
         """
-        delta_I = pa['delta_I_all']  # I_max - I_min in I/(ρR⁴) units
-        delta_I_phys = delta_I * C.ICE_DENSITY * C.EUROPA_RADIUS**4
-        I0 = self._ospw_I0
-        # Apply OSPW correction: geometric → physical epsilon
-        epsilon = delta_I_phys * self._ospw_eps_correction / I0
-        if abs(epsilon) < 1e-20:
-            return 0.0
-        n = self._ospw_n
-        Cf = self._ospw_Cf
-        # omega = 2ε²n²I₀/C_f · sin(2ψ) (overdamped balance)
-        omega = 2.0 * epsilon**2 * n**2 * I0 / Cf * np.sin(2.0 * misalign_rad)
-        # Store for diagnostics
-        self._last_omega_deg_per_Myr = np.degrees(omega) * 1e6 * 365.25 * 86400
         dt_s = dt * 365.25 * 86400.0
-        d_angle = omega * dt_s
-        return min(d_angle, misalign_rad)
+        old = self.spin_pole.copy()
+        self.spin_pole, info = PW.overdamped_step(self.spin_pole, I_total,
+                                                  self._ospw_Cf, dt_s)
+        d_angle = np.arccos(np.clip(np.dot(old, self.spin_pole), -1, 1))
+        self._last_omega_deg_per_Myr = np.degrees(info['psi_dot']) * 1e6 * 365.25 * 86400
+        return d_angle
 
-    def _coupled_step(self, dt, misalign_rad, pa, v_perp_hat):
+    def _coupled_step(self, dt, I_total):
         """OSPW dissipation + B&H gravity-gradient shell-interior coupling.
 
-        Two torques act on the shell in different directions:
-          1. Driving (toward v_max): ω_drive = 2ε²n²I₀/C_f · sin(2ψ)
-          2. Coupling (toward interior): ω_couple = 4ε K_G sin(2δ) / C_f
-
-        The interior stays approximately tidally locked (its libration
-        period ~years is unresolvable at our dt ~kyr).  The coupling
-        provides a restoring torque preventing the shell from drifting
-        too far from the initial synchronous orientation.
-
-        Updates self.spin_pole directly (vector sum of two forces).
+        Overdamped: C_f s_dot = (driving torque) + (coupling torque), with
+          driving   n^2 [I s - (s.I s) s]           (Eq. 5.39, vector form)
+          coupling  K_G sin(2 delta) toward the interior pole.
+        The coupling-torque normalization (K_G = factor x (3/2)(B_i - A_i) n^2)
+        is NOT verified against B&H 2023, which treats a single axis only.
+        Explicit step, capped at the current misalignment.
         """
-        delta_I = pa['delta_I_all']
-        delta_I_phys = delta_I * C.ICE_DENSITY * C.EUROPA_RADIUS**4
-        I0 = self._ospw_I0
-        epsilon = delta_I_phys * self._ospw_eps_correction / I0
-        if abs(epsilon) < 1e-20:
-            return
         n = self._ospw_n
         Cf = self._ospw_Cf
         dt_s = dt * 365.25 * 86400.0
-
-        # 1. Driving angular velocity toward v_max (same as _ospw_step)
-        omega_drive = 2.0 * epsilon**2 * n**2 * I0 / Cf * np.sin(
-            2.0 * misalign_rad)
-
-        # 2. Coupling angular velocity toward interior_pole
-        #    In overdamped limit: (K_G/I₀) sin(2δ) / γ_damp
-        #    = (K_G/I₀) sin(2δ) × (4εI₀/Cf) = 4ε K_G sin(2δ) / Cf
-        cos_sep = np.clip(
-            np.dot(self.spin_pole, self.interior_pole), -1, 1)
+        s = self.spin_pole
+        Is = s @ I_total @ s
+        d_spin = (n**2 / Cf) * (I_total @ s - Is * s) * dt_s
+        cos_sep = np.clip(np.dot(s, self.interior_pole), -1, 1)
         sep_rad = np.arccos(cos_sep)
-        if sep_rad > 1e-10:
-            omega_couple = (4.0 * abs(epsilon) * self._K_G
-                            * np.sin(2.0 * sep_rad) / Cf)
-        else:
-            omega_couple = 0.0
-
-        # Direction toward interior_pole on the unit sphere
-        dot_ip = np.dot(self.interior_pole, self.spin_pole)
-        v_couple = self.interior_pole - dot_ip * self.spin_pole
+        v_couple = self.interior_pole - cos_sep * s
         v_couple_norm = np.linalg.norm(v_couple)
-
-        # Total displacement: vector sum of driving + coupling
-        d_spin = omega_drive * dt_s * v_perp_hat
-        if v_couple_norm > 1e-10:
-            v_couple_hat = v_couple / v_couple_norm
-            d_spin += omega_couple * dt_s * v_couple_hat
-
-        # Limit step size to prevent numerical overshooting
-        # (same as _ospw_step's min(d_angle, misalign_rad))
+        if sep_rad > 1e-10 and v_couple_norm > 1e-10:
+            d_spin = d_spin + (self._K_G * np.sin(2.0 * sep_rad) / Cf) * dt_s \
+                * v_couple / v_couple_norm
+        pa = _find_principal_axes(I_total, s)
+        misalign_rad = np.radians(pa['misalignment_deg'])
         d_magnitude = np.linalg.norm(d_spin)
         if d_magnitude > misalign_rad and misalign_rad > 1e-10:
             d_spin *= misalign_rad / d_magnitude
             d_magnitude = misalign_rad
         if d_magnitude > 1e-15:
-            self.spin_pole = self.spin_pole + d_spin
+            self.spin_pole = s + d_spin
             self.spin_pole /= np.linalg.norm(self.spin_pole)
-
         self._last_omega_deg_per_Myr = (
             np.degrees(d_magnitude / dt_s) * 1e6 * 365.25 * 86400)
 
@@ -922,49 +824,35 @@ class ShellEvolution:
         return False
 
     def _check_reorientation_l2(self):
-        """Original l=2 harmonic stability check (backward compat)."""
+        """l=2 harmonic stability check with discrete 90-degree reorientation.
+
+        Unstable when the total (shell + fossil, thickness-equivalent)
+        t20 + 2 t22 > 0 by more than cfg.reorient_threshold in Delta(B-C)/A.
+        On a 90-degree rotation about the sub-Jovian axis the body-fixed fossil
+        rotates with the shell (_rotate_l2); the shell is reset to the new
+        equilibrium.
+        """
         cfg = self.cfg
         mom = _compute_moments(self.b, self.theta, self.lam)
-
+        tot_t20_km = (mom['t20'] + self.fossil_t20) / 1000
+        tot_t22_km = (mom['t22'] + self.fossil_t22) / 1000
+        delta_BC_A = 1e-7 * (tot_t20_km + 2 * tot_t22_km)
+        if delta_BC_A <= cfg.reorient_threshold:
+            return False
+        n = len(self.history['cycle_events']) + 1
+        self.history['cycle_events'].append((self.t, n))
+        self.f_dark *= (1.0 - cfg.reorient_albedo_reset)
+        A_new = self.model.albedo_field(self.f_dark)
+        self.b = self._b_eq(self.model.surface_temperature(A_new))
         if cfg.use_fossil_bulge:
-            tot_t20_km = (mom['t20'] + self.fossil_t20) / 1000
-            tot_t22_km = (mom['t22'] + self.fossil_t22) / 1000
-            delta_BC_A = 1e-7 * (tot_t20_km + 2 * tot_t22_km)
-        else:
-            delta_BC_A = mom['delta_BC_A']
-
-        if delta_BC_A > cfg.reorient_threshold:
-            n = len(self.history['cycle_events']) + 1
-            self.history['cycle_events'].append((self.t, n))
-
-            if cfg.use_fossil_bulge:
-                tot_t20 = mom['t20'] + self.fossil_t20
-                tot_t22 = mom['t22'] + self.fossil_t22
-                t20_rot, t22_rot = _rotate_l2(tot_t20, tot_t22)
-
-                self.f_dark *= (1.0 - cfg.reorient_albedo_reset)
-                A_new = self.model.albedo_field(self.f_dark)
-                T_s_new = self.model.surface_temperature(A_new)
-                self.b = _equilibrium_thickness(T_s_new, self.D, self.H)
-
-                mom_new = _compute_moments(self.b, self.theta, self.lam)
-                self.fossil_t20 = t20_rot - mom_new['t20']
-                self.fossil_t22 = t22_rot - mom_new['t22']
-
-                post_t20_km = (mom_new['t20'] + self.fossil_t20) / 1000
-                post_t22_km = (mom_new['t22'] + self.fossil_t22) / 1000
-                post_delta = 1e-7 * (post_t20_km + 2 * post_t22_km)
-                if post_delta > cfg.reorient_threshold:
-                    print(f'  WARNING: post-rotation still unstable '
-                          f'(Delta(B-C)/A = {post_delta:.2e})')
-            else:
-                self.f_dark *= (1.0 - cfg.reorient_albedo_reset)
-                A_new = self.model.albedo_field(self.f_dark)
-                T_s_new = self.model.surface_temperature(A_new)
-                self.b = _equilibrium_thickness(T_s_new, self.D, self.H)
-
-            return True
-        return False
+            self.fossil_t20, self.fossil_t22 = _rotate_l2(self.fossil_t20, self.fossil_t22)
+            mom_new = _compute_moments(self.b, self.theta, self.lam)
+            post = 1e-7 * ((mom_new['t20'] + self.fossil_t20)
+                           + 2 * (mom_new['t22'] + self.fossil_t22)) / 1000
+            if post > cfg.reorient_threshold:
+                print(f'  WARNING: post-rotation still unstable '
+                      f'(Delta(B-C)/A = {post:.2e})')
+        return True
 
     def run(self, record_every=None):
         cfg = self.cfg
@@ -1017,7 +905,7 @@ def parameter_survey(base_cfg, tau_dark_values=None, tau_shell_values=None):
                 rheology_case=base_cfg.rheology_case,
                 A_bright=base_cfg.A_bright,
                 A_dark=base_cfg.A_dark,
-                n_theta=91, n_lam=181,
+                n_theta=91, n_lam=180,
                 dt_years=min(td / 5, 1e3),
                 t_max_years=5e8,
                 n_cycles_max=3,
@@ -1088,7 +976,7 @@ def fig1_quasi_static(sweep, cfg, save_path=None):
         ax1.set_xlabel('Darkening fraction $f$')
 
     label = CASE_STYLES.get(cfg.rheology_case, ('', '', '', cfg.rheology_case))[3]
-    fb_tag = rf' ($\alpha$={cfg.fossil_bulge_factor})' if cfg.use_fossil_bulge else ''
+    fb_tag = ' (hydrostatic fossil)' if cfg.use_fossil_bulge else ' (no fossil)'
     ax1.set_title(f'Polar wander stability: {label}{fb_tag}')
     plt.tight_layout()
     if save_path:
@@ -1236,7 +1124,7 @@ def fig2_time_series(history, cfg, save_path=None):
     label = CASE_STYLES.get(cfg.rheology_case, ('', '', '', cfg.rheology_case))[3]
     fb_tag = ''
     if has_fossil:
-        fb_tag = rf' (fossil $\alpha$={cfg.fossil_bulge_factor})'
+        fb_tag = ' (hydrostatic fossil)'
     if has_tensor:
         fb_tag += ' [full tensor]'
     if cfg.tpw_model != 'exponential':
@@ -1338,9 +1226,8 @@ def fig4_mollweide_snapshots(cfg, save_path=None):
     return fig
 
 
-def fig5_all_rheologies(save_path=None, A_bright=0.55, A_dark=0.15,
-                        use_fossil_bulge=True, use_full_inertia=True,
-                        fossil_bulge_factor=1.5):
+def fig5_all_rheologies(save_path=None, A_bright=0.55, A_dark=0.3814,
+                        use_fossil_bulge=True, use_full_inertia=True):
     """Δ(B-C)/A and misalignment vs f for all 4 rheology cases."""
     show_tensor = use_fossil_bulge and use_full_inertia
     if show_tensor:
@@ -1367,8 +1254,7 @@ def fig5_all_rheologies(save_path=None, A_bright=0.55, A_dark=0.15,
         if ax_tr is not None:
             cfg_fb = PolarWanderConfig(
                 rheology_case=case, A_bright=A_bright, A_dark=A_dark,
-                use_fossil_bulge=True, use_full_inertia=use_full_inertia,
-                fossil_bulge_factor=fossil_bulge_factor)
+                use_fossil_bulge=True, use_full_inertia=use_full_inertia)
             sweep_fb = quasi_static_sweep(cfg_fb)
             ax_tr.plot(sweep_fb['f_dark'], sweep_fb['delta_BC_A'] * 1e8,
                        color=color, marker=marker, markevery=5, markersize=4,
@@ -1401,7 +1287,7 @@ def fig5_all_rheologies(save_path=None, A_bright=0.55, A_dark=0.15,
 
     ax_tl.set_title('Without fossil bulge')
     if ax_tr is not None:
-        ax_tr.set_title(rf'With fossil bulge ($\alpha$={fossil_bulge_factor})')
+        ax_tr.set_title('With hydrostatic fossil bulge')
 
     if show_tensor:
         for ax in [ax_bl, ax_br]:
@@ -1410,7 +1296,7 @@ def fig5_all_rheologies(save_path=None, A_bright=0.55, A_dark=0.15,
             ax.legend(fontsize=8.5, loc='best')
             ax.grid(True, alpha=0.2)
         ax_bl.set_title('Misalignment (no fossil)')
-        ax_br.set_title(rf'Misalignment ($\alpha$={fossil_bulge_factor})')
+        ax_br.set_title('Misalignment (hydrostatic fossil)')
 
     plt.tight_layout()
     if save_path:
@@ -1507,7 +1393,8 @@ def main():
     parser.add_argument('--tau-dark', type=float, default=1e4)
     parser.add_argument('--tau-shell', type=float, default=1e7)
     parser.add_argument('--A-bright', type=float, default=0.55)
-    parser.add_argument('--A-dark', type=float, default=0.15)
+    parser.add_argument('--A-dark', type=float, default=0.3814,
+                        help='dark endmember Bond albedo (Hapke non-ice endmember)')
     parser.add_argument('--n-cycles', type=int, default=5)
     parser.add_argument('--sweep-only', action='store_true',
                         help='Only run quasi-static sweep (fast)')
@@ -1517,10 +1404,11 @@ def main():
                         help='Quasi-static sweep for all 4 rheologies')
     parser.add_argument('--no-fossil-bulge', action='store_true',
                         help='Disable fossil bulge (original behavior)')
-    parser.add_argument('--fossil-factor', type=float, default=1.5,
-                        help='Fossil bulge factor alpha (default: 1.5)')
-    parser.add_argument('--tau-visc', type=float, default=3e7,
-                        help='Fossil relaxation timescale [yr] (default: 3e7)')
+    parser.add_argument('--psi0', type=float, default=PSI0_OBLIQUITY_RAD,
+                        help='psi0 seed [rad] applied when the pole becomes unstable')
+    parser.add_argument('--thickness-method', choices=('eq28', 'exact'), default='eq28')
+    parser.add_argument('--parameter-set', default='paper', choices=sorted(C.PARAMETER_SETS),
+                        help="constants: 'paper' (validation) or 'modern' (science)")
     parser.add_argument('--no-full-inertia', action='store_true',
                         help='Use l=2 harmonics instead of full tensor')
     parser.add_argument('--misalignment-threshold', type=float, default=5.0,
@@ -1533,21 +1421,19 @@ def main():
                         help='TPW dynamics: exponential (free tau), '
                              'ospw (viscous), coupled (ospw+interior)')
     # OSPW parameters
-    parser.add_argument('--ospw-Tf', type=float, default=130.0,
-                        help='Fracture base temperature [K] (default: 130)')
+    parser.add_argument('--ospw-Tf', type=float, default=124.0,
+                        help='Fracture base temperature [K] (default: 124, OSPW p. 264)')
     parser.add_argument('--ospw-eta0', type=float, default=3e14,
                         help='Melting viscosity [Pa s] (default: 3e14)')
     parser.add_argument('--ospw-l', type=float, default=15.0,
                         help='Arrhenius activation parameter (default: 15)')
-    parser.add_argument('--ospw-bc', type=float, default=20.0,
-                        help='Shell thickness [km] (default: 20)')
+    parser.add_argument('--ospw-bc', type=float, default=None,
+                        help='Shell thickness b_c [km] (default: initial mean b)')
     parser.add_argument('--ospw-d-lith', type=float, default=2.0,
                         help='Lithosphere thickness [km] (default: 2)')
     # Iceberg effect
     parser.add_argument('--no-iceberg', action='store_true',
-                        help='Disable iceberg amplification of inertia tensor')
-    parser.add_argument('--iceberg-amp', type=float, default=0.0,
-                        help='Override iceberg amplification factor (0=auto)')
+                        help='Use the rigid (uncompensated) load instead of Eq. 2.18')
     # B&H interior coupling
     parser.add_argument('--interior-gamma', type=float, default=28.0,
                         help='C_interior/C_shell ratio (default: 28)')
@@ -1561,6 +1447,8 @@ def main():
     parser.add_argument('--t-max', type=float, default=1e8,
                         help='Total simulation time [yr] (default: 1e8)')
     args = parser.parse_args()
+    C.use_parameter_set(args.parameter_set)
+    print(C.describe_active())
 
     use_full = not args.no_full_inertia
     if args.dt is not None:
@@ -1570,12 +1458,11 @@ def main():
             dt = args.tau_tpw / 10.0
         else:
             # OSPW/coupled: adapt dt to the slower τ_f timescale
-            temp_cfg = OSPWConfig(
-                fracture_base_temp=args.ospw_Tf,
-                melting_viscosity=args.ospw_eta0,
-                activation_param=args.ospw_l,
-            )
-            tau_f_yr, _ = compute_tau_f(temp_cfg)
+            tau_f_yr = PW.tau_f(PW.OSPWParams(
+                shell_thickness=(args.ospw_bc or 20.0) * 1e3,
+                lithosphere_thickness=args.ospw_d_lith * 1e3,
+                fracture_temp=args.ospw_Tf, melting_viscosity=args.ospw_eta0,
+                activation_l=args.ospw_l))
             dt = max(1e3, min(tau_f_yr / 100.0, 1e4))
     else:
         dt = 1e3
@@ -1590,19 +1477,18 @@ def main():
         t_max_years=args.t_max,
         n_cycles_max=args.n_cycles,
         use_fossil_bulge=not args.no_fossil_bulge,
-        fossil_bulge_factor=args.fossil_factor,
-        tau_visc=args.tau_visc,
+        psi0_rad=args.psi0,
+        thickness_method=args.thickness_method,
         use_full_inertia=use_full,
         misalignment_threshold_deg=args.misalignment_threshold,
         tau_tpw=args.tau_tpw,
         tpw_model=args.tpw_model,
-        ospw_shell_thickness=args.ospw_bc * 1e3,
+        ospw_shell_thickness=args.ospw_bc * 1e3 if args.ospw_bc else None,
         ospw_lithosphere_thickness=args.ospw_d_lith * 1e3,
         ospw_melting_viscosity=args.ospw_eta0,
         ospw_activation_param=args.ospw_l,
         ospw_fracture_base_temp=args.ospw_Tf,
         use_iceberg_effect=not args.no_iceberg,
-        iceberg_amplification=args.iceberg_amp,
         interior_gamma=args.interior_gamma,
         interior_triaxiality=args.interior_triaxiality,
         interior_K_G_factor=args.interior_KG_factor,
@@ -1617,11 +1503,11 @@ def main():
     # --- Quasi-static sweep ---
     fb_str = 'ON' if cfg.use_fossil_bulge else 'OFF'
     tensor_str = 'full tensor' if cfg.use_full_inertia else 'l=2 harmonics'
-    print(f'Fossil bulge: {fb_str} (alpha={cfg.fossil_bulge_factor})')
+    print(f'Fossil bulge: {fb_str} (body-fixed hydrostatic, OSPW Eqs. 3.8-3.10)')
     print(f'Inertia model: {tensor_str}')
     if cfg.use_full_inertia:
-        print(f'  tau_visc={cfg.tau_visc:.0e} yr, '
-              f'misalignment threshold={cfg.misalignment_threshold_deg} deg')
+        print(f'  misalignment threshold={cfg.misalignment_threshold_deg} deg, '
+              f'psi0={cfg.psi0_rad:.1e} rad')
         print(f'  TPW model: {cfg.tpw_model}')
         if cfg.tpw_model == 'exponential':
             print(f'  tau_tpw={cfg.tau_tpw:.0e} yr (free parameter)')
@@ -1658,8 +1544,7 @@ def main():
         fig5_all_rheologies(save_path=sp('fig5_all_rheologies'),
                             A_bright=args.A_bright, A_dark=args.A_dark,
                             use_fossil_bulge=cfg.use_fossil_bulge,
-                            use_full_inertia=cfg.use_full_inertia,
-                            fossil_bulge_factor=cfg.fossil_bulge_factor)
+                            use_full_inertia=cfg.use_full_inertia)
 
     if not args.sweep_only:
         # --- Mollweide snapshots ---
@@ -1672,7 +1557,7 @@ def main():
         evo = ShellEvolution(cfg)
         # Print OSPW/coupled diagnostics
         if cfg.tpw_model in ('ospw', 'coupled') and cfg.use_full_inertia:
-            tau_f_yr, _ = compute_tau_f(evo._ospw_cfg)
+            tau_f_yr = PW.tau_f(evo._ospw_p)
             print(f'  OSPW: C_f={evo._ospw_Cf:.3e} kg m^2/s, '
                   f'tau_f={tau_f_yr/1e6:.2f} Myr')
             print(f'  OSPW epsilon correction: {evo._ospw_eps_correction:.4f}')

@@ -1,275 +1,173 @@
-"""Validate the O&S implementation against published results (Table I).
+"""Validate the O&S implementation against the published Table I.
 
 Usage:
     python -m ojakangas_stevenson.validate
     python -m ojakangas_stevenson.validate --plots --save-dir ./validation_plots
-    python -m ojakangas_stevenson.validate --cr 0.5   # test with C_R=0.5
+    python -m ojakangas_stevenson.validate --method exact     # informational only
 
-Note on C_R discrepancy:
-    The paper states C_R = 0.5 (Ross & Schubert 1987 correction), but
-    using C_R = 1.0 gives much better agreement with Table I for all
-    flow law cases (within ~5%). With C_R = 0.5, all cases are ~50%
-    too thick. The Maxwell case has ~25% error with C_R = 1.0, likely
-    due to different parameter sensitivity. All formulas have been
-    independently verified correct through:
-    - Incompressibility constraint checks (machine precision)
-    - Numerical vs analytic time-averaging agreement
-    - Independent derivation from paper's equations
+The gate (exit 0) runs in PAPER mode (constants.PAPER, C_R = 0.5, Eq. 2.8)
+and requires EVERY Table I entry -- average thickness, 4 t22 and t20 + 2 t22
+for all four cases -- to agree with the paper within 5% OR 0.1 km.
+
+History: before 2026-10 the thickness solver was not Eq. 2.8 (it dropped the
+factor 2 on D and added H linearly). That made C_R = 0.5 give shells ~45% too
+thick and led to the accidental fit C_R = 0.85, with a 30% tolerance on the
+average only. With Eq. 2.8 the paper's own C_R = 0.5 reproduces all twelve
+entries (physics review, 2026-10-03).
 """
 
 import argparse
-import sys
 import os
+import sys
+
 import numpy as np
 
 from . import constants as C
 from .surface_temperature import OSSurfaceTemperature
-from .rheology import MaxwellRheology, FlowLawRheology
-from .shell_thickness import IceShellModel
+from .shell_thickness import IceShellModel, table1_case, TABLE1_CASES
 
-
-# Paper reference values (Table I)
+# Paper reference values (thermal paper Table I, p. 230)
 PAPER_VALUES = {
-    'Maxwell, H=0': {
-        'avg_km': 23.0,
-        '4t22_km': 6.6,
-        't20_2t22_km': -0.1,
-    },
-    'Maxwell, H=10': {
-        'avg_km': 21.0,
-        '4t22_km': 4.6,
-        't20_2t22_km': 0.4,
-    },
-    'Flow law n_G=3': {
-        'avg_km': 25.0,
-        '4t22_km': 4.4,
-        't20_2t22_km': 1.1,
-    },
-    'Flow law n_G=5.2': {
-        'avg_km': 13.0,
-        '4t22_km': 2.0,
-        't20_2t22_km': 0.8,
-    },
+    'maxwell_h0': ('Maxwell, H=0', {'avg_km': 23.0, '4t22_km': 6.6, 't20_2t22_km': -0.1}),
+    'maxwell_h10': ('Maxwell, H=10', {'avg_km': 21.0, '4t22_km': 4.6, 't20_2t22_km': 0.4}),
+    'flow_ng3': ('Flow law n_G=3', {'avg_km': 25.0, '4t22_km': 4.4, 't20_2t22_km': 1.1}),
+    'flow_ng52': ('Flow law n_G=5.2', {'avg_km': 13.0, '4t22_km': 2.0, 't20_2t22_km': 0.8}),
 }
+REL_TOL = 0.05     # 5%
+ABS_TOL_KM = 0.1   # or 0.1 km, whichever is looser
+
+
+def entry_passes(computed, paper):
+    """True if |computed - paper| <= max(5% |paper|, 0.1 km)."""
+    return abs(computed - paper) <= max(REL_TOL * abs(paper), ABS_TOL_KM)
 
 
 def validate_surface_temperatures():
-    """Check surface temperature values against paper."""
+    """Check the Appendix A surface temperatures (Eq. A.9 / A.15)."""
     print("=" * 60)
-    print("Surface Temperature Validation (Appendix A)")
+    print("Surface Temperature (Appendix A, Eqs. A.9, A.15-A.18)")
     print("=" * 60)
-
     model = OSSurfaceTemperature()
-    T_eq = model.temperature(np.pi / 2)
-    T_pole = model.temperature(0.001)
+    T_eq = float(model.temperature(np.pi / 2))
+    T_pole = float(model.temperature(0.0))
     T_avg = model.global_mean_temperature()
-
-    print(f"  Equator (theta=pi/2):  {T_eq:.1f} K  (paper: ~110 K)")
-    print(f"  Pole    (theta~0):     {T_pole:.1f} K  (paper: ~52 K)")
-    print(f"  Global mean:           {T_avg:.1f} K  (paper: ~100 K)")
-
-    ok = abs(T_eq - 110) < 5 and abs(T_pole - 52) < 5 and abs(T_avg - 100) < 10
-    status = "PASS" if ok else "FAIL"
-    print(f"  Status: {status}")
-    print()
+    T_pole_expected = (((1 - 0.5) * C.SOLAR_FLUX_JUPITER * C.OBLIQUITY
+                        / (np.sqrt(2.0) * np.pi)) / C.STEFAN_BOLTZMANN) ** 0.25
+    print(f"  Equator: {T_eq:.1f} K  (paper text: ~110 K)")
+    print(f"  Pole:    {T_pole:.1f} K  (Eq. A.18 at phi = 0: {T_pole_expected:.1f} K; "
+          f"the paper's text says ~52 K, which is S0 i/pi, not A.15)")
+    print(f"  Mean:    {T_avg:.1f} K  (paper text: ~100 K)")
+    ok = (abs(T_eq - 110) < 2 and abs(T_pole - T_pole_expected) < 1e-9
+          and abs(T_avg - 100) < 5)
+    print(f"  Status: {'PASS' if ok else 'FAIL'}\n")
     return ok
 
 
-def validate_derived_constants(c_r=None):
-    """Check derived constants."""
-    c_r_val = c_r if c_r is not None else C.C_R
-    print("=" * 60)
-    print(f"Derived Constants (C_R = {c_r_val})")
-    print("=" * 60)
-    print(f"  gamma = {C.gamma():.4e}")
-    print(f"  mu'   = {C.mu_prime():.3f}  (expected ~0.6)")
-    print(f"  g2    = {C.g2(c_r=c_r):.4e}")
-    print(f"  g3    = {C.g3(c_r=c_r):.4e}")
-    print(f"  g3/g2 = {C.g3(c_r=c_r)/C.g2(c_r=c_r):.3f}  (expected 11/3 = 3.667)")
-    print(f"  n*tau_min = {C.ntau_min():.2f}  (nominal = 1)")
-    print(f"  n     = {C.MEAN_MOTION:.4e} rad/s")
-    print(f"  e     = {C.ECCENTRICITY}")
-    print(f"  a     = {C.EUROPA_RADIUS:.4e} m")
-    print()
-
-
-def build_models(c_r=None):
-    """Build all 4 models from Table I."""
+def build_models(c_r=None, method='eq28'):
+    """The four Table I models."""
     temp_model = OSSurfaceTemperature()
-
-    models = {
-        'Maxwell, H=0': IceShellModel(
-            MaxwellRheology(),
-            surface_temp_model=temp_model,
-            H_flux=C.H_FLUX_ZERO,
-            c_r=c_r,
-        ),
-        'Maxwell, H=10': IceShellModel(
-            MaxwellRheology(),
-            surface_temp_model=temp_model,
-            H_flux=C.H_FLUX_10,
-            c_r=c_r,
-        ),
-        'Flow law n_G=3': IceShellModel(
-            FlowLawRheology(
-                n_G=C.GLEN_EXPONENT_1,
-                n_A=C.ARRHENIUS_EXPONENT,
-                A0_cgs=C.A0_FLOW_1_CGS,
-            ),
-            surface_temp_model=temp_model,
-            H_flux=C.H_FLUX_ZERO,
-            c_r=c_r,
-        ),
-        'Flow law n_G=5.2': IceShellModel(
-            FlowLawRheology(
-                n_G=C.GLEN_EXPONENT_2,
-                n_A=C.ARRHENIUS_EXPONENT,
-                A0_cgs=C.A0_FLOW_2_CGS,
-            ),
-            surface_temp_model=temp_model,
-            H_flux=C.H_FLUX_ZERO,
-            c_r=c_r,
-        ),
-    }
+    models = {}
+    for key in TABLE1_CASES:
+        rheology, H = table1_case(key)
+        models[key] = IceShellModel(rheology, surface_temp_model=temp_model,
+                                    H_flux=H, c_r=c_r, method=method)
     return models
 
 
-def validate_thickness(models, n_theta=181, n_lam=361, n_theta_sh=181, n_lam_sh=361):
-    """Validate shell thickness against Table I."""
+def validate_thickness(models, n_theta=361, n_lam=720):
+    """Compare all twelve Table I entries; return (all_ok, results)."""
     print("=" * 60)
-    print("Shell Thickness Validation (Table I)")
+    print("Shell Thickness (Table I): pass if within 5% or 0.1 km")
     print("=" * 60)
-
-    header = f"{'Case':<22} | {'Avg b':>7} | {'Paper':>7} | {'Err':>5} | {'4t22':>7} | {'Paper':>7} | {'t20+2t22':>8} | {'Paper':>7}"
+    header = (f"{'Case':<18} | {'<b>':>6} {'paper':>5} | {'4t22':>6} {'paper':>5} | "
+              f"{'t20+2t22':>8} {'paper':>5} | status")
     print(header)
     print("-" * len(header))
-
     all_ok = True
-    results_dict = {}
-
-    for name, model in models.items():
-        avg_m = model.average_thickness(n_theta, n_lam)
-        avg_km = avg_m / 1000.0
-
-        moments = model.moment_differences(n_theta_sh, n_lam_sh)
-        four_t22 = moments['4t22_km']
-        t20_2t22 = moments['t20_plus_2t22_km']
-
-        paper = PAPER_VALUES[name]
-        err_pct = abs(avg_km - paper['avg_km']) / paper['avg_km'] * 100
-
-        print(f"{name:<22} | {avg_km:7.1f} | {paper['avg_km']:7.1f} | {err_pct:4.1f}% | "
-              f"{four_t22:7.1f} | {paper['4t22_km']:7.1f} | {t20_2t22:8.1f} | {paper['t20_2t22_km']:7.1f}")
-
-        # Store for plotting
-        results_dict[name] = {
-            'computed_avg_km': avg_km,
-            'paper_avg_km': paper['avg_km'],
-            'computed_4t22_km': four_t22,
-            'paper_4t22_km': paper['4t22_km'],
-            'computed_t20_2t22_km': t20_2t22,
+    results = {}
+    for key, model in models.items():
+        label, paper = PAPER_VALUES[key]
+        theta, lam, b = model.thickness_grid(n_theta, n_lam)
+        from .grid import area_mean, harmonics
+        h = harmonics(b, theta, lam)
+        computed = {'avg_km': area_mean(b, theta, lam) / 1e3,
+                    '4t22_km': h['four_t22'] / 1e3,
+                    't20_2t22_km': h['t20_2t22'] / 1e3}
+        ok = {k: entry_passes(computed[k], paper[k]) for k in paper}
+        all_ok &= all(ok.values())
+        flags = ''.join('.' if ok[k] else 'X' for k in ('avg_km', '4t22_km', 't20_2t22_km'))
+        print(f"{label:<18} | {computed['avg_km']:6.2f} {paper['avg_km']:5.1f} | "
+              f"{computed['4t22_km']:6.2f} {paper['4t22_km']:5.1f} | "
+              f"{computed['t20_2t22_km']:8.2f} {paper['t20_2t22_km']:5.1f} | "
+              f"{'PASS' if all(ok.values()) else 'FAIL ' + flags}")
+        results[label] = {
+            'computed_avg_km': computed['avg_km'], 'paper_avg_km': paper['avg_km'],
+            'computed_4t22_km': computed['4t22_km'], 'paper_4t22_km': paper['4t22_km'],
+            'computed_t20_2t22_km': computed['t20_2t22_km'],
             'paper_t20_2t22_km': paper['t20_2t22_km'],
         }
-
-        # Check tolerance (30% for average thickness)
-        if err_pct > 30:
-            all_ok = False
-
-    print()
-    status = "PASS" if all_ok else "FAIL"
-    print(f"  Overall status: {status}")
-    print()
-    return all_ok, results_dict
+    print(f"\n  Overall: {'PASS' if all_ok else 'FAIL'}\n")
+    return all_ok, results
 
 
 def generate_plots(models, results_dict, save_dir):
     """Generate validation plots."""
     from . import plotting
-
     os.makedirs(save_dir, exist_ok=True)
-
-    print("Generating plots...")
-
-    # Surface temperature
     plotting.plot_surface_temperature(
         save_path=os.path.join(save_dir, 'surface_temperature.png'))
-    print(f"  Saved surface_temperature.png")
-
-    # Strain pattern
-    plotting.plot_strain_pattern(
-        save_path=os.path.join(save_dir, 'strain_pattern.png'))
-    print(f"  Saved strain_pattern.png")
-
-    # Shell thickness contours for each case
-    for name, model in models.items():
-        fname = name.replace(' ', '_').replace(',', '').replace('=', '').lower()
+    plotting.plot_strain_pattern(save_path=os.path.join(save_dir, 'strain_pattern.png'))
+    for key, model in models.items():
         plotting.plot_shell_thickness_contour(
-            model,
-            save_path=os.path.join(save_dir, f'thickness_{fname}.png'))
-        print(f"  Saved thickness_{fname}.png")
-
-    # Thickness vs colatitude
-    for name, model in models.items():
-        fname = name.replace(' ', '_').replace(',', '').replace('=', '').lower()
+            model, save_path=os.path.join(save_dir, f'thickness_{key}.png'))
         plotting.plot_thickness_vs_colatitude(
-            model,
-            save_path=os.path.join(save_dir, f'thickness_profile_{fname}.png'))
-        print(f"  Saved thickness_profile_{fname}.png")
-
-    # Validation bar chart
+            model, save_path=os.path.join(save_dir, f'thickness_profile_{key}.png'))
     plotting.plot_validation_table(
-        results_dict,
-        save_path=os.path.join(save_dir, 'validation_table.png'))
-    print(f"  Saved validation_table.png")
-
-    print()
+        results_dict, save_path=os.path.join(save_dir, 'validation_table.png'))
+    print(f"Plots -> {save_dir}\n")
 
 
-def run_all_validations(plot=False, save_dir='./validation_plots', c_r=None):
-    """Run all validation cases.
-
-    Parameters
-    ----------
-    c_r : float, optional
-        Tidal correction factor. Default: module-level C.C_R.
-    """
-    print()
-    print("Ojakangas & Stevenson (1989) Implementation Validation")
-    print("=" * 60)
-    c_r_val = c_r if c_r is not None else C.C_R
-    print(f"C_R = {c_r_val}, e = {C.ECCENTRICITY}, a = {C.EUROPA_RADIUS:.4e} m")
-    print()
-
-    validate_derived_constants(c_r=c_r)
-    ok_temp = validate_surface_temperatures()
-
-    models = build_models(c_r=c_r)
-    ok_thickness, results_dict = validate_thickness(models)
-
-    if plot:
-        generate_plots(models, results_dict, save_dir)
-
+def run_all_validations(plot=False, save_dir='./validation_plots', c_r=None,
+                        method='eq28', parameter_set='paper'):
+    """Run the validation. Returns True only for a passing PAPER-mode gate."""
+    with C.parameter_set(parameter_set):
+        print("\nOjakangas & Stevenson (1989) implementation validation")
+        print("=" * 60)
+        c_r_val = C.C_R if c_r is None else c_r
+        print(C.describe_active().replace(f"C_R={C.C_R}", f"C_R={c_r_val}"))
+        print(f"thickness law: {method}\n")
+        print(f"  gamma = {C.gamma():.4e}, mu' = {C.mu_prime():.3f}, "
+              f"g3/g2 = {C.g3(c_r)/C.g2(c_r):.4f} (11/3), n tau_min = {C.ntau_min():.3f}\n")
+        ok_temp = validate_surface_temperatures()
+        models = build_models(c_r=c_r, method=method)
+        ok_thickness, results = validate_thickness(models)
+        if plot:
+            generate_plots(models, results, save_dir)
+    gate = (parameter_set == 'paper' and method == 'eq28' and c_r in (None, 0.5))
     all_ok = ok_temp and ok_thickness
-    if all_ok:
-        print("All validations PASSED.")
-    else:
-        print("Some validations FAILED. Check output above.")
-
+    if not gate:
+        print("NOTE: not the gate configuration (paper set, Eq. 2.8, C_R = 0.5); "
+              "results are informational.")
+        return False
+    print("All validations PASSED." if all_ok else "Some validations FAILED.")
     return all_ok
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Validate O&S ice shell model against paper results')
-    parser.add_argument('--plots', action='store_true',
-                        help='Generate validation plots')
-    parser.add_argument('--save-dir', default='./validation_plots',
-                        help='Directory for saving plots')
+        description='Validate the O&S ice shell model against Table I')
+    parser.add_argument('--plots', action='store_true', help='Generate validation plots')
+    parser.add_argument('--save-dir', default='./validation_plots')
     parser.add_argument('--cr', type=float, default=None,
-                        help='Tidal correction factor C_R (default: module default)')
+                        help='Tidal correction factor C_R (default: 0.5, the paper value)')
+    parser.add_argument('--method', choices=('eq28', 'exact'), default='eq28',
+                        help='thickness law (the gate uses Eq. 2.8)')
+    parser.add_argument('--parameter-set', default='paper',
+                        choices=sorted(C.PARAMETER_SETS),
+                        help='constants (the gate uses the paper set)')
     args = parser.parse_args()
-
-    ok = run_all_validations(plot=args.plots, save_dir=args.save_dir, c_r=args.cr)
+    ok = run_all_validations(plot=args.plots, save_dir=args.save_dir, c_r=args.cr,
+                             method=args.method, parameter_set=args.parameter_set)
     sys.exit(0 if ok else 1)
 
 

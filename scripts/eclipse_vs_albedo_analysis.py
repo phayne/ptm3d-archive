@@ -17,8 +17,10 @@ This script:
        imprint, Jupiter reflected, Jupiter IR) and gives a first-order linearized
        attribution of b11^c, with the thermal-inertia caveat made explicit.
 
-Gridding uses PERIODIC longitude padding to avoid the lambda=+/-180 seam artifact
-that the library temperature_2d() produces (linear griddata is not periodic).
+Gridding uses the library PTM3DSurfaceTemperature.temperature_2d(), which pads
+the lambda = +-180 deg seam periodically, on the package's periodic grid (no
+duplicated +-180 column). Thickness (O&S Eq. 2.8) and harmonics come from the
+ojakangas_stevenson package; nothing is re-implemented here.
 
 Run with the europa_py39 env (numpy/scipy/matplotlib):
     /Users/paha3326/anaconda3/envs/europa_py39/bin/python scripts/eclipse_vs_albedo_analysis.py
@@ -30,18 +32,17 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.interpolate import griddata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "src", "python"))
 
 from ojakangas_stevenson import constants as C                       # noqa: E402
+from ojakangas_stevenson import grid as G                            # noqa: E402
 from ojakangas_stevenson.ptm3d_coupling import (                     # noqa: E402
     PTM3DSurfaceTemperature, _read_binary_timestep, _load_ply_face_latlon)
-from ojakangas_stevenson.rheology import MaxwellRheology, FlowLawRheology  # noqa: E402
-from ojakangas_stevenson.tidal_strains import (                      # noqa: E402
-    time_averaged_strain_squared, time_averaged_strain_power)
+from ojakangas_stevenson.shell_thickness import (                    # noqa: E402
+    equilibrium_thickness, dissipation_field, table1_case)
 
 # ---------------------------------------------------------------- configuration
 RUNS = {
@@ -51,7 +52,7 @@ RUNS = {
 ALBEDO = 0.5                 # uniform-ice Bond albedo (planetary_properties.h:108)
 EPS = 0.95                   # surface emissivity / IR absorptivity (PTM3D)
 SIGMA = 5.670374419e-8       # Stefan-Boltzmann
-N_THETA, N_LAM = 361, 721
+N_THETA, N_LAM = 361, 720
 OUTDIR = os.path.join(REPO, "plots", "ice-shell-dynamics", "eclipse_analysis")
 
 CASES = [("maxwell_h0", "Maxwell H=0"), ("maxwell_h10", "Maxwell H=10"),
@@ -61,103 +62,63 @@ COMPONENTS = [("direct_solar", "eclipse (direct solar)", 1.0 - ALBEDO),
               ("primary_reflected", "Jupiter reflected", 1.0 - ALBEDO),
               ("primary_ir", "Jupiter IR", EPS)]
 
-THETA1D = np.linspace(0.001, np.pi - 0.001, N_THETA)
-LAM1D = np.linspace(-np.pi, np.pi, N_LAM)
+THETA1D, LAM1D = G.periodic_grid(N_THETA, N_LAM)
 
 
 # ---------------------------------------------------------------- gridding (seam-free)
-def grid_field(values, colat, lon_rad):
-    """Interpolate per-face values onto the (theta, lam) grid with PERIODIC
-    longitude padding (avoids the lambda=+/-180 seam artifact)."""
-    lon3 = np.concatenate([lon_rad - 2 * np.pi, lon_rad, lon_rad + 2 * np.pi])
-    col3 = np.concatenate([colat, colat, colat])
-    val3 = np.concatenate([values, values, values])
-    THETA, LAM = np.meshgrid(THETA1D, LAM1D, indexing="ij")
-    G = griddata((col3, lon3), val3, (THETA, LAM), method="linear")
-    nan = np.isnan(G)
-    if nan.any():
-        Gn = griddata((col3, lon3), val3, (THETA, LAM), method="nearest")
-        G[nan] = Gn[nan]
-    return G
-
-
-def face_arrays(obj):
-    """Symmetrized per-face values + colatitude[rad] + wrapped longitude[rad]."""
-    lon_rad = ((np.radians(obj._face_lon) + np.pi) % (2 * np.pi)) - np.pi
-    return obj._face_temp, obj._face_colat, lon_rad
-
-
 def gridded_temperature(run_dir):
+    """Arithmetic time-mean surface temperature, N-S symmetrized, on the grid."""
     st = PTM3DSurfaceTemperature.from_binary_files(
         os.path.join(run_dir, "temperature"), os.path.join(run_dir, "mesh.ply"))
     st.symmetrize_ns()
-    return grid_field(*face_arrays(st))
+    return st.temperature_2d(THETA1D, LAM1D)
 
 
 def gridded_component(run_dir, comp, lat, lon):
     data = _read_binary_timestep(
         os.path.join(run_dir, "statistics", comp + "_avg.bin"), len(lat))
+    if data is None:
+        raise FileNotFoundError(f"unreadable {comp}_avg.bin in {run_dir}")
     obj = PTM3DSurfaceTemperature.from_arrays(data, lat, lon)
     obj.symmetrize_ns()
-    return grid_field(*face_arrays(obj))
+    return obj.temperature_2d(THETA1D, LAM1D)
 
 
 # ---------------------------------------------------------------- O&S thickness + SH
+CASE_KEYS = ("maxwell_h0", "maxwell_h10", "flow_ng3", "flow_ng52")
+
+
 def build_dissipation():
-    """Tidal dissipation integral D per rheology (temperature-independent)."""
+    """Tidal dissipation integral D per rheology (temperature-independent).
+
+    Returns {case: (D, H, rheology)}.
+    """
     THETA, LAM = np.meshgrid(THETA1D, LAM1D, indexing="ij")
-    g2, g3 = C.g2(), C.g3()
-    eij2 = time_averaged_strain_squared(THETA, LAM, g2, g3)
-    maxwell = MaxwellRheology()
-    flow3 = FlowLawRheology(n_G=C.GLEN_EXPONENT_1, n_A=C.ARRHENIUS_EXPONENT,
-                            A0_cgs=C.A0_FLOW_1_CGS)
-    flow52 = FlowLawRheology(n_G=C.GLEN_EXPONENT_2, n_A=C.ARRHENIUS_EXPONENT,
-                             A0_cgs=C.A0_FLOW_2_CGS)
-    D_max = maxwell.dissipation_integral(C.MEAN_MOTION**2 * eij2)
-    e3, e52 = flow3.strain_exponent, flow52.strain_exponent
-    sp3 = time_averaged_strain_power(THETA, LAM, e3, g2, g3, n_samples=360)
-    sp52 = time_averaged_strain_power(THETA, LAM, e52, g2, g3, n_samples=360)
-    D3 = flow3.dissipation_integral(C.MEAN_MOTION**(2 * e3) * sp3)
-    D52 = flow52.dissipation_integral(C.MEAN_MOTION**(2 * e52) * sp52)
-    return {"maxwell_h0": (D_max, 0.0), "maxwell_h10": (D_max, C.H_FLUX_10),
-            "flow_ng3": (D3, 0.0), "flow_ng52": (D52, 0.0)}
+    out = {}
+    for key in CASE_KEYS:
+        rheology, H = table1_case(key)
+        out[key] = (dissipation_field(rheology, THETA, LAM), H, rheology)
+    return out
 
 
 def solve_b(T_s, D, H):
-    ln_r = np.log(C.T_MELT / T_s)
-    A = D / ln_r
-    disc = H**2 + 4 * A * C.A1_CONDUCTIVITY * ln_r
-    return np.clip((-H + np.sqrt(disc)) / (2 * A), 0, 200e3)
+    """O&S Eq. 2.8 (package implementation)."""
+    return equilibrium_thickness(T_s, D, H)
 
 
 def sh_full(b):
     """Degree-1 & 2 harmonics (km), average (km), and t20/t22 moments (m)."""
-    theta, lam = THETA1D, LAM1D
-    dt, dl = theta[1] - theta[0], lam[1] - lam[0]
-    ct, st = np.cos(theta), np.sin(theta)
-    w = st[:, None]
-    avg = np.sum(b * w) * dt * dl / (4 * np.pi) / 1000.0
-    P11 = st
-    b11c = 3 / (4 * np.pi) * np.sum(b * P11[:, None] * np.cos(lam)[None, :] * w) * dt * dl / 1000
-    b11s = 3 / (4 * np.pi) * np.sum(b * P11[:, None] * np.sin(lam)[None, :] * w) * dt * dl / 1000
-    b10 = 3 / (4 * np.pi) * np.sum(b * ct[:, None] * w) * dt * dl / 1000
-    P20 = 0.5 * (3 * ct**2 - 1)
-    t20 = 5 / (4 * np.pi) * np.sum(b * P20[:, None] * w) * dt * dl
-    P22 = 3 * st**2
-    t22 = 5 / (48 * np.pi) * np.sum(b * P22[:, None] * np.cos(2 * lam)[None, :] * w) * dt * dl
-    b22s = 5 / (48 * np.pi) * np.sum(b * P22[:, None] * np.sin(2 * lam)[None, :] * w) * dt * dl / 1000
-    return dict(avg=avg, b10=b10, b11c=b11c, b11s=b11s, b20=t20 / 1000,
-                b22c=t22 / 1000, b22s=b22s, t20=t20, t22=t22,
+    h = G.harmonics(b, THETA1D, LAM1D)
+    t20, t22 = h["t20"], h["t22"]
+    return dict(avg=G.area_mean(b, THETA1D, LAM1D) / 1000.0, b10=h["b10"] / 1000,
+                b11c=h["b11c"] / 1000, b11s=h["b11s"] / 1000, b20=t20 / 1000,
+                b22c=t22 / 1000, b22s=h["b22s"] / 1000, t20=t20, t22=t22,
                 four_t22=4 * t22 / 1000, t20_2t22=(t20 + 2 * t22) / 1000,
                 dBA_C=1.0e-7 * (4 * t22 / 1000), dBC_A=1.0e-7 * ((t20 + 2 * t22) / 1000))
 
 
 def b11c_only(b):
-    theta, lam = THETA1D, LAM1D
-    dt, dl = theta[1] - theta[0], lam[1] - lam[0]
-    st = np.sin(theta)
-    return 3 / (4 * np.pi) * np.sum(
-        b * st[:, None] * np.cos(lam)[None, :] * st[:, None]) * dt * dl / 1000
+    return G.harmonics(b, THETA1D, LAM1D)["b11c"] / 1000
 
 
 # ---------------------------------------------------------------- T1: geophysics
@@ -171,7 +132,7 @@ def run_geophysics(diss):
         T = gridded_temperature(run_dir)
         res = {}
         for key, _ in CASES:
-            D, H = diss[key]
+            D, H, _ = diss[key]
             b = solve_b(T, D, H)
             res[key] = dict(T=T, b_km=b / 1000, **sh_full(b))
         geo[tag] = res
@@ -238,7 +199,7 @@ def run_attribution(geo, diss):
     print("-" * len(hdr))
     attrib = {}
     for key, label in CASES:
-        D, H = diss[key]
+        D, H, _ = diss[key]
         b_full = solve_b(T_full, D, H)
         tot = b11c_only(b_full)
         parts = {}
@@ -414,13 +375,15 @@ def verify(geo, fmap):
 
 # ---------------------------------------------------------------- main
 def main():
+    print(C.describe_active())
     diss = build_dissipation()
     geo, table = run_geophysics(diss)
     fmap, attrib, ecl_def, jshine = run_attribution(geo, diss)
     verify(geo, fmap)
     make_figures(geo, fmap, attrib)
     os.makedirs(OUTDIR, exist_ok=True)
-    dump = {"T1": table, "T2": attrib, "eclipse_deficit_Wm2": ecl_def,
+    dump = {"parameter_set": C.active_parameter_set().as_dict(), "C_R": C.C_R,
+            "T1": table, "T2": attrib, "eclipse_deficit_Wm2": ecl_def,
             "jupiter_shine_subjovian_Wm2": jshine, "albedo": ALBEDO, "eps": EPS}
     with open(os.path.join(OUTDIR, "numbers.json"), "w") as f:
         json.dump(dump, f, indent=2, default=float)

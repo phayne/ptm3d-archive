@@ -53,11 +53,29 @@ class MaxwellRheology:
         -------
         float or ndarray
             Dissipation integral D [W/m^2].
-            This enters the shell thickness equation b = a1*ln(T_M/T_s) / (D + H).
+            This enters the shell thickness law, Eq. 2.8:
+            b = ln(T_M/T_s) / sqrt(2 D/a1 + (H/a1)^2).
         """
         prefactor = 2.0 * self.mu / (self.n * self.l)
         arctan_term = np.pi / 2.0 - np.arctan(self.ntau_min)
         return prefactor * strain_rate_sq * arctan_term
+
+    def dissipation_fraction_above(self, T, T_melt=None):
+        """Fraction of the Eq. 3.5 integral contributed between T and T_M.
+
+        With the power-law viscosity of Eq. 3.4, x = n tau_M =
+        (n tau_M)_min (T_M/T)^l, and the integral of q dT'/T' from T to T_M is
+        (2 mu <edot^2>/(n l)) [arctan x(T) - arctan x_min] exactly. Returns
+        that divided by the full Eq. 3.5 value (x(T) -> infinity), so 0 at
+        T_M and -> 1 for T << T_M. Used by the exact first integral of
+        Eqs. 2.4/2.5 (shell_thickness.equilibrium_thickness(method='exact')).
+        """
+        if T_melt is None:
+            T_melt = C.T_MELT
+        T = np.asarray(T, dtype=float)
+        x = self.ntau_min * (T_melt / T) ** self.l
+        x0 = np.arctan(self.ntau_min)
+        return (np.arctan(x) - x0) / (np.pi / 2.0 - x0)
 
     @property
     def name(self):
@@ -128,6 +146,18 @@ class FlowLawRheology:
         """
         prefactor = 2.0 * self.n_G / (self.A0_si ** (1.0 / self.n_G) * self.n_A)
         return prefactor * strain_power_avg
+
+    def dissipation_fraction_above(self, T, T_melt=None):
+        """Fraction of the Eq. 4.7 integral contributed between T and T_M.
+
+        With A = A0 (T/T_M)^(-n_A) (Eq. 4.6), q is proportional to
+        (T/T_M)^(n_A/n_G), so the integral of q dT'/T' from T to T_M is the
+        Eq. 4.7 value times 1 - (T/T_M)^(n_A/n_G).
+        """
+        if T_melt is None:
+            T_melt = self.T_melt
+        T = np.asarray(T, dtype=float)
+        return 1.0 - (T / T_melt) ** (self.n_A / self.n_G)
 
     @property
     def name(self):

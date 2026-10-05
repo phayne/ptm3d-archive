@@ -27,10 +27,9 @@ from scipy.special import lpmv, gammaln
 from ojakangas_stevenson import constants as C
 from ojakangas_stevenson.surface_temperature import OSSurfaceTemperature
 from ojakangas_stevenson.ptm3d_coupling import PTM3DSurfaceTemperature
-from ojakangas_stevenson.rheology import MaxwellRheology, FlowLawRheology
-from ojakangas_stevenson.shell_thickness import IceShellModel
-from ojakangas_stevenson.tidal_strains import (
-    time_averaged_strain_squared, time_averaged_strain_power)
+from ojakangas_stevenson import grid as G
+from ojakangas_stevenson.shell_thickness import (
+    equilibrium_thickness, dissipation_field, table1_case, TABLE1_CASES)
 
 # ---------------------------------------------------------------------------
 # Global style
@@ -82,83 +81,57 @@ def _panel_label(ax, label, x=-0.02, y=1.04, fontsize=12, **kwargs):
 # Data computation helpers
 # ---------------------------------------------------------------------------
 
-def compute_grids(surface_temp, n_theta=361, n_lam=721):
-    """Compute thickness grids for all 4 rheology cases.
+CASE_LABELS = {
+    'maxwell_h0': 'Maxwell, $H$=0',
+    'maxwell_h10': 'Maxwell, $H$=10',
+    'flow_ng3': 'Flow law $n_G$=3',
+    'flow_ng52': 'Flow law $n_G$=5.2',
+}
 
-    Returns dict of {case_name: (theta, lam, b_km, avg_km, moments)}.
-    """
-    theta = np.linspace(0.001, np.pi - 0.001, n_theta)
-    lam = np.linspace(-np.pi, np.pi, n_lam)
-    THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
 
-    g2, g3 = C.g2(), C.g3()
-    a1, T_M = C.A1_CONDUCTIVITY, C.T_MELT
-
-    # Surface temperature field
+def _surface_temperature_grid(surface_temp, theta, lam):
     if hasattr(surface_temp, 'temperature_2d'):
-        T_s = surface_temp.temperature_2d(theta, lam)
-    else:
-        T_s = surface_temp.temperature(THETA)
+        return np.asarray(surface_temp.temperature_2d(theta, lam), dtype=float)
+    THETA, _ = np.meshgrid(theta, lam, indexing='ij')
+    return surface_temp.temperature(THETA)
 
-    # Dissipation integrals
-    eij2 = time_averaged_strain_squared(THETA, LAM, g2, g3)
-    maxwell = MaxwellRheology()
-    flow3 = FlowLawRheology(n_G=C.GLEN_EXPONENT_1, n_A=C.ARRHENIUS_EXPONENT,
-                             A0_cgs=C.A0_FLOW_1_CGS)
-    flow52 = FlowLawRheology(n_G=C.GLEN_EXPONENT_2, n_A=C.ARRHENIUS_EXPONENT,
-                              A0_cgs=C.A0_FLOW_2_CGS)
 
-    strain_rate_sq = C.MEAN_MOTION**2 * eij2
-    D_maxwell = maxwell.dissipation_integral(strain_rate_sq)
+def _dissipation_by_case(theta, lam):
+    """{case: (rheology, D, H)} on the grid (package implementation)."""
+    THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
+    out = {}
+    for key in TABLE1_CASES:
+        rheology, H = table1_case(key)
+        out[key] = (rheology, dissipation_field(rheology, THETA, LAM), H)
+    return out
 
-    exp3 = flow3.strain_exponent
-    exp52 = flow52.strain_exponent
-    sp3 = time_averaged_strain_power(THETA, LAM, exp3, g2, g3, n_samples=360)
-    sp52 = time_averaged_strain_power(THETA, LAM, exp52, g2, g3, n_samples=360)
-    D_flow3 = flow3.dissipation_integral(C.MEAN_MOTION**(2*exp3) * sp3)
-    D_flow52 = flow52.dissipation_integral(C.MEAN_MOTION**(2*exp52) * sp52)
 
-    def _solve_b(T_s, D, H):
-        ln_r = np.log(T_M / T_s)
-        A = D / ln_r
-        disc = H**2 + 4*A*a1*ln_r
-        return np.clip((-H + np.sqrt(disc)) / (2*A), 0, 200e3)
-
-    def _avg(b):
-        dt, dl = theta[1]-theta[0], lam[1]-lam[0]
-        return np.sum(b * np.sin(theta)[:, None]) * dt * dl / (4*np.pi)
-
-    def _moments(b):
-        dt, dl = theta[1]-theta[0], lam[1]-lam[0]
-        ct, st = np.cos(theta), np.sin(theta)
-        P20 = 0.5*(3*ct**2 - 1)
-        P22 = 3*st**2
-        c2l = np.cos(2*lam)
-        i20 = b * P20[:, None] * st[:, None]
-        t20 = 5/(4*np.pi) * np.sum(i20) * dt * dl
-        i22 = b * P22[:, None] * c2l[None, :] * st[:, None]
-        t22 = 5/(48*np.pi) * np.sum(i22) * dt * dl
-        return {'t20': t20, 't22': t22,
-                '4t22_km': 4*t22/1000, 't20_2t22_km': (t20+2*t22)/1000}
-
-    cases_def = [
-        ('Maxwell, $H$=0',      'maxwell_h0',    D_maxwell, 0.0),
-        ('Maxwell, $H$=10',     'maxwell_h10',   D_maxwell, C.H_FLUX_10),
-        ('Flow law $n_G$=3',    'flow_ng3',      D_flow3,   0.0),
-        ('Flow law $n_G$=5.2',  'flow_ng52',     D_flow52,  0.0),
-    ]
-
+def _case_results(T_s, theta, lam, diss, method='eq28', with_sh=False):
+    """Thickness, average and harmonics for the four cases (Eq. 2.8)."""
     results = {}
-    for label, key, D, H in cases_def:
-        b = _solve_b(T_s, D, H)
-        b_km = b / 1000
-        avg_km = _avg(b) / 1000
-        mom = _moments(b)
-        results[key] = {
-            'label': label, 'theta': theta, 'lam': lam, 'b_km': b_km,
-            'avg_km': avg_km, 'moments': mom, 'T_s': T_s,
-        }
+    for key, (rheology, D, H) in diss.items():
+        b = equilibrium_thickness(T_s, D, H, method=method, rheology=rheology)
+        h = G.harmonics(b, theta, lam)
+        mom = {'t20': h['t20'], 't22': h['t22'],
+               '4t22_km': h['four_t22'] / 1000, 't20_2t22_km': h['t20_2t22'] / 1000}
+        r = {'label': CASE_LABELS[key], 'theta': theta, 'lam': lam,
+             'b_km': b / 1000, 'avg_km': G.area_mean(b, theta, lam) / 1000,
+             'moments': mom, 'T_s': T_s}
+        if with_sh:
+            r['sh'] = {k: h[k] / 1000 for k in ('b11c', 'b11s', 'b20', 'b22c', 'b22s')}
+        results[key] = r
     return results
+
+
+def compute_grids(surface_temp, n_theta=361, n_lam=720, method='eq28'):
+    """Compute thickness grids for all 4 rheology cases on the periodic grid.
+
+    Returns dict of {case_key: {'label', 'theta', 'lam', 'b_km', 'avg_km',
+    'moments', 'T_s'}}.
+    """
+    theta, lam = G.periodic_grid(n_theta, n_lam)
+    T_s = _surface_temperature_grid(surface_temp, theta, lam)
+    return _case_results(T_s, theta, lam, _dissipation_by_case(theta, lam), method)
 
 
 def sh_smooth_temperature(T_2d, theta, lam, l_max):
@@ -167,12 +140,10 @@ def sh_smooth_temperature(T_2d, theta, lam, l_max):
     Parameters
     ----------
     T_2d : (n_theta, n_lam) array
-        Temperature on a regular (theta, lam) grid.
+        Temperature on the grid of grid.periodic_grid: Gauss-Legendre
+        colatitudes, longitudes from -pi with NO repeated +pi column.
     theta : (n_theta,) array
-        Colatitude values (0 to pi).
     lam : (n_lam,) array
-        Longitude values (-pi to pi), with lam[-1] = lam[0] + 2*pi
-        (periodic endpoint included).
     l_max : int
         Maximum spherical harmonic degree to retain.
 
@@ -180,16 +151,13 @@ def sh_smooth_temperature(T_2d, theta, lam, l_max):
     -------
     T_smooth : (n_theta, n_lam) array, same shape as T_2d
     """
-    dt = theta[1] - theta[0]
+    G.check_periodic(lam)
+    w_theta = G.theta_weights(theta)        # Gauss-Legendre weights (sum = 2)
     cos_t = np.cos(theta)
-    sin_t = np.sin(theta)
-
-    # Remove repeated periodic endpoint for FFT
-    T_periodic = T_2d[:, :-1]
-    N = T_periodic.shape[1]
+    N = T_2d.shape[1]
 
     # FFT along longitude axis
-    T_fft = np.fft.rfft(T_periodic, axis=1)
+    T_fft = np.fft.rfft(T_2d, axis=1)
     f_c = np.real(T_fft) * 2.0 / N   # cosine coefficients
     f_s = -np.imag(T_fft) * 2.0 / N  # sine coefficients
     f_c[:, 0] /= 2.0                  # m=0 has no factor-of-2
@@ -209,9 +177,9 @@ def sh_smooth_temperature(T_2d, theta, lam, l_max):
             log_norm = (np.log(2*l + 1) - np.log(2)
                         + gammaln(l - m + 1) - gammaln(l + m + 1))
             N_lm = np.exp(log_norm)
-            a_lm = N_lm * np.sum(f_c[:, m] * Plm * sin_t) * dt
-            b_lm = (N_lm * np.sum(f_s[:, m] * Plm * sin_t) * dt
-                     if m > 0 else 0.0)
+            a_lm = N_lm * np.sum(f_c[:, m] * Plm * w_theta)
+            b_lm = (N_lm * np.sum(f_s[:, m] * Plm * w_theta)
+                    if m > 0 else 0.0)
             coeffs[(l, m)] = (a_lm, b_lm)
 
     T_smooth = np.zeros_like(T_2d)
@@ -227,120 +195,22 @@ def sh_smooth_temperature(T_2d, theta, lam, l_max):
     return T_smooth
 
 
-def compute_grids_smoothed(surface_temp, l_max_values, n_theta=361, n_lam=721):
+def compute_grids_smoothed(surface_temp, l_max_values, n_theta=361, n_lam=720,
+                           method='eq28'):
     """Compute thickness grids for multiple l_max values.
 
     Returns dict of {l_max: results_dict}, where each results_dict has the same
-    structure as compute_grids() output.
+    structure as compute_grids() output plus 'sh' (b11c, b11s, b20, b22c, b22s
+    in km).
     """
-    theta = np.linspace(0.001, np.pi - 0.001, n_theta)
-    lam = np.linspace(-np.pi, np.pi, n_lam)
-    THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
-
-    g2, g3 = C.g2(), C.g3()
-    a1, T_M = C.A1_CONDUCTIVITY, C.T_MELT
-
-    # Full temperature field
-    if hasattr(surface_temp, 'temperature_2d'):
-        T_s_full = surface_temp.temperature_2d(theta, lam)
-    else:
-        T_s_full = surface_temp.temperature(THETA)
-
-    # Dissipation integrals (independent of temperature)
-    eij2 = time_averaged_strain_squared(THETA, LAM, g2, g3)
-    maxwell = MaxwellRheology()
-    flow3 = FlowLawRheology(n_G=C.GLEN_EXPONENT_1, n_A=C.ARRHENIUS_EXPONENT,
-                             A0_cgs=C.A0_FLOW_1_CGS)
-    flow52 = FlowLawRheology(n_G=C.GLEN_EXPONENT_2, n_A=C.ARRHENIUS_EXPONENT,
-                              A0_cgs=C.A0_FLOW_2_CGS)
-
-    strain_rate_sq = C.MEAN_MOTION**2 * eij2
-    D_maxwell = maxwell.dissipation_integral(strain_rate_sq)
-
-    exp3 = flow3.strain_exponent
-    exp52 = flow52.strain_exponent
-    sp3 = time_averaged_strain_power(THETA, LAM, exp3, g2, g3, n_samples=360)
-    sp52 = time_averaged_strain_power(THETA, LAM, exp52, g2, g3, n_samples=360)
-    D_flow3 = flow3.dissipation_integral(C.MEAN_MOTION**(2*exp3) * sp3)
-    D_flow52 = flow52.dissipation_integral(C.MEAN_MOTION**(2*exp52) * sp52)
-
-    def _solve_b(T_s, D, H):
-        ln_r = np.log(T_M / T_s)
-        A = D / ln_r
-        disc = H**2 + 4*A*a1*ln_r
-        return np.clip((-H + np.sqrt(disc)) / (2*A), 0, 200e3)
-
-    def _avg(b):
-        dt, dl = theta[1]-theta[0], lam[1]-lam[0]
-        return np.sum(b * np.sin(theta)[:, None]) * dt * dl / (4*np.pi)
-
-    def _moments(b):
-        dt, dl = theta[1]-theta[0], lam[1]-lam[0]
-        ct, st = np.cos(theta), np.sin(theta)
-        P20 = 0.5*(3*ct**2 - 1)
-        P22 = 3*st**2
-        c2l = np.cos(2*lam)
-        i20 = b * P20[:, None] * st[:, None]
-        t20 = 5/(4*np.pi) * np.sum(i20) * dt * dl
-        i22 = b * P22[:, None] * c2l[None, :] * st[:, None]
-        t22 = 5/(48*np.pi) * np.sum(i22) * dt * dl
-        return {'t20': t20, 't22': t22,
-                '4t22_km': 4*t22/1000, 't20_2t22_km': (t20+2*t22)/1000}
-
-    def _sh_decomp(b):
-        """Full SH decomposition for b11c, b11s, b20, b22c, b22s."""
-        dt, dl = theta[1]-theta[0], lam[1]-lam[0]
-        ct, st = np.cos(theta), np.sin(theta)
-        # b11c, b11s: l=1, m=1
-        P11 = st
-        c1l = np.cos(lam)
-        s1l = np.sin(lam)
-        i11c = b * P11[:, None] * c1l[None, :] * st[:, None]
-        i11s = b * P11[:, None] * s1l[None, :] * st[:, None]
-        b11c = 3/(4*np.pi) * np.sum(i11c) * dt * dl / 1000
-        b11s = 3/(4*np.pi) * np.sum(i11s) * dt * dl / 1000
-        # b20: l=2, m=0
-        P20 = 0.5*(3*ct**2 - 1)
-        i20 = b * P20[:, None] * st[:, None]
-        b20 = 5/(4*np.pi) * np.sum(i20) * dt * dl / 1000
-        # b22c, b22s: l=2, m=2
-        P22 = 3*st**2
-        c2l = np.cos(2*lam)
-        s2l = np.sin(2*lam)
-        i22c = b * P22[:, None] * c2l[None, :] * st[:, None]
-        i22s = b * P22[:, None] * s2l[None, :] * st[:, None]
-        b22c = 5/(48*np.pi) * np.sum(i22c) * dt * dl / 1000
-        b22s = 5/(48*np.pi) * np.sum(i22s) * dt * dl / 1000
-        return {'b11c': b11c, 'b11s': b11s, 'b20': b20,
-                'b22c': b22c, 'b22s': b22s}
-
-    cases_def = [
-        ('Maxwell, $H$=0',      'maxwell_h0',    D_maxwell, 0.0),
-        ('Maxwell, $H$=10',     'maxwell_h10',   D_maxwell, C.H_FLUX_10),
-        ('Flow law $n_G$=3',    'flow_ng3',      D_flow3,   0.0),
-        ('Flow law $n_G$=5.2',  'flow_ng52',     D_flow52,  0.0),
-    ]
-
+    theta, lam = G.periodic_grid(n_theta, n_lam)
+    T_s_full = _surface_temperature_grid(surface_temp, theta, lam)
+    diss = _dissipation_by_case(theta, lam)
     all_results = {}
     for l_max in l_max_values:
         print(f'  l_max = {l_max}...')
-        if l_max is None:
-            T_s = T_s_full
-        else:
-            T_s = sh_smooth_temperature(T_s_full, theta, lam, l_max)
-
-        results = {}
-        for label, key, D, H in cases_def:
-            b = _solve_b(T_s, D, H)
-            b_km = b / 1000
-            avg_km = _avg(b) / 1000
-            mom = _moments(b)
-            sh = _sh_decomp(b)
-            results[key] = {
-                'label': label, 'theta': theta, 'lam': lam, 'b_km': b_km,
-                'avg_km': avg_km, 'moments': mom, 'sh': sh, 'T_s': T_s,
-            }
-        all_results[l_max] = results
+        T_s = T_s_full if l_max is None else sh_smooth_temperature(T_s_full, theta, lam, l_max)
+        all_results[l_max] = _case_results(T_s, theta, lam, diss, method, with_sh=True)
     return all_results
 
 
@@ -775,9 +645,7 @@ def fig4_latitude_profiles(results_os, results_ptm, save_path=None):
 
 def fig5_surface_temperature(temp_os, temp_ptm, save_path=None):
     """Two-panel Mollweide of surface temperature: O&S vs PTM3D."""
-    n_theta, n_lam = 361, 721
-    theta = np.linspace(0.001, np.pi - 0.001, n_theta)
-    lam = np.linspace(-np.pi, np.pi, n_lam)
+    theta, lam = G.periodic_grid(361, 720)
     THETA, LAM = np.meshgrid(theta, lam, indexing='ij')
     lat = np.pi/2 - theta
     LON, LAT = np.meshgrid(lam, lat, indexing='ij')
@@ -1019,7 +887,11 @@ def main():
                         default='output/europa_global_ico7_no-albedo/mesh.ply')
     parser.add_argument('--smoothed', action='store_true',
                         help='Generate SH-smoothed analysis (albedo map)')
+    parser.add_argument('--parameter-set', default='paper', choices=sorted(C.PARAMETER_SETS),
+                        help="constants: 'paper' (validation) or 'modern' (science)")
     args = parser.parse_args()
+    C.use_parameter_set(args.parameter_set)
+    print(C.describe_active())
 
     if args.smoothed:
         generate_smoothed(save_dir=args.save_dir, dpi=args.dpi, fmt=args.format,
