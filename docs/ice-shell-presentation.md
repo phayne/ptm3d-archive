@@ -82,18 +82,18 @@ The 3-D temperature field adds **degree-1 (hemispheric) harmonics** absent from 
 
 ## 5. Moments of inertia & stability
 
-$$\Delta\!\left(\tfrac{B-A}{C}\right) \approx 10^{-7}\,(4t_{22}), \qquad
-  \Delta\!\left(\tfrac{B-C}{A}\right) \approx 10^{-7}\,(t_{20}+2t_{22})$$
+$$\Delta\negthinspace\left(\tfrac{B-A}{C}\right) \approx 10^{-7}\thinspace(4t_{22}), \qquad
+  \Delta\negthinspace\left(\tfrac{B-C}{A}\right) \approx 10^{-7}\thinspace(t_{20}+2t_{22})$$
 
-| Case | $\Delta(B\!-\!A)/C$ (albedo-map) | $\Delta(B\!-\!C)/A$ const-albedo | $\Delta(B\!-\!C)/A$ albedo-map |
+| Case | $\Delta(B\negthinspace-\negthinspace A)/C$ (albedo-map) | $\Delta(B\negthinspace-\negthinspace C)/A$ const-albedo | $\Delta(B\negthinspace-\negthinspace C)/A$ albedo-map |
 |------|:-------------------------------:|:-------------------------------:|:-----------------------------:|
 | Maxwell, $H$=0   | $5.99\times10^{-7}$ | $-2.9\times10^{-8}$ (stable) | $+1.0\times10^{-8}$ (**unstable**) |
 | Maxwell, $H$=10  | $3.71\times10^{-7}$ | $+2.9\times10^{-8}$ | $+6.1\times10^{-8}$ |
 | Flow law $n_G$=3 | $4.89\times10^{-7}$ | $+9.0\times10^{-8}$ | $+1.4\times10^{-7}$ |
 | Flow law $n_G$=5.2 | $2.31\times10^{-7}$ | $+6.6\times10^{-8}$ | $+9.4\times10^{-8}$ |
 
-- **$\Delta(B\!-\!A)/C$ is robust** (<1% albedo sensitivity) — set by the tidal dissipation pattern.
-- **$\Delta(B\!-\!C)/A$ is albedo-controlled** (30–60% change). For Maxwell $H$=0, variable albedo **flips it from stable to marginally unstable** → motivates polar wander.
+- **$\Delta(B\negthinspace-\negthinspace A)/C$ is robust** (<1% albedo sensitivity) — set by the tidal dissipation pattern.
+- **$\Delta(B\negthinspace-\negthinspace C)/A$ is albedo-controlled** (30–60% change). For Maxwell $H$=0, variable albedo **flips it from stable to marginally unstable** → motivates polar wander.
 
 ---
 
@@ -104,7 +104,7 @@ $$\Delta\!\left(\tfrac{B-A}{C}\right) \approx 10^{-7}\,(4t_{22}), \qquad
 Magnetospheric plasma preferentially **darkens the trailing hemisphere** on $10^3$–$10^5$ yr timescales (Paranicas et al. 2001; **Burnett & Hayne 2021**). This suggests a **self-resetting cycle**:
 
 1. Darkening → lower albedo → higher $T_s$ → **thins** trailing-hemisphere shell
-2. Mass redistribution drives $\Delta(B\!-\!C)/A>0$ → **instability**
+2. Mass redistribution drives $\Delta(B\negthinspace-\negthinspace C)/A>0$ → **instability**
 3. Shell reorients (TPW) → exposes fresh bright ice on the new trailing side
 4. Albedo resets → cycle restarts
 
@@ -116,8 +116,8 @@ A stabilizer is required (3 of 4 rheologies are unstable even without darkening)
 
 ![Instability vs. darkening fraction, with and without fossil bulge](/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/plots/ice-shell-dynamics/polar_wander/fig5_all_rheologies.png)
 
-- **Without fossil bulge (left):** 3 of 4 rheologies have $\Delta(B\!-\!C)/A>0$ even at $f=0$ → *permanent* instability (unphysical — Europa is stable today).
-- **With fossil bulge (right):** all rheologies start at $\Delta(B\!-\!C)/A=0$ and grow with darkening fraction $f$.
+- **Without fossil bulge (left):** 3 of 4 rheologies have $\Delta(B\negthinspace-\negthinspace C)/A>0$ even at $f=0$ → *permanent* instability (unphysical — Europa is stable today).
+- **With fossil bulge (right):** all rheologies start at $\Delta(B\negthinspace-\negthinspace C)/A=0$ and grow with darkening fraction $f$.
 - For Maxwell $H$=0, instability sets in at critical darkening **$f_{\rm crit}\approx0.12$**.
 
 ---
@@ -129,7 +129,7 @@ A stabilizer is required (3 of 4 rheologies are unstable even without darkening)
 **Quasi-static, shell-only field (NO fossil bulge)** — the bare destabilizing trend. Maxwell $H$=0, trailing hemisphere darkens ($f$: 0 → 1):
 
 - Mean thickness drops 20.3 km (bright) → 19.3 km (dark).
-- $\Delta(B\!-\!C)/A$: $-1.3\times10^{-8}$ (stable) → $+6.2\times10^{-8}$ (unstable).
+- $\Delta(B\negthinspace-\negthinspace C)/A$: $-1.3\times10^{-8}$ (stable) → $+6.2\times10^{-8}$ (unstable).
 - The trailing hemisphere visibly thins while the tidal equatorial band persists.
 
 ---
@@ -161,7 +161,7 @@ Full 3×3 inertia-tensor model **with the fossil bulge as stabilizer** ($\alpha=
 ## 11. Key takeaways
 
 1. **3-D thermal structure matters.** Spatially variable albedo adds the largest *non-tidal*, degree-1 thickness signal — a leading/trailing asymmetry $b_{11}^s\sim1$–1.7 km — that 1-D models miss entirely.
-2. **Stability splits by moment.** $\Delta(B\!-\!A)/C$ is tidally robust; $\Delta(B\!-\!C)/A$ is albedo-controlled and can be **destabilizing** (flips Maxwell $H$=0 stable → unstable).
+2. **Stability splits by moment.** $\Delta(B\negthinspace-\negthinspace A)/C$ is tidally robust; $\Delta(B\negthinspace-\negthinspace C)/A$ is albedo-controlled and can be **destabilizing** (flips Maxwell $H$=0 stable → unstable).
 3. **Recurrent polar wander.** Trailing-hemisphere darkening plausibly drives TPW on **~1–2 Myr** (shell-thermal) timescales; interior coupling can **delay onset to ~16 Myr**.
 4. **Robust to smoothing.** All geophysical quantities converge by spherical-harmonic degree $\ell\approx4$ (see Backup) — insensitive to the unknown lateral-diffusion scale.
 
