@@ -117,7 +117,10 @@ axisymmetric degree ≤ 4 content as exogenic: its zonal profile S_map(θ) about
 coordinates. Note that about 65% of the map's zonal b₂₀ is a dark low-latitude band (|lat| < 25°),
 not bright poles, and the band is not longitude-uniform; E3map assumes it follows the spin pole.
 (`E3`, which kept the exosphere model's tidal-even c₂…c₄ with the map's zonal profile,
-double-counts degree 2 and is superseded.)
+double-counts degree 2 and is superseded.) `E4` is E1 plus a dose-dependent radiolytic darkening
+term, `κ u` with `u = −(D/⟨D⟩ − 1)` the normalized penetrating dose (Halo's model; `exo_dose_file`,
+`exo_dose_scenario`, `exo_dose_kappa`), evaluated in tidal coordinates as a whole 2-D field; no B&H
+cos γ term is added, since the dose term carries its own c₁.
 See `ojakangas_stevenson/exogenic_albedo.py`. Initial-condition modes for the hypothesis test:
 `init_b_mode` `uniform_equilibrium` / `equilibrium` / `blend`, `init_l2_perturb_km`, and
 `init_pole_offset_deg`.

@@ -109,6 +109,9 @@ def exo_profile_fit(path, case, variant, A_meas, theta, lam,
       'E3' (42318df; SUPERSEDED, double-counts degree 2, Fermi F1): E2 with
            the spin part replaced by the map's zonal profile but the MODEL's
            tidal-even c2..c4 kept (2.5-3.7x the map's c2);
+      'E4' is E1 plus the dose-darkening term (``add_dose``; set up by the
+           coupled model from exo_dose_* ; no B&H term: the dose term
+           carries its own c1);
       'E3map' (E3-fair): the MAP's own axisymmetric degree <= 4 content as
            exogenic: the map's zonal profile S_map(theta) about the spin pole
            plus the map's c1..c4 (``mergny_tidal_Pn_coeffs``) in tidal
@@ -132,11 +135,13 @@ def exo_profile_fit(path, case, variant, A_meas, theta, lam,
         c_map = fit_template(A_meas, theta, lam, 'bh2021')['coeffs'][0]
         c_impl = c_map - c[0]
         c[0] = c_map
+    elif variant == 'E4':
+        pass                                    # E1 here; the dose term is added by add_dose
     elif variant == 'E3map':
         c = np.asarray(d['mergny_tidal_Pn_coeffs'], dtype=float).copy()
         c_impl = 0.0
     elif variant != 'E1':
-        raise ValueError(f"variant must be E1, E2, E3 or E3map: {variant!r}")
+        raise ValueError(f"variant must be E1, E2, E3, E3map or E4: {variant!r}")
     if variant in ('E3', 'E3map'):
         S = np.asarray(d['mergny_dA_spin_theta'], dtype=float)
     if sym_S is None:
@@ -152,6 +157,46 @@ def exo_profile_fit(path, case, variant, A_meas, theta, lam,
             'source': str(path)}
 
 
+def dose_unit_field(path, scenario):
+    """u = -(D/<D> - 1) of Halo's dose-darkening forcing, on its (theta, lam) grid.
+
+    The dose-darkening term is dA_dose = kappa u (zero mean), with D/<D> the
+    normalized deposited dose of ``scenario`` (``dose_norm_<scenario>``, e.g.
+    'EN_1mm': Nordheim-lens electrons in the top 1 mm, heavy-ion skin dose
+    discounted). The whole field is EXTERNAL frame: tidal coordinates.
+    """
+    d = np.load(path)
+    u = -(np.asarray(d[f'dose_norm_{scenario}'], dtype=float) - 1.0)
+    th, lm = np.asarray(d['theta'], float), np.asarray(d['lam'], float)
+    return th, lm, u - G.area_mean(u, th, lm)
+
+
+def add_dose(fit, path, scenario, kappa):
+    """Return a copy of an exo_profiles fit with kappa x dose_unit_field added (variant E4)."""
+    th, lm, u = dose_unit_field(path, scenario)
+    out = dict(fit)
+    out.update({'dose_theta': th, 'dose_lam': lm, 'dose_u': u, 'dose_kappa': float(kappa),
+                'dose_scenario': scenario, 'dose_source': str(path)})
+    return out
+
+
+def _periodic_interp(th, lm, F, theta_t, lam_t):
+    """Bilinear interpolation of F(theta, lam) (GL rows, periodic lam) at (theta_t, lam_t).
+
+    Pole rows are added as the mean of the nearest row (a single-valued pole).
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    lam_c = np.append(lm, lm[0] + 2.0 * np.pi)
+    Fc = np.column_stack([F, F[:, 0]])
+    th_c = np.concatenate([[0.0], th, [np.pi]])
+    Fc = np.vstack([np.full(Fc.shape[1], F[0].mean()), Fc, np.full(Fc.shape[1], F[-1].mean())])
+    rgi = RegularGridInterpolator((th_c, lam_c), Fc)
+    tt = np.asarray(theta_t, dtype=float)
+    ll = np.mod(np.asarray(lam_t, dtype=float) - lm[0], 2.0 * np.pi) + lm[0]
+    tt, ll = np.broadcast_arrays(tt, ll)
+    return rgi(np.stack([tt.ravel(), ll.ravel()], -1)).reshape(tt.shape)
+
+
 def template_field(fit, theta_t, lam_t):
     """A_exo^eq at tidal coordinates (zero area mean; no constant)."""
     if fit['form'] == 'exo_profiles':
@@ -160,6 +205,9 @@ def template_field(fit, theta_t, lam_t):
         out = np.interp(th, fit['theta_S'], fit['S'])   # constant beyond the GL end nodes
         for n, cn in enumerate(fit['coeffs'], start=1):
             out = out + cn * _legendre(n, cos_g)
+        if fit.get('dose_kappa'):
+            out = out + fit['dose_kappa'] * _periodic_interp(fit['dose_theta'], fit['dose_lam'],
+                                                           fit['dose_u'], th, lam_t)
         return out
     out = np.zeros(np.broadcast(theta_t, lam_t).shape)
     for c, f in zip(fit['coeffs'], basis(fit['form'], theta_t, lam_t)):

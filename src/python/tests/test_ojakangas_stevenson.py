@@ -1033,6 +1033,54 @@ def test_fD_warns():
     assert 'not a physical convection proxy' in buf.getvalue()
 
 
+
+def test_e4_dose_term():
+    """E4 = E1 + kappa u, u = -(D/<D> - 1) zero-mean, evaluated in TIDAL coordinates by a
+    periodic bilinear interpolation (exact at the nodes, accurate off them), and wired
+    into the coupled model."""
+    import tempfile
+    from ojakangas_stevenson import exogenic_albedo as EA
+    theta, lam = G.periodic_grid(24, 48)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    path, S, c, T2 = _exo_npz(theta, lam)
+    Dn = 1.0 + 0.5 * np.sin(TH) ** 4 * (1.0 + 0.6 * np.sin(TH) * np.sin(LA))  # lens-like
+    dpath = os.path.join(tempfile.mkdtemp(), 'dose.npz')
+    np.savez(dpath, theta=theta, lam=lam, dose_norm_EN_1mm=Dn)
+    th_u, lm_u, u = EA.dose_unit_field(dpath, 'EN_1mm')
+    assert abs(G.area_mean(u, theta, lam)) < 1e-14
+    A = 0.55 - 0.12 * np.sin(TH) * np.sin(LA)
+    e1 = EA.exo_profile_fit(path, 'high_1M', 'E4', A, theta, lam)
+    e4 = EA.add_dose(e1, dpath, 'EN_1mm', 0.2)
+    assert np.allclose(EA.template_field(e4, TH, LA), EA.template_field(e1, TH, LA) + 0.2 * u, atol=1e-14)
+    # off the nodes: smooth analytic field of the tidal coordinates, 46 x 90 grid
+    th2, lm2 = G.periodic_grid(46, 90)
+    TH2, LA2 = np.meshgrid(th2, lm2, indexing='ij')
+    Fx = lambda t, l: np.sin(t) ** 2 * np.cos(2 * l) + np.cos(t)                  # noqa: E731
+    tq, lq = np.random.default_rng(1).uniform(0, np.pi, 500), np.random.default_rng(2).uniform(-4, 4, 500)
+    # bilinear bound h^2 max|F''| / 8 with h = 4 deg and |F''| <= 4 (cos 2 lam): ~2.4e-3 per axis
+    h = 2 * np.pi / len(lm2)
+    assert np.max(np.abs(EA._periodic_interp(th2, lm2, Fx(TH2, LA2), tq, lq) - Fx(tq, lq))) < 2 * h * h * 4 / 8
+    # wired: the coupled exogenic albedo at t = 0 is A_unif + E4
+    path_f = _split_forcing(theta, lam, A)
+    css, cfg = _small_coupled(t_max_years=1e3, albedo_mode='split', forcing_file=path_f,
+                              split_component='exogenic', tau_exo_yr=0.0, init_b_mode='equilibrium',
+                              exo_template='exo_file', exo_forcing_file=path, exo_case='high_1M',
+                              exo_variant='E4', exo_dose_file=dpath, exo_dose_kappa=0.2)
+    cfg.use_ptm3d_surrogate = True
+    evo = css.CoupledEvolution(cfg)
+    assert np.allclose(evo.model.A_exo, EA.template_field(e4, TH, LA), atol=1e-14)
+    css, cfg = _small_coupled(t_max_years=1e3, albedo_mode='split', forcing_file=path_f,
+                              split_component='exogenic', exo_template='exo_file', exo_forcing_file=path,
+                              exo_variant='E4')
+    cfg.use_ptm3d_surrogate = True
+    try:
+        css.CoupledEvolution(cfg)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('E4 without a dose file accepted')
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

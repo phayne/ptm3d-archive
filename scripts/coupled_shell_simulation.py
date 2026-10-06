@@ -146,6 +146,10 @@ class CoupledConfig(PolarWanderConfig):
     exo_scale_zonal: float = 1.0
     exo_scale_odd: float = 1.0
     exo_sym_S: bool = None             # None: symmetrize S for E3map only
+    # exo_variant='E4': E1 + kappa x dose-darkening field (exogenic_albedo.add_dose)
+    exo_dose_file: str = None
+    exo_dose_scenario: str = 'EN_1mm'
+    exo_dose_kappa: float = None
     albedo_clamp: tuple = (0.3814, 0.80)  # Hapke non-ice endmember .. ice; None = off
     ptm3d_resolution: int = 5
     ptm3d_refresh_pole_deg: float = 10.0
@@ -361,6 +365,11 @@ class CoupledEvolution(ShellEvolution):
                     cfg.exo_forcing_file, cfg.exo_case, cfg.exo_variant, A_meas,
                     self.theta, self.lam, cfg.exo_scale_zonal, cfg.exo_scale_odd,
                     cfg.exo_sym_S)
+                if cfg.exo_variant == 'E4':
+                    if not cfg.exo_dose_file or cfg.exo_dose_kappa is None:
+                        raise ValueError("exo_variant='E4' needs exo_dose_file and exo_dose_kappa")
+                    self.exo_fit = EA.add_dose(self.exo_fit, cfg.exo_dose_file,
+                                               cfg.exo_dose_scenario, cfg.exo_dose_kappa)
             else:
                 self.exo_fit = EA.fit_template(A_meas, self.theta, self.lam, cfg.exo_template)
             _, A_intr = EA.split_map(A_meas, self.theta, self.lam, self.exo_fit)
