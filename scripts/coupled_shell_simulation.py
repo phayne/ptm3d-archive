@@ -119,6 +119,10 @@ class CoupledConfig(PolarWanderConfig):
     # 'stefan_sensible': f = 1 + S/L (exact S/L; an UPPER estimate, ~8% slow, 42318df);
     # 'stefan': f = 1 (latent only, 679af84); 'diffusive': b^2/kappa (pre-2026-10-05).
     relaxation_mode: str = 'stefan_eigen'
+    # Multiplies the relaxation time before the floor/cap clip (sensitivity tests,
+    # e.g. 2.0 for "2 tau"; 1.0 = unchanged). Frozen relaxation: set
+    # tau_diff_floor_yr = tau_diff_cap_yr = 1e12 (the clip then binds and warns).
+    relaxation_scale: float = 1.0
     # --- PTM3D surrogate / multi-rate ---
     use_ptm3d_surrogate: bool = True
     use_live_ptm3d: bool = False        # Phase 2: periodic full-PTM3D refresh
@@ -550,6 +554,10 @@ class CoupledEvolution(ShellEvolution):
         tau = PW.stefan_relaxation_time(b, T_s, sensible=sens) / (365.25 * 86400.0)
         if cfg.conv_flow_tau:
             tau = tau * cfg.conv_s
+        if cfg.relaxation_scale != 1.0:
+            if not cfg.relaxation_scale > 0:
+                raise ValueError(f'relaxation_scale must be > 0: {cfg.relaxation_scale}')
+            tau = tau * cfg.relaxation_scale
         out = np.clip(tau, cfg.tau_diff_floor_yr, cfg.tau_diff_cap_yr)
         if not self._warned_tau_clip and not np.array_equal(out, tau):
             self._warned_tau_clip = True

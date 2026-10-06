@@ -1138,6 +1138,24 @@ def test_demo_forcing():
     assert np.isclose(np.max(np.abs(A_t)), np.max(np.abs(EA.template_field(f, TH, LA))), rtol=0.02)
 
 
+
+def test_relaxation_scale_and_frozen():
+    """relaxation_scale multiplies tau; floor = cap = 1e12 yr freezes the shell (and warns)."""
+    import io, contextlib
+    css, cfg = _small_coupled(t_max_years=1e3)
+    evo = css.CoupledEvolution(cfg)
+    T = np.full_like(evo.b, 100.0); b = np.full_like(evo.b, 25e3)
+    base = evo._tau_relax_years(b, T)
+    evo.cfg.relaxation_scale = 2.0
+    assert np.allclose(evo._tau_relax_years(b, T), 2.0 * base, rtol=1e-12)
+    evo.cfg.relaxation_scale = 1.0
+    evo.cfg.tau_diff_floor_yr = evo.cfg.tau_diff_cap_yr = 1e12
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert np.all(evo._tau_relax_years(b, T) == 1e12)
+    assert 'clipped' in buf.getvalue()
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):
