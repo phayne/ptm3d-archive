@@ -89,7 +89,7 @@ def _legendre(n, x):
 
 
 def exo_profile_fit(path, case, variant, A_meas, theta, lam,
-                    scale_zonal=1.0, scale_odd=1.0):
+                    scale_zonal=1.0, scale_odd=1.0, sym_S=None):
     """Exosphere-derived exogenic template (Halo, 2026-10-05), as a fit dict.
 
     ``path``: exo_albedo_forcing_91x180.npz. It decomposes the exosphere
@@ -106,10 +106,18 @@ def exo_profile_fit(path, case, variant, A_meas, theta, lam,
       'E2' E1 plus the B&H cos(gamma) implantation term, amplitude chosen so
            the total cos(gamma) coefficient equals the measured map's
            (the bh2021 fit of A_meas, -0.124 for eq36);
-      'E3' E2 with the spin-frame part replaced by the MAP's own zonal profile
-           (``mergny_dA_spin_theta``) at its observed amplitude: the whole
-           observed zonal (bright-pole) term follows the spin pole. (Adding it
-           to S instead would double-count the model's share.)
+      'E3' (42318df; SUPERSEDED, double-counts degree 2, Fermi F1): E2 with
+           the spin part replaced by the map's zonal profile but the MODEL's
+           tidal-even c2..c4 kept (2.5-3.7x the map's c2);
+      'E3map' (E3-fair): the MAP's own axisymmetric degree <= 4 content as
+           exogenic: the map's zonal profile S_map(theta) about the spin pole
+           plus the map's c1..c4 (``mergny_tidal_Pn_coeffs``) in tidal
+           coordinates. Case- and scale-independent (no model input). The
+           map's S is N-S symmetrized (``sym_S``, default for E3map, Fermi F2:
+           its south cap, -0.198 vs -0.040 north, sits in the gap-fill
+           annulus). NOTE: ~65% of the map's zonal b20 is a DARK LOW-LATITUDE
+           BAND (|lat| < 25 deg), not bright poles, and that band is not
+           longitude-uniform; E3map assumes it follows the spin pole.
     S is made zero-mean (the global darkening changes <b>, not the driving).
     """
     d = np.load(path)
@@ -124,16 +132,24 @@ def exo_profile_fit(path, case, variant, A_meas, theta, lam,
         c_map = fit_template(A_meas, theta, lam, 'bh2021')['coeffs'][0]
         c_impl = c_map - c[0]
         c[0] = c_map
+    elif variant == 'E3map':
+        c = np.asarray(d['mergny_tidal_Pn_coeffs'], dtype=float).copy()
+        c_impl = 0.0
     elif variant != 'E1':
-        raise ValueError(f"variant must be E1, E2 or E3: {variant!r}")
-    if variant == 'E3':
+        raise ValueError(f"variant must be E1, E2, E3 or E3map: {variant!r}")
+    if variant in ('E3', 'E3map'):
         S = np.asarray(d['mergny_dA_spin_theta'], dtype=float)
+    if sym_S is None:
+        sym_S = variant == 'E3map'
+    if sym_S:
+        S = 0.5 * (S + S[::-1])                 # GL nodes are symmetric about the equator
     w = G.theta_weights(theta)
     S = S - np.sum(S * w) / np.sum(w)
     return {'form': 'exo_profiles', 'names': ['S(theta_spin)'] + [f'P{n}(cos gamma)' for n in range(1, 5)],
             'coeffs': [float(x) for x in c], 'const': 0.0, 'theta_S': np.asarray(theta, float),
             'S': S, 'c_impl': float(c_impl), 'case': case, 'variant': variant,
-            'scale_zonal': scale_zonal, 'scale_odd': scale_odd, 'source': str(path)}
+            'scale_zonal': scale_zonal, 'scale_odd': scale_odd, 'sym_S': bool(sym_S),
+            'source': str(path)}
 
 
 def template_field(fit, theta_t, lam_t):

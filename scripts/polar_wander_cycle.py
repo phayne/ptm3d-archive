@@ -135,11 +135,17 @@ class PolarWanderConfig:
     #   conv_s:  steady-state flow damping of the whole anomaly,
     #            b_eq = <b_f> + s (b_f - <b_f>)  (degree >= 1 scaled by s exactly).
     # Fermi: s ~ tau_flow/(tau_flow + tau_th) ~ 0.4 (code rheology) to ~0.02
-    # (fine grains); f_D ~ 0.4. conv_flow_tau (option, off): also scale the
-    # relaxation time by s (the flow relaxes the anomaly faster); not ruled.
+    # (fine grains).
+    # conv_flow_tau (default True since 2026-10-05): the same competition that
+    # damps the anomaly to s relaxes it faster, 1/tau = 1/tau_th + 1/tau_flow,
+    # i.e. tau_eff = s tau_th; False relaxes at the conductive rate (42318df).
+    # ⛔ conv_fD is NOT a physical proxy on its own (Fermi F4): the conductive
+    # control is a +-6 km cancellation of insolation and tidal terms, and
+    # convection would damp the insolation (ocean-interface) term too. Kept
+    # as a code option; any value != 1 prints a WARNING. Not reported.
     conv_s: float = 1.0
     conv_fD: float = 1.0
-    conv_flow_tau: bool = False
+    conv_flow_tau: bool = True
     # Sub-Jovian meridian once the pole has moved: 'projection' = body x
     # projected into the equatorial plane (pre-2026-10-05); 'min_moment' =
     # the minimum-moment axis in the plane perpendicular to the spin
@@ -562,6 +568,10 @@ class ShellEvolution:
         if cfg.meridian_mode == 'min_moment' and not self._supports_meridian:
             raise ValueError(f"meridian_mode='min_moment' is not implemented for "
                              f"{type(self).__name__} (its albedo model ignores the meridian)")
+        if getattr(cfg, 'conv_fD', 1.0) != 1.0:
+            print(f'  WARNING: conv_fD = {cfg.conv_fD} reweights the tidal term alone; this is '
+                  f'not a physical convection proxy (convection would damp the insolation '
+                  f'term too; Fermi F4)')
         if cfg.seed_rearm not in ('any_axis', 'max_axis'):
             raise ValueError(f'seed_rearm must be any_axis or max_axis: {cfg.seed_rearm!r}')
         if cfg.tpw_model == 'coupled' and cfg.tidal_torque:

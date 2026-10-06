@@ -20,8 +20,9 @@ Contents
 * Eqs. 5.19-5.21 / 5.26 / 5.38  the same with the tidal torque from Jupiter
             (``overdamped_step_tidal``; stiffness 4 n^2 eps toward Jupiter),
             and the quasi-static sub-Jovian meridian (``meridian_min_moment``)
-* Stefan-limited shell relaxation time (1 + S/L) rho L b / q, S/L exact
-            (``stefan_relaxation_time``, ``sensible_heat_ratio``)
+* Stefan-limited shell relaxation time f rho L b / q, f = exact eigenmode
+            factor or 1 + S/L (``stefan_relaxation_time``, ``stefan_eigen_factor``,
+            ``sensible_heat_ratio``)
 
 Conventions: body frame x toward Jupiter (sub-Jovian point), z along the
 spin axis at the epoch the fossil froze. C20, C22 are unnormalized
@@ -521,34 +522,115 @@ def sensible_heat_ratio(T_s, T_m=None, latent_heat=None):
     return num / F / L
 
 
+_TABLES = {}
+_T_TABLE = np.arange(30.0, 272.0 + 1e-9, 0.02)        # T_s grid for the S/L table [K]
+_T_EIG = np.arange(30.0, 272.0 + 1e-9, 1.0)           # T_s grid for the eigenmode table [K]
+
+
+def _table_key(kind):
+    return (kind, C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY, tuple(C.ICE_CP_COEFFS), C.ICE_LATENT_HEAT,
+            C.T_MELT, C.ICE_DENSITY)
+
+
+def sensible_heat_ratio_tabulated(T_s):
+    """``sensible_heat_ratio`` interpolated from a 0.02 K table (built once per constant set).
+
+    Agrees with the quadrature to < 1e-9 (tested); removes the per-cell
+    quadrature that cost 45% of a coupled run (Fermi F10).
+    """
+    key = _table_key('S/L')
+    if key not in _TABLES:
+        _TABLES[key] = sensible_heat_ratio(_T_TABLE)
+    return np.interp(np.asarray(T_s, dtype=float), _T_TABLE, _TABLES[key])
+
+
+def _kirchhoff_profile(Ts, zeta):
+    """T(zeta) of the steady k = a1/T + a0 profile: a1 ln(T/Ts) + a0 (T - Ts) = zeta F."""
+    T_m = C.T_MELT
+    a1, a0 = C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY
+    F = a1 * np.log(T_m / Ts) + a0 * (T_m - Ts)
+    T = Ts * (T_m / Ts) ** zeta                          # exact for a0 = 0; Newton otherwise
+    for _ in range(50 if a0 else 0):
+        g = a1 * np.log(T / Ts) + a0 * (T - Ts) - zeta * F
+        T = T - g / (a1 / T + a0)
+    return T, F
+
+
+def stefan_eigen_factor(T_s, n=600):
+    """Exact slowest-mode relaxation time of the conductive Stefan shell, in units of rho L b^2 / F.
+
+    Linearized about the steady conductive profile, a perturbation of the
+    Kirchhoff variable u = int k dT obeys (rho c_p / k) du/dt = u'' with u = 0
+    at the surface and the Stefan condition rho L db/dt = -(flux jump) at the
+    base. Its slowest decay rate lambda solves the symmetric generalized
+    eigenproblem  int v' phi' dz = lambda [ int (rho c_p/k) v phi dz +
+    (rho L b / F) v(b) phi(b) ]  (linear finite elements, n elements). Returns
+    1 / (lambda rho L b^2 / F), independent of b. Modern k = 651/T: ~1.40 at
+    100 K (Fermi's shooting, stefan_eig2.py), vs 1 + S/L = 1.50 (the
+    sensible-heat bound, ~8% slow). Validated against the constant-k, c_p
+    case tau/tau_L = St/x^2, x tan x = St (test).
+    """
+    from scipy.linalg import eigh
+    Ts = float(T_s)
+    zeta_n = np.linspace(0.0, 1.0, n + 1)
+    zeta_m = 0.5 * (zeta_n[1:] + zeta_n[:-1])
+    T_m, F = _kirchhoff_profile(Ts, zeta_m)
+    c0, c1 = C.ICE_CP_COEFFS
+    w = C.ICE_DENSITY * (c0 + c1 * T_m) / (C.A1_CONDUCTIVITY / T_m + C.A0_CONDUCTIVITY)
+    # b = 1 m (the factor is b-independent); element length h
+    h = 1.0 / n
+    K = np.zeros((n + 1, n + 1))
+    M = np.zeros((n + 1, n + 1))
+    for e in range(n):
+        i = slice(e, e + 2)
+        K[i, i] += np.array([[1.0, -1.0], [-1.0, 1.0]]) / h
+        M[i, i] += w[e] * h / 6.0 * np.array([[2.0, 1.0], [1.0, 2.0]])
+    M[n, n] += C.ICE_DENSITY * C.ICE_LATENT_HEAT * 1.0 / F
+    lam = eigh(K[1:, 1:], M[1:, 1:], eigvals_only=True, subset_by_index=[0, 0])[0]
+    tau_L = C.ICE_DENSITY * C.ICE_LATENT_HEAT * 1.0 / F
+    return 1.0 / (lam * tau_L)
+
+
+def stefan_eigen_factor_tabulated(T_s):
+    """``stefan_eigen_factor`` interpolated from a 1 K table (built once per constant set, ~1 s)."""
+    key = _table_key('eig')
+    if key not in _TABLES:
+        _TABLES[key] = np.array([stefan_eigen_factor(T, n=300) for T in _T_EIG])
+    return np.interp(np.asarray(T_s, dtype=float), _T_EIG, _TABLES[key])
+
+
 def stefan_relaxation_time(b, T_s, T_m=None, latent_heat=None, density=None,
-                           sensible='exact'):
+                           sensible='eigen'):
     """Stefan-limited relaxation time of the shell thickness [s].
 
-    tau = (1 + S/L) rho L b / q = (1 + S/L) rho L b^2 / F.
+    tau = f rho L b^2 / F,  F = a1 ln(T_m/T_s) + a0 (T_m - T_s)  (q_cond = F/b).
     A thickness anomaly decays only as fast as the basal flux imbalance can
-    melt or freeze ice and re-equilibrate the profile: rho (L + S) db/dt =
-    q_cond(b) - q_in, with the conductive flux of the k = a1/T + a0 shell
-    q_cond = F/b, F = a1 ln(T_m/T_s) + a0 (T_m - T_s). Linearized about
-    equilibrium, dq/db = -q/b, so the e-folding time is (L + S) rho b^2 / F.
-    S/L from ``sensible_heat_ratio`` (exact for the actual profile; ~0.50 at
-    100 K for modern k = 651/T and c_p = 90 + 7.49 T). For b = 30 km, T_s =
-    100 K, modern constants: ~20 Myr (latent heat alone: ~13 Myr), consistent
-    with OSPW's "<~ a few x 1e7 yr" (p. 247).
+    melt or freeze ice and re-equilibrate the profile. Linearized about
+    equilibrium (dq/db = -q/b) with latent heat alone, f = 1; the factor f
+    carries the sensible heat:
 
-    ``sensible``: 'exact' (default since 2026-10-05, Paul's ruling) or 'none'
-    (latent heat only, the 679af84 form). Not included: the change of
-    internal tidal heating with b, which modifies dq/db.
+    ``sensible``:
+      'eigen' (default since 2026-10-05, Fermi F6): f = the exact slowest
+          eigenmode of the conductive Stefan problem (``stefan_eigen_factor``,
+          tabulated in T_s); ~1.40 at 100 K, ~19 Myr for 30 km.
+      'exact': f = 1 + S/L, S/L exact for the steady profile
+          (``sensible_heat_ratio``, tabulated). An UPPER estimate: it puts the
+          whole profile's sensible heat on the base, ~8% slower than 'eigen'.
+      'none': f = 1 (latent heat only, the 679af84 form, ~13 Myr for 30 km).
+    O&S/OSPW quote "<~ a few x 1e7 yr" (OSPW p. 247). Not included: the change
+    of internal tidal heating with b, which modifies dq/db.
     """
     T_m = C.T_MELT if T_m is None else T_m
     L = C.ICE_LATENT_HEAT if latent_heat is None else latent_heat
     rho = C.ICE_DENSITY if density is None else density
     T_s = np.asarray(T_s, dtype=float)
     F = C.A1_CONDUCTIVITY * np.log(T_m / T_s) + C.A0_CONDUCTIVITY * (T_m - T_s)
-    if sensible == 'exact':
-        fac = 1.0 + sensible_heat_ratio(T_s, T_m, L)
+    if sensible == 'eigen':
+        fac = stefan_eigen_factor_tabulated(T_s)
+    elif sensible == 'exact':
+        fac = 1.0 + sensible_heat_ratio_tabulated(T_s)
     elif sensible == 'none':
         fac = 1.0
     else:
-        raise ValueError(f"sensible must be 'exact' or 'none', got {sensible!r}")
+        raise ValueError(f"sensible must be 'eigen', 'exact' or 'none', got {sensible!r}")
     return fac * rho * L * np.asarray(b, dtype=float) ** 2 / F

@@ -114,10 +114,11 @@ class CoupledConfig(PolarWanderConfig):
     cp_const: float = 2000.0            # used only with cp_mode='constant'
     tau_diff_floor_yr: float = 1e3
     tau_diff_cap_yr: float = 5e7
-    # 'stefan_sensible' (default, Paul 2026-10-05): tau = (1 + S/L) rho L b / q,
-    # S/L exact per location; 'stefan': rho L b / q (latent only, 679af84);
-    # 'diffusive': b^2/kappa (pre-2026-10-05, 4-5x too fast).
-    relaxation_mode: str = 'stefan_sensible'
+    # 'stefan_eigen' (default, Fermi F6): tau = f rho L b / q, f = exact slowest
+    # eigenmode of the conductive Stefan shell (~1.40 at 100 K), per location;
+    # 'stefan_sensible': f = 1 + S/L (exact S/L; an UPPER estimate, ~8% slow, 42318df);
+    # 'stefan': f = 1 (latent only, 679af84); 'diffusive': b^2/kappa (pre-2026-10-05).
+    relaxation_mode: str = 'stefan_eigen'
     # --- PTM3D surrogate / multi-rate ---
     use_ptm3d_surrogate: bool = True
     use_live_ptm3d: bool = False        # Phase 2: periodic full-PTM3D refresh
@@ -144,6 +145,7 @@ class CoupledConfig(PolarWanderConfig):
     exo_variant: str = 'E2'
     exo_scale_zonal: float = 1.0
     exo_scale_odd: float = 1.0
+    exo_sym_S: bool = None             # None: symmetrize S for E3map only
     albedo_clamp: tuple = (0.3814, 0.80)  # Hapke non-ice endmember .. ice; None = off
     ptm3d_resolution: int = 5
     ptm3d_refresh_pole_deg: float = 10.0
@@ -357,7 +359,8 @@ class CoupledEvolution(ShellEvolution):
                     raise ValueError("exo_template='exo_file' needs exo_forcing_file")
                 self.exo_fit = EA.exo_profile_fit(
                     cfg.exo_forcing_file, cfg.exo_case, cfg.exo_variant, A_meas,
-                    self.theta, self.lam, cfg.exo_scale_zonal, cfg.exo_scale_odd)
+                    self.theta, self.lam, cfg.exo_scale_zonal, cfg.exo_scale_odd,
+                    cfg.exo_sym_S)
             else:
                 self.exo_fit = EA.fit_template(A_meas, self.theta, self.lam, cfg.exo_template)
             _, A_intr = EA.split_map(A_meas, self.theta, self.lam, self.exo_fit)
@@ -512,9 +515,10 @@ class CoupledEvolution(ShellEvolution):
     def _tau_relax_years(self, b, T_s):
         """Local shell relaxation time [yr] for cfg.relaxation_mode.
 
-        'stefan_sensible': (1 + S/L) rho L b / q with S/L exact for the local
-        T_s (ojakangas_stevenson.polar_wander.stefan_relaxation_time; ~20 Myr
-        for 30 km). 'stefan': rho L b / q (latent only, ~13 Myr).
+        'stefan_eigen': f rho L b / q with f the exact eigenmode factor for the
+        local T_s (ojakangas_stevenson.polar_wander.stefan_relaxation_time;
+        ~19 Myr for 30 km). 'stefan_sensible': f = 1 + S/L (upper estimate,
+        ~20 Myr). 'stefan': rho L b / q (latent only, ~13 Myr).
         'diffusive': _tau_diff_years (b^2/kappa). All are clipped to
         [tau_diff_floor_yr, tau_diff_cap_yr]; in the Stefan modes a clip that
         binds is reported once. cfg.conv_flow_tau multiplies the result by
@@ -523,10 +527,11 @@ class CoupledEvolution(ShellEvolution):
         cfg = self.cfg
         if cfg.relaxation_mode == 'diffusive':
             return self._tau_diff_years(b, T_s)
-        if cfg.relaxation_mode not in ('stefan', 'stefan_sensible'):
-            raise ValueError(f"relaxation_mode must be 'stefan_sensible', 'stefan' or "
-                             f"'diffusive', got {cfg.relaxation_mode!r}")
-        sens = 'exact' if cfg.relaxation_mode == 'stefan_sensible' else 'none'
+        sens = {'stefan_eigen': 'eigen', 'stefan_sensible': 'exact', 'stefan': 'none'}.get(
+            cfg.relaxation_mode)
+        if sens is None:
+            raise ValueError(f"relaxation_mode must be 'stefan_eigen', 'stefan_sensible', "
+                             f"'stefan' or 'diffusive', got {cfg.relaxation_mode!r}")
         tau = PW.stefan_relaxation_time(b, T_s, sensible=sens) / (365.25 * 86400.0)
         if cfg.conv_flow_tau:
             tau = tau * cfg.conv_s

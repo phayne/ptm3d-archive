@@ -45,14 +45,16 @@ Each step:
    `b = ln(T_M/T_s) / [(2/a₁)D + (H/a₁)²]^{1/2}`, with $C_R = 0.5$
    (`ojakangas_stevenson.shell_thickness`; `--thickness-method exact` integrates the first
    integral of Eqs. 2.4/2.5 instead). D is re-rotated when the pole drifts.
-4. **Relax at the local Stefan time** (default, `relaxation_mode='stefan_sensible'`) —
-   `b ← b_eq + (b−b_eq)·e^{−dt/τ}`, `τ(θ,λ) = (1 + S/L) ρ L b / q = (1 + S/L) ρ L b² / F`, with L the
-   latent heat of fusion, `F = a₁ ln(T_M/T_s) + a₀ (T_M − T_s)` the conductive flux integral and S the
-   sensible heat of the steady conductive profile per unit mass, computed exactly per location
-   (`sensible_heat_ratio`; S/L = 0.53 / 0.50 / 0.48 at T_s = 90 / 100 / 110 K for k = 651/T,
-   c_p = 90 + 7.49 T). τ ≈ 20 Myr for b = 30 km at 100 K, within OSPW's "≲ a few × 10⁷ yr" (p. 247).
-   Not included: the change of internal tidal heating with b. Options: `'stefan'` (latent heat only,
-   ≈ 13 Myr) and `'diffusive'` (the earlier `τ_diff = b²/κ`, 4–5× too fast).
+4. **Relax at the local Stefan time** (default, `relaxation_mode='stefan_eigen'`) —
+   `b ← b_eq + (b−b_eq)·e^{−dt/τ}`, `τ(θ,λ) = f ρ L b / q = f ρ L b² / F`, with L the latent heat of
+   fusion and `F = a₁ ln(T_M/T_s) + a₀ (T_M − T_s)` the conductive flux integral. The factor f carries
+   the sensible heat and is the exact slowest eigenmode of the linearized conductive Stefan problem
+   (`stefan_eigen_factor`, finite elements, tabulated in T_s): f = 1.42 / 1.40 / 1.37 at
+   T_s = 90 / 100 / 110 K for k = 651/T, c_p = 90 + 7.49 T. τ ≈ 19 Myr for b = 30 km at 100 K, within
+   OSPW's "≲ a few × 10⁷ yr" (p. 247). Not included: the change of internal tidal heating with b.
+   Options: `'stefan_sensible'` (f = 1 + S/L with S/L exact, 0.53 / 0.50 / 0.48 at those T_s; an upper
+   estimate, ~8% slow because it charges the whole profile's sensible heat to the base),
+   `'stefan'` (latent heat only, ≈ 13 Myr) and `'diffusive'` (the earlier `τ_diff = b²/κ`, 4–5× too fast).
 5. **Reorient (OSPW Eq. 5.39)** — the physical inertia tensor is the Eq. 2.18 bottom-loaded
    (buoyantly compensated, iceberg-effect) tensor of the thickness field plus, optionally
    (`--fossil hydrostatic`), the body-fixed hydrostatic fossil bulge of Eqs. 3.8–3.10. The pole
@@ -81,14 +83,20 @@ at the initial pole (`forcing_file`, built by `build_forcing.py`).
 ### 1.0 Convection bracketing proxy (`conv_s`, `conv_fD`)
 
 The paper model stays the conductive O&S shell. The shell is near the onset of stagnant-lid
-convection (Fermi, 2026-10-05), so two knobs bracket its effect on the forced thickness anomaly:
-`conv_fD` reweights the tidal-heating (D) part of the equilibrium anomaly,
-`b_f = B(T_s, ⟨D⟩) + f_D [B(T_s, D) − B(T_s, ⟨D⟩)]`, leaving the surface-temperature response
-(the same per kelvin in a stagnant lid as in O&S) unchanged; `conv_s` damps the whole anomaly by
-steady basal flow, `b_eq = ⟨b_f⟩ + s (b_f − ⟨b_f⟩)`, so every degree ≥ 1 harmonic scales by s
-exactly. Bracket: s ∈ {1, 0.4, 0.1, 0.03}, f_D ∈ {1, 0.4}. The relaxation time is not changed
-(`conv_flow_tau` would also scale it by s; off, not ruled). With a fossil the Eq. 3.12 verdict
-flips at s* = threshold / (t₂₀ + 2t₂₂); without one it cannot flip for any s > 0 (only the rate scales).
+convection (Fermi, 2026-10-05), so `conv_s` brackets the effect of steady basal flow on the forced
+thickness anomaly: `b_eq = ⟨b⟩ + s (b − ⟨b⟩)`, so every degree ≥ 1 harmonic scales by s exactly.
+Bracket: s ∈ {1, 0.4, 0.1, 0.03}. The same flow–conduction competition that sets
+s ≈ τ_flow/(τ_flow + τ_th) also relaxes the anomaly faster, so with `conv_flow_tau` (default on) the
+relaxation time is s·τ_th; `conv_flow_tau=False` relaxes at the conductive rate. With a fossil the
+Eq. 3.12 verdict flips at s* = threshold / (t₂₀ + 2t₂₂); without one it cannot flip for any s > 0
+(only the rate scales).
+
+`conv_fD` (reweight the tidal-heating part of the anomaly alone,
+`b_f = B(T_s, ⟨D⟩) + f_D [B(T_s, D) − B(T_s, ⟨D⟩)]`) is kept as a code option but is **not a
+physical convection proxy on its own** and is not reported: the conductive control is a ±6 km
+cancellation of the insolation (+5.6 km) and tidal (−6.1 km) terms, and in a convecting shell the
+load comes from the ocean-interface relief, which convection damps for both terms. Removing only the
+tidal term makes every shell unstable for the wrong reason. Any value ≠ 1 prints a warning.
 
 ### 1.1 Split albedo (`albedo_mode='split'`)
 
@@ -103,8 +111,13 @@ Options `exo_template='apex_l2'` (adds P₂(cos γ)) and `'bh2021_zonal'` (adds 
 P₂(cos θ_t) latitude term, not exogenic in origin) are for sensitivity tests.
 `exo_template='exo_file'` uses the exosphere-model forcing (`exo_profile_fit`): S(θ) about the spin
 pole plus T(γ) = Σ cₙ Pₙ(cos γ) in tidal coordinates (E1); E2 adds the B&H cos γ implantation term
-so the total cos γ coefficient equals the map's; E3 also takes the map's own zonal profile as
-spin-frame.
+so the total cos γ coefficient equals the map's. `E3map` (E3-fair) takes the map's whole
+axisymmetric degree ≤ 4 content as exogenic: its zonal profile S_map(θ) about the spin pole
+(north–south symmetrized; the south cap lies in the gap-fill annulus) plus its c₁…c₄ in tidal
+coordinates. Note that about 65% of the map's zonal b₂₀ is a dark low-latitude band (|lat| < 25°),
+not bright poles, and the band is not longitude-uniform; E3map assumes it follows the spin pole.
+(`E3`, which kept the exosphere model's tidal-even c₂…c₄ with the map's zonal profile,
+double-counts degree 2 and is superseded.)
 See `ojakangas_stevenson/exogenic_albedo.py`. Initial-condition modes for the hypothesis test:
 `init_b_mode` `uniform_equilibrium` / `equilibrium` / `blend`, `init_l2_perturb_km`, and
 `init_pole_offset_deg`.

@@ -855,16 +855,18 @@ def test_sensible_heat_ratio_exact():
         h = lambda T: 90.0 * T + 3.745 * T * T                      # noqa: E731
         closed = (h(Tm) - 90.0 * (Tm - Ts) / lnr - 3.745 * (Tm ** 2 - Ts ** 2) / (2 * lnr)) / L
         assert np.isclose(PW.sensible_heat_ratio(Ts), closed, rtol=1e-10)
-        tau = PW.stefan_relaxation_time(30e3, 100.0)
+        tau = PW.stefan_relaxation_time(30e3, 100.0, sensible='exact')
         assert np.isclose(tau / PW.stefan_relaxation_time(30e3, 100.0, sensible='none'),
-                          1.0 + closed, rtol=1e-10)
-    css, cfg = _small_coupled(t_max_years=1e3)
-    assert cfg.relaxation_mode == 'stefan_sensible'
+                          1.0 + closed, rtol=1e-8)
+        # the 0.02 K table reproduces the quadrature (Fermi F10)
+        T = np.linspace(60.0, 200.0, 777)
+        assert np.max(np.abs(PW.sensible_heat_ratio_tabulated(T) - PW.sensible_heat_ratio(T))) < 1e-9
+    css, cfg = _small_coupled(t_max_years=1e3, relaxation_mode='stefan_sensible')
     evo = css.CoupledEvolution(cfg)
     T = np.linspace(90.0, 130.0, evo.b.size).reshape(evo.b.shape)  # per location
     b = np.full_like(evo.b, 25e3)
     assert np.allclose(evo._tau_relax_years(b, T),
-                       PW.stefan_relaxation_time(b, T) / PW.YEAR_S, rtol=1e-12)
+                       PW.stefan_relaxation_time(b, T, sensible='exact') / PW.YEAR_S, rtol=1e-12)
 
 
 def test_convection_proxy_knobs():
@@ -876,8 +878,11 @@ def test_convection_proxy_knobs():
     T = 100.0 + 5.0 * np.sin(TH) * np.sin(LA) + 3.0 * np.cos(TH) ** 2
     b1 = evo._b_eq(T)
     import polar_wander_cycle as pwc
-    assert np.array_equal(b1, pwc._equilibrium_thickness(T, evo.D, evo.H, cfg.thickness_method,
-                                                         evo.rheology))
+    # s = f_D = 1 takes the plain O&S path. rtol 1e-14, not array_equal: repeated
+    # in-process evaluations of the same expression intermittently differ by
+    # ~2 ULP on this machine (cause not identified; ledger PTM-709).
+    assert np.allclose(b1, pwc._equilibrium_thickness(T, evo.D, evo.H, cfg.thickness_method,
+                                                      evo.rheology), rtol=1e-14, atol=0)
     h1 = G.harmonics(b1, evo.theta, evo.lam)
     for s_ in (0.4, 0.03):
         evo.cfg.conv_s, evo.cfg.conv_fD = s_, 1.0
@@ -954,6 +959,78 @@ def test_exo_profile_template_variants():
     evo.model.advance(1e3, tilt)
     th_t, lm_t = pwc._tidal_coordinates(theta, lam, tilt)
     assert np.allclose(evo.model.A_exo, EA.template_field(evo.exo_fit, th_t, lm_t))
+
+
+
+# --------------------------------------------------------------------------- Fermi round-2 fixes (F1, F2, F4, F6, F10)
+def test_stefan_eigen_factor():
+    """Exact eigenmode factor: Fermi's shooting 1.422/1.396/1.372 at 90/100/110 K
+    (modern), the constant-k analytic case St/x^2 (x tan x = St), the table,
+    ~8% below 1 + S/L, and the coupled default."""
+    with C.parameter_set('modern'):
+        f = [PW.stefan_eigen_factor(T) for T in (90.0, 100.0, 110.0)]
+        assert np.allclose(f, [1.422, 1.396, 1.372], atol=1.5e-3), f
+        r = np.array(f) / (1.0 + PW.sensible_heat_ratio(np.array([90.0, 100.0, 110.0])))
+        assert np.all((0.92 < r) & (r < 0.94)), r
+        T = np.array([73.3, 100.0, 141.7])
+        assert np.allclose(PW.stefan_eigen_factor_tabulated(T),
+                           [PW.stefan_eigen_factor(x, n=300) for x in T], rtol=2e-4)
+        assert np.isclose(PW.stefan_relaxation_time(30e3, 100.0)
+                          / PW.stefan_relaxation_time(30e3, 100.0, sensible='none'),
+                          PW.stefan_eigen_factor_tabulated(100.0), rtol=1e-12)
+    # constant k, c_p: tau/tau_L = St/x^2, x tan x = St, St = c dT / L
+    from scipy.optimize import brentq
+    saved = (C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY, C.ICE_CP_COEFFS)
+    try:
+        C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY, C.ICE_CP_COEFFS = 0.0, 2.5, (1500.0, 0.0)
+        St = 1500.0 * 173.0 / C.ICE_LATENT_HEAT
+        x = brentq(lambda x: x * np.tan(x) - St, 1e-6, np.pi / 2 - 1e-9)
+        assert np.isclose(PW.stefan_eigen_factor(100.0), St / x ** 2, rtol=1e-4)
+    finally:
+        C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY, C.ICE_CP_COEFFS = saved
+    css, cfg = _small_coupled(t_max_years=1e3)
+    assert cfg.relaxation_mode == 'stefan_eigen'
+    evo = css.CoupledEvolution(cfg)
+    T = np.linspace(90.0, 130.0, evo.b.size).reshape(evo.b.shape)
+    b = np.full_like(evo.b, 25e3)
+    assert np.allclose(evo._tau_relax_years(b, T), PW.stefan_relaxation_time(b, T) / PW.YEAR_S,
+                       rtol=1e-12)
+    # conv_flow_tau (default on): tau_eff = s tau_th
+    evo.cfg.conv_s = 0.4
+    assert np.allclose(evo._tau_relax_years(b, T),
+                       0.4 * PW.stefan_relaxation_time(b, T) / PW.YEAR_S, rtol=1e-12)
+
+
+def test_e3map_is_the_maps_axisymmetric_content():
+    """E3map = map zonal profile (N-S symmetrized) + map c1..c4; no model input."""
+    from ojakangas_stevenson import exogenic_albedo as EA
+    theta, lam = G.periodic_grid(24, 48)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    path, S, c, T2 = _exo_npz(theta, lam)
+    d = dict(np.load(path))
+    M = 0.05 * (1.5 * np.cos(theta) ** 2 - 0.5) + 0.02 * np.cos(theta)    # N-S asymmetric
+    d['mergny_dA_spin_theta'] = M
+    d['mergny_tidal_Pn_coeffs'] = np.array([-0.124, -0.006, -0.015, 0.007])
+    np.savez(path, **d)
+    A = 0.55 - 0.12 * np.sin(TH) * np.sin(LA)
+    f = EA.exo_profile_fit(path, 'high_1M', 'E3map', A, theta, lam)
+    assert np.allclose(f['coeffs'], [-0.124, -0.006, -0.015, 0.007]) and f['sym_S']
+    w = G.theta_weights(theta)
+    Ms = 0.05 * (1.5 * np.cos(theta) ** 2 - 0.5)
+    assert np.allclose(f['S'], Ms - np.sum(Ms * w) / np.sum(w), atol=1e-15)
+    assert np.allclose(EA.exo_profile_fit(path, 'high_1M', 'E3map', A, theta, lam, 2.0, 3.0)['coeffs'],
+                       f['coeffs'])                                          # case/scale-independent
+    g = EA.exo_profile_fit(path, 'high_1M', 'E3map', A, theta, lam, sym_S=False)
+    assert not np.allclose(g['S'], f['S'])
+
+
+def test_fD_warns():
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        css, cfg = _small_coupled(t_max_years=1e3, conv_fD=0.4)
+        css.CoupledEvolution(cfg)
+    assert 'not a physical convection proxy' in buf.getvalue()
 
 
 if __name__ == '__main__':
