@@ -244,22 +244,41 @@ class IceShellModel:
         h = self.harmonics(n_theta, n_lam)
         return h['t20'], h['t22']
 
-    def moment_differences(self, n_theta=181, n_lam=360):
-        """Table I combinations and the approximate Eqs. 5.9-5.10.
+    def moment_differences(self, n_theta=181, n_lam=360, bc_over_d=10.0, normalization='C_body'):
+        """Table I combinations and the moment differences of the shell (exact Eq. 2.18 chain).
 
-        Delta((B-A)/C) ~ 1e-7 (4 t22 / 1 km),
-        Delta((B-C)/A) ~ 1e-7 ((t20 + 2 t22) / 1 km)  [O&S thermal paper].
+        Delta(B-A) and Delta(B-C) come from the physical (bottom-loaded,
+        compensated) shell tensor, polar_wander.shell_inertia_tensor, with
+        b_c = <b> and d = b_c / bc_over_d, divided by the ``normalization`` C of
+        polar_wander.nsr_normalizations ('C_body' default, 'I_0', 'C_s').
+        Before 2026-10-06 this returned O&S Eqs. 5.9-5.10 as written,
+        1e-7 (4 t22 / 1 km) and 1e-7 ((t20 + 2 t22) / 1 km): an order-of-magnitude
+        rounding that is 12-18x low against the exact chain normalized to C_body
+        (Fermi demo spec sec. 6.2). That form is kept as '*_os_eq59'.
+        'polar_wander_unstable' is the no-fossil sign test (t20 + 2 t22 > 0).
         """
-        t20, t22 = self.spherical_harmonic_decomposition(n_theta, n_lam)
+        from . import polar_wander as PW
+        theta, lam, b = self.thickness_grid(n_theta, n_lam)
+        h = G.harmonics(b, theta, lam)
+        t20, t22 = h['t20'], h['t22']
         t20_km, t22_km = t20 / 1000.0, t22 / 1000.0
-        delta_BA_C = 1.0e-7 * (4.0 * t22_km)
-        delta_BC_A = 1.0e-7 * (t20_km + 2.0 * t22_km)
+        bc = G.area_mean(b, theta, lam)
+        p = PW.OSPWParams(shell_thickness=bc, lithosphere_thickness=bc / bc_over_d)
+        I = PW.shell_inertia_tensor(b, theta, lam, p)
+        Cn = PW.nsr_normalizations(p, bc)[normalization]
+        dBA = float(I[1, 1] - I[0, 0])
+        dBC = float(I[1, 1] - I[2, 2])
         return {
             't20': t20,
             't22': t22,
             '4t22_km': 4.0 * t22_km,
             't20_plus_2t22_km': t20_km + 2.0 * t22_km,
-            'delta_BA_C': delta_BA_C,
-            'delta_BC_A': delta_BC_A,
-            'polar_wander_unstable': delta_BC_A > 0,
+            'delta_BA': dBA,
+            'delta_BC': dBC,
+            'delta_BA_C': dBA / Cn,
+            'delta_BC_A': dBC / Cn,
+            'normalization': normalization,
+            'delta_BA_C_os_eq59': 1.0e-7 * (4.0 * t22_km),
+            'delta_BC_A_os_eq59': 1.0e-7 * (t20_km + 2.0 * t22_km),
+            'polar_wander_unstable': t20_km + 2.0 * t22_km > 0,
         }

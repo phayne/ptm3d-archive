@@ -476,6 +476,42 @@ def _unit(v):
     return v / np.linalg.norm(v)
 
 
+def tidal_frame_B_minus_A(I, spin, sub_jovian):
+    """B - A = I_trail - I_subJ [kg m^2] of a tensor in the current tidal frame.
+
+    The NSR twin of ``tidal_frame_t20_2t22``: e = sub-Jovian (projected), trail
+    = spin x e. For the Eq. 2.18 shell tensor, B - A = 4 M a^2 C22 with C22 from
+    ``shell_c2m``, so Delta(B-A)/Delta(B-C) = 4 t22/(t20 + 2 t22) exactly.
+    """
+    s = np.asarray(spin, dtype=float)
+    e = projected_meridian(s, sub_jovian)
+    tr = np.cross(s, e)
+    return float(tr @ I @ tr - e @ I @ e)
+
+
+def nsr_normalizations(p, mean_b=None):
+    """The three C used to normalize (B - A)/C [kg m^2] (Fermi demo spec sec. 6.2).
+
+    'C_body' = C_MA2_EUROPA M a^2 (whole body, lockstep / strong coupling);
+    'I_0' = OSPW Eq. 5.29 (shell + ~100 km of ocean, O&S thermal p. 233);
+    'C_s' = (8 pi/3) rho_c b a^4 (1 - 2b/a + (4/3)(b/a)^2) (shell alone, weak coupling).
+    """
+    b = p.shell_thickness if mean_b is None else mean_b
+    x = b / p.radius
+    return {'C_body': C.C_MA2_EUROPA * p.mass * p.radius**2,
+            'I_0': moment_I0(p),
+            'C_s': 8.0 * np.pi / 3.0 * p.ice_density * b * p.radius**4 * (1.0 - 2.0 * x + 4.0 / 3.0 * x * x)}
+
+
+def kappa_star_gp(e=None):
+    """B&H 2023 Eq. 7 (MacDonald torque) capture threshold: kappa* = (2/3)[9.5 pi e^2/(2 sqrt 2)]^2.
+
+    5.80e-7 at e = 0.0094; 4.64e-4 at e = 0.05 (B&H 2023 ms p. 21).
+    """
+    e = C.ECCENTRICITY if e is None else e
+    return 2.0 / 3.0 * (9.5 * np.pi * e * e / (2.0 * np.sqrt(2.0))) ** 2
+
+
 def tidal_frame_t20_2t22(I_shell, spin, sub_jovian, p, cw=None):
     """Thickness-equivalent t20 + 2 t22 [m] of a shell tensor in the tidal frame.
 

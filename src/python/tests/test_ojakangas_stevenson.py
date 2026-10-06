@@ -1081,6 +1081,63 @@ def test_e4_dose_term():
         raise AssertionError('E4 without a dose file accepted')
 
 
+
+# --------------------------------------------------------------------------- simple demo + NSR (2026-10-06)
+def test_moment_differences_exact_chain():
+    """moment_differences uses the Eq. 2.18 shell tensor; the O&S Eq. 5.9 rounding
+    1e-7 (4 t22 / km) is 12-18x low against it in the whole-body normalization."""
+    with C.parameter_set('modern'):
+        rh, H = table1_case('maxwell_h0')
+        m = IceShellModel(rh, H_flux=H)
+        r = m.moment_differences(91, 180)
+        theta, lam, b = m.thickness_grid(91, 180)
+        bc = G.area_mean(b, theta, lam)
+        p = PW.OSPWParams(shell_thickness=bc, lithosphere_thickness=bc / 10.0)
+        I = PW.shell_inertia_tensor(b, theta, lam, p)
+        Cb = C.C_MA2_EUROPA * p.mass * p.radius ** 2
+        assert np.isclose(r['delta_BA_C'], (I[1, 1] - I[0, 0]) / Cb, rtol=1e-12)
+        ratio = r['delta_BA_C'] / r['delta_BA_C_os_eq59']
+        assert 12.0 < ratio < 19.0, ratio
+        # B - A = 4 M a^2 C22, B - C = M a^2 (C20 + 2 C22): the ratio is 4 t22/(t20 + 2 t22)
+        assert np.isclose(r['delta_BA'] / r['delta_BC'], r['4t22_km'] / r['t20_plus_2t22_km'], rtol=1e-6)
+        assert np.isclose(PW.tidal_frame_B_minus_A(I, np.array([0, 0, 1.0]), np.array([1.0, 0, 0])),
+                          r['delta_BA'], rtol=1e-12)
+        Cs = PW.nsr_normalizations(p, bc)
+        assert Cs['C_body'] > Cs['I_0'] > Cs['C_s']
+
+
+def test_kappa_star_gp():
+    """B&H 2023 Eq. 7: 5.80e-7 at e = 0.0094; 4.64e-4 at e = 0.05 (their ms p. 21)."""
+    assert np.isclose(PW.kappa_star_gp(0.0094), 5.80e-7, rtol=2e-3)
+    assert np.isclose(PW.kappa_star_gp(0.05), 4.64e-4, rtol=2e-3)
+
+
+def test_demo_forcing():
+    """Demo forcing: every term zero-mean; Bhat has unit band contrast; the cos(gamma)
+    and Y22 terms are the code's b11s and b22c bases; it follows the tidal frame."""
+    from ojakangas_stevenson import exogenic_albedo as EA
+    import polar_wander_cycle as pwc
+    theta, lam = G.periodic_grid(91, 180)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    for shape, kw in (('cos2', {}), ('cos2', {'delta': 0.0}), ('gauss', {}), ('p2', {})):
+        f = EA.demo_fit(theta, lam, a_b=-0.03, shape=shape, **kw)
+        A = EA.template_field(f, TH, LA)
+        assert abs(G.area_mean(A, theta, lam)) < 1e-14
+        assert np.isclose(EA.band_contrast(A, theta, lam), -0.03, rtol=1e-12), shape
+        assert np.allclose(A, A[::-1], atol=1e-15) and np.allclose(A, A[:, :1], atol=1e-15)
+    f = EA.demo_fit(theta, lam, a1=-0.12, a22=0.006)
+    h = G.harmonics(EA.template_field(f, TH, LA), theta, lam)
+    assert np.isclose(h['b11s'], -0.12, rtol=1e-9) and np.isclose(h['b22c'], 0.006, rtol=1e-9)
+    assert abs(h['b20']) < 1e-12
+    fb = EA.demo_fit(theta, lam, a_b=1.0)
+    hb = G.harmonics(EA.template_field(fb, TH, LA), theta, lam)
+    assert -1.62 < hb['b20'] < -1.52, hb['b20']          # spec: b20 per unit beta = -1.567
+    tilt = np.array([0.0, np.sin(0.3), np.cos(0.3)])
+    th_t, lm_t = pwc._tidal_coordinates(theta, lam, tilt)
+    A_t = EA.template_field(f, th_t, lm_t)
+    assert np.isclose(np.max(np.abs(A_t)), np.max(np.abs(EA.template_field(f, TH, LA))), rtol=0.02)
+
+
 if __name__ == '__main__':
     failures = 0
     for name, fn in sorted(globals().items()):

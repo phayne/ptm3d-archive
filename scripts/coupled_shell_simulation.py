@@ -150,6 +150,8 @@ class CoupledConfig(PolarWanderConfig):
     exo_dose_file: str = None
     exo_dose_scenario: str = 'EN_1mm'
     exo_dose_kappa: float = None
+    # exo_template='demo': simple demonstration forcing (exogenic_albedo.demo_fit)
+    exo_demo: dict = None              # {'a1':, 'a_b':, 'a22':, 'shape':, 'phi_b':, 'delta':}
     albedo_clamp: tuple = (0.3814, 0.80)  # Hapke non-ice endmember .. ice; None = off
     ptm3d_resolution: int = 5
     ptm3d_refresh_pole_deg: float = 10.0
@@ -370,6 +372,10 @@ class CoupledEvolution(ShellEvolution):
                         raise ValueError("exo_variant='E4' needs exo_dose_file and exo_dose_kappa")
                     self.exo_fit = EA.add_dose(self.exo_fit, cfg.exo_dose_file,
                                                cfg.exo_dose_scenario, cfg.exo_dose_kappa)
+            elif cfg.exo_template == 'demo':
+                if cfg.split_component != 'exogenic':
+                    raise ValueError("exo_template='demo' is defined for split_component='exogenic'")
+                self.exo_fit = EA.demo_fit(self.theta, self.lam, **(cfg.exo_demo or {}))
             else:
                 self.exo_fit = EA.fit_template(A_meas, self.theta, self.lam, cfg.exo_template)
             _, A_intr = EA.split_map(A_meas, self.theta, self.lam, self.exo_fit)

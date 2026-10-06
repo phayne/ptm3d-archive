@@ -197,8 +197,61 @@ def _periodic_interp(th, lm, F, theta_t, lam_t):
     return rgi(np.stack([tt.ravel(), ll.ravel()], -1)).reshape(tt.shape)
 
 
+def band_shape(lat_deg, shape='cos2', phi_b=25.0, delta=10.0):
+    """Unnormalized latitude band B(phi) (1 inside, 0 outside), N-S symmetric.
+
+    'cos2' (Fermi's demo spec, sec. 2): 1 for |phi| <= phi_b - delta/2, a cos^2
+    taper over delta, 0 beyond phi_b + delta/2 (phi_b = half-width at half
+    maximum). 'gauss': exp(-ln2 (phi/phi_b)^2) (HWHM phi_b). 'p2': -P2(sin phi).
+    """
+    a = np.abs(np.asarray(lat_deg, dtype=float))
+    if shape == 'cos2':
+        if delta <= 0:
+            return (a <= phi_b).astype(float)
+        x = np.clip((a - phi_b + 0.5 * delta) / delta, 0.0, 1.0)
+        return np.cos(0.5 * np.pi * x) ** 2
+    if shape == 'gauss':
+        return np.exp(-np.log(2.0) * (a / phi_b) ** 2)
+    if shape == 'p2':
+        return -_p2(np.sin(np.radians(a)))
+    raise ValueError(f"band shape must be cos2, gauss or p2: {shape!r}")
+
+
+def band_contrast(F, theta, lam, band_deg=25.0):
+    """beta(F) = <F>_{|lat| < band_deg} - <F>_global (area-weighted; the map's band statistic)."""
+    w = G.area_weights(theta, lam)
+    lat = np.degrees(0.5 * np.pi - np.asarray(theta, dtype=float))
+    m = np.broadcast_to((np.abs(lat) < band_deg)[:, None], np.shape(F))
+    return float(np.sum(F * w * m) / np.sum(w * m) - np.sum(F * w) / np.sum(w))
+
+
+def demo_fit(theta, lam, a1=0.0, a_b=0.0, a22=0.0, shape='cos2', phi_b=25.0, delta=10.0):
+    """Fit dict of the simple demonstration forcing (Fermi's spec, sec. 1.1-2).
+
+    A_exo = a1 cos(gamma) + a_b Bhat(lat_t) + a22 Y22(theta_t, lam_t), all in TIDAL
+    coordinates: cos(gamma) = sin(theta_t) sin(lam_t) (a1 < 0 darkens the trailing
+    hemisphere); Bhat = (B - <B>)/beta(B - <B>), so a_b is the band contrast beta
+    (a_b < 0: dark low-latitude band); Y22 = 3 sin^2(theta_t) cos(2 lam_t) (the
+    unnormalized b22c basis). Every term has zero area mean. The normalization
+    of Bhat is computed on the run grid (theta, lam).
+    """
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    B = band_shape(np.degrees(0.5 * np.pi - TH), shape, phi_b, delta)
+    B0 = B - G.area_mean(B, theta, lam)
+    norm = band_contrast(B0, theta, lam)
+    return {'form': 'demo', 'a1': float(a1), 'a_b': float(a_b), 'a22': float(a22), 'shape': shape,
+            'phi_b': float(phi_b), 'delta': float(delta), 'B_mean': float(G.area_mean(B, theta, lam)),
+            'B_norm': float(norm), 'coeffs': [float(a1)], 'const': 0.0, 'names': ['demo']}
+
+
 def template_field(fit, theta_t, lam_t):
     """A_exo^eq at tidal coordinates (zero area mean; no constant)."""
+    if fit['form'] == 'demo':
+        th = np.asarray(theta_t, dtype=float)
+        lat = np.degrees(0.5 * np.pi - th)
+        B = (band_shape(lat, fit['shape'], fit['phi_b'], fit['delta']) - fit['B_mean']) / fit['B_norm']
+        return (fit['a1'] * np.sin(th) * np.sin(lam_t) + fit['a_b'] * B
+                + fit['a22'] * 3.0 * np.sin(th) ** 2 * np.cos(2.0 * np.asarray(lam_t)))
     if fit['form'] == 'exo_profiles':
         th = np.asarray(theta_t, dtype=float)
         cos_g = np.sin(th) * np.sin(lam_t)

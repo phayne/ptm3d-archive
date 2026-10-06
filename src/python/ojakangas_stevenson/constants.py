@@ -157,6 +157,9 @@ def ice_heat_capacity(T):
     """cp(T) = 90 + 7.49 T [J/(kg K)] (heat1d planets.py Europa cpCoeff)."""
     return ICE_CP_COEFFS[0] + ICE_CP_COEFFS[1] * np.asarray(T, dtype=float)
 WATER_DENSITY = 1000.0      # Density of liquid water [kg/m^3]
+# Europa's normalized polar moment C/(M a^2) = 0.346 (Anderson et al. 1998,
+# Science 281, 2019). Used only to normalize (B - A)/C for the NSR diagnostic.
+C_MA2_EUROPA = 0.346
 # Latent heat of fusion of ice Ih at 273 K [J/kg] (333.55 kJ/kg, e.g.
 # Petrenko & Whitworth 1999). Used by the Stefan-limited shell relaxation.
 ICE_LATENT_HEAT = 3.3355e5
