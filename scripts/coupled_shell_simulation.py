@@ -28,8 +28,13 @@ Physics choices (project decisions of 2026-10-04, after the 2026-10-03 review):
     bottom-loaded) inertia tensor plus an optional body-fixed hydrostatic
     fossil (Eqs. 3.8-3.10). The pole is seeded with a physical offset psi0
     (--psi0) when it becomes unstable, not left to float round-off.
-  * Relaxation: tau_diff = b^2/kappa per location -- see _tau_diff_years for
-    what that approximation leaves out.
+  * Relaxation (2026-10-05): Stefan-limited, tau = rho L b / q per location
+    (relaxation_mode='stefan', default; ojakangas_stevenson.polar_wander.
+    stefan_relaxation_time). 'diffusive' keeps the earlier b^2/kappa
+    (_tau_diff_years), which is 4-5x too fast.
+  * Split albedo (albedo_mode='split', 2026-10-05): A = A_intr(body) +
+    A_exo(tidal frame, relaxing on tau_exo_yr); template and anchoring in
+    ojakangas_stevenson.exogenic_albedo.
 
 Run (needs scipy/matplotlib -- use europa_py39; europa_viz for the animation):
     PY=/Users/paha3326/anaconda3/envs/europa_py39/bin/python
@@ -61,6 +66,8 @@ from polar_wander_cycle import (
     _tidal_coordinates, _area_mean, _ospw_params, _fossil_state,
 )
 from ojakangas_stevenson import polar_wander as PW
+from ojakangas_stevenson import exogenic_albedo as EA
+from ojakangas_stevenson import grid as G
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -84,8 +91,22 @@ class CoupledConfig(PolarWanderConfig):
     tau_dark: float = 1e4               # free; tested 1e4-1e7 yr
     # --- initial condition ---
     use_fossil_bulge: bool = False      # True: body-fixed hydrostatic fossil (Eqs. 3.8-3.10)
-    init_b_mode: str = 'equilibrium_mean'  # 'equilibrium_mean', 'equilibrium' or 'constant'
+    # 'equilibrium_mean', 'equilibrium' (for the t = 0 albedo), 'constant',
+    # 'uniform_equilibrium' (for the uniform albedo A_unif of forcing_file,
+    # i.e. the forcing is switched on at t = 0), or 'blend' =
+    # (1 - init_blend_frac) * uniform_equilibrium + init_blend_frac * equilibrium.
+    init_b_mode: str = 'equilibrium_mean'
     init_b_const_m: float = 20e3
+    init_blend_frac: float = 0.5
+    # Random-phase degree-2 thickness perturbation added to the initial
+    # shell: RMS drawn uniformly in init_l2_perturb_km (lo, hi), direction in
+    # the 5-D real Y2m space from init_perturb_seed. (0, 0) = none.
+    init_l2_perturb_km: tuple = (0.0, 0.0)
+    init_perturb_seed: int = 0
+    # Pole displaced at t = 0 (after the shell is built for pole = body z) by
+    # this angle, toward azimuth init_pole_azimuth_deg (from body x toward y).
+    init_pole_offset_deg: float = 0.0
+    init_pole_azimuth_deg: float = 0.0
     # --- reorientation ---
     tpw_model: str = 'ospw'
     # --- per-location thermal diffusion ---
@@ -93,6 +114,15 @@ class CoupledConfig(PolarWanderConfig):
     cp_const: float = 2000.0            # used only with cp_mode='constant'
     tau_diff_floor_yr: float = 1e3
     tau_diff_cap_yr: float = 5e7
+    # 'stefan_eigen' (default, Fermi F6): tau = f rho L b / q, f = exact slowest
+    # eigenmode of the conductive Stefan shell (~1.40 at 100 K), per location;
+    # 'stefan_sensible': f = 1 + S/L (exact S/L; an UPPER estimate, ~8% slow, 42318df);
+    # 'stefan': f = 1 (latent only, 679af84); 'diffusive': b^2/kappa (pre-2026-10-05).
+    relaxation_mode: str = 'stefan_eigen'
+    # Multiplies the relaxation time before the floor/cap clip (sensitivity tests,
+    # e.g. 2.0 for "2 tau"; 1.0 = unchanged). Frozen relaxation: set
+    # tau_diff_floor_yr = tau_diff_cap_yr = 1e12 (the clip then binds and warns).
+    relaxation_scale: float = 1.0
     # --- PTM3D surrogate / multi-rate ---
     use_ptm3d_surrogate: bool = True
     use_live_ptm3d: bool = False        # Phase 2: periodic full-PTM3D refresh
@@ -103,9 +133,30 @@ class CoupledConfig(PolarWanderConfig):
     # 'darkening': spin-frame apex darkening (A_bright -> A_dark);
     # 'static_map': body-fixed albedo field from forcing_file ('measured' or
     # 'uniform'), constant in time, carried with the shell as the pole moves.
+    # 'split': A = A_intr(body) + A_exo(tidal frame), see split_* below.
     albedo_mode: str = 'darkening'
     static_field: str = 'measured'
     use_residual: bool = True           # add the body-fixed residual R (static_map)
+    # --- split albedo (albedo_mode='split') ---
+    # 'full' (A_intr + A_exo), 'exogenic' (A_intr = uniform A_unif),
+    # 'intrinsic' (A_exo = 0; the control).
+    split_component: str = 'full'
+    tau_exo_yr: float = 1e6             # 0 = instantaneous tidal frame; inf = body-fixed
+    exo_template: str = 'bh2021'        # see exogenic_albedo.TEMPLATE_FORMS, or 'exo_file'
+    # exo_template='exo_file': exosphere-derived template (exogenic_albedo.exo_profile_fit)
+    exo_forcing_file: str = None
+    exo_case: str = 'high_1M'
+    exo_variant: str = 'E2'
+    exo_scale_zonal: float = 1.0
+    exo_scale_odd: float = 1.0
+    exo_sym_S: bool = None             # None: symmetrize S for E3map only
+    # exo_variant='E4': E1 + kappa x dose-darkening field (exogenic_albedo.add_dose)
+    exo_dose_file: str = None
+    exo_dose_scenario: str = 'EN_1mm'
+    exo_dose_kappa: float = None
+    # exo_template='demo': simple demonstration forcing (exogenic_albedo.demo_fit)
+    exo_demo: dict = None              # {'a1':, 'a_b':, 'a22':, 'shape':, 'phi_b':, 'delta':}
+    albedo_clamp: tuple = (0.3814, 0.80)  # Hapke non-ice endmember .. ice; None = off
     ptm3d_resolution: int = 5
     ptm3d_refresh_pole_deg: float = 10.0
     ptm3d_refresh_albedo_rms: float = 0.03
@@ -124,7 +175,7 @@ class CoupledConfig(PolarWanderConfig):
 # ---------------------------------------------------------------------------
 # Cosine-apex darkening
 # ---------------------------------------------------------------------------
-def _darkening_weight_cosine_apex(theta, lam, spin_pole, power=1.0):
+def _darkening_weight_cosine_apex(theta, lam, spin_pole, power=1.0, sub_jovian=None):
     """Apex-centered darkening weight: w = max(0, cos gamma)^power, where gamma
     is the angular distance from the trailing-hemisphere apex.
 
@@ -132,22 +183,26 @@ def _darkening_weight_cosine_apex(theta, lam, spin_pole, power=1.0):
     vector (0,1,0); for a general point (theta_t, lam_t) the cosine of the
     angular distance is cos(gamma) = sin(theta_t) * sin(lam_t).
     """
-    theta_t, lam_t = _tidal_coordinates(theta, lam, spin_pole)
+    theta_t, lam_t = _tidal_coordinates(theta, lam, spin_pole, sub_jovian)
     cos_gamma = np.sin(theta_t) * np.sin(lam_t)
     return np.maximum(0.0, cos_gamma) ** power
 
 
 class CosineApexAlbedoModel(AlbedoDarkeningModel):
     """Darkening with an apex-centered cosine spot (or the parent sin form)."""
+    meridian = None                     # sub-Jovian vector (None = projection)
 
     def albedo_field(self, f_dark, spin_pole=None):
         cfg = self.cfg
         if getattr(cfg, 'darkening_mode', 'cosine') == 'sin':
+            if self.meridian is not None:
+                raise ValueError("darkening_mode='sin' ignores the meridian; "
+                                 "use meridian_mode='projection'")
             return super().albedo_field(f_dark, spin_pole)
         if spin_pole is None:
             spin_pole = np.array([0.0, 0.0, 1.0])
         w = _darkening_weight_cosine_apex(
-            self.theta, self.lam, spin_pole, cfg.darkening_power)
+            self.theta, self.lam, spin_pole, cfg.darkening_power, self.meridian)
         return cfg.A_bright + (cfg.A_dark - cfg.A_bright) * f_dark * w
 
 
@@ -200,6 +255,68 @@ class StaticAlbedoModel(AlbedoDarkeningModel):
         return self.A_grid
 
 
+class SplitAlbedoModel(AlbedoDarkeningModel):
+    """A = clamp(A_intr(body) + A_exo), A_exo relaxing to a tidal-frame template.
+
+    dA_exo/dt = [A_exo^eq(tidal coordinates) - A_exo] / tau_exo, integrated
+    exactly per step for the pole and meridian at the start of the step.
+    tau_exo = 0: A_exo = A_exo^eq every step; tau_exo = inf: A_exo frozen in
+    the body at its t = 0 value. fit = None: no exogenic part.
+    """
+    meridian = None
+
+    def __init__(self, cfg, A_intr, fit):
+        super().__init__(cfg)
+        self.A_intr = np.broadcast_to(np.asarray(A_intr, dtype=float),
+                                      (len(self.theta), len(self.lam))).copy()
+        self.fit = fit
+        self.A_exo = self.equilibrium_exo(np.array([0.0, 0.0, 1.0]))
+        self.clamped_fraction = 0.0
+
+    def equilibrium_exo(self, spin_pole):
+        if self.fit is None:
+            return np.zeros_like(self.A_intr)
+        th_t, lm_t = _tidal_coordinates(self.theta, self.lam, spin_pole, self.meridian)
+        return EA.template_field(self.fit, th_t, lm_t)
+
+    def advance(self, dt, spin_pole):
+        tau = self.cfg.tau_exo_yr
+        if self.fit is None or np.isinf(tau):
+            return
+        eq = self.equilibrium_exo(spin_pole)
+        if tau <= 0:
+            self.A_exo = eq
+        else:
+            self.A_exo = eq + (self.A_exo - eq) * np.exp(-dt / tau)
+
+    def albedo_field(self, f_dark, spin_pole=None):
+        A = self.A_intr + self.A_exo
+        clamp = self.cfg.albedo_clamp
+        if clamp is None:
+            return A
+        out = np.clip(A, clamp[0], clamp[1])
+        self.clamped_fraction = float(np.mean(out != A))
+        return out
+
+
+def _random_l2_field(theta, lam, seed, rms_range):
+    """Random-phase degree-2 field with RMS uniform in rms_range [m].
+
+    Real Y2m basis normalized to unit RMS on the sphere:
+    sqrt(5) P2(z), sqrt(15) xz, sqrt(15) yz, sqrt(15) xy, sqrt(15)(x^2-y^2)/2.
+    Returns (field, rms, unit coefficient vector).
+    """
+    rng = np.random.default_rng(seed)
+    u = rng.normal(size=5)
+    u /= np.linalg.norm(u)
+    rms = rng.uniform(*rms_range)
+    TH, LA = np.meshgrid(theta, lam, indexing='ij')
+    x, y, z = np.sin(TH) * np.cos(LA), np.sin(TH) * np.sin(LA), np.cos(TH)
+    f = [np.sqrt(5.0) * (1.5 * z * z - 0.5), np.sqrt(15.0) * x * z, np.sqrt(15.0) * y * z,
+         np.sqrt(15.0) * x * y, np.sqrt(15.0) * 0.5 * (x * x - y * y)]
+    return rms * sum(c * fi for c, fi in zip(u, f)), rms, u
+
+
 def load_forcing(cfg, theta, lam):
     """Read cfg.forcing_file and check it was built on this run's grid."""
     d = np.load(cfg.forcing_file)
@@ -215,13 +332,19 @@ class CoupledEvolution(ShellEvolution):
     relaxation, cosine-apex darkening, and a uniform / no-fossil initial state.
     """
 
+    _supports_meridian = True
+
     def __init__(self, cfg):
         # Parent sets up grid, D (spin pole = z), OSPW, history, and records.
         super().__init__(cfg)
         self._pole0 = self.spin_pole.copy()
         self._R = None
         self._dT_interp = None
+        self._warned_tau_clip = False
+        self.exo_fit = None
+        self.init_perturbation = None
         forcing = load_forcing(cfg, self.theta, self.lam) if cfg.forcing_file else None
+        self._A_unif = float(forcing['A_unif']) if forcing is not None else cfg.A_bright
         if cfg.albedo_mode == 'static_map':
             if forcing is None:
                 raise ValueError("albedo_mode='static_map' needs forcing_file")
@@ -237,8 +360,45 @@ class CoupledEvolution(ShellEvolution):
         elif cfg.albedo_mode == 'darkening':
             # Swap in the cosine-apex darkening model.
             self.model = CosineApexAlbedoModel(cfg)
+        elif cfg.albedo_mode == 'split':
+            if forcing is None:
+                raise ValueError("albedo_mode='split' needs forcing_file")
+            A_meas = np.asarray(forcing['A_meas'], dtype=float)
+            if cfg.exo_template == 'exo_file':
+                if not cfg.exo_forcing_file:
+                    raise ValueError("exo_template='exo_file' needs exo_forcing_file")
+                self.exo_fit = EA.exo_profile_fit(
+                    cfg.exo_forcing_file, cfg.exo_case, cfg.exo_variant, A_meas,
+                    self.theta, self.lam, cfg.exo_scale_zonal, cfg.exo_scale_odd,
+                    cfg.exo_sym_S)
+                if cfg.exo_variant == 'E4':
+                    if not cfg.exo_dose_file or cfg.exo_dose_kappa is None:
+                        raise ValueError("exo_variant='E4' needs exo_dose_file and exo_dose_kappa")
+                    self.exo_fit = EA.add_dose(self.exo_fit, cfg.exo_dose_file,
+                                               cfg.exo_dose_scenario, cfg.exo_dose_kappa)
+            elif cfg.exo_template == 'demo':
+                if cfg.split_component != 'exogenic':
+                    raise ValueError("exo_template='demo' is defined for split_component='exogenic'")
+                self.exo_fit = EA.demo_fit(self.theta, self.lam, **(cfg.exo_demo or {}))
+            else:
+                self.exo_fit = EA.fit_template(A_meas, self.theta, self.lam, cfg.exo_template)
+            _, A_intr = EA.split_map(A_meas, self.theta, self.lam, self.exo_fit)
+            comp = cfg.split_component
+            if comp == 'full':
+                self.model = SplitAlbedoModel(cfg, A_intr, self.exo_fit)
+            elif comp == 'exogenic':
+                self.model = SplitAlbedoModel(cfg, self._A_unif, self.exo_fit)
+            elif comp == 'intrinsic':
+                self.model = SplitAlbedoModel(cfg, A_intr, None)
+            else:
+                raise ValueError(f'split_component must be full, exogenic or intrinsic: {comp!r}')
+            # Residual: the uniform-field R only. The measured-map residual
+            # R_meas is an albedo response tied to the whole map and cannot be
+            # assigned to the body or the tidal frame, so it is dropped here.
+            self._R = np.array(forcing['R_unif']) if cfg.use_residual else None
         else:
-            raise ValueError(f'albedo_mode must be darkening or static_map: {cfg.albedo_mode!r}')
+            raise ValueError(f'albedo_mode must be darkening, static_map or split: '
+                             f'{cfg.albedo_mode!r}')
 
         # Build the temperature surrogate (dT_PTM interpolator).
         if forcing is not None:
@@ -269,8 +429,34 @@ class CoupledEvolution(ShellEvolution):
             # the thermal-equilibrium shell for the initial pole
             self.b = b_eq0.copy()
             b0 = _area_mean(b_eq0, self.theta, self.lam)
+        elif cfg.init_b_mode in ('uniform_equilibrium', 'blend'):
+            # equilibrium for the uniform albedo (forcing switched on at t=0),
+            # or a partial relaxation toward the forced equilibrium. b_c is
+            # the forced-equilibrium mean for every initial condition, so the
+            # OSPW parameters do not change with the initial condition.
+            # T for the uniform albedo takes the uniform-field residual: with
+            # static_map 'measured', self._R is R_meas, which belongs to the map.
+            A_u = np.full_like(A0, self._A_unif)
+            R_run = self._R
+            if forcing is not None:
+                self._R = np.array(forcing['R_unif']) if cfg.use_residual else None
+            try:
+                b_u = self._b_eq(self.surface_temperature_coupled(A_u, self.spin_pole))
+            finally:
+                self._R = R_run
+            f = 0.0 if cfg.init_b_mode == 'uniform_equilibrium' else cfg.init_blend_frac
+            self.b = (1.0 - f) * b_u + f * b_eq0
+            b0 = _area_mean(b_eq0, self.theta, self.lam)
         else:
             raise ValueError(f'unknown init_b_mode {cfg.init_b_mode!r}')
+        if cfg.init_l2_perturb_km and cfg.init_l2_perturb_km[1] > 0:
+            dbp, rms, u = _random_l2_field(self.theta, self.lam, cfg.init_perturb_seed,
+                                           tuple(1e3 * x for x in cfg.init_l2_perturb_km))
+            self.b = self.b + dbp
+            h = G.harmonics(dbp, self.theta, self.lam)
+            self.init_perturbation = {'seed': cfg.init_perturb_seed, 'rms_km': rms / 1e3,
+                                      'u': [float(x) for x in u],
+                                      't20_2t22_km': h['t20_2t22'] / 1e3}
         self._b0_uniform = b0
         # OSPW parameters for the uniform start (b_c = b0 unless fixed).
         self._ospw_p = _ospw_params(cfg, b0)
@@ -278,7 +464,12 @@ class CoupledEvolution(ShellEvolution):
         self._ospw_Cf = PW.dissipation_cf(self._ospw_p)
         self._ospw_I0 = PW.moment_I0(self._ospw_p)
         self._seed_armed = True
+        self._last_seed_pole = None
         self.seed_events = []
+        if cfg.init_pole_offset_deg:
+            d, az = np.radians(cfg.init_pole_offset_deg), np.radians(cfg.init_pole_azimuth_deg)
+            self.spin_pole = np.array([np.sin(d) * np.cos(az), np.sin(d) * np.sin(az), np.cos(d)])
+            self._pole0 = self.spin_pole.copy()
 
         # PTM3D refresh bookkeeping (Phase 2).
         self._ptm3d_calls = 0
@@ -301,7 +492,8 @@ class CoupledEvolution(ShellEvolution):
             T_solar = T_solar + self._R          # body-fixed residual (static_map)
         if self._dT_interp is None:
             return T_solar
-        theta_t, lam_t = _tidal_coordinates(self.theta, self.lam, spin_pole)
+        theta_t, lam_t = _tidal_coordinates(self.theta, self.lam, spin_pole,
+                                            self._meridian_arg())
         pts = np.stack([theta_t.ravel(), lam_t.ravel()], axis=-1)
         dT = self._dT_interp(pts).reshape(theta_t.shape)
         return T_solar + dT
@@ -339,19 +531,59 @@ class CoupledEvolution(ShellEvolution):
         tau_yr = tau_s / (365.25 * 86400.0)
         return np.clip(tau_yr, cfg.tau_diff_floor_yr, cfg.tau_diff_cap_yr)
 
+    def _tau_relax_years(self, b, T_s):
+        """Local shell relaxation time [yr] for cfg.relaxation_mode.
+
+        'stefan_eigen': f rho L b / q with f the exact eigenmode factor for the
+        local T_s (ojakangas_stevenson.polar_wander.stefan_relaxation_time;
+        ~19 Myr for 30 km). 'stefan_sensible': f = 1 + S/L (upper estimate,
+        ~20 Myr). 'stefan': rho L b / q (latent only, ~13 Myr).
+        'diffusive': _tau_diff_years (b^2/kappa). All are clipped to
+        [tau_diff_floor_yr, tau_diff_cap_yr]; in the Stefan modes a clip that
+        binds is reported once. cfg.conv_flow_tau multiplies the result by
+        conv_s (option; see PolarWanderConfig).
+        """
+        cfg = self.cfg
+        if cfg.relaxation_mode == 'diffusive':
+            return self._tau_diff_years(b, T_s)
+        sens = {'stefan_eigen': 'eigen', 'stefan_sensible': 'exact', 'stefan': 'none'}.get(
+            cfg.relaxation_mode)
+        if sens is None:
+            raise ValueError(f"relaxation_mode must be 'stefan_eigen', 'stefan_sensible', "
+                             f"'stefan' or 'diffusive', got {cfg.relaxation_mode!r}")
+        tau = PW.stefan_relaxation_time(b, T_s, sensible=sens) / (365.25 * 86400.0)
+        if cfg.conv_flow_tau:
+            tau = tau * cfg.conv_s
+        if cfg.relaxation_scale != 1.0:
+            if not cfg.relaxation_scale > 0:
+                raise ValueError(f'relaxation_scale must be > 0: {cfg.relaxation_scale}')
+            tau = tau * cfg.relaxation_scale
+        out = np.clip(tau, cfg.tau_diff_floor_yr, cfg.tau_diff_cap_yr)
+        if not self._warned_tau_clip and not np.array_equal(out, tau):
+            self._warned_tau_clip = True
+            print(f'  WARNING: Stefan relaxation time clipped to '
+                  f'[{cfg.tau_diff_floor_yr:.0e}, {cfg.tau_diff_cap_yr:.0e}] yr on '
+                  f'{np.mean(out != tau):.1%} of the grid (range {tau.min():.2e}-'
+                  f'{tau.max():.2e} yr) at t={self.t/1e6:.2f} Myr')
+        return out
+
     # -- one coupled step (mirror of ShellEvolution.step) -----------------
     def step(self, dt):
         cfg = self.cfg
+        self.model.meridian = self._meridian_arg()
         self._update_dissipation()
-        # 1. Exponential darkening
+        # 1. Exponential darkening; split albedo: A_exo relaxes toward the
+        #    tidal-frame template for the current pole and meridian
         self.f_dark = 1.0 - (1.0 - self.f_dark) * np.exp(-dt / cfg.tau_dark)
+        if isinstance(self.model, SplitAlbedoModel):
+            self.model.advance(dt, self.spin_pole)
         # 2-3. Temperature (surrogate) and O&S equilibrium thickness
         A = self.model.albedo_field(self.f_dark, spin_pole=self.spin_pole)
         T_s = self.surface_temperature_coupled(A, self.spin_pole)
         b_eq = self._b_eq(T_s)
-        # 4. Relax shell toward equilibrium at the LOCAL diffusion timescale
-        tau_diff = self._tau_diff_years(self.b, T_s)
-        self.b = b_eq + (self.b - b_eq) * np.exp(-dt / tau_diff)
+        # 4. Relax shell toward equilibrium at the LOCAL relaxation timescale
+        tau_relax = self._tau_relax_years(self.b, T_s)
+        self.b = b_eq + (self.b - b_eq) * np.exp(-dt / tau_relax)
         # 5-6. Physical inertia tensor (Eq. 2.18 shell + body-fixed fossil)
         #      and OSPW reorientation (Eq. 5.39, with the psi0 seed).
         self._reorient(dt, self.total_inertia_tensor())

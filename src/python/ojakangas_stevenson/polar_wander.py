@@ -17,6 +17,12 @@ Contents
 * Eq. 5.29  I_0, Eq. 5.15 C_f, Eq. 5.32 (t/tau)_equil, Eq. 5.34 epsilon,
             Eq. 5.41 tau_f, Eq. 4.22 undamped time scale
 * Eq. 5.39  overdamped reorientation (``overdamped_step``)
+* Eqs. 5.19-5.21 / 5.26 / 5.38  the same with the tidal torque from Jupiter
+            (``overdamped_step_tidal``; stiffness 4 n^2 eps toward Jupiter),
+            and the quasi-static sub-Jovian meridian (``meridian_min_moment``)
+* Stefan-limited shell relaxation time f rho L b / q, f = exact eigenmode
+            factor or 1 + S/L (``stefan_relaxation_time``, ``stefan_eigen_factor``,
+            ``sensible_heat_ratio``)
 
 Conventions: body frame x toward Jupiter (sub-Jovian point), z along the
 spin axis at the epoch the fossil froze. C20, C22 are unnormalized
@@ -357,3 +363,310 @@ def overdamped_step(spin, I_dev, cf, dt_s):
         'unstable': bool(a != len(vals) - 1),
     }
     return new, info
+
+
+def projected_meridian(spin, reference=(1.0, 0.0, 0.0)):
+    """Unit vector of ``reference`` projected into the plane perpendicular to spin.
+
+    The pre-2026-10-05 sub-Jovian meridian: the body x axis carried into the
+    current equatorial plane. Falls back to body y when spin ~ reference.
+    """
+    s = np.asarray(spin, dtype=float)
+    r = np.asarray(reference, dtype=float)
+    e = r - (r @ s) * s
+    n = np.linalg.norm(e)
+    if n < 1e-10:
+        e = np.array([0.0, 1.0, 0.0]) - s[1] * s
+        n = np.linalg.norm(e)
+    return e / n
+
+
+def meridian_min_moment(I_dev, spin, reference, rel_tol=1e-12):
+    """Sub-Jovian direction = minimum-moment axis in the plane perpendicular to spin.
+
+    In synchronous rotation the tidal torque -3 n^2 (I_j - I_k) (OSPW
+    Eqs. 5.19-5.21) turns the shell about its spin axis until the smallest
+    in-plane moment faces Jupiter (stiffness 3 n^2 (B - A)). This returns that
+    axis, assuming the libration about the spin axis is quasi-static.
+
+    ``reference`` fixes the sign (continuity with the previous meridian:
+    sub-Jovian vs anti-Jovian, hence which hemisphere trails) and is
+    returned (projected) when the in-plane moments are degenerate to
+    ``rel_tol`` of the largest tensor element.
+    """
+    s = np.asarray(spin, dtype=float)
+    u = projected_meridian(s, reference)
+    v = np.cross(s, u)
+    I = np.asarray(I_dev, dtype=float)
+    M = np.array([[u @ I @ u, u @ I @ v], [v @ I @ u, v @ I @ v]])
+    vals, vecs = np.linalg.eigh(M)
+    if vals[1] - vals[0] <= rel_tol * max(np.abs(I).max(), 1e-300):
+        return u
+    a, b = vecs[:, 0]
+    e = a * u + b * v
+    if e @ u < 0:
+        e = -e
+    return e / np.linalg.norm(e)
+
+
+def _tidal_rhs(s, I, k, meridian_fn):
+    """s_dot of the overdamped flow with centrifugal and tidal torques.
+
+    Torque on the shell (body frame), for spin s and sub-Jovian unit vector
+    e (perpendicular to s):  tau = n^2 (I s) x s - 3 n^2 (I e) x e
+    (OSPW Eqs. 5.19-5.21: the rotational potential -(n^2/2) s.I.s plus the
+    tidal potential (3 n^2/2) e.I.e). Overdamped, C_f omega = tau, and
+    s_dot = s x omega gives
+        s_dot = (n^2/C_f) [I s - (s.I s) s + 3 (e.I s) e].
+    """
+    e = meridian_fn(s)
+    Is = I @ s
+    return k * (Is - (s @ Is) * s + 3.0 * (e @ Is) * e)
+
+
+def overdamped_step_tidal(spin, I_dev, cf, dt_s, meridian_fn, max_growth=0.1):
+    """Overdamped reorientation (Eq. 5.39) WITH the tidal torque from Jupiter.
+
+    ``overdamped_step`` keeps only the rotational (centrifugal) torque, so a
+    tilt of the pole toward Jupiter is resisted with stiffness n^2 (C - A)
+    instead of the 4 n^2 (C - A) of OSPW Eqs. 5.26/5.38. Here the torque is
+    the full one (see ``_tidal_rhs``); the tilt toward the trailing apex
+    keeps stiffness n^2 (C - B) (the tidal term vanishes for it).
+
+    ``meridian_fn(s)`` returns the sub-Jovian unit vector for pole s
+    (``projected_meridian`` or a frozen ``meridian_min_moment``).
+
+    Integration: classical RK4 with substeps chosen so that the largest
+    possible growth factor per substep, 4 k (I_max - I_min) dt_sub, is
+    <= max_growth (k = n^2/C_f), and renormalization after each substep.
+    No closed form exists because e depends on s.
+
+    Returns (new_spin, info) like ``overdamped_step``.
+    """
+    k = C.MEAN_MOTION**2 / cf
+    I = np.asarray(I_dev, dtype=float)
+    vals, vecs = np.linalg.eigh(I)
+    spread = vals[-1] - vals[0]
+    n_sub = max(1, int(np.ceil(4.0 * k * spread * dt_s / max_growth)))
+    h = dt_s / n_sub
+    s = np.asarray(spin, dtype=float).copy()
+    rate0 = np.linalg.norm(_tidal_rhs(s, I, k, meridian_fn))
+    for _ in range(n_sub):
+        k1 = _tidal_rhs(s, I, k, meridian_fn)
+        k2 = _tidal_rhs(_unit(s + 0.5 * h * k1), I, k, meridian_fn)
+        k3 = _tidal_rhs(_unit(s + 0.5 * h * k2), I, k, meridian_fn)
+        k4 = _tidal_rhs(_unit(s + h * k3), I, k, meridian_fn)
+        s = _unit(s + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4))
+    c = vecs.T @ np.asarray(spin, dtype=float)
+    a = int(np.argmax(np.abs(c)))
+    info = {
+        'eigenvalues': vals,
+        'axes': vecs,
+        'i_axis': a,
+        'I_spin': float(vals[a]),
+        'I_target': float(vals[-1]) if a != len(vals) - 1 else float(vals[a]),
+        'psi_dot': float(rate0),
+        'unstable': bool(a != len(vals) - 1),
+        'n_substeps': n_sub,
+    }
+    return s, info
+
+
+def _unit(v):
+    return v / np.linalg.norm(v)
+
+
+def tidal_frame_B_minus_A(I, spin, sub_jovian):
+    """B - A = I_trail - I_subJ [kg m^2] of a tensor in the current tidal frame.
+
+    The NSR twin of ``tidal_frame_t20_2t22``: e = sub-Jovian (projected), trail
+    = spin x e. For the Eq. 2.18 shell tensor, B - A = 4 M a^2 C22 with C22 from
+    ``shell_c2m``, so Delta(B-A)/Delta(B-C) = 4 t22/(t20 + 2 t22) exactly.
+    """
+    s = np.asarray(spin, dtype=float)
+    e = projected_meridian(s, sub_jovian)
+    tr = np.cross(s, e)
+    return float(tr @ I @ tr - e @ I @ e)
+
+
+def nsr_normalizations(p, mean_b=None):
+    """The three C used to normalize (B - A)/C [kg m^2] (Fermi demo spec sec. 6.2).
+
+    'C_body' = C_MA2_EUROPA M a^2 (whole body, lockstep / strong coupling);
+    'I_0' = OSPW Eq. 5.29 (shell + ~100 km of ocean, O&S thermal p. 233);
+    'C_s' = (8 pi/3) rho_c b a^4 (1 - 2b/a + (4/3)(b/a)^2) (shell alone, weak coupling).
+    """
+    b = p.shell_thickness if mean_b is None else mean_b
+    x = b / p.radius
+    return {'C_body': C.C_MA2_EUROPA * p.mass * p.radius**2,
+            'I_0': moment_I0(p),
+            'C_s': 8.0 * np.pi / 3.0 * p.ice_density * b * p.radius**4 * (1.0 - 2.0 * x + 4.0 / 3.0 * x * x)}
+
+
+def kappa_star_gp(e=None):
+    """B&H 2023 Eq. 7 (MacDonald torque) capture threshold: kappa* = (2/3)[9.5 pi e^2/(2 sqrt 2)]^2.
+
+    5.80e-7 at e = 0.0094; 4.64e-4 at e = 0.05 (B&H 2023 ms p. 21).
+    """
+    e = C.ECCENTRICITY if e is None else e
+    return 2.0 / 3.0 * (9.5 * np.pi * e * e / (2.0 * np.sqrt(2.0))) ** 2
+
+
+def tidal_frame_t20_2t22(I_shell, spin, sub_jovian, p, cw=None):
+    """Thickness-equivalent t20 + 2 t22 [m] of a shell tensor in the tidal frame.
+
+    (I_trail - I_spin) of the Eq. 2.18 shell tensor, with trail = spin x
+    sub_jovian, divided by M a^2 C_2m(1 m). Equals the harmonic t20 + 2 t22
+    when the tidal frame is the body frame (I_yy - I_zz = M a^2 (C20 + 2 C22))
+    and is defined for any pole, so it tracks the quantity of the Eq. 3.12
+    test along a polar-wander path.
+    """
+    s = np.asarray(spin, dtype=float)
+    e = projected_meridian(s, sub_jovian)
+    tr = np.cross(s, e)
+    d = tr @ I_shell @ tr - s @ I_shell @ s
+    return d / (p.mass * p.radius**2 * shell_c2m(1.0, p, cw))
+
+
+_GL_X, _GL_W = np.polynomial.legendre.leggauss(48)
+
+
+def sensible_heat_ratio(T_s, T_m=None, latent_heat=None):
+    """S/L for the steady conductive profile of a shell with surface T_s, exactly.
+
+    When the base advances by db the whole profile, which scales with b for
+    the k = a1/T + a0 shell without internal heating (z/b = int_Ts^T k dT / F),
+    must also be re-equilibrated. The energy per unit area to make a shell of
+    thickness b from melt at T_m is rho b [L + S], with
+        S = int_0^1 [h(T_m) - h(T(zeta))] dzeta
+          = (1/F) int_Ts^Tm [h(T_m) - h(T)] k(T) dT,   h(T) = int c_p dT,
+    c_p = 90 + 7.49 T (constants.ice_heat_capacity), F = int_Ts^Tm k dT.
+    Evaluated by 48-point Gauss-Legendre in T (smooth integrand; exact to
+    ~1e-12). Modern k = 651/T: S/L = 0.530 / 0.503 / 0.477 at T_s = 90 / 100
+    / 110 K (Fermi, 2026-10-05). Returns an array shaped like T_s.
+    """
+    T_m = C.T_MELT if T_m is None else T_m
+    L = C.ICE_LATENT_HEAT if latent_heat is None else latent_heat
+    Ts = np.asarray(T_s, dtype=float)
+    c0, c1 = C.ICE_CP_COEFFS
+    h = lambda T: c0 * T + 0.5 * c1 * T * T                     # noqa: E731
+    k = lambda T: C.A1_CONDUCTIVITY / T + C.A0_CONDUCTIVITY     # noqa: E731
+    half = 0.5 * (T_m - Ts)[..., None]
+    T = 0.5 * (T_m + Ts)[..., None] + half * _GL_X
+    num = np.sum(_GL_W * (h(T_m) - h(T)) * k(T), axis=-1) * half[..., 0]
+    F = C.A1_CONDUCTIVITY * np.log(T_m / Ts) + C.A0_CONDUCTIVITY * (T_m - Ts)
+    return num / F / L
+
+
+_TABLES = {}
+_T_TABLE = np.arange(30.0, 272.0 + 1e-9, 0.02)        # T_s grid for the S/L table [K]
+_T_EIG = np.arange(30.0, 272.0 + 1e-9, 1.0)           # T_s grid for the eigenmode table [K]
+
+
+def _table_key(kind):
+    return (kind, C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY, tuple(C.ICE_CP_COEFFS), C.ICE_LATENT_HEAT,
+            C.T_MELT, C.ICE_DENSITY)
+
+
+def sensible_heat_ratio_tabulated(T_s):
+    """``sensible_heat_ratio`` interpolated from a 0.02 K table (built once per constant set).
+
+    Agrees with the quadrature to < 1e-9 (tested); removes the per-cell
+    quadrature that cost 45% of a coupled run (Fermi F10).
+    """
+    key = _table_key('S/L')
+    if key not in _TABLES:
+        _TABLES[key] = sensible_heat_ratio(_T_TABLE)
+    return np.interp(np.asarray(T_s, dtype=float), _T_TABLE, _TABLES[key])
+
+
+def _kirchhoff_profile(Ts, zeta):
+    """T(zeta) of the steady k = a1/T + a0 profile: a1 ln(T/Ts) + a0 (T - Ts) = zeta F."""
+    T_m = C.T_MELT
+    a1, a0 = C.A1_CONDUCTIVITY, C.A0_CONDUCTIVITY
+    F = a1 * np.log(T_m / Ts) + a0 * (T_m - Ts)
+    T = Ts * (T_m / Ts) ** zeta                          # exact for a0 = 0; Newton otherwise
+    for _ in range(50 if a0 else 0):
+        g = a1 * np.log(T / Ts) + a0 * (T - Ts) - zeta * F
+        T = T - g / (a1 / T + a0)
+    return T, F
+
+
+def stefan_eigen_factor(T_s, n=600):
+    """Exact slowest-mode relaxation time of the conductive Stefan shell, in units of rho L b^2 / F.
+
+    Linearized about the steady conductive profile, a perturbation of the
+    Kirchhoff variable u = int k dT obeys (rho c_p / k) du/dt = u'' with u = 0
+    at the surface and the Stefan condition rho L db/dt = -(flux jump) at the
+    base. Its slowest decay rate lambda solves the symmetric generalized
+    eigenproblem  int v' phi' dz = lambda [ int (rho c_p/k) v phi dz +
+    (rho L b / F) v(b) phi(b) ]  (linear finite elements, n elements). Returns
+    1 / (lambda rho L b^2 / F), independent of b. Modern k = 651/T: ~1.40 at
+    100 K (Fermi's shooting, stefan_eig2.py), vs 1 + S/L = 1.50 (the
+    sensible-heat bound, ~8% slow). Validated against the constant-k, c_p
+    case tau/tau_L = St/x^2, x tan x = St (test).
+    """
+    from scipy.linalg import eigh
+    Ts = float(T_s)
+    zeta_n = np.linspace(0.0, 1.0, n + 1)
+    zeta_m = 0.5 * (zeta_n[1:] + zeta_n[:-1])
+    T_m, F = _kirchhoff_profile(Ts, zeta_m)
+    c0, c1 = C.ICE_CP_COEFFS
+    w = C.ICE_DENSITY * (c0 + c1 * T_m) / (C.A1_CONDUCTIVITY / T_m + C.A0_CONDUCTIVITY)
+    # b = 1 m (the factor is b-independent); element length h
+    h = 1.0 / n
+    K = np.zeros((n + 1, n + 1))
+    M = np.zeros((n + 1, n + 1))
+    for e in range(n):
+        i = slice(e, e + 2)
+        K[i, i] += np.array([[1.0, -1.0], [-1.0, 1.0]]) / h
+        M[i, i] += w[e] * h / 6.0 * np.array([[2.0, 1.0], [1.0, 2.0]])
+    M[n, n] += C.ICE_DENSITY * C.ICE_LATENT_HEAT * 1.0 / F
+    lam = eigh(K[1:, 1:], M[1:, 1:], eigvals_only=True, subset_by_index=[0, 0])[0]
+    tau_L = C.ICE_DENSITY * C.ICE_LATENT_HEAT * 1.0 / F
+    return 1.0 / (lam * tau_L)
+
+
+def stefan_eigen_factor_tabulated(T_s):
+    """``stefan_eigen_factor`` interpolated from a 1 K table (built once per constant set, ~1 s)."""
+    key = _table_key('eig')
+    if key not in _TABLES:
+        _TABLES[key] = np.array([stefan_eigen_factor(T, n=300) for T in _T_EIG])
+    return np.interp(np.asarray(T_s, dtype=float), _T_EIG, _TABLES[key])
+
+
+def stefan_relaxation_time(b, T_s, T_m=None, latent_heat=None, density=None,
+                           sensible='eigen'):
+    """Stefan-limited relaxation time of the shell thickness [s].
+
+    tau = f rho L b^2 / F,  F = a1 ln(T_m/T_s) + a0 (T_m - T_s)  (q_cond = F/b).
+    A thickness anomaly decays only as fast as the basal flux imbalance can
+    melt or freeze ice and re-equilibrate the profile. Linearized about
+    equilibrium (dq/db = -q/b) with latent heat alone, f = 1; the factor f
+    carries the sensible heat:
+
+    ``sensible``:
+      'eigen' (default since 2026-10-05, Fermi F6): f = the exact slowest
+          eigenmode of the conductive Stefan problem (``stefan_eigen_factor``,
+          tabulated in T_s); ~1.40 at 100 K, ~19 Myr for 30 km.
+      'exact': f = 1 + S/L, S/L exact for the steady profile
+          (``sensible_heat_ratio``, tabulated). An UPPER estimate: it puts the
+          whole profile's sensible heat on the base, ~8% slower than 'eigen'.
+      'none': f = 1 (latent heat only, the 679af84 form, ~13 Myr for 30 km).
+    O&S/OSPW quote "<~ a few x 1e7 yr" (OSPW p. 247). Not included: the change
+    of internal tidal heating with b, which modifies dq/db.
+    """
+    T_m = C.T_MELT if T_m is None else T_m
+    L = C.ICE_LATENT_HEAT if latent_heat is None else latent_heat
+    rho = C.ICE_DENSITY if density is None else density
+    T_s = np.asarray(T_s, dtype=float)
+    F = C.A1_CONDUCTIVITY * np.log(T_m / T_s) + C.A0_CONDUCTIVITY * (T_m - T_s)
+    if sensible == 'eigen':
+        fac = stefan_eigen_factor_tabulated(T_s)
+    elif sensible == 'exact':
+        fac = 1.0 + sensible_heat_ratio_tabulated(T_s)
+    elif sensible == 'none':
+        fac = 1.0
+    else:
+        raise ValueError(f"sensible must be 'eigen', 'exact' or 'none', got {sensible!r}")
+    return fac * rho * L * np.asarray(b, dtype=float) ** 2 / F
