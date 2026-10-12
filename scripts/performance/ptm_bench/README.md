@@ -1,0 +1,49 @@
+# ptm_bench: Moon3D R1 benchmark and accuracy harness (C2/C3)
+
+Reviewer 1 asked for two things before any scaling claim means anything: that
+accuracy improves with N, and that the cost exponents are measured rather than
+assumed. This harness produces both. Scope is what R1 needs, not a general
+framework. Plan of record: `~/projects/moon3d_R1/PTM3D_changes_for_R1.md`, section 4.
+
+Python with numpy and PyYAML (VTK for arm C meshes), e.g.
+`~/anaconda3/envs/europa_viz/bin/python3`.
+
+| file | role |
+|---|---|
+| `make_meshes.py` | mesh ladders: A bowl (exported by `bowl_crater_ptm`), B fBm (band-limited / extended), C Moon3D decimations, D Haworth (verified, not modified) + `manifest.json` |
+| `plan.py` | builds the batch, predicts wall time and peak memory per run against the hard caps, prints the GPU-safety block; `--write plan.json` |
+| `run_bench.py` | executes `plan.json` resumably (JSONL ledger); refuses a busy machine; records provenance (SHA, exe and every dylib md5, Embree) |
+| `accuracy.py` | bowl metrics: floor F_sky bias and peak (kept separate), T_floor vs Ingersoll Eq. 8, per-face Q_ind vs a same-N reference |
+| `collect.py` | ledger -> one CSV for the exponent fits; flags shared-machine rows |
+| `templates/moon_lunation.yaml` | engine template: one lunation, 360 steps, 2 spin-up orbits |
+
+Engine and tool hooks this relies on (all inert when unset):
+
+- `PTM_TIMING_JSON=<path>`: `ptm_thermal_sim` writes per-phase wall/CPU/peak RSS, per-coupling-iteration
+  records and the radiosity traversal counters (`src/cpp/main/run_timing.h`). Outputs are byte-identical
+  with it set or unset.
+- `[VF-STATS]` banner on every `PTM_HMATRIX_VF_REPLACE` load; `<csr>.vf_stats.json` from
+  `assemble_vf_haworth.py` (`scripts/ptm12_diag/vf_stats.py`, C4); `# STATS` line from `mc_ref_pp`.
+- `bowl_crater_ptm`: `PTM_BOWL_WRITE_PLY`, `PTM_BOWL_VF_CSR`, `PTM_BOWL_ESTIMATOR=sparse_production`,
+  `PTM_BOWL_WRITE_CSR`, `PTM_BOWL_DUMP`.
+
+## Order of operations
+
+```
+PY=~/anaconda3/envs/europa_viz/bin/python3
+B=~/projects/moon3d_R1/bench
+$PY make_meshes.py --out $B/meshes --arms A,B,C,D
+$PY plan.py --manifest $B/meshes/manifest.json --root $B/runs --write $B/plan.json   # dry run + plan
+$PY run_bench.py --plan $B/plan.json --bin-dir <build>/bin --dry-run                  # what would run
+# only on a quiet machine, after Stage 1 and Stage 3; GPU rows additionally need --gpu-ok
+nohup caffeinate -i $PY run_bench.py --plan $B/plan.json --bin-dir <build>/bin --gpu-ok > $B/batch.log 2>&1 &
+$PY collect.py $B/runs/ledger.jsonl --csv $B/runs/collected.csv
+```
+
+Rules the code enforces: no timing on a shared machine (`--allow-shared` is for smoke tests and marks
+every record); no coupled row without a CSR (a silent in-engine VF build on a large lunar mesh is the
+wedge trigger); coupled rows must log `REPLACED H-matrix`; GPU rows get batch 1280, pause 1500 ms,
+`PTM_RAD_RERUN_MAX_GPUS=1`; no AGT/Artemis path is accepted by `make_meshes.py`.
+
+Precision trap: VTK's PLY reader (and so pyvista) demotes double vertices to float32, i.e. 0.125 m at
+the lunar radius, coarser than a 2.5 mm Moon3D facet. Read these PLYs with numpy, or VTK legacy files.
