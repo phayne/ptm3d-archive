@@ -22,6 +22,7 @@
 #include <embree4/rtcore.h>
 #include <unordered_map>
 #include <algorithm>  // std::max/min({...}) initializer-list overloads: NOT transitive on Linux libstdc++
+#include <chrono>
 using V3=std::array<double,3>;
 static double dot(const V3&a,const V3&b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
 static V3 cross(const V3&a,const V3&b){return{{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]}};}
@@ -117,6 +118,7 @@ static Mesh loadPLY(const char* path,const char* tag){
 int main(int argc,char**argv){
     if(argc<5){fprintf(stderr,"usage: mc_ref mesh.ply tmax.bin facelist.txt nrays [offset_m] [keps] [min_hits_or_legacy_frac] [outbin]\n"
                               "  env PTM_PP_RING_PLY=<ring.ply>  ring occluder (blocked, never a recorded partner)\n");return 2;}
+    const auto wall_t0=std::chrono::steady_clock::now();
     const char* ply=argv[1]; const char* tf=argv[2]; const char* fl=argv[3]; int NR=atoi(argv[4]);
     double OFF=(argc>5)?atof(argv[5]):1e-4; double KEPS=(argc>6)?atof(argv[6]):0.2;
     double THR_ARG=(argc>7)?atof(argv[7]):1e-5; const char* OUTB=(argc>8)?argv[8]:"pp_out.bin";
@@ -208,6 +210,8 @@ int main(int argc,char**argv){
     printf("# face SumF F_sky F_warm384 Qir\n");
     RTCIntersectArguments ia; rtcInitIntersectArguments(&ia);
     long ring_total=0, ray_total=0, back_total=0, backseen_total=0;
+    // C4 sweep statistics (stderr STATS line only; the .bin output is unaffected).
+    long terr_total=0, faces_swept=0, partners_seen=0, partners_kept=0, max_kept=0;
     for(long pf:want){ if(pf<0||pf>=(long)nf)continue; const V3&c=ctr[pf]; V3 ax=nn[pf]; double heps=KEPS*edge[pf];
         V3 t=(std::fabs(ax[2])<0.9)?V3{{0,0,1}}:V3{{1,0,0}}; V3 bx=nrm(cross(ax,t)),by=cross(ax,bx);
         long terr=0,warm=0,tot=0,ringhit=0,backhit=0,backseen=0; double Qir=0; std::unordered_map<int,long> hits;
@@ -256,6 +260,9 @@ int main(int argc,char**argv){
         double SumF=double(terr)/tot, Fsky=double(tot-terr-ringhit-backhit)/tot, Fw=double(warm)/tot, Qir_abs=EPS*EPS*(Qir/tot);
         printf("%7ld %.4f %.4f %.4f %.1f\n",pf,SumF,Fsky,Fw,Qir_abs);
         ring_total+=ringhit; ray_total+=tot; back_total+=backhit; backseen_total+=backseen;
+        terr_total+=terr; ++faces_swept; partners_seen+=(long)hits.size();
+        { long kept=0; for(auto&kv:hits) if(kv.second>=MIN_HITS) ++kept;
+          partners_kept+=kept; if(kept>max_kept) max_kept=kept; }
         { static FILE* fb=fopen(OUTB,"wb"); int nnz=0; for(auto&kv:hits){ if(kv.second>=MIN_HITS) nnz++; }
           int src=(int)pf; fwrite(&src,4,1,fb); fwrite(&nnz,4,1,fb);
           for(auto&kv:hits){ double F=(double)kv.second/tot; if(kv.second>=MIN_HITS){ int j=kv.first; float ff=(float)F; fwrite(&j,4,1,fb); fwrite(&ff,4,1,fb);} }
@@ -270,5 +277,15 @@ int main(int argc,char**argv){
             BACKCULL?"ON":"OFF",backseen_total,ray_total,
             ray_total?double(backseen_total)/ray_total:0.0,back_total,backseen_total-back_total,
             BACKCULL?"":"  <-- PHYSICALLY WRONG, cull disabled by env");
+    // One machine-readable line for the R1 benchmark (C4): ray accounting and wall time of
+    // THIS process (one chunk of a sweep). Parsed by scripts/ptm12_diag/vf_stats.py.
+    { const double wall=std::chrono::duration<double>(std::chrono::steady_clock::now()-wall_t0).count();
+      const long sky=ray_total-terr_total-ring_total-back_total;
+      fprintf(stderr,"# STATS {\"n_faces_mesh\":%zu,\"faces_swept\":%ld,\"nrays\":%d,\"min_hits\":%ld,"
+                     "\"rays_total\":%ld,\"terrain_hits\":%ld,\"ring_blocked\":%ld,\"backface_blocked\":%ld,"
+                     "\"backface_seen\":%ld,\"sky\":%ld,\"partners_seen\":%ld,\"partners_kept\":%ld,"
+                     "\"max_partners_kept\":%ld,\"wall_s\":%.3f}\n",
+              nf,faces_swept,NR,MIN_HITS,ray_total,terr_total,ring_total,back_total,backseen_total,sky,
+              partners_seen,partners_kept,max_kept,wall); }
     rtcReleaseScene(sc);rtcReleaseDevice(dev); return 0;
 }

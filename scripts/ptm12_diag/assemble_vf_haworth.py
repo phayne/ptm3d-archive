@@ -209,6 +209,10 @@ def main():
                          "that happened to hit), which inflates far-field entries by up to 2x. "
                          "'hits' exists ONLY so the regression gate can prove the defect; it must "
                          "never be used to build a view-factor matrix for science.")
+    ap.add_argument("--sweep-logs", default=None,
+                    help="glob of the mc_ref_pp chunk logs (stderr) for this sweep. Their "
+                         "'# STATS' lines feed the back-face / ring / sky ray fractions in "
+                         "<csr>.vf_stats.json (C4). Optional; omitted -> those fields are absent.")
     ap.add_argument("--allow-incomplete-sweep", action="store_true",
                     help="Assemble even when the sweep does not cover every face exactly once. "
                          "The result is BIASED on the affected faces (divisor 2 assumes both ray "
@@ -360,11 +364,14 @@ def main():
     del Sd, Aend                         # both were consumed by F
 
     # ---- symmetric ΣF<=1 cap (reciprocity-preserving congruence) ----
+    cap_rows_scaled = 0                  # C4 stats: rows over 1 before the first sweep
     for it in range(40):
         rs = np.zeros(N); np.add.at(rs, rows, F)
         if rs.max() <= 1.0 + 1e-9:
             break
         c = np.ones(N); over = rs > 1.0; c[over] = 1.0 / rs[over]
+        if it == 0:
+            cap_rows_scaled = int(over.sum())
         F = F * np.sqrt(c[rows] * c[cols])
     rs = np.zeros(N); np.add.at(rs, rows, F)
     print(f"[assemble] symmetric-cap sweeps={it+1} -> SigmaF max={rs.max():.4f} (#>1={(rs>1.0+1e-6).sum()}) "
@@ -426,6 +433,15 @@ def main():
     with open(str(out) + ".provenance.json", "w") as fh:
         json.dump(prov, fh, indent=2)
     print(f"[assemble] provenance -> {out}.provenance.json  (estimator: {prov['estimator']})")
+
+    # ---- C4 view-factor statistics sidecar (stats only; the CSR above is final) ----
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import vf_stats
+    st = vf_stats.compute(indptr, cols, F.astype(np.float32), N, area=area, nrays=int(a.nrays),
+                          min_hits=float(a.min_hits), cap_sweeps=it + 1,
+                          rows_scaled=cap_rows_scaled, sweep_logs=a.sweep_logs, csr_path=out)
+    print(vf_stats.banner(st))
+    print(f"[assemble] vf stats -> {vf_stats.write_sidecar(out, st)}")
 
 
 if __name__ == "__main__":

@@ -321,6 +321,48 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
             if (s > 1.0 + 1e-6) ++nover;
             maxrs = std::max(maxrs, s);
         }
+        // [VF-STATS] (Moon3D R1, C4): what the loaded operator IS -- size, sparsity,
+        // partners per face and the terrain/sky split -- in one line, for every run
+        // that loads a referee CSR. Statistics only; nothing below reads them.
+        // Same field order as scripts/ptm12_diag/vf_stats.py banner().
+        {
+            std::vector<double> rsum(static_cast<size_t>(nn)), cnt(static_cast<size_t>(nn));
+            for (int32_t i = 0; i < nn; ++i) {
+                double s = 0.0;
+                for (int64_t k = indptr[i]; k < indptr[i + 1]; ++k) s += data[k];
+                rsum[static_cast<size_t>(i)] = s;
+                cnt[static_cast<size_t>(i)] = static_cast<double>(indptr[i + 1] - indptr[i]);
+            }
+            auto pct = [](std::vector<double> v, double q) {   // by value: nth_element reorders
+                if (v.empty()) return 0.0;
+                const size_t k = static_cast<size_t>(q * static_cast<double>(v.size() - 1) + 0.5);
+                std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+                return v[k];
+            };
+            const double N = static_cast<double>(nn);
+            double sf_mean = 0.0;
+            for (double v : rsum) sf_mean += v;
+            sf_mean /= std::max(N, 1.0);
+            std::ostringstream os;
+            os << std::setprecision(4) << std::fixed
+               << "  [VF-STATS] N=" << nn << " nnz=" << nnz
+               << " nnz/face=" << std::setprecision(1) << static_cast<double>(nnz) / std::max(N, 1.0)
+               << " (p5/p50/p95/max " << std::setprecision(0) << pct(cnt, 0.05) << "/"
+               << pct(cnt, 0.50) << "/" << pct(cnt, 0.95) << "/" << pct(cnt, 1.0) << ")"
+               << std::scientific << std::setprecision(3)
+               << " nnz/N^2=" << static_cast<double>(nnz) / (N * N)
+               << std::fixed << std::setprecision(4)
+               << " sumF p5/p50/p95/max " << pct(rsum, 0.05) << "/" << pct(rsum, 0.50) << "/"
+               << pct(rsum, 0.95) << "/" << maxrs
+               << " Fsky p5/p50/p95 " << 1.0 - pct(rsum, 0.95) << "/" << 1.0 - pct(rsum, 0.50)
+               << "/" << 1.0 - pct(rsum, 0.05) << " mean sumF=" << sf_mean
+               << " CSR " << std::setprecision(3)
+               << (static_cast<double>(nnz) * 8.0 + (N + 1.0) * 8.0) / 1e9 << " GB in memory";
+            const std::string side = std::string(vfr) + ".vf_stats.json";
+            std::ifstream sj(side);
+            os << "; sidecar " << (sj.good() ? side : std::string("ABSENT (pre-C4 assembler)"));
+            std::cout << os.str() << std::endl;
+        }
         if (nover > 0 || neg < -1e-9) {
             std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: corrected VF violates invariants (rows>1="
                       << nover << ", min entry=" << neg << "). A non-physical VF (ΣF>1 or negative F) "
