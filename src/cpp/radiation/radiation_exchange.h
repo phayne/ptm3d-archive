@@ -203,6 +203,16 @@ private:
     std::vector<float>   data_;
 };
 
+// Process-wide radiosity cost counters (the same ones PTM_RAD_COST_REPORT prints
+// at exit), readable at any time. Read-only: for the run-timing JSON
+// (PTM_TIMING_JSON, Moon3D R1 change C2). Never consumed by a solve.
+struct RadCostTotals {
+    long   solves     = 0;    // radiosity solves (one per timestep per band route)
+    long   traversals = 0;    // CSR traversals (Jacobi sweeps, fused two-band = 1)
+    double seconds    = 0.0;  // in-solver wall, summed over solves
+};
+RadCostTotals radCostTotals();
+
 // Result of a power iteration on the loaded view-factor operator F.
 // ADVISORY ONLY -- nothing in the solve consumes it. Linearizing the outer
 // radiation<->thermal Picard loop gives M = G·ε·F·(I−ρ_r F)^-1·D with

@@ -60,6 +60,7 @@
 // Radiation exchange module
 #include "../radiation/radiation_config.h"
 #include "../radiation/radiation_exchange.h"
+#include "run_timing.h"   // PTM_TIMING_JSON per-component timing (inert when unset)
 
 // Orbital mechanics module (generic bodies)
 #include "../orbital/generic_body.h"
@@ -18164,6 +18165,7 @@ int main(int argc, char** argv) {
     
     // Start timing
     auto start_time_point = std::chrono::high_resolution_clock::now();
+    ptm::timing::begin("setup");   // mesh, ephemeris, configuration -> illumination
     
     // ------------------------------------------------------------------
     // Create / import mesh (with ASCII PLY fallback for large DTM exports)
@@ -19626,6 +19628,8 @@ int main(int argc, char** argv) {
 
     // Add ray tracing timer start
     auto ray_tracing_start = std::chrono::high_resolution_clock::now();
+    ptm::timing::end("setup");
+    ptm::timing::begin("illumination");
 
     bool success;
     if (use_batch_processing) {
@@ -19647,6 +19651,10 @@ int main(int argc, char** argv) {
 
     // Add ray tracing timer end and reporting
     auto ray_tracing_end = std::chrono::high_resolution_clock::now();
+    ptm::timing::end("illumination");
+    ptm::timing::counter("n_faces", static_cast<double>(mesh->faces.size()));
+    ptm::timing::counter("illumination_days", total_simulation_days);
+    ptm::timing::begin("post_illumination");   // illumination -> first thermal solve
     auto ray_tracing_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         ray_tracing_end - ray_tracing_start).count();
     double ray_tracing_sec = ray_tracing_ms / 1000.0;
@@ -20867,6 +20875,8 @@ int main(int argc, char** argv) {
                     ++n;
                 }
             } eqi_solve_timer(eqi_t_solve_s, eqi_n_solve);
+            ptm::timing::end("post_illumination");   // no-op after the first call
+            ptm::timing::Scope timing_thermal_scope("thermal_whole_mesh");
             const bool use_simd_batch_l  = thermal_config.getPropertyBool("use_simd_batch", true);
             const bool use_gpu_thermal_l = thermal_config.getPropertyBool("use_gpu_thermal", false);
             ice::IceStabilityAccumulator* ice_acc_l =
@@ -21193,6 +21203,8 @@ int main(int argc, char** argv) {
             const std::vector<double>* face_H_ptr =
                 planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
             bool thermal_success_streamed;
+            ptm::timing::end("post_illumination");
+            ptm::timing::Scope timing_thermal_streamed("thermal_whole_mesh");   // to block end
             // Same capability gate as the non-streamed dispatch. Streamed
             // SIMD-batch IS the supported driver (streaming changes where the
             // forcing comes from, not who integrates it); streamed SCALAR is
@@ -21496,6 +21508,7 @@ int main(int argc, char** argv) {
             }
 
             // Create radiation exchange manager
+            ptm::timing::begin("radiation_setup");   // VF load / build + prepare()
             radiation::RadiationExchangeManager rad_manager(mesh, rad_config);
 
             // Try to load pre-computed view factors. Distinguish "file missing" from
@@ -21809,7 +21822,9 @@ int main(int argc, char** argv) {
             // Prepare (classify faces, compute view factors if needed). two_band_ is now
             // activated BEFORE initGPU (via config_.band_separated inside prepare()), so
             // initGPU can set two_band_gpu_ok_ for sparse Sum_j F_ij <= 1 meshes (PTM-11).
-            if (!rad_manager.prepare(illumination_series)) {
+            const bool rad_prepared = rad_manager.prepare(illumination_series);
+            ptm::timing::end("radiation_setup");
+            if (!rad_prepared) {
                 std::cout << "No faces need radiation exchange - skipping coupling loop" << std::endl;
             } else {
                 std::cout << "Faces requiring radiation exchange: " << rad_manager.numExchangeFaces()
@@ -22874,6 +22889,10 @@ int main(int argc, char** argv) {
                     if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
                     const std::chrono::steady_clock::time_point eqi_sweep_t0 =
                         std::chrono::steady_clock::now();
+                    ptm::timing::begin("radiosity_sweep");
+                    const ptm::timing::Snapshot timing_iter_t0 = ptm::timing::now();
+                    const radiation::RadCostTotals timing_rad0 = radiation::radCostTotals();
+                    double timing_sweep_s = 0.0;
 
                     // Step 1: Compute indirect flux at EVERY timestep
                     // This captures time-varying thermal emission from illuminated walls
@@ -23179,6 +23198,31 @@ int main(int argc, char** argv) {
                     }
                     flux_progress.finish();
                     eqi_t_sweep_s += eqiElapsed(eqi_sweep_t0);
+                    ptm::timing::end("radiosity_sweep");
+                    timing_sweep_s = eqiElapsed(eqi_sweep_t0);
+                    auto timing_record_iteration = [&](double n_rethermal, double rethermal_s,
+                                                       double max_dT, double eqi_restart = 0.0) {
+                        if (!ptm::timing::enabled()) return;
+                        const radiation::RadCostTotals rc = radiation::radCostTotals();
+                        const ptm::timing::Snapshot t1 = ptm::timing::now();
+                        ptm::timing::iteration({
+                            {"iter", static_cast<double>(iter + 1)},
+                            {"sweep_wall_s", timing_sweep_s},
+                            {"rethermal_wall_s", rethermal_s},
+                            {"faces_rethermal", n_rethermal},
+                            {"max_dT_K", max_dT},
+                            {"radiosity_solves", static_cast<double>(rc.solves - timing_rad0.solves)},
+                            {"radiosity_traversals",
+                             static_cast<double>(rc.traversals - timing_rad0.traversals)},
+                            {"radiosity_in_solver_s", rc.seconds - timing_rad0.seconds},
+                            {"iter_wall_s", t1.wall - timing_iter_t0.wall},
+                            {"iter_cpu_s", t1.cpu - timing_iter_t0.cpu},
+                            {"peak_rss_bytes", static_cast<double>(t1.rss)},
+                            // 1 = this sweep fed the internal eq-indirect pass, which
+                            // re-solved the whole mesh (inside iter_wall_s) and restarted
+                            // the loop; the next record is iteration 1 again.
+                            {"eq_indirect_restart", eqi_restart}});
+                    };
                     ++eqi_n_sweep;
 
                     // Denominator is the span actually SWEPT, not the whole table:
@@ -23201,6 +23245,7 @@ int main(int argc, char** argv) {
                     // what this estimator can and cannot reach.
                     if (!eq_indirect_from_converged) {
                         const int rc = runEqIndirectPass("iteration-0 sweep");
+                        if (rc > 0) timing_record_iteration(0.0, 0.0, -1.0, 1.0);
                         if (rc < 0) return 1;
                         if (rc > 0) { iter = -1; continue; }  // ++ makes it iter 0
                     }
@@ -23388,6 +23433,7 @@ int main(int argc, char** argv) {
 
                     if (faces_to_rerun.empty()) {
                         std::cout << "  No faces need re-run. Converged." << std::endl;
+                        timing_record_iteration(0.0, 0.0, -1.0);
                         // A second, earlier exit from the coupling loop. The
                         // "converged" eq-indirect estimator has to fire here too
                         // -- a run that leaves through this door is just as
@@ -23395,8 +23441,13 @@ int main(int argc, char** argv) {
                         // test at the end of the body, and skipping the pass on
                         // one of two exits is a silent behavior difference.
                         if (eq_indirect_from_converged) {
+                            const auto timing_eqi_t0 = std::chrono::steady_clock::now();
                             const int rc = runEqIndirectPass(
                                 "converged coupling loop (no face needs re-run)");
+                            if (rc > 0)   // restart marker: every record before it is an ABANDONED loop
+                                ptm::timing::iteration({{"iter", static_cast<double>(iter + 1)},
+                                                        {"eq_indirect_restart", 1.0},
+                                                        {"eqi_pass_wall_s", eqiElapsed(timing_eqi_t0)}});
                             if (rc < 0) return 1;
                             if (rc > 0) { iter = -1; continue; }
                         }
@@ -23429,6 +23480,8 @@ int main(int argc, char** argv) {
                     // (Hayne for direct/reflected, ε for primary_ir, + indirect)
                     // — this ensures both paths give physics-consistent results.
                     std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
+                    ptm::timing::begin("rethermal");
+                    const auto timing_rethermal_t0 = std::chrono::steady_clock::now();
 
                     // Check if GPU thermal is enabled
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
@@ -23860,6 +23913,8 @@ int main(int argc, char** argv) {
                     // arrays (indirect_solar/ir) are thus one Picard step stale, within
                     // rad_coupling_temp_tol. Iteration cap (max_coupling_iterations)
                     // unchanged. ----
+                    ptm::timing::end("rethermal");
+                    const double timing_rethermal_s = eqiElapsed(timing_rethermal_t0);
                     bool coupling_loop_done = false;
                     {
                         double max_change_post = 0.0;
@@ -23879,6 +23934,8 @@ int main(int argc, char** argv) {
                             : static_cast<double>(num_faces) * total_time_steps;
                         const double face_frac = static_cast<double>(count_changing) / frac_denom;
                         std::cout << "  Max temperature change: " << max_change_post << " K" << std::endl;
+                        timing_record_iteration(static_cast<double>(faces_to_rerun.size()),
+                                                timing_rethermal_s, max_change_post);
                         std::cout << (rad_coupling_physics_mode
                                        ? "  Faces still changing:   "
                                        : "  Samples still changing: ")
@@ -23928,9 +23985,14 @@ int main(int argc, char** argv) {
                     if (eq_indirect_from_converged
                             && (coupling_loop_done
                                 || iter + 1 >= rad_max_coupling_iter)) {
+                        const auto timing_eqi_t0 = std::chrono::steady_clock::now();
                         const int rc = runEqIndirectPass(
                             coupling_loop_done ? "converged coupling loop"
                                                : "coupling loop at iteration cap");
+                        if (rc > 0)   // restart marker: every record before it is an ABANDONED loop
+                            ptm::timing::iteration({{"iter", static_cast<double>(iter + 1)},
+                                                    {"eq_indirect_restart", 1.0},
+                                                    {"eqi_pass_wall_s", eqiElapsed(timing_eqi_t0)}});
                         if (rc < 0) return 1;
                         if (rc > 0) { iter = -1; continue; }  // ++ makes it iter 0
                     }
@@ -24403,6 +24465,8 @@ int main(int argc, char** argv) {
     // coupling loop above has finished. A past run's directory can now answer
     // "which solver produced this?" without its log -- see
     // tools/solver_disclosure.h for why that question had no answer before.
+    ptm::timing::mark("thermal_coupling_done");
+    ptm::timing::begin("export");   // provenance, per-step frames, statistics, extras
     ptm::appendThermalSolverProvenance(output_dir);
 
     // ========================================================================
@@ -26652,6 +26716,21 @@ int main(int argc, char** argv) {
     barrier_if_parallel();
 
     std::cout << "Cleanup completed successfully" << std::endl;
+
+    // PTM_TIMING_JSON (Moon3D R1, C2): one JSON per successful run. Inert when unset.
+    if (ptm::timing::enabled()) {
+        ptm::timing::end("export");
+        const radiation::RadCostTotals rc = radiation::radCostTotals();
+        ptm::timing::counter("radiosity_solves_total", static_cast<double>(rc.solves));
+        ptm::timing::counter("radiosity_traversals_total", static_cast<double>(rc.traversals));
+        ptm::timing::counter("radiosity_in_solver_s_total", rc.seconds);
+        ptm::timing::write({{"engine_git_sha", PTM_BUILD_GIT_SHA},
+                            {"embree_library", PTM_BUILD_EMBREE_LIB},
+                            {"embree_max_isa", PTM_BUILD_EMBREE_MAX_ISA},
+                            {"build_gpu", PTM_BUILD_GPU},
+                            {"config", config_file},
+                            {"output_dir", output_dir}});
+    }
 
     return 0;
     }  // end of main

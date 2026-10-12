@@ -146,6 +146,14 @@ struct RadCostReporter {
 static RadCostReporter g_rad_cost_reporter;
 }  // namespace
 
+RadCostTotals radCostTotals() {
+    RadCostTotals t;
+    t.solves = g_rad_solves.load();
+    t.traversals = g_rad_sweeps.load();
+    t.seconds = g_rad_seconds.load();
+    return t;
+}
+
 static bool radIterTraceEnabled() {
     static const bool on = (std::getenv("PTM_RAD_ITER_TRACE") != nullptr);
     return on;
