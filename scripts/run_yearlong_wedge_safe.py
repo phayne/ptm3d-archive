@@ -73,6 +73,25 @@ exactly as run_chunked_simulation.py does, so the existing ptm_merge_chunks
 binary combines them into a single, standard statistics/ directory
 mathematically equivalent to an unchunked run.
 
+EPOCH GRID / HAND-OFF (2026-10-12). The output grid is half-open: chunk k
+exports epochs t0 + (S_k + i)*dt for i in [0, N_k), where S_k is the integer
+count of output steps before it and dt = duration_days*86400/timesteps. Two
+things make the hand-off land EXACTLY on the successor's first epoch, the
+same two run_chunked_simulation.py uses:
+  * thermal.checkpoint_lookahead_steps = 1 on every chunk: the engine
+    integrates one grid point past the export window (not exported, not
+    reduced) and writes final_state_file THERE. Without it the state was the
+    last EXPORTED frame, one cadence stale.
+  * simulation.start_time is left as the base config has it, and the chunk
+    start is carried as simulation.start_time_offset_seconds = S_k*dt in ET
+    seconds. Shifting the UTC string instead is off the ET grid by the
+    TDB-UTC periodic term (measured 0.57 ms at the Jan-21 seam of the Stage-1
+    Haworth run, and a whole second across a leap second).
+Before this fix the engine refused the hand-off (the 1-cadence-stale gap plus
+the 0.57 ms UTC error exceeded its one-cadence warn band). Older engines took
+the stale state silently, so every earlier run of this driver carries a
+1-cadence seam at each chunk boundary (BUGS.md PTM-719).
+
 PICARD CAP (2026-08-15). Every radiation knob is inherited from the base config
 byte for byte, so a k_max chosen once by habit propagates silently to every
 later generation of that config. The moon3d year-long lineage carried
@@ -129,7 +148,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_chunked_simulation import (  # noqa: E402
     fmt_duration, parse_iso8601, fmt_iso8601, is_valid_checkpoint,
-    _deep_copy, chunk_is_complete,
+    _deep_copy, chunk_is_complete, CHECKPOINT_LOOKAHEAD_STEPS,
 )
 # Phase R (R3/R5): shared runtime-robustness gates. Kept OPT-IN here so this
 # script's default behavior is byte-for-byte the same as before -- the gate
@@ -375,10 +394,24 @@ def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
                     duration_days: float, timesteps: int,
                     equilibration_orbits, gpu_batch_size: int,
                     initial_state_file, final_state_file: Path,
-                    skip_time_series: bool = True) -> Path:
+                    skip_time_series: bool = True,
+                    start_time_offset_s: float | None = None,
+                    checkpoint_lookahead_steps: int = 0) -> Path:
+    """`start_time_offset_s` not None: leave simulation.start_time as the base
+    config has it and place the chunk with simulation.start_time_offset_seconds
+    (ET seconds, absolute -- it REPLACES any base offset; the caller folds the
+    base offset in). None: legacy UTC-string placement via `start_time`, still
+    used by the calibrate probe, which has no successor.
+
+    `checkpoint_lookahead_steps`: written to thermal.checkpoint_lookahead_steps
+    (config_parser.cpp:702) so final_state_file is the state at the NEXT
+    chunk's first epoch. 0 leaves the key out entirely."""
     cfg = _deep_copy(base_cfg)
     sim = cfg.setdefault("simulation", {})
-    sim["start_time"] = fmt_iso8601(start_time)
+    if start_time_offset_s is None:
+        sim["start_time"] = fmt_iso8601(start_time)
+    else:
+        sim["start_time_offset_seconds"] = float(start_time_offset_s)
     sim["duration_days"] = float(duration_days)
     sim["timesteps"] = int(timesteps)
 
@@ -391,6 +424,10 @@ def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
     else:
         th.pop("initial_state_file", None)
     th["final_state_file"] = str(final_state_file)
+    if checkpoint_lookahead_steps:
+        th["checkpoint_lookahead_steps"] = int(checkpoint_lookahead_steps)
+    else:
+        th.pop("checkpoint_lookahead_steps", None)
 
     out = cfg.setdefault("output", {})
     out["directory"] = str(chunk_dir)
@@ -411,6 +448,50 @@ def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
     with open(cfg_path, "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
     return cfg_path
+
+
+def resume_epoch_problems(chunk_dir: Path, offset_s: float, lookahead: int) -> list[str]:
+    """Why a COMPLETE chunk on disk must not be reused by this plan.
+
+    A chunk written by the pre-2026-10-12 driver has no look-ahead and a
+    UTC-shifted start: its checkpoint is one cadence stale. Reusing it would
+    hand that stale state to the successor, which the engine only WARNS about
+    when the gap is exactly one cadence -- i.e. the seam would come back with
+    nothing but a log line. So the resume path compares the chunk's own
+    config.yaml against this plan and refuses on any difference."""
+    cfg_path = chunk_dir / "config.yaml"
+    if not cfg_path.is_file():
+        return [f"{cfg_path} missing -- cannot verify how this chunk was placed"]
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    sim = cfg.get("simulation", {}) or {}
+    th = cfg.get("thermal", {}) or {}
+    problems = []
+    have_la = int(th.get("checkpoint_lookahead_steps", 0) or 0)
+    if have_la != lookahead:
+        problems.append(f"thermal.checkpoint_lookahead_steps={have_la}, plan wants "
+                        f"{lookahead} (a chunk without it checkpoints one cadence stale)")
+    have_off = sim.get("start_time_offset_seconds")
+    if have_off is None or abs(float(have_off) - offset_s) > 1e-6:
+        problems.append(f"simulation.start_time_offset_seconds={have_off}, plan wants "
+                        f"{offset_s:.6f} (chunk was placed on a different epoch grid)")
+    return problems
+
+
+def gate_check_handoff(log_path: Path) -> list[str]:
+    """A warm-started chunk must have restored its predecessor's state with the
+    epoch clause passing OUTRIGHT. The engine refuses a gap of more than one
+    cadence, but only WARNS on exactly one cadence (thermal_state_io.h, the
+    'epoch clause'); that warning is the stale seam this driver used to
+    produce, so here it is a failure."""
+    text = log_path.read_text(errors="replace")
+    problems = []
+    if "identity trailer verified" not in text:
+        problems.append("checkpoint restore did not report 'identity trailer verified'")
+    if re.search(r"WARNING: epoch:", text):
+        problems.append("restored checkpoint is off this chunk's first epoch "
+                        "(engine 'WARNING: epoch:' -- stale hand-off)")
+    return problems
 
 
 # --------------------------------------------------------------------------
@@ -680,7 +761,17 @@ def mode_run(args):
     a_out_steps = args.stage_a_output_steps
     a_days = a_out_steps / output_steps_per_day
     b_out_steps_total = total_output_steps - a_out_steps
-    b_start = start + dt.timedelta(days=a_days)
+
+    # Half-open ET grid (see "EPOCH GRID / HAND-OFF" in the module docstring).
+    # Offsets are INTEGER step counts times one cadence, converted once, so no
+    # chunk start inherits a running floating-point sum. A base config's own
+    # start_time_offset_seconds is folded in, not overwritten.
+    cadence_s = float(sim.get("duration_days")) * 86400.0 / total_output_steps
+    base_offset_s = float(sim.get("start_time_offset_seconds", 0.0) or 0.0)
+    lookahead = CHECKPOINT_LOOKAHEAD_STEPS
+
+    def offset_for(steps_before: int) -> float:
+        return base_offset_s + steps_before * cadence_s
 
     # Stage B is split into N sequential sub-chunks (chunk_001..chunk_00N),
     # each chained via the SAME checkpoint mechanism as stage A -> stage B,
@@ -695,21 +786,35 @@ def mode_run(args):
     extra = b_out_steps_total - base_steps * nb
     steps_list = [base_steps + (1 if i < extra else 0) for i in range(nb)]
 
+    a_offset_s = offset_for(0)
     print(f"[run] plan: chunk_000 = {eq_orbits}-orbit equilibration + "
-          f"{a_out_steps} output ts ({a_days:.3f} d) @ batch={args.stage_a_batch_size}")
-    cum_days = a_days
+          f"{a_out_steps} output ts ({a_days:.3f} d, steps [0, {a_out_steps}), "
+          f"start +{a_offset_s:.6f} s ET) @ batch={args.stage_a_batch_size}")
+    cum_steps = a_out_steps
     b_plan = []
     for i, steps in enumerate(steps_list):
         days = steps / output_steps_per_day
-        st = start + dt.timedelta(days=cum_days)
-        b_plan.append((i + 1, steps, days, st))
-        print(f"[run] plan: chunk_{i+1:03d} = {steps} output ts ({days:.3f} d, start "
-              f"{fmt_iso8601(st)}) @ batch={args.stage_b_batch_size}")
-        cum_days += days
+        off = offset_for(cum_steps)
+        b_plan.append((i + 1, steps, days, off))
+        # The UTC string is DISPLAY ONLY; the engine is placed by the ET offset.
+        st = start + dt.timedelta(seconds=off)
+        print(f"[run] plan: chunk_{i+1:03d} = {steps} output ts ({days:.3f} d, steps "
+              f"[{cum_steps}, {cum_steps + steps}), start +{off:.6f} s ET "
+              f"~ {fmt_iso8601(st)}) @ batch={args.stage_b_batch_size}")
+        cum_steps += steps
+    print(f"[run] plan: merged grid = {cum_steps} half-open output epochs at "
+          f"{cadence_s:.6f} s cadence; every chunk integrates "
+          f"{lookahead} look-ahead step(s) past its window (not exported, not "
+          f"reduced) and checkpoints there, on its successor's first epoch.")
+    if cum_steps != total_output_steps:
+        sys.exit(f"[run] internal error: plan covers {cum_steps} output steps, "
+                 f"config asks for {total_output_steps}")
     ledger.record(event="plan", chunk_000_out_steps=a_out_steps,
                   stage_b_nchunks=nb, stage_b_out_steps_total=b_out_steps_total,
                   eq_orbits=eq_orbits, stage_a_batch=args.stage_a_batch_size,
-                  stage_b_batch=args.stage_b_batch_size)
+                  stage_b_batch=args.stage_b_batch_size,
+                  cadence_s=cadence_s, checkpoint_lookahead_steps=lookahead,
+                  start_offsets_s=[a_offset_s] + [p[3] for p in b_plan])
 
     # Phase R (R3d): launch-time consistency check vs the host machine profile.
     # The solver's own self-chunking (R2) enforces the timestep ceiling, so here
@@ -736,6 +841,23 @@ def mode_run(args):
     if args.dry_run:
         return 0
 
+    # --- Resume consistency (before ANY launch) ---
+    # A complete chunk on disk is reused only if it was placed on THIS plan's
+    # epoch grid with the look-ahead; otherwise its checkpoint is stale.
+    resume_bad = []
+    for cdir, off in [(chunk_a, a_offset_s)] + [
+            (args.output_dir / f"chunk_{idx:03d}", off) for idx, _s, _d, off in b_plan]:
+        if chunk_is_complete(cdir):
+            for pr in resume_epoch_problems(cdir, off, lookahead):
+                resume_bad.append(f"{cdir.name}: {pr}")
+    if resume_bad:
+        ledger.record(event="ABORT", reason="stale chunks on disk", problems=resume_bad)
+        sys.exit("[run] REFUSING to resume: complete chunk(s) on disk were not "
+                 "written on this plan's epoch grid with the checkpoint "
+                 "look-ahead, so their hand-off states are stale:\n  - "
+                 + "\n  - ".join(resume_bad)
+                 + "\nMove those chunk_NNN/ dirs and _thermal_state/ aside and relaunch.")
+
     # --- Stage A ---
     if not (chunk_is_complete(chunk_a) and is_valid_checkpoint(state_a)):
         if chunk_a.exists() and not any(chunk_a.iterdir()):
@@ -744,7 +866,9 @@ def mode_run(args):
                                 equilibration_orbits=eq_orbits,
                                 gpu_batch_size=args.stage_a_batch_size,
                                 initial_state_file=None, final_state_file=state_a,
-                                skip_time_series=not args.keep_time_series)
+                                skip_time_series=not args.keep_time_series,
+                                start_time_offset_s=a_offset_s,
+                                checkpoint_lookahead_steps=lookahead)
         ok = run_with_retry(args.ptm_bin, cfg_a, args.output_dir / "chunk_000.log",
                             args.retries, args.chunk_timeout_min, ledger, "chunk_000",
                             expect_hole_seal_count=args.expect_hole_seal_count)
@@ -763,21 +887,29 @@ def mode_run(args):
     # --- Stage B, N sub-chunks ---
     prev_state = state_a
     all_chunk_dirs = [chunk_a]
-    for idx, steps, days, st in b_plan:
+    for idx, steps, days, off in b_plan:
         cdir = args.output_dir / f"chunk_{idx:03d}"
         this_state = state_dir / f"thermal_state_after_chunk_{idx:03d}.bin"
         all_chunk_dirs.append(cdir)
         label = f"chunk_{idx:03d}"
         if chunk_is_complete(cdir):
-            print(f"[run] {label} already complete (resume) -- skipping.")
+            if not is_valid_checkpoint(this_state):
+                ledger.record(event="ABORT", reason=f"{label} complete but checkpoint invalid")
+                sys.exit(f"[run] {label} is complete but {this_state} is not a valid "
+                         "checkpoint; its successor cannot be chained. Move the chunk "
+                         "aside and relaunch.")
+            print(f"[run] {label} already complete (resume, placed on this plan's "
+                  "grid with the look-ahead) -- skipping.")
             prev_state = this_state
             continue
-        cfg_b = make_stage_yaml(base_cfg, cdir, st, days, steps,
+        cfg_b = make_stage_yaml(base_cfg, cdir, start, days, steps,
                                 equilibration_orbits=None,  # inherited but will be
                                                             # force-zeroed by the code
                                 gpu_batch_size=args.stage_b_batch_size,
                                 initial_state_file=prev_state, final_state_file=this_state,
-                                skip_time_series=not args.keep_time_series)
+                                skip_time_series=not args.keep_time_series,
+                                start_time_offset_s=off,
+                                checkpoint_lookahead_steps=lookahead)
         ok = run_with_retry(args.ptm_bin, cfg_b, args.output_dir / f"{label}.log",
                             args.retries, args.chunk_timeout_min, ledger, label,
                             expect_hole_seal_count=args.expect_hole_seal_count)
@@ -785,6 +917,7 @@ def mode_run(args):
             ledger.record(event="ABORT", reason=f"{label} failed")
             sys.exit(f"[run] {label} (output stage) FAILED after retries -- see log + ledger.")
         rad_problems = gate_check_by_mode(gate_mode, args.output_dir / f"{label}.log")
+        rad_problems += gate_check_handoff(args.output_dir / f"{label}.log")
         if rad_problems:
             ledger.record(event="ABORT", reason=f"{label} radiation gates failed: {rad_problems}")
             sys.exit(f"[run] {label} radiation gate FAILED: {rad_problems}")
