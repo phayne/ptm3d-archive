@@ -15,6 +15,7 @@ Python with numpy and PyYAML (VTK for arm C meshes), e.g.
 | `run_bench.py` | executes `plan.json` resumably (JSONL ledger); refuses a busy machine; records provenance (SHA, exe and every dylib md5, Embree) |
 | `accuracy.py` | bowl metrics: floor F_sky bias and peak (kept separate), T_floor vs Ingersoll Eq. 8, per-face Q_ind vs a same-N reference |
 | `collect.py` | ledger -> one CSV for the exponent fits; flags shared-machine rows |
+| `inventory.py` | timings ALREADY measured (Stage 1/3, keps sweep, v4 sweeps): per-component splits recovered from logs, overlap/contamination flags -> `bench/inventory.json` |
 | `templates/moon_lunation.yaml` | engine template: one lunation, 360 steps, 2 spin-up orbits |
 
 Engine and tool hooks this relies on (all inert when unset):
@@ -58,6 +59,15 @@ records what it deletes in the ledger:
 - Guard: before each row, free >= 2 x the row's `predicted_disk_peak_bytes` + `--disk-reserve-gib`
   (default 15). Otherwise the batch stops between rows (ledger `abort_disk`, exit 3); resume later.
 `plan.py` prints each row's disk peak and final footprint and the simulated batch peak.
+
+Trimmed batch (Paul 2026-10-13, < 24 h predicted). Rates are MEASURED on the R1 binary family
+(10 clean Stage-3 Moon3D 509k lunations; `inventory.py`), not assumed. Coupled timing rows are
+SHORT windows (30 output steps at the lunation cadence + 0.25 spin-up orbit, `coupling_mode: fixed`,
+2 iterations: iteration 1 = transient re-thermal with the equilibration replay, iteration 2 = steady).
+Rad-off rows keep full lunations because illumination cost is not uniform over a lunation. Sweeps above
+~1e6 faces are seeded-random 1-in-10 ROW SAMPLES (`row_sample_1_in`): per-face sweep cost and an nnz
+bracket from the per-face `nkept` column of `mc_ref_pp` (validated against full sweeps within 2 SE).
+The full Haworth r25_100m refinement sweep is opt-in (`plan.py --with-haworth-refinement`).
 
 Precision trap: VTK's PLY reader (and so pyvista) demotes double vertices to float32, i.e. 0.125 m at
 the lunar radius, coarser than a 2.5 mm Moon3D facet. Read these PLYs with numpy, or VTK legacy files.

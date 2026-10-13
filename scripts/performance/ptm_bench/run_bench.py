@@ -71,6 +71,14 @@ def run_sweep(row, a, rundir):
     nf = int(row["n_faces"])
     faces = (Path(row["facelist"]).read_text().split() if row.get("facelist")
              else [str(i) for i in range(nf)])
+    stride = int(row.get("row_sample_1_in", 1))
+    if stride > 1:
+        if row.get("assemble", True):
+            raise SystemExit(f"FATAL: row {row['id']}: a row-sampled sweep cannot be assembled")
+        # seeded RANDOM 1-in-k sample (a fixed stride aliases with grid meshes' two-
+        # triangles-per-cell ordering: measured +4.2 % / 2.7 SE bias at stride 10)
+        import random
+        faces = sorted(random.Random(20261013).sample(faces, max(1, len(faces) // stride)), key=int)
     J = min(int(row.get("jobs", a.jobs)), len(faces))
     import numpy as np
     tmax = rundir / "tmax.bin"
@@ -120,7 +128,26 @@ def run_sweep(row, a, rundir):
         import vf_stats
         tot, nl, nfiles, missing = vf_stats.parse_sweep_stats(str(rundir / "sweep/log_*.txt"))
         res["sweep_stats"] = {**tot, "stats_lines": nl, "files": nfiles, "missing": missing}
-        if not row.get("facelist") and tot.get("partners_kept") is not None:
+        if stride > 1 and tot.get("partners_kept") is not None:
+            # per swept face: the nkept column of mc_ref_pp's stdout (exact per face), so the
+            # SE is that of a simple random sample, not of a handful of chunk means
+            import statistics as stt
+            per = [int(ln.split()[5]) for f in sorted((rundir / "sweep").glob("out_*.txt"))
+                   for ln in f.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+            if len(per) != len(faces):
+                raise RuntimeError(f"row sample: {len(per)} per-face rows for {len(faces)} faces swept")
+            mu = sum(per) / len(per)
+            se = stt.stdev(per) / len(per) ** 0.5 if len(per) > 1 else float("nan")
+            D = mu * nf
+            res["nnz_bracket"] = {
+                "lo": D, "hi": 2 * D, "directed_partners_per_face": mu,
+                "directed_partners_per_face_se": se, "row_sample_1_in": stride,
+                "faces_swept": int(tot.get("faces_swept", 0)),
+                "label": f"ROW-SAMPLED BRACKET ESTIMATE, not a count: seeded random 1-in-{stride} faces swept; "
+                         "D = N x mean directed partners per swept face; the symmetric matrix would "
+                         "hold between D and 2D entries. No bins, no assembly (M1)."}
+            res["sweep_s_per_face"] = sweep_s / max(1, len(faces))
+        elif not row.get("facelist") and tot.get("partners_kept") is not None:
             D = int(tot["partners_kept"])
             res["nnz_bracket"] = {
                 "lo": D, "hi": 2 * D, "directed_partners_D": D,

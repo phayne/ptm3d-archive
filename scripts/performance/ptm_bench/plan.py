@@ -25,15 +25,23 @@ RATES = {
     # assemble_vf_haworth.py: 509k v4 7.45e8 nnz in 833 s; plan range 11-19 min / 1e9.
     "asm_s_per_nnz": 833 / 7.45e8,
     "asm_bytes_per_nnz": 48.0,            # vf-assembler-memory-fix-2026-09-13 (measured)
-    # CPU radiosity: CSR traversal throughput, 48 threads. A3GT Y00 log 2.48e9 nnz at
-    # 3.166 s/step (two-band fused). ASSUMPTION (Stage 3 probe will replace it).
-    "cpu_nnz_traversals_per_s": 1.6e9,
-    "traversals_per_solve": 4.0,          # fused two-band Jacobi, rho-dependent; 2 measured at rho 0.15
-    "steps_per_sweep": 600,               # 360 output + 240 spin-up steps swept (smoke log: 3000 solves / 5 sweeps)
-    "picard_sweeps_terrain": 5,           # measured 4-5 on terrain/fBm smokes
-    "picard_sweeps_moon3d": 12,           # rho 0.78 -> rate 0.77/sweep; cap 16
-    # Engine rad-off lunation on the GPU (illumination + thermal), Moon3D 509k: 115-124 s.
-    "gpu_radoff_s_per_face": 120 / 509337,
+    # ---- MEASURED on the R1 binary family (afbd2bd GPU build), 10 clean Stage-3 Moon3D
+    # 509k coupled lunations + 7 radoff (inventory.py, bench/inventory.json, 2026-10-13):
+    # CPU radiosity (fused two-band Jacobi, 48 thr, rho(F) 0.78): 118.8 s per 600-step sweep
+    # at 745,322,408 nnz (sd 11.9 s) -> 3.76e9 nnz x steps / s. The old assumption
+    # (1.6e9 traversals/s, 4 per solve) was 9.4x pessimistic.
+    "cpu_rad_nnz_steps_per_s": 600 * 745322408 / 118.8,
+    # illumination (CPU Embree AVX-512, 48 thr): ~73 s per 600 steps at 509,337 faces.
+    "illum_s_per_face_step": 73.0 / (600 * 509337),
+    # GPU thermal kernel, whole mesh, N=1: ~45 s per 600 steps at 509,337 faces (kernel time,
+    # host pauses excluded); re-thermal iteration 1 ~0.8x of it, iterations >= 2 ~0.28x.
+    "gpu_kernel_s_per_face_step": 45.0 / (600 * 509337),
+    "reth_iter1_frac": 0.8,
+    "reth_steady_frac": 0.28,
+    # everything else in a lunation (setup, export of 7 x 360 frames, statistics): radoff
+    # wall 242-353 s - illum - kernel ~ 210 s at 509k -> 4.1e-4 s/face.
+    "remainder_s_per_face_lunation": 210.0 / 509337,
+    "csr_load_bytes_per_s": 1.0e9,        # ASSUMED (not separable in the Stage-3 logs)
     # CPU illumination: 10,082 faces in 15.8 s at 8 threads on a contended box -> x6 threads.
     "cpu_illum_s_per_face_48": 15.8 / 10082 / 6,
     # CPU SIMD thermal: 1.57 s per whole-mesh pass at 10,082 faces, 8 threads, contended.
@@ -49,7 +57,7 @@ RATES = {
     # The streamed-thermal path (engaged above ~10 GB) is NOT measured; see PROBE rows.
     "engine_bytes_per_face": 1.0e5,
     "engine_bytes_base": 1.0e8,
-    "repeat_max_wall_s": 1800,            # timing repeats (n=2) only for rows <= 30 min
+    "repeat_max_wall_s": 900,             # timing repeats (n=2) only for rows <= 15 min
 }
 # Disk model (bytes), calibrated 2026-10-12 on the smoke runs: per-step frames 7 fields x
 # 360 steps x (4N + 4) = 10.1 kB/face; statistics/ 87 B/face + mesh.ply 45 B/face; partner
@@ -139,7 +147,8 @@ class Plan:
             return small, small, 0.0
         if kind == "engine":
             kept = DISK["engine_kept_per_face"] * n + DISK["engine_kept_fixed"]
-            frames = 7 * 360 * (4 * n + 4)
+            n_out = (run or {}).get("overrides", {}).get("simulation.timesteps", 360)
+            frames = 7 * n_out * (4 * n + 4)
             return frames + kept, kept, 0.0
         b = DISK["bowl_per_face"] * n + 1e6
         return b, b, 0.0
@@ -174,7 +183,7 @@ class Plan:
             self.runs.append(run)
 
 
-def sweep_cost(n_src, nr):
+def sweep_cost(n_src, nr):   # n_src = faces actually swept
     return n_src * nr / RATES["mc_rays_per_s_48"]
 
 
@@ -182,25 +191,73 @@ def asm_cost(nnz):
     return nnz * RATES["asm_s_per_nnz"], nnz * RATES["asm_bytes_per_nnz"]
 
 
-def engine_mem(n):
-    return RATES["engine_bytes_base"] + n * RATES["engine_bytes_per_face"]
+def engine_mem(n, steps=600):
+    return RATES["engine_bytes_base"] + n * RATES["engine_bytes_per_face"] * steps / 600
 
 
-def coupled_cost(n, nnz, sweeps, gpu_thermal=True):
-    rad = sweeps * RATES["steps_per_sweep"] * RATES["traversals_per_solve"] * nnz / RATES["cpu_nnz_traversals_per_s"]
-    base = n * RATES["gpu_radoff_s_per_face"] if gpu_thermal else n * (
-        RATES["cpu_illum_s_per_face_48"] + 2 * RATES["cpu_thermal_s_per_face_pass_48"])
-    reth = sweeps * n * (RATES["gpu_radoff_s_per_face"] * 0.8 if gpu_thermal
-                         else RATES["cpu_thermal_s_per_face_pass_48"])
-    mem = nnz * 8 + engine_mem(n)         # CSR in the solver + per-face series
-    return base + rad + reth, mem
+# --------------------------------------------------------------------------- short windows
+# Coupled timing rows run a SHORT window, not a lunation (Paul 2026-10-13, <24 h batch):
+# 30 output steps at the lunation cadence + 0.25 spin-up orbit (30 steps), coupling_mode
+# fixed with 2 iterations. Iteration 1 carries the GPU equilibration replay (the costly,
+# transient re-thermal: Stage 3 kernel 35 s vs 12.5 s steady at 509k), iteration 2 is the
+# steady state; the eq-indirect pass adds one sweep + one whole-mesh solve, as in
+# production. Stationarity evidence (inventory.py on the 10 clean Stage-3 coupled runs):
+# within a sweep, elapsed is linear in steps to 3-12 %; per-sweep wall drifts +8-15 % from
+# sweep 1 to 12; re-thermal kernel per iteration is flat from iteration 2 on (sd < 0.5 s).
+WIN_OUT, WIN_EQ_ORBITS, WIN_ITERS = 30, 0.25, 2
+WIN_STEPS = WIN_OUT + int(round(WIN_EQ_ORBITS * 120))
+WINDOW = {"simulation.timesteps": WIN_OUT,
+          "simulation.duration_days": round(WIN_OUT * 29.53 / 360, 6),
+          "thermal.equilibration_orbits": WIN_EQ_ORBITS,
+          "radiation.max_coupling_iterations": WIN_ITERS,
+          "radiation.coupling_mode": "fixed"}
 
 
-def build(man, root):
+def radoff_cost(n, gpu_devices=None):
+    """Full-lunation rad-off row (illumination is NOT stationary over a lunation, so the
+    illumination/thermal curves keep whole lunations). Calibrated on Stage 3 radoff at
+    509k (4 GPUs): wall 242-353 s = illum ~75 + kernel ~45 + remainder ~210 (export)."""
+    illum = RATES["illum_s_per_face_step"] * n * 600
+    if gpu_devices:
+        th = RATES["gpu_kernel_s_per_face_step"] * n * 600 / (RATES["gpu_n4_thermal_speedup"]
+                                                                 if gpu_devices == 4 else 1)
+    else:
+        th = 2 * RATES["cpu_thermal_s_per_face_pass_48"] * n
+    return illum + th + RATES["remainder_s_per_face_lunation"] * n + 20
+
+
+def window_cost(n, nnz):
+    """Short coupled window: illumination + eq-indirect sweep + 2 iteration sweeps on
+    WIN_STEPS steps, whole-mesh solve x2 (initial + eq-indirect), re-thermal iteration 1
+    (transient) + 2 (steady), CSR load, small export."""
+    ill = RATES["illum_s_per_face_step"] * n * WIN_STEPS
+    rad = (1 + WIN_ITERS) * WIN_STEPS * nnz / RATES["cpu_rad_nnz_steps_per_s"]
+    k = RATES["gpu_kernel_s_per_face_step"] * n * WIN_STEPS
+    th = 2 * k + RATES["reth_iter1_frac"] * k + RATES["reth_steady_frac"] * k * (WIN_ITERS - 1)
+    load = nnz * 8 / RATES["csr_load_bytes_per_s"]
+    rem = 30 + RATES["remainder_s_per_face_lunation"] * n * WIN_OUT / 360
+    return ill + rad + th + load + rem, nnz * 8 + engine_mem(n, WIN_STEPS)
+
+
+def full_coupled_cost(n, nnz, sweeps=12):
+    """Model check only: a full-lunation coupled run (used to verify the rates reproduce
+    Stage 3, not scheduled)."""
+    ill = RATES["illum_s_per_face_step"] * n * 600
+    rad = sweeps * 600 * nnz / RATES["cpu_rad_nnz_steps_per_s"]
+    k = RATES["gpu_kernel_s_per_face_step"] * n * 600
+    th = k + RATES["reth_iter1_frac"] * k + RATES["reth_steady_frac"] * k * (sweeps - 2)
+    return ill + rad + th + RATES["remainder_s_per_face_lunation"] * n + nnz * 8 / RATES["csr_load_bytes_per_s"]
+
+
+ROW_SAMPLE_1_IN = 10   # row-sampled sweeps: seeded random 1-in-10 faces
+
+
+def build(man, root, with_haworth_refinement=False):
     P = Plan(root, man)
     by = {}
     for m in man:
         by.setdefault(m["family"], []).append(m)
+    P.dropped = []
 
     # ------------------------------------------------------------ arm A: bowl
     bowls = sorted([m for m in by.get("bowl", [])], key=lambda m: (m["dd"] != 0.2, m["n_faces"]))
@@ -233,7 +290,14 @@ def build(man, root):
             mc.append(("E2c", int(20 * n), 0.2))
         if n <= 3.1e4:
             mc.append(("E2k", 200000, 0.01))    # keps attribution (2026-10-12 smoke)
-            mc.append(("Eref", 2000000, 0.2))   # high-NR reference at the same N
+        if 1.1e4 < n <= 3.1e4:
+            P.dropped.append((f"{tag}_Eref_nr2e+06 (sweep + solve)", "same-N reference is E0 "
+                              "exact at this N; Eref kept at N <= 1e4 for the 2e6 -> exact check"))
+        if n <= 1.1e4:
+            # high-NR reference at the same N. TRIMMED at N ~ 3e4 (2026-10-13): E0 exact
+            # exists at every N <= 3e4 and is the better reference; Eref at N <= 1e4 is
+            # kept to show the 2e6-ray estimator converging onto the exact matrix.
+            mc.append(("Eref", 2000000, 0.2))
         for name, nr, keps in mc:
             nnz = n * nnz_per_face("bowl", n, nr)
             sid = f"{tag}_{name}_nr{nr:g}_k{keps:g}"
@@ -257,78 +321,106 @@ def build(man, root):
 
     # ------------------------------------------------------------ arm B: fBm
     for fam in ("fbm_bandlimited", "fbm_extended"):
+        short = fam[4:]
         for m in sorted(by.get(fam, []), key=lambda m: m["n_faces"]):
             n = m["n_faces"]
-            tag = f"B_{fam[4:]}_n{n}"
+            tag = f"B_{short}_n{n}"
             geo = dict(mesh=m["path"], n_faces=n)
-            cpu_t = n * (RATES["cpu_illum_s_per_face_48"] + 2 * RATES["cpu_thermal_s_per_face_pass_48"])
-            P.add("B", f"{tag}_radoff_cpu", "engine", cpu_t, engine_mem(n), "illum + thermal, CPU",
-                  run=dict(overrides={"radiation.enabled": False}, **geo), repeats=2)
-            g1 = n * RATES["gpu_radoff_s_per_face"]
-            P.add("B", f"{tag}_radoff_gpu1", "engine", g1, engine_mem(n), "GPU N=1", gpu=True,
-                  run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True,
-                                      "thermal.gpu_devices": 1}, **geo), repeats=2)
-            P.add("B", f"{tag}_radoff_gpu4", "engine", g1 / RATES["gpu_n4_thermal_speedup"],
-                  engine_mem(n), "GPU N=4 (rad-off only; validated physics-neutral)", gpu=True,
-                  run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True,
-                                      "thermal.gpu_devices": 4}, **geo), repeats=2)
-            for nr in (20000, 200000):
-                if nr == 200000 and n > 1.1e6:
+            # rad-off, full lunation: illumination + thermal curves (CPU, GPU N=1, GPU N=4)
+            for nm, ov, ndev in (("radoff_cpu", {"radiation.enabled": False}, None),
+                                 ("radoff_gpu1", {"radiation.enabled": False, "thermal.use_gpu": True,
+                                                  "thermal.gpu_devices": 1}, 1),
+                                 ("radoff_gpu4", {"radiation.enabled": False, "thermal.use_gpu": True,
+                                                  "thermal.gpu_devices": 4}, 4)):
+                if ndev == 4 and fam == "fbm_extended":
+                    P.dropped.append((f"{tag}_{nm}", "N=4 scaling measured once (band-limited); "
+                                      "the thermal kernel cost per face does not depend on roughness"))
                     continue
-                nnz = n * nnz_per_face(fam, n, nr)
-                sid = f"{tag}_nr{nr:g}"
-                asm_t, asm_m = asm_cost(nnz)
-                can_asm = nnz <= CAPS["assembly_nnz_planning"] and n <= 1.1e6
-                P.add("B", sid + "_sweep", "sweep", sweep_cost(n, nr) + (asm_t if can_asm else 0),
-                      asm_m if can_asm else None,
-                      f"nnz {nnz:.2e}" + ("" if can_asm else " -> sweep only, no bins; nnz BRACKET [D, 2D] from STATS"),
-                      run=dict(nrays=nr, assemble=can_asm, **geo), repeats=1, nnz=nnz)
-                if can_asm and nr == 20000:
-                    w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_terrain"])
-                    P.add("B", sid + "_coupled", "engine", w, mem,
-                          "coupled; thermal GPU N=1, radiosity CPU" + (" (>1e8 nnz)" if nnz > 1e8 else ""),
-                          gpu=True, repeats=2,
-                          run=dict(csr=str(Path(root) / (sid + "_sweep") / "vf.csr"),
-                                   overrides={"thermal.use_gpu": True, "thermal.gpu_devices": 1,
-                                              "radiation.use_gpu": False}, **geo))
+                P.add("B", f"{tag}_{nm}", "engine", radoff_cost(n, ndev), engine_mem(n),
+                      "full lunation; illumination + thermal", gpu=bool(ndev), repeats=2,
+                      run=dict(overrides=ov, **geo))
+            nnz2e4 = n * nnz_per_face(fam, n, 20000)
+            if n > 1.1e6:
+                P.add("B", f"{tag}_nr2e4_rowsample", "sweep", sweep_cost(n / ROW_SAMPLE_1_IN, 20000), None,
+                      f"1-in-{ROW_SAMPLE_1_IN} row sample: per-face sweep cost + partners/face -> nnz BRACKET",
+                      run=dict(nrays=20000, assemble=False, row_sample_1_in=ROW_SAMPLE_1_IN, **geo))
+                P.dropped.append((f"{tag}_nr20000_sweep (full)", f"replaced by a 1-in-{ROW_SAMPLE_1_IN} "
+                                  "row sample: same per-face cost and partners/face, 10x cheaper"))
+                continue
+            asm_t, asm_m = asm_cost(nnz2e4)
+            sid = f"{tag}_nr20000"
+            P.add("B", sid + "_sweep", "sweep", sweep_cost(n, 20000) + asm_t, asm_m,
+                  f"nnz {nnz2e4:.2e}", run=dict(nrays=20000, **geo), nnz=nnz2e4)
+            w, mem = window_cost(n, nnz2e4)
+            P.add("B", sid + "_window", "engine", w, mem,
+                  f"SHORT coupled window ({WIN_OUT}+{WIN_STEPS - WIN_OUT} steps, {WIN_ITERS} it); "
+                  "thermal GPU N=1, radiosity CPU", gpu=True, repeats=2,
+                  run=dict(csr=str(Path(root) / (sid + "_sweep") / "vf.csr"),
+                           overrides={**WINDOW, "thermal.use_gpu": True, "thermal.gpu_devices": 1,
+                                      "radiation.use_gpu": False}, **geo))
+            nnz2e5 = n * nnz_per_face(fam, n, 200000)
+            if n > 1.1e5:
+                P.add("B", f"{tag}_nr2e5_rowsample", "sweep", sweep_cost(n / ROW_SAMPLE_1_IN, 200000), None,
+                      f"1-in-{ROW_SAMPLE_1_IN} row sample at NR 2e5 -> nnz BRACKET",
+                      run=dict(nrays=200000, assemble=False, row_sample_1_in=ROW_SAMPLE_1_IN, **geo))
+            else:
+                asm_t, asm_m = asm_cost(nnz2e5)
+                P.add("B", f"{tag}_nr200000_sweep", "sweep", sweep_cost(n, 200000) + asm_t, asm_m,
+                      f"nnz {nnz2e5:.2e} (no consumer: nnz/saturation only)",
+                      run=dict(nrays=200000, **geo), nnz=nnz2e5)
 
     # ------------------------------------------------------------ arm C: Moon3D
     for m in sorted(by.get("moon3d_dec", []), key=lambda m: m["n_faces"]):
         n = m["n_faces"]
         tag = f"C_moon3d_n{n}"
         geo = dict(mesh=m["path"], n_faces=n)
+        P.add("C", f"{tag}_radoff_gpu1", "engine", radoff_cost(n, 1), engine_mem(n),
+              "full lunation; illumination + thermal", gpu=True, repeats=2,
+              run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True,
+                                  "thermal.gpu_devices": 1}, **geo))
+        if n > 4e5:
+            P.dropped.append((f"{tag}_nr2e5_sweep + _coupled", "509k point taken from the paper "
+                              "mesh: v4 CSR sweep provenance (2026-08-24) + 10 clean Stage-3 coupled "
+                              "lunations + one short calibration window (C_moon3d_509k_v4_window)"))
+            continue
         nnz = n * nnz_per_face("moon3d", n, 200000)
         asm_t, asm_m = asm_cost(nnz)
         P.add("C", f"{tag}_nr2e5_sweep", "sweep", sweep_cost(n, 200000) + asm_t, asm_m,
               f"nnz {nnz:.2e} (nnz ~ N^2 regime test)", run=dict(nrays=200000, **geo), nnz=nnz)
-        P.add("C", f"{tag}_radoff_gpu1", "engine", n * RATES["gpu_radoff_s_per_face"], engine_mem(n),
-              "GPU N=1", gpu=True, repeats=2,
-              run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True}, **geo))
-        w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_moon3d"])
-        P.add("C", f"{tag}_coupled", "engine", w, mem, "coupled; CPU radiosity", gpu=True, repeats=2,
+        w, mem = window_cost(n, nnz)
+        P.add("C", f"{tag}_window", "engine", w, mem, "SHORT coupled window; CPU radiosity",
+              gpu=True, repeats=2,
               run=dict(csr=str(Path(root) / f"{tag}_nr2e5_sweep" / "vf.csr"),
-                       overrides={"thermal.use_gpu": True, "radiation.use_gpu": False}, **geo))
+                       overrides={**WINDOW, "thermal.use_gpu": True, "thermal.gpu_devices": 1,
+                                  "radiation.use_gpu": False}, **geo))
     for m in by.get("moon3d_509k_v4_existing", []):
         n, nnz = 509337, 745322408
-        w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_moon3d"])
-        P.add("C", "C_moon3d_509k_v4_coupled", "engine", w, mem,
-              "paper-lineage mesh + v4 CSR (no re-sweep, PTM-19)", gpu=True, repeats=2,
+        w, mem = window_cost(n, nnz)
+        P.add("C", "C_moon3d_509k_v4_window", "engine", w, mem,
+              "CALIBRATION: same mesh/CSR/settings as Stage 3, with PTM_TIMING_JSON -> checks the "
+              "log-derived components of the 10 reused Stage-3 lunations", gpu=True, repeats=2,
               run=dict(mesh=str(HOME / "dev/heat3d/moon3d_c_cartesian_NEW_500k_clean_native.ply"),
                        n_faces=n, csr=m["csr"],
-                       overrides={"thermal.use_gpu": True, "radiation.use_gpu": False}))
+                       overrides={**WINDOW, "thermal.use_gpu": True, "thermal.gpu_devices": 1,
+                                  "radiation.use_gpu": False}))
     for m in by.get("moon3d_original", []):
-        n = m.get("n_faces", 1698274)
+        n = m.get("n_faces", 1698264)
         nnz = n * nnz_per_face("moon3d", n, 200000)
-        P.add("C", "C_moon3d_orig_nr2e5_sweep", "sweep", sweep_cost(n, 200000), None,
-              f"1.7M original (PLY): no bins, no assembly; nnz reported as a BRACKET [D, 2D] "
-              f"from the sweep STATS lines (model ~{nnz:.1e})",
-              run=dict(mesh=m["path"], n_faces=n, nrays=200000, assemble=False))
-        P.add("C", "C_moon3d_orig_radoff_gpu1", "engine", n * RATES["gpu_radoff_s_per_face"], engine_mem(n),
-              "GPU N=1", gpu=True, repeats=2,
+        P.add("C", "C_moon3d_orig_nr2e5_rowsample", "sweep", sweep_cost(n / ROW_SAMPLE_1_IN, 200000), None,
+              f"1.7M original (PLY), 1-in-{ROW_SAMPLE_1_IN} row sample: no bins, no assembly; nnz "
+              f"BRACKET [D, 2D] scaled from partners/face (model ~{nnz:.1e})",
+              run=dict(mesh=m["path"], n_faces=n, nrays=200000, assemble=False, row_sample_1_in=ROW_SAMPLE_1_IN))
+        P.dropped.append(("C_moon3d_orig_nr2e5_sweep (all rows, 1.8 h)",
+                          f"1-in-{ROW_SAMPLE_1_IN} row sample gives the same per-face cost and partners/face"))
+        P.add("C", "C_moon3d_orig_radoff_gpu1", "engine", radoff_cost(n, 1), engine_mem(n),
+              "full lunation; the only >1e6 Moon3D illumination/thermal point", gpu=True, repeats=1,
               run=dict(mesh=m["path"], n_faces=n,
-                       overrides={"radiation.enabled": False, "thermal.use_gpu": True}))
+                       overrides={"radiation.enabled": False, "thermal.use_gpu": True,
+                                  "thermal.gpu_devices": 1}))
 
     # ------------------------------------------------------------ arm D: Haworth
+    # DEM-limited, spans < 1 decade (99.7k-900k): comparability with the paper matrices,
+    # not an exponent family.
     existing = {"haworth_radcore_r32c": (HOME / "projects/moon3d/vf/resweep_v4_2026-08-24/haworthr32c/"
                                          "haworth_radcore_r32c_v4.csr", 567837786),
                 "sunlit_radcore_r50": (HOME / "projects/moon3d/vf/resweep_v4_2026-08-24/sunlit_radcore_r50/"
@@ -339,39 +431,53 @@ def build(man, root):
             n = m["n_faces"]
             tag = f"D_{fam}_n{n}"
             geo = dict(mesh=m["path"], n_faces=n)
-            P.add("D", f"{tag}_radoff_gpu1", "engine", n * RATES["gpu_radoff_s_per_face"], engine_mem(n),
-                  "GPU N=1", gpu=True, repeats=2,
-                  run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True}, **geo))
+            P.add("D", f"{tag}_radoff_gpu1", "engine", radoff_cost(n, 1), engine_mem(n),
+                  "full lunation", gpu=True, repeats=2,
+                  run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True,
+                                      "thermal.gpu_devices": 1}, **geo))
+            wov = {**WINDOW, "thermal.use_gpu": True, "thermal.gpu_devices": 1, "radiation.use_gpu": False}
             if fam in existing:
                 csr, nnz = existing[fam]
-                w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_terrain"])
-                P.add("D", f"{tag}_coupled_v4", "engine", w, mem, "paper matrix (v4), CPU radiosity",
-                      gpu=True, repeats=2,
-                      run=dict(csr=str(csr), overrides={"thermal.use_gpu": True,
-                                                        "radiation.use_gpu": False}, **geo))
+                w, mem = window_cost(n, nnz)
+                P.add("D", f"{tag}_window_v4", "engine", w, mem, "SHORT window on the paper matrix (v4)",
+                      gpu=True, repeats=2, run=dict(csr=str(csr), overrides=wov, **geo))
+                P.dropped.append((f"{tag}_coupled_v4 (full lunation)", "short window measures the "
+                                  "same per-step / per-iteration costs; Stage 1 r50 runs are GPU-"
+                                  "radiosity route, not comparable for radiosity"))
                 continue
             nr = 20000 if fam == "haworth_r15" else 200000
             nnz = n * nnz_per_face("haworth", n, nr)
-            can = nnz <= CAPS["assembly_nnz_planning"]
+            if fam == "haworth_radcore_r25_100m" and not with_haworth_refinement:
+                P.add("D", f"{tag}_nr{nr:g}_rowsample", "sweep", sweep_cost(n / ROW_SAMPLE_1_IN, nr), None,
+                      f"1-in-{ROW_SAMPLE_1_IN} row sample: per-face cost + nnz BRACKET (full sweep is "
+                      "--with-haworth-refinement)",
+                      run=dict(nrays=nr, assemble=False, row_sample_1_in=ROW_SAMPLE_1_IN, **geo))
+                P.dropped.append((f"{tag}_nr200000_sweep (full, 49 GB disk) + _coupled",
+                                  "not needed for Arm A or for any exponent (Haworth spans <1 decade); "
+                                  "Paul's 1.8x override for it is retained in --with-haworth-refinement"))
+                continue
             asm_t, asm_m = asm_cost(nnz)
-            P.add("D", f"{tag}_nr{nr:g}_sweep", "sweep", sweep_cost(n, nr) + (asm_t if can else 0),
-                  asm_m if can else None, f"nnz {nnz:.2e}" + ("" if can else " -> sweep only, no bins; nnz BRACKET [D, 2D]"),
-                  run=dict(nrays=nr, assemble=can, **geo), nnz=nnz)
-            if can:
-                w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_terrain"])
-                P.add("D", f"{tag}_coupled", "engine", w, mem, "coupled; CPU radiosity", gpu=True,
-                      repeats=2, run=dict(csr=str(Path(root) / f"{tag}_nr{nr:g}_sweep" / "vf.csr"),
-                                          overrides={"thermal.use_gpu": True,
-                                                     "radiation.use_gpu": False}, **geo))
+            P.add("D", f"{tag}_nr{nr:g}_sweep", "sweep", sweep_cost(n, nr) + asm_t, asm_m,
+                  f"nnz {nnz:.2e}", run=dict(nrays=nr, **geo), nnz=nnz)
+            w, mem = window_cost(n, nnz)
+            P.add("D", f"{tag}_window", "engine", w, mem, "SHORT coupled window; CPU radiosity",
+                  gpu=True, repeats=2,
+                  run=dict(csr=str(Path(root) / f"{tag}_nr{nr:g}_sweep" / "vf.csr"), overrides=wov, **geo))
+
     # Every override must name a scheduled row: a typo would otherwise silently leave
     # the default in place for the row the ruling was about.
-    missing = [k for k in DISK_GUARD_OVERRIDES if k not in {r["id"] for r in P.runs}]
-    if missing:
-        raise SystemExit(f"FATAL: disk-guard override(s) name no scheduled row: {missing}")
+    ids = {r["id"] for r in P.runs}
+    missing = [k for k in DISK_GUARD_OVERRIDES if k not in ids]
+    by_design = [k for k in missing if k.startswith("D_haworth_radcore_r25_100m") and not with_haworth_refinement]
+    if set(missing) - set(by_design):
+        raise SystemExit(f"FATAL: disk-guard override(s) name no scheduled row: {sorted(set(missing) - set(by_design))}")
+    for k in by_design:
+        print(f"NOTE: disk-guard override for {k} is NOT applied: that row is not scheduled "
+              "(run with --with-haworth-refinement to schedule it, override included)")
     # Front-load: each FRONT_LOAD row plus every row that consumes its CSR, in their
     # original relative order, then everything else.
     front = set()
-    for rid in FRONT_LOAD:
+    for rid in [x for x in FRONT_LOAD if x in ids]:
         front.add(rid)
         csr = str(Path(root) / rid / "vf.csr")
         front |= {r["id"] for r in P.runs if r.get("csr") == csr}
@@ -398,9 +504,11 @@ def main():
     ap.add_argument("--root", default=str(HOME / "projects/moon3d_R1/bench/runs"))
     ap.add_argument("--write", default=None, help="write plan.json for run_bench.py")
     ap.add_argument("--json-table", default=None, help="write the predicted table as JSON")
+    ap.add_argument("--with-haworth-refinement", action="store_true",
+                    help="schedule the full r25_100m NR 2e5 sweep (49 GB) + its coupled window")
     a = ap.parse_args()
     man = json.loads(Path(a.manifest).read_text())
-    P = build(man, a.root)
+    P = build(man, a.root, a.with_haworth_refinement)
     tot = {}
     held = [r for r in P.rows if r["status"] != "ok"]
     # Disk: run the scheduled rows in order (repeats expanded) with the runner's own
@@ -478,6 +586,12 @@ def main():
           f"median {sorted(prof)[len(prof) // 2] / 2**30:.2f} GiB, end {prof[-1] / 2**30:.2f} GiB; "
           f"batch peak (max over rows of retained + that row's peak) {batch_peak / 2**30:.2f} GiB")
     print(f"HELD (not scheduled): {len(held)} rows -- " + ", ".join(r["id"] for r in held))
+    print(f"DROPPED / REPLACED vs the full-lunation plan ({len(P.dropped)}):")
+    for rid, why in P.dropped:
+        print(f"  - {rid}: {why}")
+    chk = full_coupled_cost(509337, 745322408)
+    print(f"MODEL CHECK: the recalibrated rates predict a full Moon3D 509k coupled lunation at "
+          f"{chk:.0f} s; the 10 clean Stage-3 runs measured 1747-2114 s.")
     print()
     print(GPU_SAFETY)
     if a.write:
