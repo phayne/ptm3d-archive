@@ -379,6 +379,8 @@ def main():
     ap.add_argument("--gpu-ok", action="store_true", help="permit GPU rows (never during Stage 1/3)")
     ap.add_argument("--repeat", type=int, default=None,
                     help="override the repeat count of rows the plan already repeats (timing rows)")
+    ap.add_argument("--max-foreign-cpu-pct", type=float, default=200.0,
+                    help="busy if other processes use more than this much CPU (100 = one core)")
     ap.add_argument("--quiet-wait-min", type=float, default=20.0,
                     help="max wait for the machine to go quiet before each row")
     ap.add_argument("--disk-reserve-gib", type=float, default=15.0,
@@ -437,7 +439,8 @@ def main():
             rid = row["id"] if rep == 0 else f"{row['id']}#r{rep}"
             if led.done(rid):
                 continue
-            st = require_quiet(allow_shared=a.allow_shared, wait_min=a.quiet_wait_min)
+            st = require_quiet(max_cpu_pct=a.max_foreign_cpu_pct, allow_shared=a.allow_shared,
+                               wait_min=a.quiet_wait_min)
             disk_guard(row, rid, root, a, led)
             rundir = root / rid.replace("#", "_")
             rundir.mkdir(parents=True, exist_ok=True)
