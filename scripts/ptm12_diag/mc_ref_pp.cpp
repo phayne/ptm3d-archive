@@ -218,7 +218,9 @@ int main(int argc,char**argv){
                        "WRONG on open meshes. A/B measurement only. ***\n"); }
     fprintf(stderr,"# CORRECTED referee: offset=%.6g m  keps=%.3f  nrays=%d%s  backface_cull=%s\n",
             OFF,KEPS,NR,hasRing?"  (+ring occluder)":"",BACKCULL?"ON":"OFF");
-    printf("# face SumF F_sky F_warm384 Qir\n");
+    // nkept (appended 2026-10-13): partners kept for this face (= its .bin record nnz), so a
+    // row-sampled sweep that writes no bins can still estimate nnz per face with a true SE.
+    printf("# face SumF F_sky F_warm384 Qir nkept\n");
     RTCIntersectArguments ia; rtcInitIntersectArguments(&ia);
     long ring_total=0, ray_total=0, back_total=0, backseen_total=0;
     FILE* fb=nullptr;   // partner .bin, opened at the first record (as before)
@@ -270,7 +272,8 @@ int main(int argc,char**argv){
         // F_sky excludes ring occlusion and back-face blocking (a blocked ray is not sky).
         // Byte-identical to 1-SumF when neither fires (ringhit==0 && backhit==0).
         double SumF=double(terr)/tot, Fsky=double(tot-terr-ringhit-backhit)/tot, Fw=double(warm)/tot, Qir_abs=EPS*EPS*(Qir/tot);
-        printf("%7ld %.4f %.4f %.4f %.1f\n",pf,SumF,Fsky,Fw,Qir_abs);
+        long nkept=0; for(auto&kv:hits) if(kv.second>=MIN_HITS) ++nkept;
+        printf("%7ld %.4f %.4f %.4f %.1f %ld\n",pf,SumF,Fsky,Fw,Qir_abs,nkept);
         ring_total+=ringhit; ray_total+=tot; back_total+=backhit; backseen_total+=backseen;
         terr_total+=terr; ++faces_swept; partners_seen+=(long)hits.size();
         { long kept=0; for(auto&kv:hits) if(kv.second>=MIN_HITS) ++kept;
