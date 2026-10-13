@@ -548,6 +548,18 @@ def run_with_retry(ptm_bin: Path, cfg_path: Path, log_path: Path,
             return True
         ledger.record(stage=label, event="attempt_failed", attempt=attempt,
                       rc=ret.returncode, problems=problems, log=str(attempt_log))
+        if ret.returncode == 0 and problems:
+            # rc=0 + a failed log gate is DETERMINISTIC: the same binary, config
+            # and mesh print the same banners every time, so a retry cannot pass
+            # (2026-10-13: a wrong --expect-hole-seal-count rejected three
+            # identical, healthy Moon3D chunk_000 runs, ~3.3 h). Fail fast; fix
+            # the expectation or the config. Retries stay reserved for rc != 0.
+            ledger.record(stage=label, event="gate_failure_not_retried", attempt=attempt,
+                          problems=problems,
+                          retry="not retried: deterministic log-gate failure on an rc=0 run")
+            print(f"[{label}] gate failure on an rc=0 run {problems} -- NOT retrying "
+                  f"(deterministic).", flush=True)
+            return False
         attempt += 1
     return False
 
