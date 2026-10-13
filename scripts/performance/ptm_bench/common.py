@@ -172,16 +172,36 @@ def run_stamped(cmd, log_path, env=None, cwd=None, timeout=None):
     with open(log_path, "w", errors="replace") as lf:
         lf.write("# cmd: %s\n" % " ".join(map(str, full)))
         p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             env=env, cwd=cwd, text=True, errors="replace", bufsize=1)
+                             env=env, cwd=cwd, text=True, errors="replace", bufsize=1,
+                             start_new_session=True)
+        # Watchdog: a hung child (e.g. a wedged GPU) never closes stdout, so a timeout on
+        # wait() would never be reached. A timer kills the whole process group instead.
+        import signal
+        import threading
+        fired = []
+
+        def _kill():
+            fired.append(time.time() - t0)
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                p.kill()
+        timer = threading.Timer(timeout, _kill) if timeout else None
+        if timer:
+            timer.daemon = True
+            timer.start()
         try:
             for ln in p.stdout:
                 lf.write("%10.3f %s" % (time.time() - t0, ln))
                 m = TIME_RSS_RE.match(ln)
                 if m:
                     rss = int(m.group(1))   # bytes on macOS
-            rc = p.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            p.kill()
+            rc = p.wait()
+        finally:
+            if timer:
+                timer.cancel()
+        if fired:
+            lf.write("# WATCHDOG: killed after %.0f s (timeout %.0f s)\n" % (fired[0], timeout))
             rc = -9
     return rc, time.time() - t0, rss
 

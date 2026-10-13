@@ -57,6 +57,11 @@ def get_dotted(d, key, default=None):
     return cur
 
 
+def row_timeout(row, a):
+    """Watchdog per row: max(--min-timeout-s, --timeout-factor x predicted wall)."""
+    return max(a.min_timeout_s, a.timeout_factor * float(row.get("predicted_wall_s") or 0))
+
+
 def resolve_mc_ref_pp(embree_root):
     sys.path.insert(0, str(PTM12))
     os.environ["PTM_EMBREE_ROOT"] = str(embree_root)
@@ -183,7 +188,8 @@ def run_bowl(row, a, rundir):
         env["PTM_BOWL_ESTIMATOR"] = "sparse_production"
     elif est != "exact":
         raise SystemExit(f"FATAL: unknown bowl estimator {est}")
-    rc, wall, rss = run_stamped([a.bowl_bin, rundir, row["dd"]], rundir / "bowl.log", env=env)
+    rc, wall, rss = run_stamped([a.bowl_bin, rundir, row["dd"]], rundir / "bowl.log", env=env,
+                                timeout=row_timeout(row, a))
     if rc != 0:
         raise RuntimeError(f"bowl_crater_ptm rc={rc}")
     acc = [sys.executable, str(Path(__file__).resolve().parent / "accuracy.py"), "bowl", str(rundir),
@@ -236,7 +242,7 @@ def run_engine(row, a, rundir):
     cfg_path = rundir / "config.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     rc, wall, rss = run_stamped([a.bin_dir / "ptm_thermal_sim", "--config", cfg_path],
-                                rundir / "engine.log", env=env, cwd=REPO)
+                                rundir / "engine.log", env=env, cwd=REPO, timeout=row_timeout(row, a))
     if rc != 0:
         raise RuntimeError(f"ptm_thermal_sim rc={rc}")
     logtxt = (rundir / "engine.log").read_text(errors="replace")
@@ -379,6 +385,9 @@ def main():
     ap.add_argument("--gpu-ok", action="store_true", help="permit GPU rows (never during Stage 1/3)")
     ap.add_argument("--repeat", type=int, default=None,
                     help="override the repeat count of rows the plan already repeats (timing rows)")
+    ap.add_argument("--timeout-factor", type=float, default=4.0,
+                    help="kill an engine/bowl row after this many x its predicted wall")
+    ap.add_argument("--min-timeout-s", type=float, default=1800.0)
     ap.add_argument("--max-foreign-cpu-pct", type=float, default=200.0,
                     help="busy if other processes use more than this much CPU (100 = one core)")
     ap.add_argument("--quiet-wait-min", type=float, default=20.0,
