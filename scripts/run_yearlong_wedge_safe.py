@@ -527,10 +527,18 @@ def run_with_retry(ptm_bin: Path, cfg_path: Path, log_path: Path,
                 ret = subprocess.run([str(ptm_bin), "--config", str(cfg_path)],
                                      stdout=lf, stderr=subprocess.STDOUT, timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            # A timeout is NOT a GPU fault: the job was still computing when the
+            # wall-clock budget ran out. Retrying the identical job cannot
+            # succeed (2026-10-13: three 90-min timeouts of a healthy ~1.9 h
+            # Moon3D annual chunk_000 burned ~4.5 h). Fail fast so the caller
+            # re-plans the budget from measured rates; retries stay reserved
+            # for real failures (rc != 0 / gate problems).
             ledger.record(stage=label, event="attempt_timeout", attempt=attempt,
-                          log=str(attempt_log))
-            attempt += 1
-            continue
+                          log=str(attempt_log), timeout_min=timeout_min,
+                          retry="not retried: timeout is not a GPU fault")
+            print(f"[{label}] TIMEOUT after {timeout_min} min -- NOT retrying "
+                  f"(raise --chunk-timeout-min from a measured estimate).", flush=True)
+            return False
         import shutil
         shutil.copy2(attempt_log, log_path)
         problems = gate_check_common(attempt_log, expect_hole_seal_count=expect_hole_seal_count)
