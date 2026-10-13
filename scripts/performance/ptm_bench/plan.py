@@ -51,6 +51,14 @@ RATES = {
     "engine_bytes_base": 1.0e8,
     "repeat_max_wall_s": 1800,            # timing repeats (n=2) only for rows <= 30 min
 }
+# Disk model (bytes), calibrated 2026-10-12 on the smoke runs: per-step frames 7 fields x
+# 360 steps x (4N + 4) = 10.1 kB/face; statistics/ 87 B/face + mesh.ply 45 B/face; partner
+# bins 6.2 B per stored nnz measured (8 B upper bound: D <= S); CSR 8 B/nnz + 8 (N + 1).
+# The runner deletes bins after assembly (M2), each harness CSR after its last consumer
+# (M3) and per-step frames after each engine row (M4); an unassembled sweep writes no bins (M1).
+DISK = {"engine_kept_per_face": 150, "engine_kept_fixed": 5e7,
+        "bin_per_nnz": 8, "csr_per_nnz": 8, "sweep_small_per_face": 60, "bowl_per_face": 100}
+
 CAPS = {
     "assembly_nnz": 6.9e9,                # 48 B/nnz on 330 GB usable (hard)
     # Planning cap: half the hard cap, because the nnz each row is planned on is a +-2x
@@ -102,8 +110,31 @@ class Plan:
         self.root, self.runs, self.rows = root, [], []
         self.man = man
 
-    def add(self, arm, rid, kind, wall, mem, note="", run=None, gpu=False, repeats=1):
+    def disk(self, kind, run, nnz):
+        """(peak bytes while the row runs, bytes it leaves behind, CSR bytes it leaves
+        behind until that CSR's last consumer)."""
+        n = (run or {}).get("n_faces", 0)
+        if kind == "sweep":
+            small = DISK["sweep_small_per_face"] * n + 1e6
+            if (run or {}).get("assemble", True):
+                csr = DISK["csr_per_nnz"] * nnz + 8 * (n + 1) + 20
+                rowsum = 8 * n
+                return small + DISK["bin_per_nnz"] * nnz + csr + rowsum, small + rowsum, csr
+            return small, small, 0.0
+        if kind == "engine":
+            kept = DISK["engine_kept_per_face"] * n + DISK["engine_kept_fixed"]
+            frames = 7 * 360 * (4 * n + 4)
+            return frames + kept, kept, 0.0
+        b = DISK["bowl_per_face"] * n + 1e6
+        return b, b, 0.0
+
+    def add(self, arm, rid, kind, wall, mem, note="", run=None, gpu=False, repeats=1, nnz=None):
         status = "ok"
+        if kind == "sweep" and run is not None and not str(run["mesh"]).endswith(".ply"):
+            # PTM-724: mc_ref_pp reads binary PLY only; a .vtk here fails every attempt.
+            raise SystemExit(f"FATAL: sweep row {rid} points at {run['mesh']}; mc_ref_pp "
+                             "reads binary PLY only. Regenerate the manifest (make_meshes.py).")
+        dpeak, dfinal, dcsr = self.disk(kind, run, nnz or 0)
         if mem is not None and mem > CAPS["ram_bytes"]:
             status = "OVER-RAM-CAP"
             if kind == "engine":
@@ -111,11 +142,16 @@ class Plan:
                 note += "; in-core model exceeds RAM, streamed path unmeasured: run after a 1e6 RSS check"
         if wall is not None and wall > RATES["repeat_max_wall_s"]:
             repeats = 1
+        produces = (str(Path(self.root) / rid / "vf.csr")
+                    if kind == "sweep" and (run or {}).get("assemble", True) else None)
         self.rows.append(dict(arm=arm, id=rid, kind=kind, wall=wall, mem=mem, note=note,
-                              status=status, gpu=gpu, repeats=repeats))
+                              status=status, gpu=gpu, repeats=repeats, disk_peak=dpeak,
+                              disk_final=dfinal, csr_bytes=dcsr, produces=produces,
+                              consumes=(run or {}).get("csr")))
         if run is not None and status == "ok":
             run.update(id=rid, kind=kind, repeats=repeats, predicted_wall_s=wall,
-                       predicted_peak_bytes=mem)
+                       predicted_peak_bytes=mem, predicted_disk_peak_bytes=dpeak,
+                       predicted_disk_final_bytes=dfinal + dcsr)
             self.runs.append(run)
 
 
@@ -189,7 +225,7 @@ def build(man, root):
                       run=dict(nrays=nr, keps=keps, assemble=False, facelist=floor_list, **geo))
                 continue
             P.add("A", sid + "_sweep", "sweep", sweep_cost(n, nr) + asm_t, asm_m,
-                  f"nnz {nnz:.2e}", run=dict(nrays=nr, keps=keps, **geo))
+                  f"nnz {nnz:.2e}", run=dict(nrays=nr, keps=keps, **geo), nnz=nnz)
             P.add("A", sid + "_solve", "bowl", 1e-9 * nnz * RATES["bowl_solve_matvecs"] + 60,
                   nnz * RATES["bowl_csr_bytes_per_nnz"], "CSR load + radiosity vs Eq. 8",
                   run=dict(estimator="csr", csr=str(Path(root) / (sid + "_sweep") / "vf.csr"),
@@ -226,8 +262,8 @@ def build(man, root):
                 can_asm = nnz <= CAPS["assembly_nnz_planning"] and n <= 1.1e6
                 P.add("B", sid + "_sweep", "sweep", sweep_cost(n, nr) + (asm_t if can_asm else 0),
                       asm_m if can_asm else None,
-                      f"nnz {nnz:.2e}" + ("" if can_asm else " -> sweep only, nnz counted"),
-                      run=dict(nrays=nr, assemble=can_asm, **geo), repeats=1)
+                      f"nnz {nnz:.2e}" + ("" if can_asm else " -> sweep only, no bins; nnz BRACKET [D, 2D] from STATS"),
+                      run=dict(nrays=nr, assemble=can_asm, **geo), repeats=1, nnz=nnz)
                 if can_asm and nr == 20000:
                     w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_terrain"])
                     P.add("B", sid + "_coupled", "engine", w, mem,
@@ -245,7 +281,7 @@ def build(man, root):
         nnz = n * nnz_per_face("moon3d", n, 200000)
         asm_t, asm_m = asm_cost(nnz)
         P.add("C", f"{tag}_nr2e5_sweep", "sweep", sweep_cost(n, 200000) + asm_t, asm_m,
-              f"nnz {nnz:.2e} (nnz ~ N^2 regime test)", run=dict(nrays=200000, **geo))
+              f"nnz {nnz:.2e} (nnz ~ N^2 regime test)", run=dict(nrays=200000, **geo), nnz=nnz)
         P.add("C", f"{tag}_radoff_gpu1", "engine", n * RATES["gpu_radoff_s_per_face"], engine_mem(n),
               "GPU N=1", gpu=True, repeats=2,
               run=dict(overrides={"radiation.enabled": False, "thermal.use_gpu": True}, **geo))
@@ -265,7 +301,8 @@ def build(man, root):
         n = m.get("n_faces", 1698274)
         nnz = n * nnz_per_face("moon3d", n, 200000)
         P.add("C", "C_moon3d_orig_nr2e5_sweep", "sweep", sweep_cost(n, 200000), None,
-              f"1.7M original: nnz {nnz:.2e} counted from sweep bins, NO assembly",
+              f"1.7M original (PLY): no bins, no assembly; nnz reported as a BRACKET [D, 2D] "
+              f"from the sweep STATS lines (model ~{nnz:.1e})",
               run=dict(mesh=m["path"], n_faces=n, nrays=200000, assemble=False))
         P.add("C", "C_moon3d_orig_radoff_gpu1", "engine", n * RATES["gpu_radoff_s_per_face"], engine_mem(n),
               "GPU N=1", gpu=True, repeats=2,
@@ -299,8 +336,8 @@ def build(man, root):
             can = nnz <= CAPS["assembly_nnz_planning"]
             asm_t, asm_m = asm_cost(nnz)
             P.add("D", f"{tag}_nr{nr:g}_sweep", "sweep", sweep_cost(n, nr) + (asm_t if can else 0),
-                  asm_m if can else None, f"nnz {nnz:.2e}" + ("" if can else " -> sweep only"),
-                  run=dict(nrays=nr, assemble=can, **geo))
+                  asm_m if can else None, f"nnz {nnz:.2e}" + ("" if can else " -> sweep only, no bins; nnz BRACKET [D, 2D]"),
+                  run=dict(nrays=nr, assemble=can, **geo), nnz=nnz)
             if can:
                 w, mem = coupled_cost(n, nnz, RATES["picard_sweeps_terrain"])
                 P.add("D", f"{tag}_coupled", "engine", w, mem, "coupled; CPU radiosity", gpu=True,
@@ -330,13 +367,40 @@ def main():
     a = ap.parse_args()
     man = json.loads(Path(a.manifest).read_text())
     P = build(man, a.root)
-    print(f"{'arm':3s} {'id':58s} {'kind':6s} {'pred wall':>9s} {'x':>2s} {'peak mem':>9s}  note")
     tot = {}
     held = [r for r in P.rows if r["status"] != "ok"]
+    # Disk: run the scheduled rows in order (repeats expanded) with the runner's own
+    # deletion rules: M1/M2/M4 are inside each row's (peak, final); a harness CSR is
+    # held from its sweep until its last consumer finishes (M3).
+    ok_rows = [r for r in P.rows if r["status"] == "ok"]
+    remaining = {}
+    for r in ok_rows:
+        if r["consumes"]:
+            remaining[r["consumes"]] = remaining.get(r["consumes"], 0) + r["repeats"]
+    alive, batch_peak, peak_at, csr_alive = 0.0, 0.0, None, {}
+    for r in ok_rows:
+        r["disk_before"] = alive
+        for rep_ in range(r["repeats"]):
+            if alive + r["disk_peak"] > batch_peak:
+                batch_peak, peak_at = alive + r["disk_peak"], r["id"]
+            alive += r["disk_final"]
+            if r["produces"] and rep_ == 0:
+                csr_alive[r["produces"]] = r["csr_bytes"]
+                alive += r["csr_bytes"]
+            for path in (r["consumes"], r["produces"]):
+                if path in csr_alive and remaining.get(path, 0) - (path == r["consumes"]) <= 0:
+                    alive -= csr_alive.pop(path)
+            if r["consumes"] in remaining:
+                remaining[r["consumes"]] -= 1
+        r["disk_after"] = alive
+    print(f"{'arm':3s} {'id':58s} {'kind':6s} {'pred wall':>9s} {'x':>2s} {'peak mem':>9s} "
+          f"{'disk pk':>8s} {'disk fin':>8s}  note")
     for r in P.rows:
         flag = "" if r["status"] == "ok" else f" [{r['status']}]"
+        fin = r["disk_final"] + r["csr_bytes"]
         print(f"{r['arm']:3s} {r['id'][:58]:58s} {r['kind']:6s} {hms(r['wall']):>9s} "
-              f"{r['repeats']:>2d} {gb(r['mem']):>9s}  {r['note']}{' (GPU)' if r['gpu'] else ''}{flag}")
+              f"{r['repeats']:>2d} {gb(r['mem']):>9s} {gb(r['disk_peak']):>8s} {gb(fin):>8s}  "
+              f"{r['note']}{' (GPU)' if r['gpu'] else ''}{flag}")
         if r["status"] != "ok":
             continue
         w = (r["wall"] or 0) * r["repeats"]
@@ -350,9 +414,15 @@ def main():
     for arm, (w, k, g) in sorted(tot.items()):
         grand += w
         print(f"arm {arm}: {k:3d} scheduled rows, predicted {hms(w)} (GPU-holding rows {hms(g)}), +-2x")
-    ok = [r for r in P.rows if r["status"] == "ok"]
     print(f"TOTAL scheduled machine time {hms(grand)} = {grand / 86400:.1f} days (+-2x); worst "
-          f"scheduled peak {gb(max((r['mem'] or 0) for r in ok))} vs {gb(CAPS['ram_bytes'])} usable")
+          f"scheduled RAM peak {gb(max((r['mem'] or 0) for r in ok_rows))} vs "
+          f"{gb(CAPS['ram_bytes'])} usable")
+    worst_row = max(ok_rows, key=lambda r: r["disk_peak"])
+    print(f"DISK: batch peak {gb(batch_peak)} (at {peak_at}); largest single-row peak "
+          f"{gb(worst_row['disk_peak'])} ({worst_row['id']}) -> the runner's guard needs "
+          f"{gb(2 * worst_row['disk_peak'])} + reserve free before that row; final footprint "
+          f"after the batch {gb(alive)}. Without M1-M4 the same rows would leave "
+          f"{gb(sum((r['disk_peak']) * r['repeats'] for r in ok_rows))}.")
     print(f"HELD (not scheduled): {len(held)} rows -- " + ", ".join(r["id"] for r in held))
     print()
     print(GPU_SAFETY)
@@ -370,7 +440,7 @@ def main():
                                              "runs": P.runs}, indent=1))
         print(f"\nwrote {a.write} ({len(P.runs)} runnable rows)")
     if a.json_table:
-        Path(a.json_table).write_text(json.dumps(P.rows, indent=1))
+        Path(a.json_table).write_text(json.dumps(P.rows, indent=1, default=str))
 
 
 if __name__ == "__main__":

@@ -45,5 +45,19 @@ every record); no coupled row without a CSR (a silent in-engine VF build on a la
 wedge trigger); coupled rows must log `REPLACED H-matrix`; GPU rows get batch 1280, pause 1500 ms,
 `PTM_RAD_RERUN_MAX_GPUS=1`; no AGT/Artemis path is accepted by `make_meshes.py`.
 
+Disk (PTM-722). The batch writes far more than it keeps, so the runner cleans up as it goes and
+records what it deletes in the ledger:
+- M1: a sweep that is never assembled writes no partner bins (`/dev/null`); its nnz is reported as a
+  BRACKET [D, 2D] from the `mc_ref_pp` STATS lines (D = directed partners kept), never as a count.
+- M2: partner bins are deleted after a successful assembly (file count and bytes recorded).
+- M3: a CSR this plan produced is deleted once EVERY consumer run (repeats included) is `done`;
+  md5, bytes, N, nnz and the vf_stats sidecar go into the ledger first, and the sidecar, provenance
+  and rowsum stay on disk. A failed or pending consumer keeps it. External CSRs are never touched.
+- M4: per-step frame directories are deleted after each engine row; `statistics/`, `timing.json`
+  and the small top-level files stay.
+- Guard: before each row, free >= 2 x the row's `predicted_disk_peak_bytes` + `--disk-reserve-gib`
+  (default 15). Otherwise the batch stops between rows (ledger `abort_disk`, exit 3); resume later.
+`plan.py` prints each row's disk peak and final footprint and the simulated batch peak.
+
 Precision trap: VTK's PLY reader (and so pyvista) demotes double vertices to float32, i.e. 0.125 m at
 the lunar radius, coarser than a 2.5 mm Moon3D facet. Read these PLYs with numpy, or VTK legacy files.

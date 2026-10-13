@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -80,6 +81,7 @@ def run_sweep(row, a, rundir):
     env = dict(os.environ)
     if row.get("ring"):
         env["PTM_PP_RING_PLY"] = row["ring"]
+    assemble = row.get("assemble", True)
     for k, ch in enumerate(chunks):
         fl = rundir / "sweep" / f"chunk_{k:03d}.txt"
         fl.write_text("\n".join(ch) + "\n")
@@ -87,14 +89,17 @@ def run_sweep(row, a, rundir):
         err = open(rundir / "sweep" / f"log_{k:03d}.txt", "w")
         procs.append(subprocess.Popen(
             [mc, str(mesh), str(tmax), str(fl), str(row["nrays"]), str(row.get("offset", 1e-4)),
-             str(row.get("keps", 0.2)), "1", str(rundir / "sweep" / f"pp_{k:03d}.bin")],
+             str(row.get("keps", 0.2)), "1",
+             # M1: a row that is never assembled writes no partner bins at all; its nnz
+             # comes from the STATS lines (a bracket, see below), its F_sky from stdout.
+             str(rundir / "sweep" / f"pp_{k:03d}.bin") if assemble else "/dev/null"],
             stdout=out, stderr=err, env=env))
     rcs = [p.wait() for p in procs]
     sweep_s = time.time() - t0
     if any(rcs):
         raise RuntimeError(f"mc_ref_pp failed in {sum(1 for r in rcs if r)} chunk(s)")
     res = {"sweep_wall_s": sweep_s, "jobs": J, "mc_ref_pp": mc, "mc_ref_pp_md5": md5(mc)}
-    if row.get("assemble", True):
+    if assemble:
         csr = rundir / "vf.csr"
         cmd = [sys.executable, str(PTM12 / "assemble_vf_haworth.py"), str(mesh),
                str(rundir / "sweep/pp_*.bin"), str(row["nrays"]), "1", str(csr),
@@ -104,11 +109,24 @@ def run_sweep(row, a, rundir):
             raise RuntimeError(f"assembly failed rc={rc}")
         res.update(assemble_wall_s=wall, assemble_peak_rss_bytes=rss, csr=str(csr),
                    vf_stats=json.loads((rundir / "vf.csr.vf_stats.json").read_text()))
+        # M2: the bins are consumed; the CSR, its provenance and vf_stats sidecar carry
+        # everything downstream needs. Record what is deleted, then delete it.
+        bins = sorted((rundir / "sweep").glob("pp_*.bin"))
+        res["bins_deleted"] = {"files": len(bins), "bytes": sum(b.stat().st_size for b in bins)}
+        for b in bins:
+            b.unlink()
     else:
         sys.path.insert(0, str(PTM12))
         import vf_stats
         tot, nl, nfiles, missing = vf_stats.parse_sweep_stats(str(rundir / "sweep/log_*.txt"))
         res["sweep_stats"] = {**tot, "stats_lines": nl, "files": nfiles, "missing": missing}
+        if not row.get("facelist") and tot.get("partners_kept") is not None:
+            D = int(tot["partners_kept"])
+            res["nnz_bracket"] = {
+                "lo": D, "hi": 2 * D, "directed_partners_D": D,
+                "label": "BRACKET, not a count: the symmetric matrix would store between D "
+                         "(every pair seen from both ends) and 2D (every pair seen from one "
+                         "end) entries. No bins written, no assembly (M1)."}
         if row.get("dd") is not None and row.get("facelist"):
             # floor-only bowl sweep: F_sky straight from the referee rows (no assembly)
             r = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "accuracy.py"),
@@ -199,13 +217,101 @@ def run_engine(row, a, rundir):
         raise RuntimeError("coupled run did not log 'REPLACED H-matrix': timing would describe "
                            "a different operator")
     t = json.loads((rundir / "timing.json").read_text())
+    # M4: per-step frames are bulk (~10 kB/face at 360 steps) and not part of the
+    # benchmark product; statistics/, timing.json and the small top-level files stay.
+    freed = prune_frames(out)
     m = re.search(r"\[VF-STATS\][^\n]*", logtxt)
-    return {"wall_s": wall, "peak_rss_bytes": rss, "timing": t,
+    return {"wall_s": wall, "peak_rss_bytes": rss, "timing": t, "frames_deleted": freed,
             "vf_stats_banner": m.group(0) if m else None,
             "rad_cost": (re.findall(r"\[rad-cost\][^\n]*", logtxt) or [None])[-1]}
 
 
 KINDS = {"sweep": run_sweep, "bowl": run_bowl, "engine": run_engine}
+
+GiB = 1024 ** 3
+
+
+def dir_bytes(d):
+    return sum(f.stat().st_size for f in Path(d).rglob("*") if f.is_file())
+
+
+def prune_frames(out):
+    """M4: delete every subdirectory of an engine output dir except statistics/."""
+    out = Path(out)
+    if not out.is_dir():
+        return {"dirs": [], "bytes": 0}
+    gone, nbytes = [], 0
+    for d in sorted(out.iterdir()):
+        if d.is_dir() and d.name != "statistics":
+            nbytes += dir_bytes(d)
+            shutil.rmtree(d)
+            gone.append(d.name)
+    return {"dirs": gone, "bytes": nbytes}
+
+
+def expanded_ids(row, a):
+    """The run ids a plan row expands to (same rule the main loop uses)."""
+    reps = row.get("repeats", 1)
+    if a.repeat and reps > 1:
+        reps = a.repeat
+    return [row["id"]] + [f"{row['id']}#r{k}" for k in range(1, reps)]
+
+
+def csr_lifecycle(plan_rows, root, a):
+    """{csr path produced by a sweep row of THIS plan: [every consumer run id]}.
+    Built over the WHOLE plan (not the --only subset), so a filtered invocation can
+    never delete a matrix a later row still needs. External matrices (the paper's
+    v4 CSRs) are not produced here and are never touched."""
+    produced = {}
+    for r in plan_rows:
+        if r["kind"] == "sweep" and r.get("assemble", True):
+            produced[str(root / r["id"].replace("#", "_") / "vf.csr")] = []
+    for r in plan_rows:
+        c = r.get("csr")
+        if c in produced:
+            produced[c] += expanded_ids(r, a)
+    return produced
+
+
+def collect_garbage(lifecycle, led, root):
+    """M3: delete a harness-produced CSR once EVERY consumer run is done (a failed or
+    pending consumer keeps it). md5, bytes, nnz and the vf_stats sidecar are written
+    to the ledger first; the sidecar, provenance and rowsum files stay on disk."""
+    for path, consumers in lifecycle.items():
+        p = Path(path)
+        if not p.exists() or not all(led.done(c) for c in consumers):
+            continue
+        assert Path(root).resolve() in p.resolve().parents, p   # never outside the run root
+        with open(p, "rb") as fh:
+            n = int.from_bytes(fh.read(4), "little")
+            fh.seek(4 + 8 + 8 * (n + 1))
+            nnz = int.from_bytes(fh.read(8), "little")
+        side = Path(str(p) + ".vf_stats.json")
+        rec = {"path": str(p), "md5": md5(p), "bytes": p.stat().st_size, "n_faces": n,
+               "nnz": nnz, "consumers": consumers,
+               "vf_stats": json.loads(side.read_text()) if side.exists() else None}
+        led.write(id=str(p), event="csr_deleted", record=rec)
+        p.unlink()
+        log(f"M3: deleted {p.name} of {p.parent.name} ({rec['bytes'] / GiB:.2f} GiB, md5 "
+            f"{rec['md5']}) after its last consumer")
+
+
+def disk_guard(row, rid, root, a, led):
+    """Refuse to START a row unless free >= 2 x its predicted disk peak + a fixed
+    reserve. A failure aborts the whole batch cleanly, between rows, never mid-row."""
+    peak = row.get("predicted_disk_peak_bytes")
+    if peak is None:
+        raise SystemExit(f"FATAL: row {row['id']} has no predicted_disk_peak_bytes; this plan "
+                         "predates the disk model. Regenerate it with plan.py.")
+    free = shutil.disk_usage(root).free
+    need = 2.0 * peak + a.disk_reserve_gib * GiB
+    if free < need:
+        led.write(id=rid, event="abort_disk", free_bytes=free, need_bytes=need,
+                  predicted_disk_peak_bytes=peak, reserve_gib=a.disk_reserve_gib)
+        log(f"ABORT (disk guard) before {rid}: free {free / GiB:.1f} GiB < 2 x predicted "
+            f"peak {peak / GiB:.2f} GiB + reserve {a.disk_reserve_gib:.0f} GiB = "
+            f"{need / GiB:.1f} GiB. No row was started; resume after freeing space.")
+        sys.exit(3)
 
 
 def main():
@@ -225,6 +331,8 @@ def main():
                     help="override the repeat count of rows the plan already repeats (timing rows)")
     ap.add_argument("--quiet-wait-min", type=float, default=20.0,
                     help="max wait for the machine to go quiet before each row")
+    ap.add_argument("--disk-reserve-gib", type=float, default=15.0,
+                    help="fixed reserve on top of 2 x the row's predicted disk peak")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     which_python_has("numpy", "yaml")
@@ -246,6 +354,8 @@ def main():
     if prov["git"]["dirty_files"]:
         log(f"WARNING: worktree has {prov['git']['dirty_files']} modified tracked files; the "
             "SHA alone does not identify this build")
+    lifecycle = csr_lifecycle(plan["runs"], root, a)
+    collect_garbage(lifecycle, led, root)   # anything a previous invocation left eligible
     for row in rows:
         reps = row.get("repeats", 1)
         if a.repeat and reps > 1:
@@ -256,6 +366,7 @@ def main():
             if led.done(rid):
                 continue
             st = require_quiet(allow_shared=a.allow_shared, wait_min=a.quiet_wait_min)
+            disk_guard(row, rid, root, a, led)
             rundir = root / rid.replace("#", "_")
             rundir.mkdir(parents=True, exist_ok=True)
             led.write(id=rid, event="start", row=row, machine=st, provenance=prov)
@@ -263,12 +374,16 @@ def main():
             try:
                 res = KINDS[row["kind"]](row, a, rundir)
             except Exception as e:   # recorded, then the batch continues
+                if row["kind"] == "engine":
+                    prune_frames(rundir / "out")   # M4 applies to a failed row as well
                 led.write(id=rid, event="fail", error=str(e))
                 log(f"FAIL {rid}: {e}")
                 continue
             led.write(id=rid, event="done", result=res, machine_after=machine_state(),
-                      shared_machine=st["shared_machine"])
+                      shared_machine=st["shared_machine"],
+                      disk_free_after_bytes=shutil.disk_usage(root).free)
             log(f"done {rid}")
+            collect_garbage(lifecycle, led, root)
 
 
 if __name__ == "__main__":

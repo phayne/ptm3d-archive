@@ -62,6 +62,12 @@ def flat(rec):
                  f_sky_p50=vs["f_sky"]["p50"], saturation=vs.get("saturation"),
                  directed_saturation=vs.get("directed_saturation"),
                  rho=vs.get("spectral", {}).get("rho"), csr_bytes=vs.get("csr_bytes"))
+    br = res.get("nnz_bracket")
+    if br:   # a BRACKET, never a count: no bins were written for this row (M1)
+        o.update(nnz_bracket_lo=br["lo"], nnz_bracket_hi=br["hi"])
+    for k in ("bins_deleted", "frames_deleted"):
+        if k in res:
+            o[f"{k}_bytes"] = res[k]["bytes"]
     ss = res.get("sweep_stats")
     if ss:
         o.update(partners_kept=ss.get("partners_kept"), rays_total=ss.get("rays_total"),
