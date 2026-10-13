@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <cmath>
 #include <vector>
 #include <array>
@@ -24,6 +25,16 @@
 #include <algorithm>  // std::max/min({...}) initializer-list overloads: NOT transitive on Linux libstdc++
 #include <chrono>
 using V3=std::array<double,3>;
+// PTM-723: every write is checked. A full disk or a quota used to truncate the partner
+// .bin silently and exit 0; the assembler then saw a short final record (or a clean
+// boundary) and the sweep looked complete. Now any failed open/write/flush/close is FATAL
+// with exit status 4, naming the file and errno.
+[[noreturn]] static void write_fail(const char* what,const char* path){
+    fprintf(stderr,"FATAL: %s failed for '%s': %s (errno %d). Output is incomplete; "
+                   "refusing to exit 0.\n",what,path,std::strerror(errno),errno);
+    std::exit(4); }
+static void wr(const void* p,size_t n,FILE* f,const char* path){
+    if(std::fwrite(p,n,1,f)!=1) write_fail("fwrite",path); }
 static double dot(const V3&a,const V3&b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
 static V3 cross(const V3&a,const V3&b){return{{a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]}};}
 static V3 nrm(const V3&a){double L=std::sqrt(dot(a,a));return L>0?V3{{a[0]/L,a[1]/L,a[2]/L}}:a;}
@@ -210,6 +221,7 @@ int main(int argc,char**argv){
     printf("# face SumF F_sky F_warm384 Qir\n");
     RTCIntersectArguments ia; rtcInitIntersectArguments(&ia);
     long ring_total=0, ray_total=0, back_total=0, backseen_total=0;
+    FILE* fb=nullptr;   // partner .bin, opened at the first record (as before)
     // C4 sweep statistics (stderr STATS line only; the .bin output is unaffected).
     long terr_total=0, faces_swept=0, partners_seen=0, partners_kept=0, max_kept=0;
     for(long pf:want){ if(pf<0||pf>=(long)nf)continue; const V3&c=ctr[pf]; V3 ax=nn[pf]; double heps=KEPS*edge[pf];
@@ -263,10 +275,11 @@ int main(int argc,char**argv){
         terr_total+=terr; ++faces_swept; partners_seen+=(long)hits.size();
         { long kept=0; for(auto&kv:hits) if(kv.second>=MIN_HITS) ++kept;
           partners_kept+=kept; if(kept>max_kept) max_kept=kept; }
-        { static FILE* fb=fopen(OUTB,"wb"); int nnz=0; for(auto&kv:hits){ if(kv.second>=MIN_HITS) nnz++; }
-          int src=(int)pf; fwrite(&src,4,1,fb); fwrite(&nnz,4,1,fb);
-          for(auto&kv:hits){ double F=(double)kv.second/tot; if(kv.second>=MIN_HITS){ int j=kv.first; float ff=(float)F; fwrite(&j,4,1,fb); fwrite(&ff,4,1,fb);} }
-          fflush(fb); }
+        { if(!fb){ fb=fopen(OUTB,"wb"); if(!fb) write_fail("fopen",OUTB); }
+          int nnz=0; for(auto&kv:hits){ if(kv.second>=MIN_HITS) nnz++; }
+          int src=(int)pf; wr(&src,4,fb,OUTB); wr(&nnz,4,fb,OUTB);
+          for(auto&kv:hits){ double F=(double)kv.second/tot; if(kv.second>=MIN_HITS){ int j=kv.first; float ff=(float)F; wr(&j,4,fb,OUTB); wr(&ff,4,fb,OUTB);} }
+          if(fflush(fb)!=0) write_fail("fflush",OUTB); }
     }
     if(hasRing) fprintf(stderr,"# RING summary: %ld ring-occlusion hits over %ld rays (%.4f) -- none recorded as partners\n",
                         ring_total,ray_total,ray_total?double(ring_total)/ray_total:0.0);
@@ -287,5 +300,7 @@ int main(int argc,char**argv){
                      "\"max_partners_kept\":%ld,\"wall_s\":%.3f}\n",
               nf,faces_swept,NR,MIN_HITS,ray_total,terr_total,ring_total,back_total,backseen_total,sky,
               partners_seen,partners_kept,max_kept,wall); }
+    if(fb && fclose(fb)!=0) write_fail("fclose",OUTB);
+    if(fflush(stdout)!=0 || ferror(stdout)) write_fail("stdout write","<stdout>");
     rtcReleaseScene(sc);rtcReleaseDevice(dev); return 0;
 }
