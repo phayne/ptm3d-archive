@@ -59,6 +59,22 @@ RATES = {
 DISK = {"engine_kept_per_face": 150, "engine_kept_fixed": 5e7,
         "bin_per_nnz": 8, "csr_per_nnz": 8, "sweep_small_per_face": 60, "bowl_per_face": 100}
 
+# Disk-guard overrides: explicit, per row, never global. run_bench.py requires free >=
+# factor x predicted_disk_peak_bytes + reserve; the default factor is 2.0. Every override is
+# written into the row and logged in the run ledger when the guard applies it.
+DISK_GUARD_DEFAULT = 2.0
+DISK_GUARD_OVERRIDES = {
+    "D_haworth_radcore_r25_100m_n400973_nr200000_sweep":
+        (1.8, "Paul ruling 2026-10-13: relax to 1.8x for the two largest rows only, so the "
+              "batch fits in ~110 GiB after snapshot thinning"),
+    "A_bowl_dd0.2_n100165_E2b_nr200000_k0.2_sweep":
+        (1.8, "Paul ruling 2026-10-13: relax to 1.8x for the two largest rows only, so the "
+              "batch fits in ~110 GiB after snapshot thinning"),
+}
+# Rows (with every row that consumes their CSR) moved to the FRONT of the batch, where free
+# space is highest: the override rows have the thinnest margin.
+FRONT_LOAD = list(DISK_GUARD_OVERRIDES)
+
 CAPS = {
     "assembly_nnz": 6.9e9,                # 48 B/nnz on 330 GB usable (hard)
     # Planning cap: half the hard cap, because the nnz each row is planned on is a +-2x
@@ -152,6 +168,9 @@ class Plan:
             run.update(id=rid, kind=kind, repeats=repeats, predicted_wall_s=wall,
                        predicted_peak_bytes=mem, predicted_disk_peak_bytes=dpeak,
                        predicted_disk_final_bytes=dfinal + dcsr)
+            if rid in DISK_GUARD_OVERRIDES:
+                f, why = DISK_GUARD_OVERRIDES[rid]
+                run.update(disk_guard_factor=f, disk_guard_override_reason=why)
             self.runs.append(run)
 
 
@@ -344,6 +363,21 @@ def build(man, root):
                       repeats=2, run=dict(csr=str(Path(root) / f"{tag}_nr{nr:g}_sweep" / "vf.csr"),
                                           overrides={"thermal.use_gpu": True,
                                                      "radiation.use_gpu": False}, **geo))
+    # Every override must name a scheduled row: a typo would otherwise silently leave
+    # the default in place for the row the ruling was about.
+    missing = [k for k in DISK_GUARD_OVERRIDES if k not in {r["id"] for r in P.runs}]
+    if missing:
+        raise SystemExit(f"FATAL: disk-guard override(s) name no scheduled row: {missing}")
+    # Front-load: each FRONT_LOAD row plus every row that consumes its CSR, in their
+    # original relative order, then everything else.
+    front = set()
+    for rid in FRONT_LOAD:
+        front.add(rid)
+        csr = str(Path(root) / rid / "vf.csr")
+        front |= {r["id"] for r in P.runs if r.get("csr") == csr}
+    P.runs = [r for r in P.runs if r["id"] in front] + [r for r in P.runs if r["id"] not in front]
+    P.rows = [r for r in P.rows if r["id"] in front] + [r for r in P.rows if r["id"] not in front]
+    P.front = front
     return P
 
 
@@ -393,6 +427,9 @@ def main():
             if r["consumes"] in remaining:
                 remaining[r["consumes"]] -= 1
         r["disk_after"] = alive
+    by_id = {r["id"]: r for r in ok_rows}
+    for run in P.runs:   # the dry run subtracts what earlier rows leave on disk
+        run["predicted_disk_retained_before_bytes"] = by_id[run["id"]]["disk_before"]
     print(f"{'arm':3s} {'id':58s} {'kind':6s} {'pred wall':>9s} {'x':>2s} {'peak mem':>9s} "
           f"{'disk pk':>8s} {'disk fin':>8s}  note")
     for r in P.rows:
@@ -419,10 +456,27 @@ def main():
           f"{gb(CAPS['ram_bytes'])} usable")
     worst_row = max(ok_rows, key=lambda r: r["disk_peak"])
     print(f"DISK: batch peak {gb(batch_peak)} (at {peak_at}); largest single-row peak "
-          f"{gb(worst_row['disk_peak'])} ({worst_row['id']}) -> the runner's guard needs "
-          f"{gb(2 * worst_row['disk_peak'])} + reserve free before that row; final footprint "
+          f"{gb(worst_row['disk_peak'])} ({worst_row['id']}); final footprint "
           f"after the batch {gb(alive)}. Without M1-M4 the same rows would leave "
           f"{gb(sum((r['disk_peak']) * r['repeats'] for r in ok_rows))}.")
+    print(f"DISK GUARD: default free >= {DISK_GUARD_DEFAULT:g} x row peak + reserve; per-row "
+          f"overrides ({len(DISK_GUARD_OVERRIDES)}):")
+    for r in ok_rows:
+        if r["id"] in DISK_GUARD_OVERRIDES:
+            f = DISK_GUARD_OVERRIDES[r["id"]][0]
+            print(f"  {r['id']}: factor {f:g}, peak {r['disk_peak'] / 2**30:.2f} GiB -> needs "
+                  f"{(f * r['disk_peak']) / 2**30 + 15:.1f} GiB free at 15 GiB reserve (default "
+                  f"would be {(2 * r['disk_peak']) / 2**30 + 15:.1f}); batch position "
+                  f"{ok_rows.index(r) + 1}/{len(ok_rows)}, retained footprint before it "
+                  f"{r['disk_before'] / 2**30:.2f} GiB")
+    rest = [r for r in ok_rows if r["id"] not in DISK_GUARD_OVERRIDES]
+    worst = max(rest, key=lambda r: r["disk_peak"])
+    print(f"  largest non-override row: {worst['id']} peak {worst['disk_peak'] / 2**30:.2f} GiB -> "
+          f"needs {2 * worst['disk_peak'] / 2**30 + 15:.1f} GiB free")
+    prof = [r["disk_after"] for r in ok_rows]
+    print(f"RETAINED FOOTPRINT (after each row, M1-M4 applied): max {max(prof) / 2**30:.2f} GiB, "
+          f"median {sorted(prof)[len(prof) // 2] / 2**30:.2f} GiB, end {prof[-1] / 2**30:.2f} GiB; "
+          f"batch peak (max over rows of retained + that row's peak) {batch_peak / 2**30:.2f} GiB")
     print(f"HELD (not scheduled): {len(held)} rows -- " + ", ".join(r["id"] for r in held))
     print()
     print(GPU_SAFETY)

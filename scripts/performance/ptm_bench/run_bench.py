@@ -296,21 +296,44 @@ def collect_garbage(lifecycle, led, root):
             f"{rec['md5']}) after its last consumer")
 
 
-def disk_guard(row, rid, root, a, led):
-    """Refuse to START a row unless free >= 2 x its predicted disk peak + a fixed
-    reserve. A failure aborts the whole batch cleanly, between rows, never mid-row."""
+DISK_GUARD_DEFAULT = 2.0
+
+
+def guard_math(row, free, a):
+    """(factor, need bytes, text). factor = the row's explicit disk_guard_factor
+    override (plan.py DISK_GUARD_OVERRIDES), else the default 2.0."""
     peak = row.get("predicted_disk_peak_bytes")
     if peak is None:
         raise SystemExit(f"FATAL: row {row['id']} has no predicted_disk_peak_bytes; this plan "
                          "predates the disk model. Regenerate it with plan.py.")
+    f = float(row.get("disk_guard_factor", DISK_GUARD_DEFAULT))
+    need = f * peak + a.disk_reserve_gib * GiB
+    txt = (f"free {free / GiB:.1f} GiB {'>=' if free >= need else '<'} {f:g} x peak "
+           f"{peak / GiB:.2f} GiB + reserve {a.disk_reserve_gib:g} GiB = {need / GiB:.1f} GiB"
+           + (f"  [OVERRIDE {f:g} (default {DISK_GUARD_DEFAULT:g}): "
+              f"{row.get('disk_guard_override_reason', 'no reason recorded')}]"
+              if "disk_guard_factor" in row else ""))
+    return f, need, txt
+
+
+def disk_guard(row, rid, root, a, led):
+    """Refuse to START a row unless free >= factor x its predicted disk peak + a fixed
+    reserve (factor 2 unless the plan row carries an explicit override, which is
+    logged in the ledger). A failure aborts the whole batch cleanly, between rows."""
     free = shutil.disk_usage(root).free
-    need = 2.0 * peak + a.disk_reserve_gib * GiB
+    f, need, txt = guard_math(row, free, a)
+    if "disk_guard_factor" in row:
+        led.write(id=rid, event="disk_guard_override", factor=f, default_factor=DISK_GUARD_DEFAULT,
+                  reason=row.get("disk_guard_override_reason"), free_bytes=free, need_bytes=need,
+                  predicted_disk_peak_bytes=row["predicted_disk_peak_bytes"],
+                  reserve_gib=a.disk_reserve_gib, passed=free >= need)
+        log(f"disk guard OVERRIDE for {rid}: {txt}")
     if free < need:
-        led.write(id=rid, event="abort_disk", free_bytes=free, need_bytes=need,
-                  predicted_disk_peak_bytes=peak, reserve_gib=a.disk_reserve_gib)
-        log(f"ABORT (disk guard) before {rid}: free {free / GiB:.1f} GiB < 2 x predicted "
-            f"peak {peak / GiB:.2f} GiB + reserve {a.disk_reserve_gib:.0f} GiB = "
-            f"{need / GiB:.1f} GiB. No row was started; resume after freeing space.")
+        led.write(id=rid, event="abort_disk", free_bytes=free, need_bytes=need, factor=f,
+                  predicted_disk_peak_bytes=row["predicted_disk_peak_bytes"],
+                  reserve_gib=a.disk_reserve_gib)
+        log(f"ABORT (disk guard) before {rid}: {txt}. No row was started; resume after "
+            "freeing space.")
         sys.exit(3)
 
 
@@ -334,6 +357,9 @@ def main():
     ap.add_argument("--disk-reserve-gib", type=float, default=15.0,
                     help="fixed reserve on top of 2 x the row's predicted disk peak")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dry-run-all", action="store_true", help="print guard math for every row")
+    ap.add_argument("--assume-free-gib", type=float, default=None,
+                    help="dry run only: evaluate the guard at this free space")
     a = ap.parse_args()
     which_python_has("numpy", "yaml")
     plan = json.loads(Path(a.plan).read_text())
@@ -343,8 +369,27 @@ def main():
     rows = [r for r in plan["runs"] if not a.only or re.search(a.only, r["id"])]
     led = Ledger(root / "ledger.jsonl")
     if a.dry_run:
-        for r in rows:
-            print(("DONE " if led.done(r["id"]) else "todo ") + r["id"])
+        # Guard math against TODAY's free space (or --assume-free-gib), row by row, in
+        # batch order. A dry run writes nothing, including no ledger entries.
+        free = (a.assume_free_gib * GiB if a.assume_free_gib is not None
+                else shutil.disk_usage(root if root.exists() else root.parent).free)
+        print(f"dry run: {'assumed' if a.assume_free_gib is not None else 'measured'} free "
+              f"{free / GiB:.1f} GiB at batch start, reserve {a.disk_reserve_gib:g} GiB; each row "
+              "is checked at start-free minus the predicted retained footprint before it")
+        n_fail = 0
+        for k, r in enumerate(rows, 1):
+            # free when this row starts = free now - what the earlier rows leave behind
+            # (plan.py simulation, M1-M4 applied); rows already done leave theirs already.
+            eff = free - (0 if led.done(r["id"]) else r.get("predicted_disk_retained_before_bytes", 0))
+            f, need, txt = guard_math(r, eff, a)
+            ok = eff >= need
+            n_fail += not ok
+            if a.dry_run_all or "disk_guard_factor" in r or not ok:
+                print(f"{k:4d} {'DONE' if led.done(r['id']) else 'todo'} "
+                      f"{'PASS' if ok else 'STOP'} {r['id']}: {txt}")
+        n_ovr = sum("disk_guard_factor" in r for r in rows)
+        print(f"dry run: {len(rows)} rows, {n_ovr} with a disk-guard override, "
+              f"{n_fail} would stop the batch at this free space")
         return
     if not (REPO / "data/kernels").exists():
         raise SystemExit("FATAL: data/kernels missing in the worktree (SPICE is CWD-relative); "
