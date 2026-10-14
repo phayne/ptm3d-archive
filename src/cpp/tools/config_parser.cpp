@@ -717,6 +717,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.eq_indirect_passes     = getWithDefault(thermal, "eq_indirect_passes",     config.thermal.eq_indirect_passes);
             config.thermal.spinup_seed            = getWithDefault(thermal, "spinup_seed",            config.thermal.spinup_seed);
             config.thermal.seed_anchor            = getWithDefault(thermal, "seed_anchor",            config.thermal.seed_anchor);
+            config.thermal.seed_indirect          = getWithDefault(thermal, "seed_indirect",          config.thermal.seed_indirect);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
@@ -1347,6 +1348,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "equilibration_stop_on_certificate" << YAML::Value << config.thermal.equilibration_stop_on_certificate;
         out << YAML::Key << "spinup_seed" << YAML::Value << config.thermal.spinup_seed;
         out << YAML::Key << "seed_anchor" << YAML::Value << config.thermal.seed_anchor;
+        // Written only when set, so a default run's config_used.yaml is unchanged.
+        if (config.thermal.seed_indirect != "off")
+            out << YAML::Key << "seed_indirect" << YAML::Value << config.thermal.seed_indirect;
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
         // (-1 = follow spinup_seed). Writing -1 into every template would make
@@ -1855,6 +1859,12 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
                          "'legacy'; got '" << config.thermal.spinup_seed << "'"
                       << std::endl;
+            valid = false;
+        }
+        if (config.thermal.seed_indirect != "off" && config.thermal.seed_indirect != "series"
+                && config.thermal.seed_indirect != "mean") {
+            std::cerr << "Error: thermal.seed_indirect must be 'off', 'series' or "
+                         "'mean'; got '" << config.thermal.seed_indirect << "'" << std::endl;
             valid = false;
         }
         thermal::EqSeedAnchor dummy_anchor;

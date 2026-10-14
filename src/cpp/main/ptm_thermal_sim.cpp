@@ -6341,6 +6341,31 @@ static bool eqPerfaceFluxMode() {
 //     construction, so it does not reintroduce the seam -- verified by
 //     measuring the seed's longitude spread at fixed latitude.
 // ---------------------------------------------------------------------------
+// ---- PTM-727: indirect-aware spin-up seed (thermal.seed_indirect) -----------
+// The seed is built from the absorbed DIRECT forcing only, so a never-lit column
+// (indirect flux is its only heat) starts on the geothermal floor and two
+// equilibration lunations leave it ~50 K too cold at depth (Fermi, F2 replay,
+// runs/stage3_f2/fermi/analyze_f093.txt). The first point at which an indirect
+// estimate exists is the eq-indirect re-solve; this hand-off is ACTIVE ONLY for
+// the duration of that whole-mesh solve (runEqIndirectPass sets it, a scope
+// guard clears it), so the first solve, the coupling re-thermals and every run
+// with thermal.seed_indirect: off never see it -- byte-identical by control
+// flow, not by arithmetic.
+enum class SeedIndirectMode { Off, Series, Mean };
+struct SeedIndirectHandoff {
+    SeedIndirectMode mode = SeedIndirectMode::Off;
+    const std::vector<std::vector<double>>* series = nullptr;  // [face][abs step], absorbed
+    const std::vector<double>* mean = nullptr;                  // per-face <q_ind>, absorbed
+    int t_lo = 0;   // first absolute step of the solved (output) window
+    int t_hi = 0;   // one past the last
+    std::string source;
+};
+static SeedIndirectHandoff g_seed_indirect;   // inactive unless mode != Off
+
+static const char* seedIndirectName(SeedIndirectMode m) {
+    return m == SeedIndirectMode::Series ? "series" : m == SeedIndirectMode::Mean ? "mean" : "off";
+}
+
 struct GpuSharedSeedContext {
     const thermal::Planet* planet = nullptr;
     const double* z               = nullptr;   // reference grid, n_layers nodes
@@ -6380,7 +6405,47 @@ struct GpuSharedSeedContext {
     double cp0                = 0.0;
     const std::vector<double>* cp_coeff = nullptr;
     SeedAnchorCensus* census  = nullptr;
+    /// Forcing window (PTM-727 series mode). Defaults reproduce the historical
+    /// window exactly: steps [0, seedForcingSteps(total_time_steps)).
+    int t_offset  = 0;
+    int n_forcing = 0;   ///< 0 = seedForcingSteps(total_time_steps)
 };
+
+/// Re-point a GPU seed context at the indirect-aware forcing when the PTM-727
+/// hand-off is active. `holder` owns the composed callable and must outlive the
+/// gpuFillSharedSeed call. Returns false (no change) when the hand-off is off.
+static bool applySeedIndirect(GpuSharedSeedContext& sc,
+                              const std::function<double(size_t, int)>& absorbed_at,
+                              std::function<double(size_t, int)>& holder,
+                              const std::vector<double>& times) {
+    const SeedIndirectHandoff& h = g_seed_indirect;
+    if (h.mode == SeedIndirectMode::Off) return false;
+    if (h.mode == SeedIndirectMode::Series) {
+        const auto* ser = h.series;
+        holder = [&absorbed_at, ser](size_t gf, int t) -> double {
+            const auto& row = (*ser)[gf];
+            return absorbed_at(gf, t) + (t < static_cast<int>(row.size()) ? row[t] : 0.0);
+        };
+        sc.t_offset  = h.t_lo;
+        sc.n_forcing = h.t_hi - h.t_lo;
+        // The output window is at ONE cadence; the historical seed's dt_s
+        // (times[1]-times[0]) is the EQUILIBRATION cadence under two-phase.
+        if (h.t_lo + 1 < static_cast<int>(times.size()))
+            sc.dt_s = times[h.t_lo + 1] - times[h.t_lo];
+        // The anchor stood down because F depended on neighbor temperatures it
+        // could not see. It now sees the iteration-0 estimate of exactly that,
+        // so it runs (and reports per face in the census as usual).
+        sc.radiation_coupled = false;
+    } else {
+        const auto* mean = h.mean;
+        holder = [&absorbed_at, mean](size_t gf, int t) -> double {
+            return absorbed_at(gf, t) + (*mean)[gf];
+        };
+        // Window and anchor unchanged: T_w of (<F> + <q_ind>), the warm bracket.
+    }
+    sc.absorbed = &holder;
+    return true;
+}
 
 static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                               std::vector<float>& T_initial,
@@ -6402,12 +6467,14 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         const double qb_f = (c.face_Qb && global_f < c.face_Qb->size())
                                 ? (*c.face_Qb)[global_f] : pl.Qb;
         double avg_flux = 0.0, sum_inst_T = 0.0;
-        const int n_samples = std::max(1, seedForcingSteps(c.total_time_steps));
+        const int n_samples = (c.n_forcing > 0)
+                                  ? c.n_forcing
+                                  : std::max(1, seedForcingSteps(c.total_time_steps));
         // The series is MATERIALIZED (not just accumulated) because the lit-face
         // anchor needs this face's forcing SPECTRUM, not only its mean.
         series.resize(static_cast<size_t>(n_samples));
         for (int t = 0; t < n_samples; ++t) {
-            const double Ft = (*c.absorbed)(global_f, t);
+            const double Ft = (*c.absorbed)(global_f, c.t_offset + t);
             series[t] = Ft;
             avg_flux += Ft;
             const double q = (Ft > 0.0 ? Ft : 0.0) + qb_f;
@@ -7491,12 +7558,56 @@ bool runThermalModelsForAllFacesBatchSoA(
                     sfc_.stride     = flux_stride;
                     sfc_.n_samples  = flux_avg_window;
                     sfc_.span_s     = seed_dt_s * flux_avg_window;
+                    // PTM-727 (thermal.seed_indirect): same composition as the
+                    // GPU helper applySeedIndirect. flux_base already carries
+                    // <q_ind> on the equilibration steps (eq_indirect_flux above),
+                    // and nothing on the output steps.
+                    std::vector<double> seed_ind_series;
+                    bool seed_ind_series_mode = false;
+                    if (g_seed_indirect.mode != SeedIndirectMode::Off && !is_subset) {
+                        const SeedIndirectHandoff& h = g_seed_indirect;
+                        if (h.mode == SeedIndirectMode::Series) {
+                            const int n = h.t_hi - h.t_lo;
+                            const auto& row = (*h.series)[global_f];
+                            seed_ind_series.resize(static_cast<size_t>(n));
+                            for (int t = 0; t < n; ++t) {
+                                const int ta = h.t_lo + t;
+                                seed_ind_series[t] = flux_base[static_cast<size_t>(ta) * flux_stride + f]
+                                    + (ta < static_cast<int>(row.size()) ? row[ta] : 0.0);
+                            }
+                            sfc_.flux = seed_ind_series.data();
+                            sfc_.stride = 1;
+                            sfc_.n_samples = n;
+                            const double dt_out = (h.t_lo + 1 < static_cast<int>(times.size()))
+                                ? times[h.t_lo + 1] - times[h.t_lo] : seed_dt_s;
+                            sfc_.span_s = dt_out * n;
+                            seed_ind_series_mode = true;
+                        } else {
+                            const double q = (*h.mean)[global_f];
+                            seed_ind_series.resize(static_cast<size_t>(flux_avg_window));
+                            for (int t = 0; t < flux_avg_window; ++t)
+                                seed_ind_series[t] = flux_base[static_cast<size_t>(t) * flux_stride + f]
+                                    + (t >= equilibration_steps ? q : 0.0);
+                            sfc_.flux = seed_ind_series.data();
+                            sfc_.stride = 1;
+                        }
+                        double a_ = 0.0, s_ = 0.0;
+                        for (double Ft : seed_ind_series) {
+                            a_ += Ft;
+                            const double q = (Ft > 0.0 ? Ft : 0.0) + batch.Qb[f];
+                            s_ += (q > 0.0) ? std::sqrt(std::sqrt(q / (batch.emissivity[f] * batch.sigma_sb))) : 0.0;
+                        }
+                        const double n_ = std::max<size_t>(1, seed_ind_series.size());
+                        flux_for_seed = std::max(0.0, a_ / n_);
+                        sum_inst_T = s_ / n_;
+                    }
                     sfc_.cycle_s    = planet.day;
                     sfc_.cp0        = planet.cp0;
                     sfc_.cp_coeff   = planet.cpCoeff.empty()
                                           ? nullptr : planet.cpCoeff.data();
                     sfc_.n_cp_coeff = static_cast<int>(planet.cpCoeff.size());
-                    sfc_.radiation_coupled = config.seed_forcing_radiation_coupled;
+                    sfc_.radiation_coupled = seed_ind_series_mode
+                        ? false : config.seed_forcing_radiation_coupled;
                     sfc_.refuse_two_timescale =
                         config.seed_anchor_refuse_two_timescale;
 
@@ -10396,6 +10507,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
+            std::function<double(size_t, int)> seed_indirect_holder;   // PTM-727
+            applySeedIndirect(sc, absorbed_at, seed_indirect_holder, times);
             // A warm-started chunk overwrites T_initial with the checkpoint a
             // few lines below (uploadAllTemps), so the seed computed here never
             // reaches the answer. Feeding the census and the guards from it
@@ -11182,6 +11295,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
+            std::function<double(size_t, int)> seed_indirect_holder;   // PTM-727
+            applySeedIndirect(sc, absorbed_at, seed_indirect_holder, times);
             // A warm-started chunk overwrites T_initial with the checkpoint a
             // few lines below (uploadAllTemps), so the seed computed here never
             // reaches the answer. Feeding the census and the guards from it
@@ -19055,6 +19170,13 @@ int main(int argc, char** argv) {
     const double resolved_analytic_cycles = thermal::analyticSeedCycles(
         resolved_seed_mode, resolved_analytic_cycles_cfg,
         planet.day, planet.year, kCpuAnalyticSeedYears);
+    if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled) {
+        // Never silent (make-silence-impossible): with radiation off there is no
+        // indirect flux and no eq-indirect pass, so the option cannot act.
+        std::cerr << "[eq-seed] WARNING: thermal.seed_indirect: "
+                  << sim_config.thermal.seed_indirect << " has NO effect: radiation is off,"
+                     " so there is no indirect flux to seed with (PTM-727)." << std::endl;
+    }
     config.spinup_seed          = resolved_seed_mode;
     config.seed_anchor          = resolved_seed_anchor;
     config.seed_forcing_radiation_coupled = sim_config.radiation.enabled;
@@ -22084,6 +22206,56 @@ int main(int argc, char** argv) {
                 // alone would let the block fire again on a later iteration.
                 bool eq_indirect_internal_finished = false;
 
+                // ---- PTM-727: thermal.seed_indirect -------------------------
+                // Acts only inside the eq-indirect re-solve, so it is refused
+                // wherever that pass can never run -- except a warm-started
+                // chunk, whose column comes from the checkpoint (which carries
+                // the fix if the first chunk ran with it): there it is a NOTE.
+                SeedIndirectMode seed_indirect_mode = SeedIndirectMode::Off;
+                {
+                    const std::string& si = sim_config.thermal.seed_indirect;
+                    seed_indirect_mode = (si == "series") ? SeedIndirectMode::Series
+                                       : (si == "mean")   ? SeedIndirectMode::Mean
+                                                          : SeedIndirectMode::Off;
+                    if (seed_indirect_mode != SeedIndirectMode::Off) {
+                        const bool gpu_l  = thermal_config.getPropertyBool("use_gpu_thermal", false);
+                        const bool simd_l = thermal_config.getPropertyBool("use_simd_batch", true);
+                        if (eq_indirect_warm_start) {
+                            std::cout << "  [eq-seed] thermal.seed_indirect: " << si
+                                      << " is inert in this warm-started chunk: its column"
+                                         " comes from the checkpoint, which carries the"
+                                         " indirect-aware seed if the first chunk ran with it."
+                                      << std::endl;
+                            seed_indirect_mode = SeedIndirectMode::Off;
+                        } else if (!eq_indirect_internal_armed) {
+                            std::cerr << "FATAL: thermal.seed_indirect: " << si << " acts only in"
+                                         " the internal eq-indirect re-solve, which cannot run"
+                                         " here (needs thermal.eq_indirect_source auto|converged,"
+                                         " no thermal.eq_indirect_flux_file, and an equilibration"
+                                         " span before the output window). Refusing to run with"
+                                         " an inert seed option.\n";
+                            return 1;
+                        } else if (!gpu_l && !simd_l) {
+                            std::cerr << "FATAL: thermal.seed_indirect: " << si << " is implemented"
+                                         " on the GPU persistent and CPU SIMD-batch solvers; this"
+                                         " run uses the CPU scalar solver (use_simd_batch: false)."
+                                         "\n";
+                            return 1;
+                        } else {
+                            std::cout << "  [eq-seed] thermal.seed_indirect: " << si
+                                      << " (PTM-727): the eq-indirect re-solve seeds every column"
+                                      << (seed_indirect_mode == SeedIndirectMode::Series
+                                              ? " from its absorbed flux + the time-varying indirect"
+                                                " flux of the sweep it reads, over the output window,"
+                                                " with the lumped anchor running"
+                                              : " from its absorbed flux + its time-mean <q_ind>"
+                                                " (warm bracket; anchor stands down)")
+                                      << ". The first whole-mesh solve and the re-thermals are"
+                                         " unchanged." << std::endl;
+                        }
+                    }
+                }
+
                 if (eq_indirect_internal_armed) {
                     // State the price before charging it, and state it in the
                     // units it is actually paid in: WHOLE-MESH THERMAL SOLVES
@@ -22840,6 +23012,35 @@ int main(int argc, char** argv) {
                     std::cout.precision(eqi_prec);
 
                     eq_indirect_vec = q_ind_mean;
+                    // PTM-727: arm the indirect-aware seed for THIS solve only.
+                    struct SeedIndirectScope {
+                        ~SeedIndirectScope() { g_seed_indirect = SeedIndirectHandoff{}; }
+                    } seed_indirect_scope;
+                    if (seed_indirect_mode != SeedIndirectMode::Off) {
+                        g_seed_indirect.mode   = seed_indirect_mode;
+                        g_seed_indirect.series = &indirect_flux_series;
+                        g_seed_indirect.mean   = &eq_indirect_vec;
+                        g_seed_indirect.t_lo   = out_lo;
+                        g_seed_indirect.t_hi   = std::min(out_hi, seedForcingSteps(total_time_steps));
+                        g_seed_indirect.source = source_desc;
+                        double nz = 0.0;
+                        for (size_t f = 0; f < num_faces; ++f) {
+                            const auto& row = indirect_flux_series[f];
+                            if (static_cast<int>(row.size()) < g_seed_indirect.t_hi) {
+                                std::cerr << "[FATAL] PTM-727 seed: indirect series of face " << f
+                                          << " has " << row.size() << " steps, needs "
+                                          << g_seed_indirect.t_hi << ".\n";
+                                return -1;
+                            }
+                            if (q_ind_mean[f] > 0.0) nz += 1.0;
+                        }
+                        std::cout << "    [eq-seed] seed_indirect: "
+                                  << seedIndirectName(seed_indirect_mode)
+                                  << " armed for this re-solve: steps [" << g_seed_indirect.t_lo
+                                  << ", " << g_seed_indirect.t_hi << ") of " << total_time_steps
+                                  << ", source " << source_desc << ", " << nz << "/" << num_faces
+                                  << " faces with indirect." << std::endl;
+                    }
                     const bool ok = solveWholeMeshThermal(
                         eq_indirect_vec, direct_solar_values,
                         primary_reflected_values, primary_ir_values);
