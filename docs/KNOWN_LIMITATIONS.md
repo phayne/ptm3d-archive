@@ -456,6 +456,22 @@ that the value you set is the value that was echoed.
 
 ---
 
+## 8. Coupled runs before the PTM-727 default change seeded never-lit columns too cold
+
+**What it is.** Until `thermal.seed_indirect` became `series` by default, the spin-up seed of a
+radiation-coupled run omitted indirect flux. A never-lit column, heated only by its neighbors,
+started on the geothermal floor and stayed cold at depth through a short equilibration. On
+Moon3D dt65 the replay estimate is +2.0 to +2.2 K on the cold-trap mean temperature
+(decisive control: `<FILL BEFORE MERGE>`). T_max moves about +0.5 K; cold-trap area @110 K about
+−0.02 pp.
+**Who is affected.** Coupled runs made before the change, mostly the cold-trap / PSR statistics of
+short (1–2 lunation) equilibrations. Long equilibrations are affected less.
+**What to do.** Nothing for new runs. To reproduce an old result exactly, set
+`thermal.seed_indirect: off` (or `--seed-indirect off`). See `docs/radiation-exchange.md` §7.8.
+**Status.** Fixed (PTM-727); the legacy value is kept on purpose.
+
+---
+
 ### Reference
 
 | Section | Internal identifier |
@@ -467,6 +483,7 @@ that the value you set is the value that was echoed.
 | Section 5 — generic-body truncation | PTM-201, PTM-60 |
 | Section 6 — CPU SIMD surface Newton | PTM-216 |
 | Section 7 — unknown keys and flags | PTM-193, PTM-203, PTM-215, PTM-32 |
+| Section 8 — spin-up seed without indirect flux | PTM-727, PTM-728 |
 
 ---
 

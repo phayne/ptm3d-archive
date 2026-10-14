@@ -939,6 +939,45 @@ the usual production setup, and the one long campaigns use — the re-run covers
 only, the equilibration phase is never revisited, and the correction is large: 54 K to 126 K in the
 deep column, +10.2 K in the window-mean surface temperature of a permanently shadowed crater floor.
 
+### 7.8 The spin-up seed and indirect flux (`thermal.seed_indirect`, BUGS.md PTM-727)
+
+§7.7 fixes the equilibration *forcing*. It does not fix the column the equilibration
+*starts from*. The spin-up seed (`src/cpp/thermal/eq_seed.h`) is built from each face's absorbed
+direct forcing, and in a coupled run its surface anchor stands down (status
+`fallback-radiation-coupled`, because the forcing depends on neighbors it cannot see). A face
+whose only heat is indirect therefore starts on the geothermal floor (25.28 K on Moon3D). Two
+equilibration lunations are far shorter than the deep column's response time, so it ends
+~50 K too cold at depth. Fermi's replay of the Moon3D dt65 run (F2,
+`runs/stage3_f2/fermi/`) put the effect on the cold-trap mean temperature at +2.0 to +2.2 K once
+spun up. **Decisive control (PTM-727): `<FILL FROM runs/ptm727_control/verdict.json BEFORE
+MERGE>`.** The last line of §7.7, "correct at leading order", does not hold for this population.
+
+`thermal.seed_indirect` acts in the eq-indirect re-solve, the first point at which an indirect
+estimate exists, and nowhere else:
+
+| value | seed forcing | surface anchor |
+|---|---|---|
+| `series` (**default**) | absorbed flux + the reduced sweep's **time-varying** indirect flux, over the output window | lumped (runs) |
+| `mean` | absorbed flux + per-face $\langle q_{\text{ind}}\rangle$ on every sample | stands down: the warm bracket $T_{\text{rad}}(\langle F\rangle + \langle q\rangle)$, which Jensen puts above $\langle T\rangle$ (24.8 K median on Moon3D never-lit faces); for attribution only |
+| `off` | absorbed flux only (legacy) | stands down |
+
+**`off` reproduces every result made before the default changed, byte for byte** — also as
+`--seed-indirect off`. The effective value, its source (default / config / cli) and whether it
+acted are written to `provenance.txt` (`seed_indirect`, `seed_indirect_source`,
+`seed_indirect_effect`) and the value to `config_used.yaml`, so an old output tree is
+unambiguous and a re-run can pin it. A coupled run on the default prints one
+`[eq-seed] DEFAULT CHANGED (PTM-727)` line naming the legacy switch.
+
+Where the default cannot act it reverts to the legacy seed and says so in one line: radiation
+off, no internal eq-indirect pass (`eq_indirect_source: off`, an `eq_indirect_flux_file`, no
+equilibration span), the CPU scalar solver, a warm-started chunk (its column comes from the
+checkpoint), or a measured $\langle q_{\text{ind}}\rangle = 0$. An **explicit** `series`/`mean`
+that cannot act is FATAL instead. Those runs are byte-identical to `off` by construction, and the
+validation suite checks it (`ptm-validate`, default arm with `--expect-differ-if-log`).
+
+Not changed by this option: the equilibration forcing itself still uses the constant
+$\langle q_{\text{ind}}\rangle$ of §7.7.
+
 ## 8. Anisotropic beamed emission
 
 ### 8.1 The model
