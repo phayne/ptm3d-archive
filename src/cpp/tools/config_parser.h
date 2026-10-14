@@ -441,6 +441,12 @@ struct SimulationConfig {
         //     iteration-0 (or converged-loop) time-varying indirect flux over
         //     the OUTPUT window (uniform cadence, the span the sweep solved),
         //     with the lumped anchor allowed to run on that composite series.
+        //     The window is cut to WHOLE cycles and must hold at least one
+        //     (FATAL otherwise: a sub-cycle seed is the cold seed again). The
+        //     EQUILIBRATION forcing of that re-solve also carries the indirect
+        //     time-varying: each eq step takes the box average of the output
+        //     samples that fall in its interval, folded by phase (Fermi R1/R2;
+        //     a series seed under constant-<q> equilibration overshoots warm).
         //     Recommended: anchors the column near the cycle-mean <T>.
         //   "mean" -- add the per-face time-mean <q_ind> to every forcing
         //     sample; the anchor still stands down (radiation-coupled), so the

@@ -6357,10 +6357,33 @@ struct SeedIndirectHandoff {
     const std::vector<std::vector<double>>* series = nullptr;  // [face][abs step], absorbed
     const std::vector<double>* mean = nullptr;                  // per-face <q_ind>, absorbed
     int t_lo = 0;   // first absolute step of the solved (output) window
-    int t_hi = 0;   // one past the last
+    int t_hi = 0;   // one past the last: t_lo + WHOLE cycles only (Fermi R2)
     std::string source;
+    // Fermi R1 (2026-10-14): in series mode the EQUILIBRATION forcing also carries
+    // the time-varying indirect, folded by phase. eq_fold[t] lists the absolute
+    // output steps whose time falls in eq step t's interval [t_t, t_t + dt_eq)
+    // modulo the cycle; the eq step takes their box average. Empty when inactive.
+    std::vector<std::vector<int>> eq_fold;
 };
 static SeedIndirectHandoff g_seed_indirect;   // inactive unless mode != Off
+
+/// The indirect flux an EQUILIBRATION step carries. Without the PTM-727 series
+/// hand-off this is exactly the per-face constant <q_ind> the eq-indirect pass
+/// has always added (eqi[gf]) -- same expression, same value, byte-identical.
+/// With it: the box average of the reduced sweep's indirect series over the
+/// output samples folded onto this eq step by phase.
+static inline double eqIndirectAt(const std::vector<double>& eqi, size_t gf, int t_abs) {
+    const SeedIndirectHandoff& h = g_seed_indirect;
+    if (h.mode == SeedIndirectMode::Series && t_abs >= 0
+            && t_abs < static_cast<int>(h.eq_fold.size())) {
+        const auto& src = h.eq_fold[static_cast<size_t>(t_abs)];
+        const auto& row = (*h.series)[gf];
+        double acc = 0.0;
+        for (int o : src) acc += row[static_cast<size_t>(o)];
+        return src.empty() ? eqi[gf] : acc / static_cast<double>(src.size());
+    }
+    return eqi[gf];
+}
 
 static const char* seedIndirectName(SeedIndirectMode m) {
     return m == SeedIndirectMode::Series ? "series" : m == SeedIndirectMode::Mean ? "mean" : "off";
@@ -6808,7 +6831,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         #pragma omp parallel for schedule(static)
         for (int t = 0; t < eq_hi; ++t) {
             double* col = &flux_column_major[static_cast<size_t>(t) * n_faces];
-            for (size_t f = 0; f < n_faces; ++f) col[f] += eq_indirect_flux[f];
+            for (size_t f = 0; f < n_faces; ++f) col[f] += eqIndirectAt(eq_indirect_flux, f, t);
         }
         std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
                      " indirect flux over steps [0, " << eq_hi << ").\n";
@@ -7387,9 +7410,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
                 if (add_eq_indirect_streamed) {
                     for (int f = 0; f < faces_in_batch; ++f) {
-                        const double q = eq_indirect_flux[start_face + f];
                         for (int t = 0; t < eq_hi_streamed; ++t)
-                            flux_tile[static_cast<size_t>(t) * BS + f] += q;
+                            flux_tile[static_cast<size_t>(t) * BS + f] +=
+                                eqIndirectAt(eq_indirect_flux, start_face + f, t);
                     }
                 }
                 // A short final batch would otherwise leave the previous
@@ -10651,7 +10674,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     if (!eq_indirect_flux.empty()
                             && (t_start + t) < equilibration_steps
                             && global_f < eq_indirect_flux.size()) {
-                        absorbed += eq_indirect_flux[global_f];
+                        absorbed += eqIndirectAt(eq_indirect_flux, global_f,
+                                                 static_cast<int>(t_start + t));
                     }
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
                 }
@@ -11441,7 +11465,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                     if (!eq_indirect_flux.empty()
                             && (t_start + t) < equilibration_steps
                             && global_f < eq_indirect_flux.size()) {
-                        absorbed += eq_indirect_flux[global_f];
+                        absorbed += eqIndirectAt(eq_indirect_flux, global_f,
+                                                 static_cast<int>(t_start + t));
                     }
                     flux[t * batch_n + f] = static_cast<float>(absorbed);
                 }
@@ -23023,6 +23048,63 @@ int main(int argc, char** argv) {
                         g_seed_indirect.t_lo   = out_lo;
                         g_seed_indirect.t_hi   = std::min(out_hi, seedForcingSteps(total_time_steps));
                         g_seed_indirect.source = source_desc;
+                        if (seed_indirect_mode == SeedIndirectMode::Series) {
+                            // ---- Fermi R2: WHOLE cycles only ----------------------
+                            // A sub-cycle window samples the indirect at one phase
+                            // (2-11 % of its mean at the L1 start on Moon3D cold
+                            // traps), which is the old cold seed again.
+                            const double cyc = planet.day;
+                            const int lo = g_seed_indirect.t_lo;
+                            const double dt_out = (lo + 1 < static_cast<int>(times.size()))
+                                ? times[lo + 1] - times[lo] : 0.0;
+                            const long spc = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
+                            const long n_cyc = (spc > 0) ? (g_seed_indirect.t_hi - lo) / spc : 0;
+                            if (n_cyc < 1) {
+                                std::cerr << "[FATAL] thermal.seed_indirect: series needs an output"
+                                             " window of at least ONE whole cycle (" << cyc
+                                          << " s = " << spc << " samples at " << dt_out
+                                          << " s); this one has " << (g_seed_indirect.t_hi - lo)
+                                          << " samples. A sub-cycle seed is the cold seed again"
+                                             " (PTM-727, Fermi R2). Use off, or a longer window.\n";
+                                return -1;
+                            }
+                            g_seed_indirect.t_hi = lo + static_cast<int>(n_cyc * spc);
+                            // ---- Fermi R1: fold the series onto the eq steps -------
+                            const int eqn = equilibration_steps;
+                            g_seed_indirect.eq_fold.assign(static_cast<size_t>(eqn), {});
+                            int n_nearest = 0;
+                            size_t n_src = 0;
+                            for (int t = 0; t < eqn; ++t) {
+                                const double dt_e = (t + 1 < static_cast<int>(times.size()))
+                                    ? times[t + 1] - times[t] : dt_out;
+                                auto& dst = g_seed_indirect.eq_fold[static_cast<size_t>(t)];
+                                int best = lo;
+                                double best_d = 1e300;
+                                for (int o = lo; o < g_seed_indirect.t_hi; ++o) {
+                                    double ph = std::fmod(times[o] - times[t], cyc);
+                                    if (ph < 0.0) ph += cyc;
+                                    // half-open [0, dt_e), a 1e-9 relative guard on
+                                    // the far edge so a sample ON it goes to the next step
+                                    if (ph < dt_e * (1.0 - 1e-9)) dst.push_back(o);
+                                    const double dc = std::min(std::fabs(ph - 0.5 * dt_e),
+                                                               cyc - std::fabs(ph - 0.5 * dt_e));
+                                    if (dc < best_d) { best_d = dc; best = o; }
+                                }
+                                if (dst.empty()) { dst.push_back(best); ++n_nearest; }
+                                n_src += dst.size();
+                            }
+                            std::cout << "    [eq-seed] seed window: " << n_cyc << " whole cycle(s) = "
+                                      << (g_seed_indirect.t_hi - lo) << " samples (R2); equilibration"
+                                         " forcing folded from them by phase onto " << eqn
+                                      << " eq steps, box average of " << std::fixed
+                                      << std::setprecision(2)
+                                      << (eqn ? double(n_src) / eqn : 0.0) << std::defaultfloat
+                                      << " samples per eq step"
+                                      << (n_nearest ? ", " + std::to_string(n_nearest)
+                                                      + " eq step(s) shorter than the output"
+                                                        " cadence took the NEAREST sample" : "")
+                                      << " (R1)." << std::endl;
+                        }
                         double nz = 0.0;
                         for (size_t f = 0; f < num_faces; ++f) {
                             const auto& row = indirect_flux_series[f];
