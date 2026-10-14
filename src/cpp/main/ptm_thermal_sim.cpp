@@ -6385,6 +6385,15 @@ static inline double eqIndirectAt(const std::vector<double>& eqi, size_t gf, int
     return eqi[gf];
 }
 
+// What the run's seed actually was, for provenance.txt (PTM-727 default change):
+// the configured value, where it came from, and whether it ACTED -- a default that
+// could not act on this run is recorded as inert with the reason, so an output tree
+// says exactly which initial condition produced it.
+struct SeedIndirectRecord {
+    std::string mode = "off", source = "default", effect = "not evaluated";
+};
+static SeedIndirectRecord g_seed_indirect_record;
+
 static const char* seedIndirectName(SeedIndirectMode m) {
     return m == SeedIndirectMode::Series ? "series" : m == SeedIndirectMode::Mean ? "mean" : "off";
 }
@@ -16978,6 +16987,18 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-simd-batch") {
             config.setProperty("use_simd_batch", false);
             std::cout << "SIMD batch solver disabled; using legacy Model::run scalar path" << std::endl;
+        } else if (arg == "--seed-indirect" && i + 1 < argc) {
+            // PTM-727. `--seed-indirect off` reproduces every run made before the
+            // default changed, byte-for-byte (the validation legacy arm uses it).
+            const std::string v = argv[++i];
+            if (v != "off" && v != "series" && v != "mean") {
+                std::cerr << "FATAL: --seed-indirect must be off | series | mean; got '"
+                          << v << "'" << std::endl;
+                return 1;
+            }
+            sim_config.thermal.seed_indirect = v;
+            sim_config.thermal.seed_indirect_source = "cli";
+            std::cout << "[eq-seed] --seed-indirect " << v << std::endl;
         } else if (arg == "--use-gpu-thermal") {
             config.setProperty("use_gpu_thermal", true);
             std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
@@ -19195,7 +19216,13 @@ int main(int argc, char** argv) {
     const double resolved_analytic_cycles = thermal::analyticSeedCycles(
         resolved_seed_mode, resolved_analytic_cycles_cfg,
         planet.day, planet.year, kCpuAnalyticSeedYears);
-    if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled) {
+    g_seed_indirect_record.mode = sim_config.thermal.seed_indirect;
+    g_seed_indirect_record.source = sim_config.thermal.seed_indirect_source;
+    g_seed_indirect_record.effect = sim_config.radiation.enabled
+        ? "inert: the radiation-exchange coupling stage did not run"   // overwritten if it does
+        : "inert: radiation off (no indirect flux)";
+    if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled
+            && sim_config.thermal.seed_indirect_source != "default") {
         // Never silent (make-silence-impossible): with radiation off there is no
         // indirect flux and no eq-indirect pass, so the option cannot act.
         std::cerr << "[eq-seed] WARNING: thermal.seed_indirect: "
@@ -22239,36 +22266,49 @@ int main(int argc, char** argv) {
                 SeedIndirectMode seed_indirect_mode = SeedIndirectMode::Off;
                 {
                     const std::string& si = sim_config.thermal.seed_indirect;
+                    const std::string& src = sim_config.thermal.seed_indirect_source;
+                    const bool explicit_si = (src != "default");
                     seed_indirect_mode = (si == "series") ? SeedIndirectMode::Series
                                        : (si == "mean")   ? SeedIndirectMode::Mean
                                                           : SeedIndirectMode::Off;
+                    g_seed_indirect_record.mode = si;
+                    g_seed_indirect_record.source = src;
+                    g_seed_indirect_record.effect = (seed_indirect_mode == SeedIndirectMode::Off)
+                        ? "legacy seed (off)" : "pending (acts in the eq-indirect re-solve)";
                     if (seed_indirect_mode != SeedIndirectMode::Off) {
                         const bool gpu_l  = thermal_config.getPropertyBool("use_gpu_thermal", false);
                         const bool simd_l = thermal_config.getPropertyBool("use_simd_batch", true);
-                        if (eq_indirect_warm_start) {
-                            std::cout << "  [eq-seed] thermal.seed_indirect: " << si
-                                      << " is inert in this warm-started chunk: its column"
-                                         " comes from the checkpoint, which carries the"
-                                         " indirect-aware seed if the first chunk ran with it."
-                                      << std::endl;
+                        std::string inert;   // why it cannot act here, if it cannot
+                        if (eq_indirect_warm_start)
+                            inert = "warm-started chunk (column comes from the checkpoint)";
+                        else if (!eq_indirect_internal_armed)
+                            inert = "no internal eq-indirect re-solve (eq_indirect_source off, an "
+                                    "eq_indirect_flux_file, or no equilibration span)";
+                        else if (!gpu_l && !simd_l)
+                            inert = "CPU scalar solver (not implemented there)";
+                        if (!inert.empty()) {
+                            if (explicit_si && !eq_indirect_warm_start) {
+                                std::cerr << "FATAL: thermal.seed_indirect: " << si << " (" << src
+                                          << ") cannot act here: " << inert << ". Refusing to"
+                                             " run with an inert seed option; set it to off.\n";
+                                return 1;
+                            }
+                            std::cout << "  [eq-seed] thermal.seed_indirect: " << si << " ("
+                                      << src << ") is inert here -- " << inert
+                                      << "; the legacy seed applies." << std::endl;
+                            g_seed_indirect_record.effect = "inert: " + inert;
                             seed_indirect_mode = SeedIndirectMode::Off;
-                        } else if (!eq_indirect_internal_armed) {
-                            std::cerr << "FATAL: thermal.seed_indirect: " << si << " acts only in"
-                                         " the internal eq-indirect re-solve, which cannot run"
-                                         " here (needs thermal.eq_indirect_source auto|converged,"
-                                         " no thermal.eq_indirect_flux_file, and an equilibration"
-                                         " span before the output window). Refusing to run with"
-                                         " an inert seed option.\n";
-                            return 1;
-                        } else if (!gpu_l && !simd_l) {
-                            std::cerr << "FATAL: thermal.seed_indirect: " << si << " is implemented"
-                                         " on the GPU persistent and CPU SIMD-batch solvers; this"
-                                         " run uses the CPU scalar solver (use_simd_batch: false)."
-                                         "\n";
-                            return 1;
                         } else {
-                            std::cout << "  [eq-seed] thermal.seed_indirect: " << si
-                                      << " (PTM-727): the eq-indirect re-solve seeds every column"
+                            if (!explicit_si) {
+                                // The ONE loud line a user cannot miss (PTM-727 default change).
+                                std::cerr << "[eq-seed] DEFAULT CHANGED (PTM-727): this coupled run"
+                                             " seeds the spin-up WITH indirect flux (thermal.seed_indirect:"
+                                          << si << "); results differ from runs before the change."
+                                             " Reproduce them with thermal.seed_indirect: off or"
+                                             " --seed-indirect off." << std::endl;
+                            }
+                            std::cout << "  [eq-seed] thermal.seed_indirect: " << si << " (" << src
+                                      << ", PTM-727): the eq-indirect re-solve seeds every column"
                                       << (seed_indirect_mode == SeedIndirectMode::Series
                                               ? " from its absorbed flux + the time-varying indirect"
                                                 " flux of the sweep it reads, over the output window,"
@@ -23018,6 +23058,8 @@ int main(int argc, char** argv) {
                                      " run is identical to eq_indirect_source: off."
                                   << std::endl;
                         eq_indirect_record.provenance = "internal pass (measured zero)";
+                        if (seed_indirect_mode != SeedIndirectMode::Off)
+                            g_seed_indirect_record.effect = "inert: measured <q_ind> = 0 on every face";
                         // This branch does NOT restart the loop, so the pass
                         // counter alone would let the next pass fire mid-Picard
                         // and corrupt a genuine coupling iteration.
@@ -23041,8 +23083,28 @@ int main(int argc, char** argv) {
                     struct SeedIndirectScope {
                         ~SeedIndirectScope() { g_seed_indirect = SeedIndirectHandoff{}; }
                     } seed_indirect_scope;
-                    if (seed_indirect_mode != SeedIndirectMode::Off) {
-                        g_seed_indirect.mode   = seed_indirect_mode;
+                    // A DEFAULT series on a sub-cycle output window cannot act (Fermi R2):
+                    // this pass then uses the legacy seed and says so in one line. An
+                    // EXPLICIT series keeps the FATAL below.
+                    SeedIndirectMode mode_now = seed_indirect_mode;
+                    if (mode_now == SeedIndirectMode::Series
+                            && sim_config.thermal.seed_indirect_source == "default") {
+                        const double cyc = planet.day;
+                        const double dt_out = (out_lo + 1 < static_cast<int>(times.size()))
+                            ? times[out_lo + 1] - times[out_lo] : 0.0;
+                        const long spc = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
+                        const int hi = std::min(out_hi, seedForcingSteps(total_time_steps));
+                        if (spc <= 0 || (hi - out_lo) / spc < 1) {
+                            std::cout << "    [eq-seed] thermal.seed_indirect: series (default) is"
+                                         " inert here -- the output window (" << (hi - out_lo)
+                                      << " samples) is shorter than one cycle (" << spc
+                                      << "); the legacy seed applies." << std::endl;
+                            g_seed_indirect_record.effect = "inert: output window shorter than one cycle";
+                            mode_now = SeedIndirectMode::Off;
+                        }
+                    }
+                    if (mode_now != SeedIndirectMode::Off) {
+                        g_seed_indirect.mode   = mode_now;
                         g_seed_indirect.series = &indirect_flux_series;
                         g_seed_indirect.mean   = &eq_indirect_vec;
                         g_seed_indirect.t_lo   = out_lo;
@@ -23116,6 +23178,7 @@ int main(int argc, char** argv) {
                             }
                             if (q_ind_mean[f] > 0.0) nz += 1.0;
                         }
+                        g_seed_indirect_record.effect = std::string("acted (") + source_desc + ")";
                         std::cout << "    [eq-seed] seed_indirect: "
                                   << seedIndirectName(seed_indirect_mode)
                                   << " armed for this re-solve: steps [" << g_seed_indirect.t_lo
@@ -24751,6 +24814,17 @@ int main(int argc, char** argv) {
     ptm::timing::mark("thermal_coupling_done");
     ptm::timing::begin("export");   // provenance, per-step frames, statistics, extras
     ptm::appendThermalSolverProvenance(output_dir);
+    {   // PTM-727: which spin-up seed produced this tree (always recorded).
+        std::ofstream pv(output_dir + "/provenance.txt", std::ios::app);
+        if (pv) {
+            pv << "seed_indirect=" << g_seed_indirect_record.mode << "\n"
+               << "seed_indirect_source=" << g_seed_indirect_record.source << "\n"
+               << "seed_indirect_effect=" << g_seed_indirect_record.effect << "\n";
+        } else {
+            std::cerr << "[eq-seed] WARNING: cannot append seed_indirect to "
+                      << output_dir << "/provenance.txt" << std::endl;
+        }
+    }
 
     // ========================================================================
     // Which ephemeris actually served this run (BUGS.md PTM-301)

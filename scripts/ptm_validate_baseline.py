@@ -520,7 +520,7 @@ def run_one(binary: str, repo: str, config: str, out_dir: str, extra,
 
 def run_suite(suite: dict, repo: str, binary: str, run_root: str,
               inputs_dir: str, names, threads: str = "48",
-              build_inputs: bool = True) -> dict:
+              build_inputs: bool = True, engine_args=()) -> dict:
     """Run `names` into `run_root/<name>`. Returns {name: run_dir}. Raises on failure.
 
     Every failure here is fatal and loud. A run that returns non-zero, writes
@@ -642,8 +642,10 @@ def run_suite(suite: dict, repo: str, binary: str, run_root: str,
         refuse_if_banked(out, f"the output directory for arm {name}")
         shutil.rmtree(out, ignore_errors=True)
         log = os.path.join(run_root, "logs", name + ".log")
+        # engine_args: appended to EVERY arm (e.g. the PTM-727 legacy arm,
+        # --engine-arg=--seed-indirect --engine-arg=off). Recorded in STATUS.txt.
         rc, secs = run_one(binary, repo, arm["config"], out,
-                           resolve_args(arm.get("args", []), inputs_dir),
+                           resolve_args(arm.get("args", []), inputs_dir) + list(engine_args),
                            log, env)
         try:
             nfiles = len(digest_run(out))
@@ -675,8 +677,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"binary {args.binary}  md5 {md5_file(args.binary)}")
     print(f"repo   {args.repo}")
     print(f"arms   {len(names)}: {', '.join(names)}")
+    if args.engine_arg:
+        print(f"engine args appended to every arm: {' '.join(args.engine_arg)}")
     run_suite(suite, args.repo, args.binary, args.run_root, args.inputs_dir,
-              names, args.threads, not args.no_build_inputs)
+              names, args.threads, not args.no_build_inputs, args.engine_arg)
     print(f"\nAll {len(names)} arm(s) ran. Run root: {args.run_root}")
     return 0
 
@@ -1016,8 +1020,10 @@ def resolve_verify_arms(args: argparse.Namespace, manifest: dict,
     print(f"  binary   {binary}  md5 {md5_file(binary)}")
     print(f"  inputs   {inputs_dir}")
     try:
+        if args.engine_arg:
+            print(f"engine args appended to every re-run arm: {' '.join(args.engine_arg)}")
         return run_suite(suite, args.repo, binary, run_root, inputs_dir,
-                         names, threads, build_inputs=True)
+                         names, threads, build_inputs=True, engine_args=args.engine_arg)
     except Exception:
         # Whatever went wrong, the partial runs and their logs are the only
         # record of it. Say where they are; the caller only prints the
@@ -1229,10 +1235,31 @@ def cmd_verify(args: argparse.Namespace) -> int:
         diffs = sorted(f for f in set(banked) & set(now)
                        if banked[f]["md5"] != now[f]["md5"])
         n = len(banked)
-        total += n
-        ident += n - len(diffs) - len(missing)
         status = "IDENTICAL" if not (diffs or missing or extra) else "DIFFERS"
-        print(f"{status:9s} {name}: {n - len(diffs) - len(missing)}/{n} files match")
+        expect_differ = False
+        if args.expect_differ_if_log:
+            # The arm's own engine log decides whether a CHANGE is expected (the
+            # PTM-727 default arm: an arm whose log shows the new seed acting must
+            # differ from the legacy bank; every other arm must stay identical).
+            log = os.path.join(os.path.dirname(os.path.abspath(run_dir)), "logs", name + ".log")
+            if not os.path.exists(log):
+                print(f"FAIL {name}: --expect-differ-if-log given but no log at {log}; "
+                      f"cannot tell whether a difference is expected")
+                problems += 1
+                continue
+            expect_differ = re.search(args.expect_differ_if_log,
+                                      open(log, errors="replace").read()) is not None
+        n_match = n - len(diffs) - len(missing)
+        if expect_differ:
+            label = "EXPECTED-DIFFER" if status == "DIFFERS" else "FAIL-NO-CHANGE"
+            print(f"{label:15s} {name}: {n_match}/{n} files match (log matches "
+                  f"{args.expect_differ_if_log!r}: the change under test acts here)")
+            if status == "IDENTICAL":
+                problems += 1     # it claims to act and changed nothing: that is a bug
+            continue              # not part of the byte-identity tally below
+        total += n
+        ident += n_match
+        print(f"{status:9s} {name}: {n_match}/{n} files match")
         for f in missing:
             print(f"    MISSING {f}")
         for f in extra:
@@ -1319,6 +1346,9 @@ def main(argv=None) -> int:
                    "statistics are thread-count dependent, so this is part of "
                    "the baseline")
     r.add_argument("--no-build-inputs", action="store_true")
+    r.add_argument("--engine-arg", action="append", default=[], metavar="ARG",
+                   help="append ARG to every arm's engine command line (repeatable; "
+                        "write --engine-arg=--seed-indirect --engine-arg=off)")
     r.set_defaults(fn=cmd_run)
 
     b = sub.add_parser("bank", help="digest finished runs into a baseline manifest")
@@ -1348,6 +1378,12 @@ def main(argv=None) -> int:
     v.add_argument("--arm", action="append", default=[], metavar="NAME=RUNDIR",
                    help="a run directory YOU produced. Refused if it is the "
                         "banked directory itself.")
+    v.add_argument("--engine-arg", action="append", default=[], metavar="ARG",
+                   help="with --rerun: append ARG to every arm's engine command line")
+    v.add_argument("--expect-differ-if-log", default="", metavar="REGEX",
+                   help="an arm whose engine log matches REGEX must DIFFER from the bank "
+                        "(identical = FAIL); every other arm must stay byte-identical. "
+                        "PTM-727 default arm: 'seed_indirect: series armed'")
     v.add_argument("--rerun", action="store_true",
                    help="run every banked arm fresh from the recipe in the "
                         "manifest and compare that. Needs --binary and --repo.")

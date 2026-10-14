@@ -430,13 +430,15 @@ struct SimulationConfig {
         std::string seed_anchor = "lumped";
 
         // INDIRECT-AWARE spin-up seed for radiation-coupled runs (BUGS.md
-        // PTM-727). The seed is built from the face's absorbed DIRECT forcing
+        // PTM-727). DEFAULT "series" since PTM-727 was confirmed (decisive control +
+        // Fermi sign-off); "off" is the supported LEGACY value and reproduces every
+        // earlier result byte-for-byte. Also settable as --seed-indirect <mode>. The seed is built from the face's absorbed DIRECT forcing
         // only, so a never-lit column (indirect is its only heat) starts on
         // the geothermal floor (25.28 K on Moon3D) and two equilibration
         // lunations leave it ~50 K too cold at depth. Acts ONLY in the
         // eq-indirect re-solve (thermal.eq_indirect_source != off), the first
         // point at which an indirect estimate exists.
-        //   "off" (default) -- byte-identical to every earlier run.
+        //   "off" -- LEGACY: byte-identical to every run before the default changed.
         //   "series" -- seed each face from its absorbed flux PLUS the
         //     iteration-0 (or converged-loop) time-varying indirect flux over
         //     the OUTPUT window (uniform cadence, the span the sweep solved),
@@ -447,13 +449,18 @@ struct SimulationConfig {
         //     time-varying: each eq step takes the box average of the output
         //     samples that fall in its interval, folded by phase (Fermi R1/R2;
         //     a series seed under constant-<q> equilibration overshoots warm).
-        //     Recommended: anchors the column near the cycle-mean <T>.
+        //     DEFAULT: anchors the column near the cycle-mean <T>.
         //   "mean" -- add the per-face time-mean <q_ind> to every forcing
         //     sample; the anchor still stands down (radiation-coupled), so the
         //     surface is the WARM bracket T_rad(<F>+<q_ind>) -- by Jensen above
         //     <T> on faces whose indirect swings (24.8 K median on Moon3D
         //     never-lit faces). Kept for A/B attribution, not recommended.
-        std::string seed_indirect = "off";
+        std::string seed_indirect = "series";
+        // Where seed_indirect came from: "default" | "config" | "cli". A DEFAULT
+        // that cannot act (no eq-indirect pass, a warm-started chunk, the CPU scalar
+        // solver) quietly reverts to the legacy seed and says so in one line; an
+        // EXPLICIT setting that cannot act is FATAL. Recorded in provenance.txt.
+        std::string seed_indirect_source = "default";
 
         // What a TWO-TIMESCALE face does. The anchor's closure picks ONE
         // conductance G from a variance match, and with diurnal AND seasonal
