@@ -14,6 +14,11 @@
       cycle, R2): logs 'seed_indirect: series armed' + the whole-cycle and fold (R1) lines, the
       eq-indirect re-solve's anchor census is no longer all fallback-radiation-coupled, and the
       temperature statistics DIFFER from OFF; switch 'mean' on G2 also runs and differs.
+FAIL-FAST: gates run in the order above (G2..G5, G6 x3, G8) and the first failure ends the script
+with "GATE_FAILED <name>" (the chain's ABORT reason). Nothing is retried: every gate is
+deterministic. G7 runs only after all gates pass and never blocks.
+TIMING: every engine run prints "TIMING <tag> <wall s>"; "TIMING_RATIO" lines give series/off and
+mean/off on the same one-lunation window (the fix's measured overhead, for the re-run estimate).
 Run metadata (config_used.yaml, heartbeat.txt, provenance.txt) is excluded from byte
 comparison: it carries paths, times and the binary SHA by design.
 
@@ -23,6 +28,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -32,6 +38,7 @@ C = Path("/Users/paha3326/projects/moon3d_R1/runs/ptm727_control/gates")
 WT = Path("/Users/paha3326/projects/moon3d_R1/ptm_bench")
 B = Path("/Users/paha3326/projects/moon3d_R1/bench")
 META = {"config_used.yaml", "heartbeat.txt", "provenance.txt"}
+WALL = {}
 
 
 def tree(d):
@@ -52,10 +59,15 @@ def run(binary, cfg, out, env_extra, tag):
     env.update(env_extra)
     env["OMP_NUM_THREADS"] = "48"
     log = C / f"{tag}.log"
+    t0 = time.time()
     with open(log, "w") as fh:
         rc = subprocess.run([str(binary / "bin/ptm_thermal_sim"), "--config", str(p)], cwd=WT,
                             env=env, stdout=fh, stderr=subprocess.STDOUT).returncode
+    WALL[tag] = time.time() - t0
+    print(f"TIMING {tag} {WALL[tag]:.1f}", flush=True)
     if rc != 0:
+        if not tag.startswith("G7_"):
+            print(f"GATE_FAILED {tag.split('_old')[0].split('_new')[0]}_engine_rc{rc}", flush=True)
         raise SystemExit(f"FATAL: {tag} rc={rc} (see {log})")
     return log.read_text(errors="replace")
 
@@ -176,19 +188,31 @@ def main():
     cfg3.write_text(yaml.safe_dump(c3, sort_keys=False))
     cpu_env = {"PTM_HMATRIX_VF_REPLACE": csr968}
     dn = B / "donoharm"
-    results = [
-        identical("G2_moon_gpu", ident, gpu_env),
-        identical("G3_moon_cpu_simd", cfg3, cpu_env),
-        identical("G4_generic_justitia", dn / "justitia_generic-test_new.yaml", {}),
-        identical("G5_europa", dn / "europa_high_res_new.yaml", {}),
-        acts("G6_gpu", ident, gpu_env, "series", C / "G2_moon_gpu_new"),
-        acts("G6_cpu", cfg3, cpu_env, "series", C / "G3_moon_cpu_simd_new"),
-        acts("G6_gpu", ident, gpu_env, "mean", C / "G2_moon_gpu_new"),
-        r2_refuses(ident, gpu_env),
+    gates = [
+        ("G2_moon_gpu", lambda: identical("G2_moon_gpu", ident, gpu_env)),
+        ("G3_moon_cpu_simd", lambda: identical("G3_moon_cpu_simd", cfg3, cpu_env)),
+        ("G4_generic_justitia", lambda: identical("G4_generic_justitia", dn / "justitia_generic-test_new.yaml", {})),
+        ("G5_europa", lambda: identical("G5_europa", dn / "europa_high_res_new.yaml", {})),
+        ("G6_gpu_series", lambda: acts("G6_gpu", ident, gpu_env, "series", C / "G2_moon_gpu_new")),
+        ("G6_cpu_series", lambda: acts("G6_cpu", cfg3, cpu_env, "series", C / "G3_moon_cpu_simd_new")),
+        ("G6_gpu_mean", lambda: acts("G6_gpu", ident, gpu_env, "mean", C / "G2_moon_gpu_new")),
+        ("G8_r2_subcycle", lambda: r2_refuses(ident, gpu_env)),
     ]
-    cpu_gpu_gap(ident, gpu_env)   # G7: reported, never blocks (a measurement of PTM-728)
-    print(f"GATES {'ALL PASS' if all(results) else 'FAILED'}: {sum(results)}/{len(results)}")
-    sys.exit(0 if all(results) else 1)
+    for name, gate in gates:          # fail fast: the first failing gate ends the script
+        if not gate():
+            print(f"GATE_FAILED {name}", flush=True)
+            sys.exit(1)
+    for on, off in (("G6_gpu_series", "G6_gpu_off_lunation"), ("G6_cpu_series", "G6_cpu_off_lunation"),
+                    ("G6_gpu_mean", "G6_gpu_off_lunation")):
+        if on in WALL and off in WALL:
+            print(f"TIMING_RATIO {on}/{off} = {WALL[on] / WALL[off]:.3f} ({WALL[on]:.1f} s / {WALL[off]:.1f} s)",
+                  flush=True)
+    try:                          # G7: reported, never blocks (a measurement of PTM-728) -- but never silent
+        cpu_gpu_gap(ident, gpu_env)
+    except (SystemExit, Exception) as e:  # noqa: BLE001
+        print(f"MEASURE G7_ptm728 FAILED (non-blocking): {e}", flush=True)
+    print(f"GATES ALL PASS: {len(gates)}/{len(gates)}")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
