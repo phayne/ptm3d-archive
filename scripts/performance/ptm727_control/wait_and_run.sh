@@ -10,10 +10,12 @@
 #
 # Gate (all must hold on two consecutive 60 s polls):
 #   - the R1 benchmark batch is terminal: BATCH_STATUS.txt has BATCH_DONE / ABORT_* / GUARD_STOP_disk
-#   - FERMI_APPROVED exists in the run directory. Its first line should read "APPROVED <sha>".
-#     If <sha> resolves to a commit and is not the worktree HEAD: ABORT_approval_sha_mismatch, at
-#     once (so the mismatch is seen now, not when the batch ends). No sha: APPROVAL_UNPINNED is
-#     logged and HEAD at gate-open is what runs.
+#   - FERMI_APPROVED exists in the run directory. Its first line should read "APPROVED <sha>"
+#     (the first hex token of 7-40 chars is taken as the sha).
+#     If <sha> is not the worktree HEAD, the approval is STALE (it reviewed other code): logged
+#     once per version of the file as APPROVAL_STALE, and the gate stays CLOSED until Fermi
+#     re-pins to HEAD. It never runs unreviewed code and it never silently waits.
+#     No sha at all: APPROVAL_UNPINNED is logged and HEAD at gate-open is what runs.
 #   - no ptm_thermal_sim and no run_bench.py process is running
 # Liveness: CONTROL_HEARTBEAT.txt is rewritten every poll; a stale heartbeat means a dead launcher.
 # A catchable signal writes LAUNCHER_KILLED_<sig> to CONTROL_STATUS.txt (SIGKILL cannot be caught:
@@ -40,21 +42,23 @@ approval_sha() {  # prints the full SHA named on FERMI_APPROVED's first line, or
   [ -n "$tok" ] && $G -C $WT rev-parse --verify --quiet "$tok^{commit}" 2>/dev/null
 }
 
-n=0; quiet=0; pinned_warned=0
+n=0; quiet=0; seen_approval=
 while true; do
   bt=0; grep -Eq $'\t(BATCH_DONE|ABORT_[A-Za-z_]*|GUARD_STOP_disk)\t' "$BATCH_ST" 2>/dev/null && bt=1
   fa=0
   if [ -f $C/FERMI_APPROVED ]; then
     fa=1
     asha=$(approval_sha); head=$($G -C $WT rev-parse HEAD)
+    ver=$(md5 -q $C/FERMI_APPROVED)
     if [ -n "$asha" ] && [ "$asha" != "$head" ]; then
-      status ABORT_approval_sha_mismatch "FERMI_APPROVED names ${asha:0:9}, worktree HEAD is ${head:0:9}: re-review needed (or Fermi re-pins)"
-      rm -f $HB; exit 1
+      fa=stale
+      [ "$seen_approval" = "$ver" ] || status APPROVAL_STALE "FERMI_APPROVED names ${asha:0:9}, worktree HEAD is ${head:0:9}: gate CLOSED until Fermi re-pins (APPROVED ${head:0:9})"
+    elif [ -z "$asha" ]; then
+      [ "$seen_approval" = "$ver" ] || status APPROVAL_UNPINNED "FERMI_APPROVED names no commit; HEAD ${head:0:9} at gate-open is what will run"
+    elif [ "$seen_approval" != "$ver" ]; then
+      status APPROVAL_PINNED "FERMI_APPROVED names ${asha:0:9} == HEAD"
     fi
-    if [ -z "$asha" ] && [ $pinned_warned = 0 ]; then
-      status APPROVAL_UNPINNED "FERMI_APPROVED names no commit; HEAD ${head:0:9} at gate-open is what will run"
-      pinned_warned=1
-    fi
+    seen_approval=$ver
   fi
   sims=$(pgrep -x ptm_thermal_sim | tr '\n' ' '); bench=$(pgrep -f run_bench.py | tr '\n' ' ')
   if [ $bt = 1 ] && [ $fa = 1 ] && [ -z "$sims" ] && [ -z "$bench" ]; then quiet=$((quiet+1)); else quiet=0; fi
