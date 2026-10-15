@@ -2159,6 +2159,12 @@ using FluxFn = std::function<double(size_t,int)>;
 struct SimdFaceSubset {
     const std::vector<int>* faces = nullptr;
     const std::vector<std::vector<double>>* extra_flux = nullptr;
+    // PTM-57 (CPU path): when set, the end-of-window T(z) of every SELECTED face is written
+    // here (layer-major, layer * n_faces + face; sized by the driver on first use) and the
+    // face is marked in end_touched -- the CPU twin of the GPU re-thermal's hand-back, so a
+    // coupled run's checkpoint carries the coupled column instead of iteration 0's.
+    std::vector<float>*   end_T       = nullptr;
+    std::vector<uint8_t>* end_touched = nullptr;
 };
 
 // SIMD batch thermal solver (SIMD-over-pixels)
@@ -6922,6 +6928,12 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // PTM-728 phase 2: re-thermal start mode (PTM_CPU_RETHERMAL). Said once per pass,
     // never silent; a resume without a valid capture is FATAL.
+    if (is_subset && subset->end_T && subset->end_touched) {
+        if (subset->end_T->size() != static_cast<size_t>(n_layers) * n_faces)
+            subset->end_T->assign(static_cast<size_t>(n_layers) * n_faces, 0.0f);
+        if (subset->end_touched->size() != n_faces)
+            subset->end_touched->assign(n_faces, 0);
+    }
     if (!is_subset && g_seed_indirect.mode == SeedIndirectMode::Series) {
         g_rt_series_lo = g_seed_indirect.t_lo;   // recorded for PTM_CPU_RETHERMAL=seed-series
         g_rt_series_hi = g_seed_indirect.t_hi;
@@ -8480,6 +8492,16 @@ bool runThermalModelsForAllFacesBatchSoA(
                         ckpt.assembled[static_cast<size_t>(layer) * n_faces + global_f]
                             = static_cast<float>(batch.T[layer * BS + f]);
                     }
+                }
+            }
+            if (is_subset && subset->end_T && subset->end_touched) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t global_f = start_face + f;
+                    if (!subset_face_selected[global_f]) continue;   // batch-mates are not recorded
+                    for (int layer = 0; layer < n_layers; ++layer)
+                        (*subset->end_T)[static_cast<size_t>(layer) * n_faces + global_f]
+                            = static_cast<float>(batch.T[layer * BS + f]);
+                    (*subset->end_touched)[global_f] = 1;
                 }
             }
 
@@ -24114,13 +24136,8 @@ int main(int argc, char** argv) {
                                   "SIMD-batch integrator re-integrates the selection"
                                 : "the whole mesh was solved by the CPU SIMD-batch "
                                   "integrator; the selection is re-integrated by it");
-                        if (want_post_coupling_state) {
-                            std::cerr << "  [Re-thermal] WARNING: CPU re-thermal path — no T(z)"
-                                         " column is handed back, so the chunk checkpoint keeps"
-                                         " iter-0's UN-COUPLED column for these "
-                                      << faces_to_rerun.size() << " faces (BUGS.md PTM-57)."
-                                         " The next chunk will cold-start them.\n";
-                        }
+                        // PTM-57: the coupled end-of-window columns are handed back below
+                        // (sub.end_T), so the checkpoint is re-archived with them.
                         std::vector<double> eqi_subset = eq_indirect_vec;
                         for (int f : faces_to_rerun)
                             if (static_cast<size_t>(f) < eqi_subset.size())
@@ -24128,6 +24145,10 @@ int main(int argc, char** argv) {
                         SimdFaceSubset sub;
                         sub.faces      = &faces_to_rerun;
                         sub.extra_flux = &indirect_flux_series;
+                        if (want_post_coupling_state) {
+                            sub.end_T       = &rad_final_T;
+                            sub.end_touched = &rad_final_touched;
+                        }
                         std::vector<std::vector<double>> rethermal_temps;
                         const std::vector<double>* face_H_ptr_r =
                             planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
