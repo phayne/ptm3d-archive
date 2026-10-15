@@ -6437,6 +6437,20 @@ struct GpuSharedSeedContext {
 /// Re-point a GPU seed context at the indirect-aware forcing when the PTM-727
 /// hand-off is active. `holder` owns the composed callable and must outlive the
 /// gpuFillSharedSeed call. Returns false (no change) when the hand-off is off.
+// PTM_DUMP_SEED_ALL=1 (diagnostic, PTM-728): record and dump every seeding pass,
+// including the CPU re-thermal subset passes. Read once; default off.
+// PTM_DIAG_CPU_FLUX_LEFT_CONST=1 (diagnostic, PTM-728): the CPU SIMD main loop holds the
+// left-endpoint flux over every substep of an interval, as the GPU thermal kernel does
+// (thermal_kernels.cl Q_surf = flux_all[tg]), instead of interpolating linearly. Default off.
+static const bool g_diag_flux_left_const = [] {
+    const char* e = std::getenv("PTM_DIAG_CPU_FLUX_LEFT_CONST");
+    return e && e[0] == '1';
+}();
+static const bool g_dump_seed_all = [] {
+    const char* e = std::getenv("PTM_DUMP_SEED_ALL");
+    return e && e[0] == '1';
+}();
+
 static bool applySeedIndirect(GpuSharedSeedContext& sc,
                               const std::function<double(size_t, int)>& absorbed_at,
                               std::function<double(size_t, int)>& holder,
@@ -7657,6 +7671,8 @@ bool runThermalModelsForAllFacesBatchSoA(
                     if (!is_subset) {
                         simd_anchor_census.add(sres);
                         thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
+                    } else if (g_dump_seed_all) {   // PTM-728 diagnostic: re-thermal seeds too
+                        thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
                     }
 
                     batch.T_eq_init[f] = sres.T_surface;
@@ -8273,8 +8289,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                 for (int s = 0; s < n_sub; ++s) {
                     const double alpha = (s + 0.5) / static_cast<double>(n_sub);
                     const double one_m = 1.0 - alpha;
-                    for (int f = 0; f < faces_in_batch; ++f) {
-                        flux_step[f] = one_m * flux_a[f] + alpha * flux_b[f];
+                    if (g_diag_flux_left_const) {   // PTM-728 diagnostic: the GPU kernel's forcing
+                        for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_a[f];
+                    } else {
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            flux_step[f] = one_m * flux_a[f] + alpha * flux_b[f];
+                        }
                     }
                     batch.setFluxContiguous(flux_step, faces_in_batch);
                     batch.advanceTimestep(dt_sub);
@@ -8600,6 +8620,9 @@ bool runThermalModelsForAllFacesBatchSoA(
     if (!is_subset) {
         simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
         thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
+    } else if (const char* all = std::getenv("PTM_DUMP_SEED_ALL"); all && all[0] == '1') {
+        // Diagnostic only (PTM-728): a re-thermal subset pass re-seeds its faces too.
+        thermal::EqSeedRecorder::instance().write("cpu-simd-subset");
     }
 
     // End timing

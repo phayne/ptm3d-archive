@@ -898,9 +898,17 @@ void EqSeedRecorder::record(std::size_t face, const EqSeedInput& in,
 
 void EqSeedRecorder::write(const std::string& tag) const {
     if (!enabled_ || rows_.empty()) return;
-    std::ofstream fh(path_);
+    // PTM_DUMP_SEED_ALL=1: keep EVERY seeding pass (a coupled run seeds again in its
+    // re-thermal passes, and the default single file keeps only the last one), as
+    // <path>.<tag>.<pass>. Default (unset): one file at <path>, exactly as before.
+    std::string out = path_;
+    if (const char* all = std::getenv("PTM_DUMP_SEED_ALL"); all && all[0] == '1') {
+        static int pass = 0;
+        out = path_ + "." + tag + "." + std::to_string(pass++);
+    }
+    std::ofstream fh(out);
     if (!fh) {
-        std::cerr << "[eq-seed] WARNING: cannot open '" << path_
+        std::cerr << "[eq-seed] WARNING: cannot open '" << out
                   << "' for writing; NO seed dump produced." << std::endl;
         return;
     }
@@ -922,7 +930,7 @@ void EqSeedRecorder::write(const std::string& tag) const {
            << rows_[i].kirch_offset << '\n';
         ++written;
     }
-    std::cerr << "[eq-seed] wrote " << written << " seed rows to " << path_
+    std::cerr << "[eq-seed] wrote " << written << " seed rows to " << out
               << std::endl;
 }
 
