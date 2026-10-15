@@ -22565,16 +22565,16 @@ int main(int argc, char** argv) {
                         && equilibration_steps > 0 && equilibration_steps < total_time_steps
                         && !(export_locations && !locations_file.empty())
                         && rethermalTwoPhase(times, equilibration_steps, total_time_steps)) {
-                    // Option A (Paul 2026-10-15): the CPU seed-series re-thermal re-equilibrates
-                    // against the PHASE-FOLDED output-window indirect (the Fermi R1 fold the
-                    // eq-indirect pass already uses), so the equilibration span need not be swept.
+                    // A3 (testing, 2026-10-15; option A's pure phase fold failed acceptance): the
+                    // CPU seed-series path sweeps the full span on iteration-0 sweeps and only the
+                    // output window afterwards; the re-thermal's eq span is the full sweep's real eq
+                    // indirect scaled per face to the current output-window level.
                     rad_skip_eq_steps = true;
                     cpu_eq_fold_fill = true;
-                    std::cout << "  [rad-skip-eq] CPU seed-series (option A): the radiosity sweep starts at"
-                                 " absolute step " << equilibration_steps << " of " << total_time_steps
-                              << "; before every CPU re-thermal pass the equilibration span of"
-                                 " indirect_flux_series is filled with the box average of the current"
-                                 " sweep's output-window series folded by phase (Fermi R1 fold)."
+                    std::cout << "  [rad-skip-eq] CPU seed-series (A3): iteration-0 sweeps cover the full span;"
+                                 " later sweeps start at absolute step " << equilibration_steps << " of "
+                              << total_time_steps << ", and their re-thermal equilibration indirect is the full"
+                                 " sweep's real series scaled per face to the current output-window mean."
                               << std::endl;
                 } else if (!thermal_config.getPropertyBool("use_gpu_thermal", false)) {
                     // The CPU selected-faces re-thermal re-integrates the WHOLE
@@ -22654,7 +22654,15 @@ int main(int argc, char** argv) {
                 }
                 // Absolute step the radiosity sweep starts at, and the exclusive
                 // upper bound of the span the selection audit inspects.
-                const int rad_sweep_t_lo = rad_skip_eq_steps ? equilibration_steps : 0;
+                // A3 (testing): the CPU seed-series path sweeps the FULL span on every iteration-0
+                // sweep and only the output window afterwards (see cpu_a3 below).
+                const int rad_sweep_t_lo_base = rad_skip_eq_steps ? equilibration_steps : 0;
+                int rad_sweep_t_lo = rad_sweep_t_lo_base;
+                // A3 reference: the eq-span indirect of the latest FULL sweep (float, face-major)
+                // and that sweep's per-face output-window mean.
+                std::vector<float>  a3_ref_eq;
+                std::vector<double> a3_ref_mean;
+                bool a3_have_ref = false;
                 const int rad_eq_audit_hi =
                     std::max(0, std::min(equilibration_steps, total_time_steps));
 
@@ -23353,6 +23361,12 @@ int main(int argc, char** argv) {
 
                 for (int iter = 0; iter < rad_max_coupling_iter; iter++) {
                     std::cout << "\n--- Radiation Iteration " << (iter + 1) << " ---" << std::endl;
+                    rad_sweep_t_lo = (cpu_eq_fold_fill && iter == 0) ? 0 : rad_sweep_t_lo_base;
+                    if (cpu_eq_fold_fill)
+                        std::cout << "  [rad-skip-eq] A3: this sweep covers steps [" << rad_sweep_t_lo << ", "
+                                  << total_time_steps << ")" << (rad_sweep_t_lo == 0
+                                      ? " -- FULL span (iteration 0): its equilibration indirect becomes the A3 reference"
+                                      : " -- output window only") << std::endl;
                     writeHeartbeat("rad_iter " + std::to_string(iter + 1)
                                    + " start (max=" + std::to_string(rad_max_coupling_iter) + ")");
                     // A pass that re-solves rewinds to iter 0, so this also
@@ -23707,6 +23721,24 @@ int main(int argc, char** argv) {
                         / (num_faces * static_cast<size_t>(total_time_steps - rad_sweep_t_lo));
                     std::cout << "  Max indirect flux: " << max_indirect << " W/m2" << std::endl;
                     std::cout << "  Mean indirect flux: " << mean_indirect << " W/m2" << std::endl;
+                    if (cpu_eq_fold_fill && rad_sweep_t_lo == 0) {
+                        const size_t eqn = static_cast<size_t>(equilibration_steps);
+                        a3_ref_eq.assign(indirect_flux_series.size() * eqn, 0.0f);
+                        a3_ref_mean.assign(indirect_flux_series.size(), 0.0);
+                        const int nout = total_time_steps - equilibration_steps;
+                        #pragma omp parallel for schedule(static)
+                        for (long f = 0; f < static_cast<long>(indirect_flux_series.size()); ++f) {
+                            const auto& row = indirect_flux_series[static_cast<size_t>(f)];
+                            for (size_t t = 0; t < eqn; ++t) a3_ref_eq[static_cast<size_t>(f) * eqn + t] = static_cast<float>(row[t]);
+                            double m = 0.0;
+                            for (int t = equilibration_steps; t < total_time_steps; ++t) m += row[static_cast<size_t>(t)];
+                            a3_ref_mean[static_cast<size_t>(f)] = (nout > 0) ? m / nout : 0.0;
+                        }
+                        a3_have_ref = true;
+                        std::cout << "  [rad-skip-eq] A3: reference recorded from this full sweep ("
+                                  << indirect_flux_series.size() << " faces x " << eqn << " eq steps, "
+                                  << (a3_ref_eq.size() * 4.0 / 1e9) << " GB).\n";
+                    }
 
                     // ==========================================================
                     // Internal equilibration-indirect pass, ESTIMATOR "auto"
@@ -24083,28 +24115,50 @@ int main(int argc, char** argv) {
                     // above, a small selection no longer bypasses the GPU
                     // branch, so it can only arrive here the same way a large
                     // one does: by failing on the device.
-                    if (rad_skip_eq_steps && !use_gpu_thermal_rerun && cpu_eq_fold_fill) {
-                        if (g_rt_eq_fold.size() != static_cast<size_t>(equilibration_steps)) {
-                            std::cerr << "\nFATAL: option A needs the Fermi R1 fold for "
-                                      << equilibration_steps << " equilibration steps, but "
-                                      << g_rt_eq_fold.size() << " are recorded (no PTM-727 series"
-                                         " eq-indirect pass ran?). Refusing to re-thermal against a"
-                                         " zero equilibration indirect.\n";
+                    if (rad_skip_eq_steps && !use_gpu_thermal_rerun && cpu_eq_fold_fill
+                            && rad_sweep_t_lo != 0) {
+                        // A3: eq-span indirect = the latest FULL sweep's real eq indirect, scaled per
+                        // face by (current output-window mean / that sweep's output-window mean).
+                        // A face whose reference mean is 0 but current mean is not falls back to the
+                        // Fermi R1 phase fold (counted). An iteration that swept the full span itself
+                        // keeps its real eq-span values (rad_sweep_t_lo == 0: this branch is skipped).
+                        if (!a3_have_ref || g_rt_eq_fold.size() != static_cast<size_t>(equilibration_steps)) {
+                            std::cerr << "\nFATAL: A3 needs a full-span reference sweep (have="
+                                      << a3_have_ref << ") and the Fermi R1 fold for " << equilibration_steps
+                                      << " eq steps (" << g_rt_eq_fold.size() << " recorded). Refusing to"
+                                         " re-thermal against an unknown equilibration indirect.\n";
                             return 1;
                         }
-                        #pragma omp parallel for schedule(static)
+                        const size_t eqn = static_cast<size_t>(equilibration_steps);
+                        const int nout = total_time_steps - equilibration_steps;
+                        long n_fold = 0;
+                        #pragma omp parallel for schedule(static) reduction(+:n_fold)
                         for (long f = 0; f < static_cast<long>(indirect_flux_series.size()); ++f) {
                             auto& row = indirect_flux_series[static_cast<size_t>(f)];
-                            for (int t = 0; t < equilibration_steps; ++t) {
-                                const auto& src = g_rt_eq_fold[static_cast<size_t>(t)];
-                                double acc = 0.0;
-                                for (int o : src) acc += row[static_cast<size_t>(o)];
-                                row[static_cast<size_t>(t)] = acc / static_cast<double>(src.size());
+                            double m = 0.0;
+                            for (int t = equilibration_steps; t < total_time_steps; ++t) m += row[static_cast<size_t>(t)];
+                            m = (nout > 0) ? m / nout : 0.0;
+                            const double m0 = a3_ref_mean[static_cast<size_t>(f)];
+                            if (m0 > 0.0) {
+                                const double r = m / m0;
+                                for (size_t t = 0; t < eqn; ++t)
+                                    row[t] = r * static_cast<double>(a3_ref_eq[static_cast<size_t>(f) * eqn + t]);
+                            } else if (m > 0.0) {
+                                ++n_fold;
+                                for (size_t t = 0; t < eqn; ++t) {
+                                    const auto& src = g_rt_eq_fold[t];
+                                    double acc = 0.0;
+                                    for (int o : src) acc += row[static_cast<size_t>(o)];
+                                    row[t] = acc / static_cast<double>(src.size());
+                                }
+                            } else {
+                                for (size_t t = 0; t < eqn; ++t) row[t] = 0.0;
                             }
                         }
-                        std::cout << "  [rad-skip-eq] option A: equilibration span of indirect_flux_series"
-                                     " filled from the folded output window for coupling iteration "
-                                  << (iter + 1) << ".\n";
+                        std::cout << "  [rad-skip-eq] A3: equilibration span of indirect_flux_series = the full"
+                                     " sweep's real eq indirect x per-face output-window ratio, coupling iteration "
+                                  << (iter + 1) << " (" << n_fold << " faces with a zero reference fell back to"
+                                     " the R1 phase fold).\n";
                     } else if (rad_skip_eq_steps && !use_gpu_thermal_rerun) {
                         std::cerr << "\nFATAL: the equilibration radiosity skip is armed but"
                                      " coupling iteration " << (iter + 1) << " fell to the CPU"
