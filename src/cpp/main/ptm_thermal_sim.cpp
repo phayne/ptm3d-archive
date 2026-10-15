@@ -8387,9 +8387,14 @@ bool runThermalModelsForAllFacesBatchSoA(
             alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
             for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
             if (rt_resume && surface_temps_out) {
-                // The resumed state is the one the whole-mesh pass filed at this index.
+                // Frame t_begin of the resumed window is RE-SOLVED with THIS pass's flux at that
+                // epoch (it carries the indirect series; the whole-mesh pass that captured the
+                // column solved this index without it, which filed never-lit surfaces ~30 K cold).
+                // Read-only, exactly as the warm-start row 0 re-solve: the trajectory is unchanged.
+                const double* flux_t0 = flux_base + static_cast<size_t>(t_begin) * flux_stride;
                 for (int f = 0; f < faces_in_batch; ++f)
-                    (*surface_temps_out)[start_face + f][t_begin] = g_cpu_post_eq_surf[start_face + f];
+                    (*surface_temps_out)[start_face + f][t_begin] =
+                        thermal::outputSurfaceTempBatch(batch, f, flux_t0[f]);
             }
             for (int t = t_begin; t < total_time_steps - 1; ++t) {
                 const double dt_output = times[t + 1] - times[t];
