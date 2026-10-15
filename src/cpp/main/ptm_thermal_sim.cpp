@@ -6478,6 +6478,10 @@ static int g_cpu_post_eq_layers = 0;
 // The hand-off itself (g_seed_indirect) is reset when that pass ends, so a later re-thermal
 // pass under PTM_CPU_RETHERMAL=seed-series reads the window from here.
 static int g_rt_series_lo = -1, g_rt_series_hi = -1;
+// Fermi R1 fold (eq step -> output steps), persisted past the eq-indirect pass for the CPU
+// seed-series radiosity skip (option A, Paul 2026-10-15): the CPU re-thermal fills the
+// equilibration span of indirect_flux_series from the output window with it.
+static std::vector<std::vector<int>> g_rt_eq_fold;
 
 static const bool g_diag_flux_left_const = [] {
     const char* e = std::getenv("PTM_DIAG_CPU_FLUX_LEFT_CONST");
@@ -22547,6 +22551,7 @@ int main(int argc, char** argv) {
                 // (PTM_RAD_SKIP_EQ_STEPS=1) is fatal; the default-on gate stands
                 // down instead, but never silently.
                 bool rad_skip_eq_steps = false;
+                bool cpu_eq_fold_fill = false;   // option A: CPU fills the eq span from the fold
                 const bool rad_skip_forced = radSkipEqStepsForced();
                 if (!radSkipEqStepsEnabled()) {
                     std::cout << "  [rad-skip-eq] PTM_RAD_SKIP_EQ_STEPS=0 (KILL SWITCH): the"
@@ -22554,6 +22559,23 @@ int main(int argc, char** argv) {
                                  " it did before 2026-08-15. On a two-phase run those steps"
                                  " solve the enclosure against a 0 K surface; measured cost"
                                  " on a 509k lunar chunk is 46.5% of the run." << std::endl;
+                } else if (!thermal_config.getPropertyBool("use_gpu_thermal", false)
+                        && cpuRethermalMode() == CpuRethermalMode::SeedSeries
+                        && sim_config.thermal.seed_indirect == "series"
+                        && equilibration_steps > 0 && equilibration_steps < total_time_steps
+                        && !(export_locations && !locations_file.empty())
+                        && rethermalTwoPhase(times, equilibration_steps, total_time_steps)) {
+                    // Option A (Paul 2026-10-15): the CPU seed-series re-thermal re-equilibrates
+                    // against the PHASE-FOLDED output-window indirect (the Fermi R1 fold the
+                    // eq-indirect pass already uses), so the equilibration span need not be swept.
+                    rad_skip_eq_steps = true;
+                    cpu_eq_fold_fill = true;
+                    std::cout << "  [rad-skip-eq] CPU seed-series (option A): the radiosity sweep starts at"
+                                 " absolute step " << equilibration_steps << " of " << total_time_steps
+                              << "; before every CPU re-thermal pass the equilibration span of"
+                                 " indirect_flux_series is filled with the box average of the current"
+                                 " sweep's output-window series folded by phase (Fermi R1 fold)."
+                              << std::endl;
                 } else if (!thermal_config.getPropertyBool("use_gpu_thermal", false)) {
                     // The CPU selected-faces re-thermal re-integrates the WHOLE
                     // span from a combined flux built out of indirect_flux_series.
@@ -23259,6 +23281,7 @@ int main(int argc, char** argv) {
                                 if (dst.empty()) { dst.push_back(best); ++n_nearest; }
                                 n_src += dst.size();
                             }
+                            g_rt_eq_fold = g_seed_indirect.eq_fold;   // for the CPU seed-series skip
                             std::cout << "    [eq-seed] seed window: " << n_cyc << " whole cycle(s) = "
                                       << (g_seed_indirect.t_hi - lo) << " samples (R2); equilibration"
                                          " forcing folded from them by phase onto " << eqn
@@ -24060,7 +24083,29 @@ int main(int argc, char** argv) {
                     // above, a small selection no longer bypasses the GPU
                     // branch, so it can only arrive here the same way a large
                     // one does: by failing on the device.
-                    if (rad_skip_eq_steps && !use_gpu_thermal_rerun) {
+                    if (rad_skip_eq_steps && !use_gpu_thermal_rerun && cpu_eq_fold_fill) {
+                        if (g_rt_eq_fold.size() != static_cast<size_t>(equilibration_steps)) {
+                            std::cerr << "\nFATAL: option A needs the Fermi R1 fold for "
+                                      << equilibration_steps << " equilibration steps, but "
+                                      << g_rt_eq_fold.size() << " are recorded (no PTM-727 series"
+                                         " eq-indirect pass ran?). Refusing to re-thermal against a"
+                                         " zero equilibration indirect.\n";
+                            return 1;
+                        }
+                        #pragma omp parallel for schedule(static)
+                        for (long f = 0; f < static_cast<long>(indirect_flux_series.size()); ++f) {
+                            auto& row = indirect_flux_series[static_cast<size_t>(f)];
+                            for (int t = 0; t < equilibration_steps; ++t) {
+                                const auto& src = g_rt_eq_fold[static_cast<size_t>(t)];
+                                double acc = 0.0;
+                                for (int o : src) acc += row[static_cast<size_t>(o)];
+                                row[static_cast<size_t>(t)] = acc / static_cast<double>(src.size());
+                            }
+                        }
+                        std::cout << "  [rad-skip-eq] option A: equilibration span of indirect_flux_series"
+                                     " filled from the folded output window for coupling iteration "
+                                  << (iter + 1) << ".\n";
+                    } else if (rad_skip_eq_steps && !use_gpu_thermal_rerun) {
                         std::cerr << "\nFATAL: the equilibration radiosity skip is armed but"
                                      " coupling iteration " << (iter + 1) << " fell to the CPU"
                                      " selected-faces re-thermal (" << faces_to_rerun.size()
