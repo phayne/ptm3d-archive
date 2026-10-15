@@ -2,6 +2,7 @@
 #include "smith_beaming.h"              // Smith (1967) anisotropic emission chi table
 #include "mc_view_factor.h"             // Monte Carlo view factor builder
 #include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
+#include "../mesh/face_orientation.h"     // PTM-733 shared surface-side rule (engine == mc_ref_pp)
 #include "../thermal/thermal_model.h"  // For ProgressBar
 #include "../gpu/gpu_guardrails.h"     // VRAM-margin + placement policy (no OpenCL dep)
 #include "../gpu/machine_profile.h"    // per-host VRAM record (no OpenCL dep)
@@ -2629,6 +2630,87 @@ std::vector<double> FaceSelector::computeShadowFractions(
 // ============================================================================
 // RadiationExchangeManager Implementation
 // ============================================================================
+
+namespace {
+// Value of a flat string key in the assembler's provenance JSON ("key": "value"); "" if absent.
+std::string provString(const std::string& txt, const std::string& key) {
+    const std::string pat = "\"" + key + "\"";
+    size_t p = txt.find(pat);
+    if (p == std::string::npos) return "";
+    p = txt.find(':', p + pat.size());
+    if (p == std::string::npos) return "";
+    size_t q1 = txt.find('"', p + 1);
+    if (q1 == std::string::npos) return "";
+    size_t q2 = txt.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return txt.substr(q1 + 1, q2 - q1 - 1);
+}
+}  // namespace
+
+void vfReplaceOrientationGate(const ptm::Mesh& mesh, bool illum_batch_path) {
+    const char* vfr = std::getenv("PTM_HMATRIX_VF_REPLACE");
+    if (!vfr || !vfr[0]) return;
+    static bool done = false;
+    if (done) return;
+    done = true;
+    // The engine's own surface side for THIS run, from the shared definition.
+    ptm::orient::FaceOrientation eng;
+    if (illum_batch_path) {
+        const bool want = ptm::orient::trueNormalsRequestedFromEnv() && !mesh.analytic_radial_normals;
+        eng = ptm::orient::computeFaceOrientation(mesh.vertices, mesh.faces, want);
+    } else {
+        eng.rule = eng.rule_requested = "raw_winding";
+        eng.n_faces = mesh.faces.size();
+        eng.sign.assign(eng.n_faces, 1);
+        eng.digest = ptm::orient::signDigest(eng.sign);
+    }
+    // What the CSR was traced with.
+    const std::string provPath = std::string(vfr) + ".provenance.json";
+    std::string txt;
+    { std::ifstream pf(provPath); if (pf) { std::ostringstream ss; ss << pf.rdbuf(); txt = ss.str(); } }
+    std::string csrRule = provString(txt, "orientation_rule");
+    std::string csrDigest = provString(txt, "orientation_digest");
+    std::string basis;
+    if (csrDigest.empty()) {
+        // Legacy CSR (no sidecar, or a pre-PTM-733 sweep): every referee before PTM-733 traced
+        // the RAW winding, so its orientation is "keep every face".
+        std::vector<int8_t> ones(eng.n_faces, 1);
+        csrDigest = ptm::orient::hex16(ptm::orient::signDigest(ones));
+        basis = txt.empty() ? "no provenance sidecar -> legacy raw winding assumed"
+                            : ("provenance orientation_rule='" + (csrRule.empty() ? std::string("<absent>") : csrRule)
+                               + "' without a digest -> legacy raw winding assumed");
+        if (csrRule.empty()) csrRule = "raw_winding_legacy";
+    } else {
+        basis = "provenance orientation_rule='" + csrRule + "'";
+    }
+    const std::string engDigest = ptm::orient::hex16(eng.digest);
+    std::cout << "  [VF-ORIENT] engine surface side: rule=" << eng.rule << " (requested "
+              << eng.rule_requested << (illum_batch_path ? "" : ", legacy --no-batch illumination")
+              << ") reversed " << eng.n_reversed << "/" << eng.n_faces << " faces vs raw winding, digest "
+              << engDigest << "; CSR: " << basis << ", digest " << csrDigest << "\n";
+    if (csrDigest == engDigest) {
+        std::cout << "  [VF-ORIENT] OK: the CSR was traced on the same side of every face that this run "
+                     "illuminates (PTM-733).\n";
+        return;
+    }
+    std::ostringstream msg;
+    msg << "the CSR '" << vfr << "' was traced on a DIFFERENT surface side than this run illuminates "
+        << "(CSR rule " << csrRule << ", digest " << csrDigest << "; engine rule " << eng.rule
+        << ", digest " << engDigest << ", " << eng.n_reversed << "/" << eng.n_faces
+        << " faces reversed vs raw winding). This is how the Moon3D 509k v4 matrix came to describe the "
+           "crater's UNDERSIDE (PTM-732). Rebuild the CSR with the referee under the SAME "
+           "PTM_ILLUM_TRUE_NORMALS setting as this run, or match this run to the CSR.";
+    const char* ov = std::getenv("PTM_VF_ORIENT_OVERRIDE");
+    if (ov && ov[0] == '1') {
+        std::cerr << "  [VF-ORIENT] *** WARNING (PTM_VF_ORIENT_OVERRIDE=1): " << msg.str()
+                  << " Proceeding ANYWAY on request: radiation exchange in this run is physically "
+                     "inconsistent with its illumination. ***\n";
+        return;
+    }
+    std::cerr << "  [VF-ORIENT] FATAL: " << msg.str()
+              << " (PTM_VF_ORIENT_OVERRIDE=1 proceeds anyway, for reproducing legacy runs only.)\n";
+    std::exit(3);
+}
 
 RadiationExchangeManager::RadiationExchangeManager(
     const std::shared_ptr<ptm::Mesh>& mesh,

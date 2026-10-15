@@ -18,7 +18,7 @@ symmetrize block and scripts/ptm12_diag/test_vf_assembler_gate.py.
 Usage: assemble_vf_haworth.py <mesh.ply> <sweep_chunks_glob> <nrays> <min_hits> <out.csr>
   [--floor-idx floor_idx.npy]   # for the before/after floor-far-wall-aggregate report
 """
-import numpy as np, glob, time, sys, argparse, os, json
+import numpy as np, glob, time, sys, argparse, os, json, re
 from pathlib import Path
 
 SIGMA = 5.670374419e-8  # Stefan-Boltzmann
@@ -170,6 +170,51 @@ def read_ply_geometry(path):
     return xyz, F["i"].astype(np.int64)
 
 
+ORIENT_RE = re.compile(r"^# ORIENTATION rule=(\S+) requested=(\S+) reversed=(\d+)/(\d+) \([^)]*\) "
+                       r"inconsistent_half_edges=(\d+) fell_back=(\d) digest=([0-9a-f]{16})")
+
+
+def sweep_orientation(sweep_logs_glob, n_faces):
+    """PTM-733: the face-orientation rule every chunk of the sweep traced with. All chunks must
+    agree exactly (rule, digest, counts); the result goes into the CSR provenance, and the engine
+    refuses a CSR whose recorded orientation differs from its own. No sweep logs, or logs from a
+    pre-PTM-733 referee, are recorded as such (never silently as 'fine')."""
+    if not sweep_logs_glob:
+        print("[assemble] *** WARNING: no --sweep-logs: the face-orientation rule of this sweep is "
+              "UNKNOWN. The engine will treat this CSR as legacy (raw winding) and accept it only "
+              "where its own orientation equals the raw winding on every face. ***", file=sys.stderr)
+        return {"orientation_rule": "unknown_no_sweep_logs"}
+    logs = sorted(glob.glob(sweep_logs_glob))
+    found, missing = set(), []
+    for lp in logs:
+        hit = None
+        for ln in open(lp, errors="replace"):
+            m = ORIENT_RE.match(ln)
+            if m:
+                hit = m.groups(); break
+        if hit is None:
+            missing.append(Path(lp).name)
+        else:
+            found.add(hit)
+    if found and missing:
+        raise SystemExit(f"FATAL: {len(missing)} sweep log(s) carry no ORIENTATION line while others do "
+                         f"({missing[:3]}): chunks from different referee builds were mixed.")
+    if not found:
+        print("[assemble] *** WARNING: the sweep logs carry no ORIENTATION line (pre-PTM-733 referee): "
+              "the sweep traced the RAW winding. Recorded as raw_winding_legacy. ***", file=sys.stderr)
+        return {"orientation_rule": "raw_winding_legacy"}
+    if len(found) != 1:
+        raise SystemExit(f"FATAL: sweep chunks disagree on the face orientation: {sorted(found)}")
+    rule, req, rev, nf, inc, fb, dig = found.pop()
+    if int(nf) != n_faces:
+        raise SystemExit(f"FATAL: ORIENTATION line covers {nf} faces, mesh has {n_faces}")
+    print(f"[assemble] face orientation: rule={rule} (requested {req}) reversed={rev}/{nf} digest={dig}")
+    return {"orientation_rule": rule, "orientation_rule_requested": req,
+            "orientation_n_reversed": int(rev), "orientation_n_faces": int(nf),
+            "orientation_inconsistent_half_edges": int(inc), "orientation_fell_back": bool(int(fb)),
+            "orientation_digest": dig}
+
+
 def face_areas(mesh_path):
     v, f = read_ply_geometry(mesh_path)
     p0, p1, p2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
@@ -231,6 +276,8 @@ def main():
             "hold indices only up to 2**31-1. Refusing rather than truncating silently.")
     print(f"[assemble] mesh={a.mesh}  N={N} faces  total_area={area.sum():.3f} m^2")
     GEOMHASH = float(area.sum()) + float((area * np.arange(1, N + 1)).sum()) * 1e-9
+
+    ORIENT = sweep_orientation(a.sweep_logs, N)   # PTM-733: before any heavy work (fails fast)
 
     FTHR = a.min_hits / a.nrays
     files = sorted(glob.glob(a.chunks_glob))
@@ -427,6 +474,7 @@ def main():
         "allow_incomplete_sweep": bool(a.allow_incomplete_sweep),
         "sigma_f_max": float(rs.max()), "sigma_f_mean": float(rs.mean()),
         "radiance_prune_eps": float(a.radiance_prune_eps),
+        **ORIENT,
         "assembler": str(Path(__file__).resolve()),
         "assembled_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

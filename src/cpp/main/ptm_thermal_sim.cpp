@@ -18856,6 +18856,8 @@ int main(int argc, char** argv) {
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
             }
 
+            // PTM-733: a VF_REPLACE CSR must be traced on the side this run illuminates (once).
+            radiation::vfReplaceOrientationGate(*mesh, use_batch_processing);
             // Create temporary radiation exchange manager for view factor computation
             radiation::RadiationExchangeManager early_rad_manager(mesh, early_rad_config);
             early_rad_manager.setEmissivity(planet.emissivity);
@@ -21654,6 +21656,8 @@ int main(int argc, char** argv) {
                 rad_config.adaptive_neighbors = false;  // Use fixed if override specified
             }
 
+            // PTM-733: a VF_REPLACE CSR must be traced on the side this run illuminates (once).
+            radiation::vfReplaceOrientationGate(*mesh, use_batch_processing);
             // Create radiation exchange manager
             ptm::timing::begin("radiation_setup");   // VF load / build + prepare()
             radiation::RadiationExchangeManager rad_manager(mesh, rad_config);

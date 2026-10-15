@@ -1,4 +1,5 @@
 #include "illumination_model.h"
+#include "../mesh/face_orientation.h"   // PTM-733 shared surface-side rule
 #include "primary_disk.h"
 #include "embree_isa_report.h"
 #include "../constants/physics_constants.h"
@@ -4051,6 +4052,39 @@ bool IlluminationModel::calculateIlluminationFromMesh(
         }
     }
     
+    // PTM-733 self-check: the surface side these illumination normals face must be EXACTLY the
+    // one the shared rule (src/cpp/mesh/face_orientation.h) gives, because that rule is what
+    // mc_ref_pp traces and what the VF_REPLACE gate compares a CSR against. Read-only (cannot
+    // change any output); runs only when a VF_REPLACE CSR is in use. Any disagreement is FATAL:
+    // it would mean the engine and the referee define "up" differently.
+    if (const char* vfr = std::getenv("PTM_HMATRIX_VF_REPLACE"); vfr && vfr[0]) {
+        const bool want = ptm::orient::trueNormalsRequestedFromEnv() && !mesh->analytic_radial_normals;
+        const ptm::orient::FaceOrientation ref =
+            ptm::orient::computeFaceOrientation(mesh->vertices, mesh->faces, want);
+        size_t disagree = 0, first = 0;
+        for (size_t i = 0; i < mesh->faces.size(); ++i) {
+            const auto& f = mesh->faces[i];
+            const auto& a = mesh->vertices[f[0]]; const auto& b = mesh->vertices[f[1]];
+            const auto& c = mesh->vertices[f[2]];
+            const double e1[3] = { b[0]-a[0], b[1]-a[1], b[2]-a[2] };
+            const double e2[3] = { c[0]-a[0], c[1]-a[1], c[2]-a[2] };
+            const double nr[3] = { e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0] };
+            const auto& n = corrected_normals[i];
+            const int8_t side = (n[0]*nr[0] + n[1]*nr[1] + n[2]*nr[2] < 0.0) ? -1 : 1;
+            if (side != ref.sign[i]) { if (disagree == 0) first = i; ++disagree; }
+        }
+        if (disagree) {
+            std::cerr << "[IlluminationModel] FATAL (PTM-733): illumination normals face a different side than "
+                         "the shared orientation rule " << ref.rule << " on " << disagree << " of "
+                      << mesh->faces.size() << " faces (first: face " << first << "). The engine and the "
+                         "view-factor referee would disagree about which side is the surface.\n";
+            std::exit(3);
+        }
+        std::cout << "[IlluminationModel] PTM-733 orientation self-check: illumination normals match the "
+                     "shared rule " << ref.rule << " on all " << mesh->faces.size() << " faces (reversed "
+                  << ref.n_reversed << " vs raw winding, digest " << ptm::orient::hex16(ref.digest) << ").\n";
+    }
+
     // Initialize Embree for ray tracing
     if (!initializeEmbree() || !initializeScene(mesh->vertices, mesh->faces)) {
         std::cerr << "Failed to initialize ray tracing." << std::endl;

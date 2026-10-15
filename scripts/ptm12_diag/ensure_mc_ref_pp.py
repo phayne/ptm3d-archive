@@ -63,6 +63,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MC_SRC = HERE / "mc_ref_pp.cpp"
+# Local headers mc_ref_pp.cpp #includes (PTM-733): part of the source, so part of the cache key.
+MC_HEADERS = [HERE.parent.parent / "src" / "cpp" / "mesh" / "face_orientation.h"]
 LEGACY_BIN = HERE / "mc_ref_pp"
 CACHE_ROOT = HERE / ".mc_ref_pp_cache"
 
@@ -219,9 +221,14 @@ def smoke_test(binary):
     with tempfile.TemporaryDirectory(prefix="mc_ref_pp_smoke_") as work:
         ply, tmax, fl = _write_smoke_inputs(work)
         outb = Path(work) / "smoke_out.bin"
+        # PTM-733: the closed-form geometry is two facing plates in a LOCAL frame (receiver
+        # wound to face the source, not the outside of a body), so no radial orientation rule
+        # applies to it. The smoke test checks the integrator and the dyld load, not the
+        # orientation (test_mc_ref_pp_orientation.py does that), so it traces the raw winding.
+        env = dict(os.environ, PTM_PP_ORIENT="raw")
         r = subprocess.run([str(binary), str(ply), str(tmax), str(fl), str(SMOKE_NRAYS),
                             "1e-4", "0.2", "1", str(outb)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=env)
         why = None
         if r.returncode != 0:
             why = f"exit status {r.returncode} (a dyld load failure exits before main)"
@@ -279,12 +286,16 @@ def find_or_build_mc_ref_pp(explicit, work):
 
 
 def _source_key():
-    """sha256 of mc_ref_pp.cpp + the exact compile command, truncated to 16 hex
+    """sha256 of mc_ref_pp.cpp + its local headers + the exact compile command, truncated to 16 hex
     chars for a directory name. Covers a source edit AND a toolchain/flag
     change (e.g. a different Embree found by pkg-config) -- either can change
     what the binary does, so either must bust the cache."""
     h = hashlib.sha256()
     h.update(MC_SRC.read_bytes())
+    for hdr in MC_HEADERS:          # a header edit must miss the cache exactly like a .cpp edit
+        if not hdr.is_file():
+            raise SystemExit(f"FATAL: mc_ref_pp header {hdr} is missing")
+        h.update(hdr.read_bytes())
     h.update(" ".join(_build_command("<out>", _compiler())).encode())
     return h.hexdigest()[:16]
 

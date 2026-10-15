@@ -776,6 +776,15 @@ struct BeamEmitStep {
 
 // Main radiation exchange manager
 // Coordinates view factor computation, radiosity solving, and thermal integration
+// PTM-733: refuse a PTM_HMATRIX_VF_REPLACE CSR traced on a different side of the surface than
+// the one this run illuminates. No-op (returns immediately) when PTM_HMATRIX_VF_REPLACE is unset.
+// illum_batch_path: true = calculateIlluminationFromMesh (radial_per_face, or winding_majority
+// under PTM_ILLUM_TRUE_NORMALS=1); false = the legacy --no-batch calculateIllumination, which
+// uses the raw winding. Compares the per-face orientation digest recorded in the CSR's
+// .provenance.json (a legacy CSR without one counts as raw winding) with the engine's own.
+// FATAL (exit 3) on mismatch unless PTM_VF_ORIENT_OVERRIDE=1 (loud WARNING). Runs once.
+void vfReplaceOrientationGate(const ptm::Mesh& mesh, bool illum_batch_path);
+
 class RadiationExchangeManager {
 public:
     RadiationExchangeManager(const std::shared_ptr<ptm::Mesh>& mesh,

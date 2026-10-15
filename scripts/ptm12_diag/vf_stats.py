@@ -86,7 +86,9 @@ def parse_sweep_stats(pattern):
                 found = True
                 n_lines += 1
                 for k, v in d.items():
-                    if k in ("n_faces_mesh", "nrays", "min_hits"):
+                    if k in ("n_faces_mesh", "nrays", "min_hits",
+                             "orientation_rule", "orientation_reversed", "orientation_digest"):
+                        # per-chunk constants (PTM-733 orientation included): collected, not summed
                         tot.setdefault(k, set()).add(v)
                     elif k == "max_partners_kept":
                         max_kept = max(max_kept, v)
@@ -97,7 +99,8 @@ def parse_sweep_stats(pattern):
                         tot[k] = tot.get(k, 0) + v
         if not found:
             missing.append(os.path.basename(p))
-    for k in ("n_faces_mesh", "nrays", "min_hits"):
+    for k in ("n_faces_mesh", "nrays", "min_hits",
+              "orientation_rule", "orientation_reversed", "orientation_digest"):
         if k in tot:
             vals = sorted(tot[k])
             tot[k] = vals[0] if len(vals) == 1 else vals   # a list here means MIXED sweeps

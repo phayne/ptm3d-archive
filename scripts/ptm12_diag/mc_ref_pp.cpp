@@ -1,5 +1,13 @@
 // PTM-12 CORRECTED occlusion-aware MC VF referee (Fermi's corrections folded in).
-//   - 0.1 mm ray offset (default; param), forced-outward normals
+//   - 0.1 mm ray offset (default; param)
+//   - face orientation by the ENGINE's rule (PTM-733, src/cpp/mesh/face_orientation.h):
+//     radial_per_face by default, winding_majority under PTM_ILLUM_TRUE_NORMALS=1 -- the same
+//     env var and the same code the engine's illumination uses. Before 2026-10-15 this tool
+//     traced along the RAW winding (this line used to claim 'forced-outward normals', which the
+//     code never did), so an inward-wound mesh silently gave the UNDERSIDE view factor (PTM-732).
+//     A reversal of more than PTM_PP_ORIENT_MAX_REVERSED_PCT (default 1) % of faces is FATAL
+//     unless PTM_PP_ORIENT_EXPECT_REVERSAL=1 acknowledges it. PTM_PP_ORIENT=raw restores the
+//     raw-winding behavior (A/B and v4 reproduction only; loud WARNING).
 //   - grazing guard: rise-march skips self-relief hits (out-of-plane rise < k*edge), re-casts
 //   - deterministic Halton QMC (bit-reproducible, no std::rand)
 // Usage: mc_ref <mesh.ply> <tmax.bin> <facelist.txt> <nrays> [offset_m=1e-4] [keps=0.2]
@@ -21,6 +29,7 @@
 #include <fstream>
 #include <sstream>
 #include <embree4/rtcore.h>
+#include "../../src/cpp/mesh/face_orientation.h"  // PTM-733: shared with the engine
 #include <unordered_map>
 #include <algorithm>  // std::max/min({...}) initializer-list overloads: NOT transitive on Linux libstdc++
 #include <chrono>
@@ -167,6 +176,46 @@ int main(int argc,char**argv){
         V3 n=nrm(cross(e1,e2)); nn[i]=n; /* RAW winding = builder normal, NO radial flip */
         double l1=std::sqrt(dot(e1,e1)),l2=std::sqrt(dot(e2,e2)),l3=std::sqrt(dot(e3,e3));
         double mx=std::max({l1,l2,l3}),mn=std::min({l1,l2,l3}); edge[i]=l1+l2+l3-mx-mn; }  // median edge
+    // ---- PTM-733: orient every face by the ENGINE's rule, never by the raw winding alone ----
+    // nn[] is both the launch-hemisphere axis and the back-face test normal, so one sign flip here
+    // moves the whole referee to the surface side the engine illuminates. A mesh the rule leaves
+    // untouched (every reversal sign +1) is byte-identical to the pre-PTM-733 tool.
+    ptm::orient::FaceOrientation ORI;
+    { const char* om=getenv("PTM_PP_ORIENT"); const std::string mode=(om&&om[0])?om:"engine";
+      if(mode=="raw"){
+          ORI.rule="raw_winding"; ORI.rule_requested="raw_winding"; ORI.n_faces=nf; ORI.sign.assign(nf,1);
+          ORI.digest=ptm::orient::signDigest(ORI.sign);
+          fprintf(stderr,"# *** WARNING: PTM_PP_ORIENT=raw -- tracing along the RAW winding (pre-PTM-733 "
+                         "behavior). On an inward-wound mesh this is the UNDERSIDE view factor (PTM-732). "
+                         "A/B and v4 reproduction only; the engine will refuse the resulting CSR unless its "
+                         "own orientation equals the raw winding on every face. ***\n");
+      } else if(mode=="engine"){
+          ORI=ptm::orient::computeFaceOrientation(Vv,Fc,ptm::orient::trueNormalsRequestedFromEnv());
+      } else { fprintf(stderr,"FATAL: PTM_PP_ORIENT='%s' (allowed: engine, raw)\n",om); std::exit(2); } }
+    for(size_t i=0;i<nf;++i) if(ORI.sign[i]<0) nn[i]={{-nn[i][0],-nn[i][1],-nn[i][2]}};
+    const double ORI_REV_PCT = nf ? 100.0*double(ORI.n_reversed)/double(nf) : 0.0;
+    fprintf(stderr,"# ORIENTATION rule=%s requested=%s reversed=%zu/%zu (%.3f%%) inconsistent_half_edges=%zu "
+                   "fell_back=%d digest=%s\n",ORI.rule.c_str(),ORI.rule_requested.c_str(),ORI.n_reversed,nf,
+            ORI_REV_PCT,ORI.inconsistent,ORI.fell_back?1:0,ptm::orient::hex16(ORI.digest).c_str());
+    if(ORI.fell_back)
+        fprintf(stderr,"# WARN: winding_majority was requested (PTM_ILLUM_TRUE_NORMALS) but %zu manifold half-edges "
+                       "are inconsistent (> 1%% of faces); using radial_per_face, exactly as the engine does.\n",
+                ORI.inconsistent);
+    { double maxpct=1.0; if(const char* e=getenv("PTM_PP_ORIENT_MAX_REVERSED_PCT")) maxpct=atof(e);
+      const char* ack=getenv("PTM_PP_ORIENT_EXPECT_REVERSAL"); const bool acked=ack&&ack[0]=='1';
+      if(ORI_REV_PCT>maxpct){
+          if(!acked){
+              fprintf(stderr,"FATAL: orientation rule %s REVERSES %.3f%% of faces relative to the raw winding "
+                             "(limit %.3g%%, PTM_PP_ORIENT_MAX_REVERSED_PCT). The mesh is wound against the "
+                             "engine's surface side (PTM-732). If that is expected, set "
+                             "PTM_PP_ORIENT_EXPECT_REVERSAL=1 to proceed on the engine's side.\n",
+                      ORI.rule.c_str(),ORI_REV_PCT,maxpct);
+              std::exit(5);
+          }
+          fprintf(stderr,"# *** WARNING: orientation REVERSES %.3f%% of faces relative to the raw winding "
+                         "(acknowledged by PTM_PP_ORIENT_EXPECT_REVERSAL=1): tracing the ENGINE's surface side. ***\n",
+                  ORI_REV_PCT);
+      } }
     V3 bbmin=Vv[0],bbmax=Vv[0]; for(auto&v:Vv)for(int k=0;k<3;++k){if(v[k]<bbmin[k])bbmin[k]=v[k];if(v[k]>bbmax[k])bbmax[k]=v[k];}
     V3 sh={{0.5*(bbmin[0]+bbmax[0]),0.5*(bbmin[1]+bbmax[1]),0.5*(bbmin[2]+bbmax[2])}};
     RTCDevice dev=rtcNewDevice(nullptr); RTCScene sc=rtcNewScene(dev); rtcSetSceneFlags(sc,RTC_SCENE_FLAG_ROBUST);
@@ -300,9 +349,11 @@ int main(int argc,char**argv){
       fprintf(stderr,"# STATS {\"n_faces_mesh\":%zu,\"faces_swept\":%ld,\"nrays\":%d,\"min_hits\":%ld,"
                      "\"rays_total\":%ld,\"terrain_hits\":%ld,\"ring_blocked\":%ld,\"backface_blocked\":%ld,"
                      "\"backface_seen\":%ld,\"sky\":%ld,\"partners_seen\":%ld,\"partners_kept\":%ld,"
-                     "\"max_partners_kept\":%ld,\"wall_s\":%.3f}\n",
+                     "\"max_partners_kept\":%ld,\"wall_s\":%.3f,\"orientation_rule\":\"%s\",\"orientation_reversed\":%zu,"
+                     "\"orientation_digest\":\"%s\"}\n",
               nf,faces_swept,NR,MIN_HITS,ray_total,terr_total,ring_total,back_total,backseen_total,sky,
-              partners_seen,partners_kept,max_kept,wall); }
+              partners_seen,partners_kept,max_kept,wall,ORI.rule.c_str(),ORI.n_reversed,
+              ptm::orient::hex16(ORI.digest).c_str()); }
     if(fb && fclose(fb)!=0) write_fail("fclose",OUTB);
     if(fflush(stdout)!=0 || ferror(stdout)) write_fail("stdout write","<stdout>");
     rtcReleaseScene(sc);rtcReleaseDevice(dev); return 0;
