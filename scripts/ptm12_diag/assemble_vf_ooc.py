@@ -117,7 +117,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mesh"); ap.add_argument("chunks_glob"); ap.add_argument("nrays", type=int)
     ap.add_argument("min_hits", type=float); ap.add_argument("out_csr")
-    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits"), default="tried")
+    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits", "pooled"), default="tried")
     ap.add_argument("--sweep-logs", default=None)
     ap.add_argument("--allow-incomplete-sweep", action="store_true")
     ap.add_argument("--floor-idx", default=None)
@@ -131,6 +131,8 @@ def main():
     a = ap.parse_args()
     if a.floor_idx:
         raise SystemExit("FATAL: --floor-idx is not supported out of core; use assemble_vf_haworth.py")
+    if a.symmetrize_divisor == "pooled":
+        raise SystemExit("FATAL: --symmetrize-divisor pooled is not implemented out of core; use assemble_vf_haworth.py")
     if a.radiance_prune_eps > 0.0:
         raise SystemExit("FATAL: radiance pruning is not supported out of core; use assemble_vf_haworth.py")
     if a.min_hits > 1 and a.symmetrize_divisor == "tried":
@@ -149,6 +151,7 @@ def main():
     log(f"mesh={a.mesh}  N={N} faces  total_area={area.sum():.3f} m^2")
     GEOMHASH = float(area.sum()) + float((area * np.arange(1, N + 1)).sum()) * 1e-9
     ORIENT = IC.sweep_orientation(a.sweep_logs, N)
+    REFEREE = IC.sweep_referee_params(a.sweep_logs)
     FTHR = a.min_hits / a.nrays
     files = sorted(glob.glob(a.chunks_glob))
     assert files, f"no chunk files matched {a.chunks_glob}"
@@ -317,7 +320,7 @@ def main():
         shutil.rmtree(scratch, ignore_errors=True)
 
     prov = {
-        "estimator": "FC-08 corrected" if a.symmetrize_divisor == "tried" else "PRE-FC-08 DEFECTIVE",
+        "estimator": {"tried": "FC-08 corrected", "hits": "PRE-FC-08 DEFECTIVE"}[a.symmetrize_divisor],
         "symmetrize_divisor": a.symmetrize_divisor,
         "symmetrize_divisor_meaning": ("mean over the 2 ray directions TRIED (unbiased)"
                                        if a.symmetrize_divisor == "tried"
@@ -333,6 +336,7 @@ def main():
         "sigma_f_max": float(rs.max()), "sigma_f_mean": float(rs.mean()),
         "radiance_prune_eps": float(a.radiance_prune_eps),
         **ORIENT,
+        **REFEREE,
         "assembler": str(Path(__file__).resolve()),
         "assembler_mode": f"out_of_core (byte-identical contract with assemble_vf_haworth.py; {K} lo-buckets, {nRB} row blocks, --ram-gib {a.ram_gib:g})",
         "assembled_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

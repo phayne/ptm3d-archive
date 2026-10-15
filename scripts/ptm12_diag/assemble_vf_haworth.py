@@ -215,6 +215,28 @@ def sweep_orientation(sweep_logs_glob, n_faces):
             "orientation_digest": dig}
 
 
+REFEREE_RE = re.compile(r"^# CORRECTED referee: offset=(\S+) m\s+keps=(\S+)\s+nrays=(\d+)")
+
+
+def sweep_referee_params(sweep_logs_glob):
+    """The referee settings every chunk swept with (offset, keps, nrays), from its own banner. All
+    chunks must agree; recorded in the provenance (keps changes the matrix: PTM-732 follow-up)."""
+    if not sweep_logs_glob:
+        return {"sweep_keps": None, "sweep_offset_m": None}
+    found = set()
+    for lp in sorted(glob.glob(sweep_logs_glob)):
+        for ln in open(lp, errors="replace"):
+            m = REFEREE_RE.match(ln)
+            if m:
+                found.add(m.groups()); break
+    if len(found) > 1:
+        raise SystemExit(f"FATAL: sweep chunks disagree on the referee settings: {sorted(found)}")
+    if not found:
+        return {"sweep_keps": None, "sweep_offset_m": None}
+    off, keps, nr = found.pop()
+    return {"sweep_keps": float(keps), "sweep_offset_m": float(off), "sweep_nrays_banner": int(nr)}
+
+
 def face_areas(mesh_path):
     v, f = read_ply_geometry(mesh_path)
     p0, p1, p2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
@@ -245,7 +267,7 @@ def main():
                          "(W/m^2, e.g. an illumination-proxy). Required when --radiance-prune-eps>0.")
     ap.add_argument("--radiance-albedo", type=float, default=0.12,
                     help="A0 for the visible-band radiance weight (reflected solar). Default 0.12.")
-    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits"), default="tried",
+    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits", "pooled"), default="tried",
                     help="Divisor used when averaging the two ray directions of an undirected "
                          "pair. 'tried' (DEFAULT, correct): divide by the 2 directions that were "
                          "TRIED, counting a direction that registered no hit as the measured zero "
@@ -253,7 +275,12 @@ def main():
                          "pre-2026-08-19 DEFECTIVE estimator (divide by the number of directions "
                          "that happened to hit), which inflates far-field entries by up to 2x. "
                          "'hits' exists ONLY so the regression gate can prove the defect; it must "
-                         "never be used to build a view-factor matrix for science.")
+                         "never be used to build a view-factor matrix for science. 'pooled' (Fermi "
+                         "2026-10-15): pool the HITS of both directions, weighted by rays per area, "
+                         "G_ij = (h_ij + h_ji) / (n_i/A_i + n_j/A_j) -- reciprocal by construction and "
+                         "the minimum-variance combination; with every face swept at the same NR it is "
+                         "G = (V_ij + V_ji) / (1/A_i + 1/A_j). It stops a noisy or biased estimate from a "
+                         "much LARGER partner pulling a small face's row down with equal weight.")
     ap.add_argument("--sweep-logs", default=None,
                     help="glob of the mc_ref_pp chunk logs (stderr) for this sweep. Their "
                          "'# STATS' lines feed the back-face / ring / sky ray fractions in "
@@ -278,6 +305,8 @@ def main():
     GEOMHASH = float(area.sum()) + float((area * np.arange(1, N + 1)).sum()) * 1e-9
 
     ORIENT = sweep_orientation(a.sweep_logs, N)   # PTM-733: before any heavy work (fails fast)
+    REFEREE = sweep_referee_params(a.sweep_logs)
+    print(f"[assemble] referee settings from the sweep logs: {REFEREE}")
 
     FTHR = a.min_hits / a.nrays
     files = sorted(glob.glob(a.chunks_glob))
@@ -382,7 +411,10 @@ def main():
     # divisor 2 -> 0.251458. The old estimator is also ray-budget dependent; this one
     # is not. See test_vf_assembler_gate.py and
     # SESSION-NOTES-2026-08-19-fc08-far-field-vf-rootcause.md.
-    S = area[I] * V.astype(np.float64)
+    pooled = a.symmetrize_divisor == "pooled"
+    # tried / hits: area-weighted directed estimates S = A_i F_ij, averaged per pair.
+    # pooled: the raw hit fractions V = h/NR are summed per pair and divided by sum(1/A).
+    S = V.astype(np.float64) if pooled else area[I] * V.astype(np.float64)
     lo = np.minimum(I, J).astype(np.int32); hi = np.maximum(I, J).astype(np.int32)
     key = np.multiply(lo, np.int64(N), dtype=np.int64)   # int64 accumulator: range ~N**2
     key += hi
@@ -398,10 +430,14 @@ def main():
         ndir = (ge - gs).astype(np.float64)
     else:
         ndir = 2.0
-    Ssym = (csum[ge] - csum[gs]) / ndir
-    print(f"[assemble] symmetrization divisor = {a.symmetrize_divisor} "
-          f"({'2 (directions tried; unbiased)' if a.symmetrize_divisor == 'tried' else 'directions HIT -- DEFECTIVE, gate use only'})")
     a_idx = lo[gs]; b_idx = hi[gs]
+    if pooled:
+        # every source face is swept with the same NR rays (mc_ref_pp), so n_i/A_i = NR/A_i
+        Ssym = (csum[ge] - csum[gs]) / (1.0 / area[a_idx] + 1.0 / area[b_idx])
+    else:
+        Ssym = (csum[ge] - csum[gs]) / ndir
+    print(f"[assemble] symmetrization divisor = {a.symmetrize_divisor} "
+          f"({'2 (directions tried; unbiased)' if a.symmetrize_divisor == 'tried' else ('POOLED hits / (1/A_i + 1/A_j) (reciprocal, minimum variance)' if pooled else 'directions HIT -- DEFECTIVE, gate use only')})")
     del S, lo, hi, key, o, csum, bnd, gs, ge   # grouping scratch; a_idx/b_idx/Ssym carry it now
     print(f"[assemble] unique undirected pairs={len(a_idx)} ({len(a_idx)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
@@ -459,11 +495,14 @@ def main():
     # silently. This sidecar makes the estimator, the ray budget and the sweep coverage
     # readable after the fact; a .csr WITHOUT one was built before FC-08 was fixed.
     prov = {
-        "estimator": "FC-08 corrected" if a.symmetrize_divisor == "tried" else "PRE-FC-08 DEFECTIVE",
+        "estimator": {"tried": "FC-08 corrected", "pooled": "pooled-hit (rays per area)",
+                      "hits": "PRE-FC-08 DEFECTIVE"}[a.symmetrize_divisor],
         "symmetrize_divisor": a.symmetrize_divisor,
-        "symmetrize_divisor_meaning": ("mean over the 2 ray directions TRIED (unbiased)"
-                                       if a.symmetrize_divisor == "tried"
-                                       else "mean over the directions that HIT (inflates far field up to 2x)"),
+        "symmetrize_divisor_meaning": {"tried": "mean over the 2 ray directions TRIED (unbiased)",
+                                       "pooled": "G_ij = (h_ij + h_ji) / (n_i/A_i + n_j/A_j): hits of both "
+                                                 "directions pooled, weighted by rays per area",
+                                       "hits": "mean over the directions that HIT (inflates far field up to 2x)"}[a.symmetrize_divisor],
+        **REFEREE,
         "nrays": int(a.nrays), "min_hits": float(a.min_hits),
         "mesh": str(a.mesh), "n_faces": int(N), "nnz": int(len(F)),
         "geomhash": float(GEOMHASH), "total_area_m2": float(area.sum()),
