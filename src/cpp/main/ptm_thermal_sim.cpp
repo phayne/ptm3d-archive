@@ -24116,7 +24116,13 @@ int main(int argc, char** argv) {
                     // branch, so it can only arrive here the same way a large
                     // one does: by failing on the device.
                     if (rad_skip_eq_steps && !use_gpu_thermal_rerun && cpu_eq_fold_fill
-                            && rad_sweep_t_lo != 0) {
+                            && rad_sweep_t_lo == 0) {
+                        // A3: this iteration swept the FULL span, so the eq span already holds the
+                        // real equilibration indirect -- nothing to fill.
+                        std::cout << "  [rad-skip-eq] A3: coupling iteration " << (iter + 1)
+                                  << " swept the full span; its re-thermal uses the real equilibration"
+                                     " indirect.\n";
+                    } else if (rad_skip_eq_steps && !use_gpu_thermal_rerun && cpu_eq_fold_fill) {
                         // A3: eq-span indirect = the latest FULL sweep's real eq indirect, scaled per
                         // face by (current output-window mean / that sweep's output-window mean).
                         // A face whose reference mean is 0 but current mean is not falls back to the
