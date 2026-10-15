@@ -6442,6 +6442,37 @@ struct GpuSharedSeedContext {
 // PTM_DIAG_CPU_FLUX_LEFT_CONST=1 (diagnostic, PTM-728): the CPU SIMD main loop holds the
 // left-endpoint flux over every substep of an interval, as the GPU thermal kernel does
 // (thermal_kernels.cl Q_surf = flux_all[tg]), instead of interpolating linearly. Default off.
+// PTM-728 phase 2: how a CPU re-thermal (face-subset) pass starts its columns.
+//   reseed       (default, unchanged): re-seed every pass from scratch on the warm-bracket
+//                fallback, then re-equilibrate over the full span.
+//   resume       restore the column state the last WHOLE-mesh pass reached at the end of
+//                equilibration (times[equilibration_steps]) and integrate only the output
+//                window -- the GPU re-thermal's state hand-off. FATAL if no valid capture.
+//   seed-series  re-seed every pass with the PTM-727 lumped series seed from this pass's own
+//                composed flux (it already carries the current indirect), then re-equilibrate.
+// Env PTM_CPU_RETHERMAL; any other value is FATAL.
+enum class CpuRethermalMode { Reseed, Resume, SeedSeries };
+static CpuRethermalMode cpuRethermalMode() {
+    static const CpuRethermalMode m = [] {
+        const char* e = std::getenv("PTM_CPU_RETHERMAL");
+        if (!e || !*e || std::string(e) == "reseed") return CpuRethermalMode::Reseed;
+        if (std::string(e) == "resume") return CpuRethermalMode::Resume;
+        if (std::string(e) == "seed-series") return CpuRethermalMode::SeedSeries;
+        std::cerr << "FATAL: PTM_CPU_RETHERMAL='" << e << "' (allowed: reseed, resume, seed-series)\n";
+        std::exit(2);
+    }();
+    return m;
+}
+// Column state at times[equilibration_steps] from the last whole-mesh CPU SIMD pass
+// (layer-major, layer * n_faces + face) and the surface value that pass filed there.
+static std::vector<double> g_cpu_post_eq_T, g_cpu_post_eq_surf;
+static int g_cpu_post_eq_steps = -1;
+static int g_cpu_post_eq_layers = 0;
+// The PTM-727 whole-cycle series window [lo, hi), recorded when the eq-indirect pass arms it.
+// The hand-off itself (g_seed_indirect) is reset when that pass ends, so a later re-thermal
+// pass under PTM_CPU_RETHERMAL=seed-series reads the window from here.
+static int g_rt_series_lo = -1, g_rt_series_hi = -1;
+
 static const bool g_diag_flux_left_const = [] {
     const char* e = std::getenv("PTM_DIAG_CPU_FLUX_LEFT_CONST");
     return e && e[0] == '1';
@@ -6615,6 +6646,13 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // ---- face subset (BUGS.md PTM-665) ------------------------------------
     const bool is_subset = (subset != nullptr);
+    const CpuRethermalMode rt_mode = cpuRethermalMode();
+    const bool rt_capture = (rt_mode == CpuRethermalMode::Resume) && !is_subset &&
+                            equilibration_steps > 0 && equilibration_steps < total_time_steps;
+    // A warm-started pass has no equilibration span: its columns come from the checkpoint
+    // restore, which already is a resume, so there is nothing to capture or restore here.
+    const bool rt_resume  = (rt_mode == CpuRethermalMode::Resume) && is_subset &&
+                            equilibration_steps > 0;
     std::vector<char> subset_batch_active;   // per batch; empty = all active
     std::vector<char> subset_face_selected;  // per global face
     if (is_subset) {
@@ -6881,6 +6919,46 @@ bool runThermalModelsForAllFacesBatchSoA(
     const int n_layers = ref_profile.nlayers;
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
+
+    // PTM-728 phase 2: re-thermal start mode (PTM_CPU_RETHERMAL). Said once per pass,
+    // never silent; a resume without a valid capture is FATAL.
+    if (!is_subset && g_seed_indirect.mode == SeedIndirectMode::Series) {
+        g_rt_series_lo = g_seed_indirect.t_lo;   // recorded for PTM_CPU_RETHERMAL=seed-series
+        g_rt_series_hi = g_seed_indirect.t_hi;
+    }
+    if (rt_mode != CpuRethermalMode::Reseed) {
+        if (rt_capture) {
+            g_cpu_post_eq_T.assign(static_cast<size_t>(n_layers) * n_faces, 0.0);
+            g_cpu_post_eq_surf.assign(n_faces, 0.0);
+            g_cpu_post_eq_steps = equilibration_steps;
+            g_cpu_post_eq_layers = n_layers;
+            std::cerr << "[Re-thermal] PTM_CPU_RETHERMAL=resume: this whole-mesh pass captures every column "
+                         "at times[" << equilibration_steps << "] (end of equilibration) for the re-thermal "
+                         "passes that follow.\n";
+        } else if (rt_resume) {
+            if (g_cpu_post_eq_steps != equilibration_steps || g_cpu_post_eq_layers != n_layers ||
+                g_cpu_post_eq_T.size() != static_cast<size_t>(n_layers) * n_faces) {
+                std::cerr << "[Re-thermal] FATAL: PTM_CPU_RETHERMAL=resume but no valid post-equilibration "
+                             "capture (captured eq steps " << g_cpu_post_eq_steps << ", this pass "
+                          << equilibration_steps << "; layers " << g_cpu_post_eq_layers << " vs " << n_layers
+                          << "). Refusing to re-seed silently.\n";
+                return false;
+            }
+            std::cerr << "[Re-thermal] PTM_CPU_RETHERMAL=resume: re-thermal pass RESUMES the captured "
+                         "end-of-equilibration state and integrates only steps [" << equilibration_steps
+                      << ", " << total_time_steps << ") -- no re-seed, no re-equilibration.\n";
+        } else if (is_subset && rt_mode == CpuRethermalMode::Resume) {
+            std::cerr << "[Re-thermal] PTM_CPU_RETHERMAL=resume: no equilibration span on this pass "
+                         "(warm start); the checkpoint restore supplies the starting columns.\n";
+        } else if (is_subset && rt_mode == CpuRethermalMode::SeedSeries) {
+            std::cerr << "[Re-thermal] PTM_CPU_RETHERMAL=seed-series: re-thermal pass re-seeds with the "
+                         "PTM-727 lumped series seed from this pass's own composed flux, then re-equilibrates"
+                      << (g_rt_series_hi > g_rt_series_lo ? "" :
+                          " -- WARNING: no PTM-727 series window was armed (thermal.seed_indirect is not "
+                          "'series'), so the legacy re-seed is used")
+                      << ".\n";
+        }
+    }
 
     // Subsurface depth-map product: this path shares ONE z[] across every face
     // in every batch, so the plan's (j, w) are valid for all of them -- but
@@ -7601,22 +7679,31 @@ bool runThermalModelsForAllFacesBatchSoA(
                     // and nothing on the output steps.
                     std::vector<double> seed_ind_series;
                     bool seed_ind_series_mode = false;
-                    if (g_seed_indirect.mode != SeedIndirectMode::Off && !is_subset) {
+                    const bool rt_seed_series = is_subset &&
+                        rt_mode == CpuRethermalMode::SeedSeries &&
+                        g_rt_series_hi > g_rt_series_lo && g_rt_series_lo >= 0;
+                    if ((g_seed_indirect.mode != SeedIndirectMode::Off && !is_subset) || rt_seed_series) {
                         const SeedIndirectHandoff& h = g_seed_indirect;
-                        if (h.mode == SeedIndirectMode::Series) {
-                            const int n = h.t_hi - h.t_lo;
-                            const auto& row = (*h.series)[global_f];
+                        if (rt_seed_series || h.mode == SeedIndirectMode::Series) {
+                            const int s_lo = rt_seed_series ? g_rt_series_lo : h.t_lo;
+                            const int s_hi = rt_seed_series ? g_rt_series_hi : h.t_hi;
+                            const int n = s_hi - s_lo;
+                            static const std::vector<double> no_row;
+                            const auto& row = rt_seed_series ? no_row : (*h.series)[global_f];
                             seed_ind_series.resize(static_cast<size_t>(n));
                             for (int t = 0; t < n; ++t) {
-                                const int ta = h.t_lo + t;
+                                const int ta = s_lo + t;
+                                // A subset pass's flux_base already carries THIS pass's indirect
+                                // (extra_flux) at every step: adding the iteration-0 row would count it twice.
                                 seed_ind_series[t] = flux_base[static_cast<size_t>(ta) * flux_stride + f]
-                                    + (ta < static_cast<int>(row.size()) ? row[ta] : 0.0);
+                                    + (is_subset ? 0.0
+                                                 : (ta < static_cast<int>(row.size()) ? row[ta] : 0.0));
                             }
                             sfc_.flux = seed_ind_series.data();
                             sfc_.stride = 1;
                             sfc_.n_samples = n;
-                            const double dt_out = (h.t_lo + 1 < static_cast<int>(times.size()))
-                                ? times[h.t_lo + 1] - times[h.t_lo] : seed_dt_s;
+                            const double dt_out = (s_lo + 1 < static_cast<int>(times.size()))
+                                ? times[s_lo + 1] - times[s_lo] : seed_dt_s;
                             sfc_.span_s = dt_out * n;
                             seed_ind_series_mode = true;
                         } else {
@@ -8205,6 +8292,16 @@ bool runThermalModelsForAllFacesBatchSoA(
             // Justitia, 0.39 K on scripts/test_chunk_seam_equivalence.py. The
             // re-solve is read-only, exactly as for every other row, so the
             // trajectory is unchanged; only the reported frame moves.
+            int t_begin = 0;
+            if (rt_resume) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t gf = start_face + f;
+                    for (int layer = 0; layer < n_layers; ++layer)
+                        batch.T[layer * BS + f] =
+                            g_cpu_post_eq_T[static_cast<size_t>(layer) * n_faces + gf];
+                }
+                t_begin = equilibration_steps;
+            }
             const bool row0_resolve = ckpt.want_in;
             alignas(64) double row0_surf[thermal::THERMAL_BATCH_SIZE];
             for (int f = 0; f < faces_in_batch; ++f) {
@@ -8277,7 +8374,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                                               "CPU main loop");
             alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
             for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
-            for (int t = 0; t < total_time_steps - 1; ++t) {
+            if (rt_resume && surface_temps_out) {
+                // The resumed state is the one the whole-mesh pass filed at this index.
+                for (int f = 0; f < faces_in_batch; ++f)
+                    (*surface_temps_out)[start_face + f][t_begin] = g_cpu_post_eq_surf[start_face + f];
+            }
+            for (int t = t_begin; t < total_time_steps - 1; ++t) {
                 const double dt_output = times[t + 1] - times[t];
                 const double* flux_a = flux_base + static_cast<size_t>(t)     * flux_stride;
                 const double* flux_b = flux_base + static_cast<size_t>(t + 1) * flux_stride;
@@ -8315,6 +8417,16 @@ bool runThermalModelsForAllFacesBatchSoA(
                     for (int f = 0; f < faces_in_batch; ++f) {
                         (*surface_temps_out)[start_face + f][t + 1] =
                             thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                    }
+                }
+                if (rt_capture && t + 1 == equilibration_steps) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const size_t gf = start_face + f;
+                        for (int layer = 0; layer < n_layers; ++layer)
+                            g_cpu_post_eq_T[static_cast<size_t>(layer) * n_faces + gf] = batch.T[layer * BS + f];
+                        g_cpu_post_eq_surf[gf] = surface_temps_out
+                            ? (*surface_temps_out)[gf][t + 1]
+                            : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                     }
                 }
                 // Depth product for frame t+1, folded at the SAME instant and
