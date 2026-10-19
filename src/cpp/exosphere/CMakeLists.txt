@@ -40,6 +40,10 @@ if(APPLE)
     message(STATUS "Configuring Exosphere for macOS/AppleClang")
 endif()
 
+# x86 ISA opt-ins only. X86_64_ARCHITECTURE / ARM_ARCHITECTURE come from the
+# root CMakeLists.txt. On arm64 these probes are skipped outright: -mavx* is
+# meaningless there, and the root selects the ISA once (-mcpu=apple-m1).
+if(X86_64_ARCHITECTURE)
 # AVX2 (native/production profile only; PTM_ARCH_NATIVE=OFF keeps x86-64 baseline)
 CHECK_CXX_COMPILER_FLAG("-mavx2" COMPILER_SUPPORTS_AVX2)
 if(COMPILER_SUPPORTS_AVX2 AND PTM_ARCH_NATIVE)
@@ -67,6 +71,7 @@ if(COMPILER_SUPPORTS_AVX512 AND PTM_ARCH_NATIVE)
     target_compile_definitions(exosphere_core PRIVATE AVX512_ENABLED)
     message(STATUS "AVX512 support enabled for exosphere_core")
 endif()
+endif()  # X86_64_ARCHITECTURE
 
 # OpenMP
 find_package(OpenMP)
@@ -111,7 +116,15 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     # -march=native/-xHost/-mtune=native and /arch:AVX2 tune to the build host and
     # SIGILL on a different target CPU -- gate them to PTM_ARCH_NATIVE=ON. The
     # portable profile (PTM_ARCH_NATIVE=OFF) emits generic baseline codegen only.
-    if(PTM_ARCH_NATIVE)
+    if(PTM_ARCH_NATIVE AND ARM_ARCHITECTURE)
+        # arm64: NO per-target -march=native. The root already applies the one
+        # project-wide CPU selection (-mcpu=apple-m1 on Apple Silicon); adding
+        # -march=native here gave exosphere_core a second -march/-mcpu token
+        # set, which the root's Eigen-ABI uniformity assertion rejects
+        # (FATAL_ERROR at configure: "built across 2 different Eigen ABIs").
+        target_compile_options(exosphere_core PRIVATE -O3 -ffast-math -fno-finite-math-only)
+        message(STATUS "exosphere_core: arm64, project-wide CPU flags only (no -march=native)")
+    elseif(PTM_ARCH_NATIVE)
         if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
             target_compile_options(exosphere_core PRIVATE -O3 -ffast-math -fno-finite-math-only -march=native)
         elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
