@@ -526,8 +526,14 @@ if(NOT DEFINED CSPICE_ROOT OR CSPICE_ROOT STREQUAL "")
         set(_PTM_CSPICE_DEFAULT "$ENV{CSPICE_DIR}")
     else()
         set(_PTM_CSPICE_DEFAULT "")
+        # Homebrew's `cspice` formula prefixes are LAST so an existing NAIF
+        # toolkit install keeps precedence (the Mac Pro resolves ~/software/cspice
+        # exactly as before); on a fresh Apple Silicon machine `brew install
+        # cspice` is then found with no flags (/opt/homebrew on arm64,
+        # /usr/local on Intel).
         foreach(_cand "/usr/local/cspice" "/opt/cspice" "$ENV{HOME}/cspice"
-                      "$ENV{HOME}/software/cspice" "/Users/paha3326/software/cspice")
+                      "$ENV{HOME}/software/cspice" "/Users/paha3326/software/cspice"
+                      "/opt/homebrew/opt/cspice" "/usr/local/opt/cspice")
             if(EXISTS "${_cand}/lib" AND _PTM_CSPICE_DEFAULT STREQUAL "")
                 set(_PTM_CSPICE_DEFAULT "${_cand}")
             endif()
@@ -542,8 +548,12 @@ set(CSPICE_INCLUDE_DIR "${CSPICE_ROOT}/include" CACHE PATH "Path to CSPICE heade
 set(CSPICE_LIBRARY_DIR "${CSPICE_ROOT}/lib" CACHE PATH "Path to CSPICE libraries")
 
 # Check if the CSPICE library exists
+# NAMES order matters: `cspice` (-> libcspice.a, the NAIF-renamed layout used on
+# the Mac Pro) is tried first in every directory; `cspice.a` is the file name
+# NAIF and Homebrew's formula actually ship (no "lib" prefix), which a bare
+# `cspice` never matches.
 find_library(CSPICE_LIBRARY
-    NAMES cspice
+    NAMES cspice cspice.a
     PATHS ${CSPICE_LIBRARY_DIR}
     NO_DEFAULT_PATH
 )
