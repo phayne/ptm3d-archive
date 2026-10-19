@@ -1,6 +1,7 @@
 # Mesh Library
 add_library(mesh_utils
     mesh_utils.cpp
+    lateral_adjacency.cpp   # C1c lateral conduction adjacency (unused unless lateral is enabled)
 )
 
 # Include directories

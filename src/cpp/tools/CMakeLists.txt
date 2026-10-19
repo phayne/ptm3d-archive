@@ -358,6 +358,32 @@ set_target_properties(test_eq_anchor
 # Thermal-state checkpoint gate (BUGS.md PTM-76). Pins the 'PTMT' format, the
 # bit-identical round trip, the single float32 rounding at the write, and the
 # refusal on every malformed or mismatched input. No GPU required.
+# C1c lateral conduction: standalone operator gates (adjacency, closure, G2, G3, decay
+# diagnostics, F3 activation). Compiles the two sources directly so it links nothing else.
+add_executable(test_lateral_conduction
+    test_lateral_conduction.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh/lateral_adjacency.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/thermal/lateral_conduction.cpp
+)
+target_include_directories(test_lateral_conduction PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+set_target_properties(test_lateral_conduction
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# C1c lateral conduction: G10' driven-response gate through the production CPU SIMD column
+# solver and the planned engine split (half lateral | CN substeps | half lateral).
+add_executable(test_lateral_g10prime
+    test_lateral_g10prime.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh/lateral_adjacency.cpp
+)
+target_include_directories(test_lateral_g10prime PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+target_link_libraries(test_lateral_g10prime PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+set_target_properties(test_lateral_g10prime
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 add_executable(test_state_io test_state_io.cpp)
 target_link_libraries(test_state_io
     PRIVATE
