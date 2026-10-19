@@ -300,6 +300,14 @@ static Outcome runCase(const Case& cs, lat::Scheme scheme, bool verbose) {
 }
 
 int main() {
+    if (envInt("G10P_PRINT_Z", 0)) {   // the production reference grid (Moon defaults), for C1b / G9
+        thermal::Planet planet("Moon");
+        thermal::Config config;
+        thermal::Profile ref(planet, 0.0, config, false);
+        std::printf("# PTM3D CPU-SIMD reference depth grid (Planet Moon, default Config): %zu nodes, z [m]\n", ref.nlayers);
+        for (size_t i = 0; i < ref.nlayers; ++i) std::printf("%zu %.9e\n", i, ref.z()[i]);
+        return 0;
+    }
     setenv("PTM_SURFACE_BC_TOLK", "1e-13", 1);   // diagnostic override: the Newton tolerance must not enter a 1e-6 bar
     int fails = 0;
     for (lat::Scheme sc : {lat::Scheme::TRBDF2, lat::Scheme::BackwardEuler}) {
