@@ -1644,7 +1644,10 @@ std::vector<int> IlluminationModel::intersectsFirstAVX512(
     size_t num_rays = origins.size();
     std::vector<int> face_ids(num_rays, -1);  // Initialize all to -1 (no hit)
 
-#if defined(__x86_64__) || defined(_M_X64) && defined(__AVX512F__) && defined(__AVX512DQ__)
+// PTM-290: parenthesized. `&&` binds tighter than `||`, so the old guard was
+// `defined(__x86_64__) || (...)` and took this 16-wide branch on EVERY x86-64
+// build. Unreachable in production either way (PTM-716: addRayToBatch has no caller).
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__AVX512F__) && defined(__AVX512DQ__)
     // Process rays in SIMD packets of 16
     size_t processed = 0;
     while (processed < num_rays) {
