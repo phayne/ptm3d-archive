@@ -11,6 +11,7 @@ void assembleConductance(const Adjacency& adj, const uint8_t* edge_active,
                          const double* k, double h, std::vector<double>& G) {
     const int64_t nf = adj.n_faces;
     G.assign(3 * nf, 0.0);
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < nf; ++i) {
         for (int e = 0; e < 3; ++e) {
             const int64_t s = 3 * i + e;
@@ -32,6 +33,7 @@ namespace {
 inline void applyA(const Adjacency& adj, const std::vector<double>& G, const std::vector<double>& diag,
                    double dt, const std::vector<double>& x, std::vector<double>& y) {
     const int64_t nf = adj.n_faces;
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < nf; ++i) {
         double acc = diag[i] * x[i];
         for (int e = 0; e < 3; ++e) {
@@ -41,9 +43,21 @@ inline void applyA(const Adjacency& adj, const std::vector<double>& G, const std
         y[i] = acc;
     }
 }
+// Deterministic for ANY thread count: fixed 8192-element chunks, partials summed serially.
+constexpr int64_t kChunk = 8192;
 inline double dot(const std::vector<double>& a, const std::vector<double>& b) {
+    const int64_t n = static_cast<int64_t>(a.size());
+    const int64_t nc = (n + kChunk - 1) / kChunk;
+    std::vector<double> part(static_cast<size_t>(nc), 0.0);
+    #pragma omp parallel for schedule(static)
+    for (int64_t c = 0; c < nc; ++c) {
+        double s = 0.0;
+        const int64_t hi = std::min(n, (c + 1) * kChunk);
+        for (int64_t i = c * kChunk; i < hi; ++i) s += a[i] * b[i];
+        part[static_cast<size_t>(c)] = s;
+    }
     double s = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) s += a[i] * b[i];
+    for (double v : part) s += v;
     return s;
 }
 }  // namespace
@@ -54,6 +68,7 @@ void pcgSolve(const Adjacency& adj, const std::vector<double>& G, const std::vec
               double theta, const std::vector<double>& rhs, const SolverOptions& opt, Workspace& ws,
               std::vector<double>& x, StepStats& st) {
     const int64_t nf = adj.n_faces;
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < nf; ++i) {
         double gs = 0.0;
         for (int e = 0; e < 3; ++e) gs += G[3 * i + e];
@@ -74,13 +89,16 @@ void pcgSolve(const Adjacency& adj, const std::vector<double>& G, const std::vec
             const double pAp = dot(ws.p, ws.Ap);
             if (!(pAp > 0.0)) break;
             const double alpha = rz / pAp;
+            #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < nf; ++i) { x[i] += alpha * ws.p[i]; ws.r[i] -= alpha * ws.Ap[i]; }
             rnorm = std::sqrt(dot(ws.r, ws.r));
             if (rnorm / denom <= opt.rel_tol) break;
+            #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < nf; ++i) ws.z[i] = (ws.diag[i] > 0.0) ? ws.r[i] / ws.diag[i] : 0.0;
             const double rz_new = dot(ws.r, ws.z);
             const double beta = rz_new / rz;
             rz = rz_new;
+            #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < nf; ++i) ws.p[i] = ws.z[i] + beta * ws.p[i];
         }
         if (it > opt.max_iter) it = opt.max_iter;
@@ -99,6 +117,7 @@ void pcgSolve(const Adjacency& adj, const std::vector<double>& G, const std::vec
 void fluxForm(const Adjacency& adj, const std::vector<double>& G, double w, const std::vector<double>& y,
               std::vector<double>& Q) {
     const int64_t nf = adj.n_faces;
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < nf; ++i) {
         double q = 0.0;
         for (int e = 0; e < 3; ++e) {
@@ -180,6 +199,35 @@ StepStats backwardEulerStep(const Adjacency& adj, const uint8_t* edge_active,
         }
     }
     return st;
+}
+
+void explicitIncrement(const Adjacency& adj, const std::vector<double>& G, const double* T,
+                       const double* rhocp, double h, double tau, double* inc,
+                       double* sum_q, double* sum_abs_q) {
+    const int64_t nf = adj.n_faces;
+    const int64_t nc = (nf + kChunk - 1) / kChunk;
+    std::vector<double> pq(static_cast<size_t>(nc), 0.0), pa(static_cast<size_t>(nc), 0.0);
+    #pragma omp parallel for schedule(static)
+    for (int64_t c = 0; c < nc; ++c) {
+        double sq = 0.0, sa = 0.0;
+        const int64_t hi = std::min(nf, (c + 1) * kChunk);
+        for (int64_t i = c * kChunk; i < hi; ++i) {
+            double q = 0.0;
+            for (int e = 0; e < 3; ++e) {
+                const int64_t s = 3 * i + e;
+                if (G[s] != 0.0) q += G[s] * (T[adj.nbr[s]] - T[i]);
+            }
+            q *= tau;
+            const double C = rhocp[i] * adj.area[i] * h;
+            inc[i] = (C > 0.0) ? q / C : 0.0;
+            sq += q; sa += std::fabs(q);
+        }
+        pq[static_cast<size_t>(c)] = sq; pa[static_cast<size_t>(c)] = sa;
+    }
+    double a = 0.0, b = 0.0;
+    for (int64_t c = 0; c < nc; ++c) { a += pq[static_cast<size_t>(c)]; b += pa[static_cast<size_t>(c)]; }
+    if (sum_q) *sum_q = a;
+    if (sum_abs_q) *sum_abs_q = b;
 }
 
 int iterationCap(double Fo_max) {

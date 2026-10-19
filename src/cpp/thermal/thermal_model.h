@@ -1161,6 +1161,11 @@ struct ThermalBatchSoA {
 
     // Advance one timestep for all faces in batch
     void advanceTimestep(double dt);
+    // C1c lateral conduction (balanced split): advanceTimestep with an explicit per-node
+    // temperature increment src[(i-1)*THERMAL_BATCH_SIZE + f] (K) added to the CN right-hand side
+    // of every interior node i = 1..n-2. Same sequence as advanceTimestep otherwise; unused by
+    // every default path (advanceTimestep itself is unchanged).
+    void advanceTimestepWithSource(double dt, const double* src);
 
     // Get surface temperature for a specific face
     double getSurfaceTemp(int face_idx) const { return T[face_idx]; }

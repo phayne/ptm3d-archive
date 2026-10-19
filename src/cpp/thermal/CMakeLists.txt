@@ -21,6 +21,20 @@ target_link_libraries(thermal
     spatial_maps  # Add this to link with the spatial_maps library
 )
 
+
+# C1c lateral operator: the ONLY thermal source compiled with OpenMP (its loops are per-element
+# independent and its reductions use fixed chunks, so results do not depend on the thread count).
+# The rest of libthermal keeps its existing flags.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    separate_arguments(_lat_omp_flags UNIX_COMMAND "${OpenMP_CXX_FLAGS}")
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/lateral_conduction.cpp
+        PROPERTIES COMPILE_OPTIONS "${_lat_omp_flags}")
+    # The runtime library only -- NOT the OpenMP::OpenMP_CXX target, whose interface compile
+    # options would switch OpenMP on for every other thermal source.
+    target_link_libraries(thermal PUBLIC ${OpenMP_CXX_LIBRARIES})
+endif()
+
 # Set up compilation flags
 target_compile_features(thermal PUBLIC cxx_std_14)
 

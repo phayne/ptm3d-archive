@@ -68,6 +68,15 @@ StepStats backwardEulerStep(const Adjacency& adj, const uint8_t* edge_active,
                             double* T, const double* k, const double* rhocp,
                             double h, double dt, const SolverOptions& opt, Workspace& ws);
 
+// Balanced-split explicit stage (Fermi ruling 2026-10-19): the lateral increment over tau at the
+// substep-start state, inc_i = tau * sum_j G_ij (T_j - T_i) / C_i with C_i = rc_i A_i h, added as a
+// source to the vertical CN step and removed again before the implicit BE correction. Faces with
+// zero capacity get 0. Returns sum_i C_i inc_i (should be round-off) in *sum_q and sum |C_i inc_i|
+// in *sum_abs_q; both deterministic for any thread count.
+void explicitIncrement(const Adjacency& adj, const std::vector<double>& G, const double* T,
+                       const double* rhocp, double h, double tau, double* inc,
+                       double* sum_q, double* sum_abs_q);
+
 // D* = 8 k / (pi h_eff), h_eff = 4 eps sigma T^3 + sqrt(k rho c_p) sqrt(omega)
 // (Hayne et al. 2021, Methods E). Units: k W/m/K, rho kg/m^3, c_p J/kg/K, T K, omega rad/s.
 double conductionLength(double k, double rho, double cp, double emissivity, double T, double omega);

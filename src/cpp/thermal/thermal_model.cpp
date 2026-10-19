@@ -3362,6 +3362,35 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     }
 }
 
+void ThermalBatchSoA::advanceTimestepWithSource(double dt, const double* src) {
+    static const bool refuse = solverEqFixEnabled();
+    if (refuse) {
+        std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX is refused on the CPU SIMD batch path "
+                     "(see ThermalBatchSoA::advanceTimestep; BUGS.md PTM-216)." << std::endl;
+        std::exit(1);
+    }
+    updateMaterialPropertiesBatchSIMD(*this);
+    applySurfaceBCBatch(*this, dt);
+    buildTridiagonalSystemBatch(*this, dt);
+    const int n_int = n_layers - 2;
+    for (int j = 0; j < n_int; ++j)
+        for (int f = 0; f < THERMAL_BATCH_SIZE; ++f)
+            d_coef[j * THERMAL_BATCH_SIZE + f] += src[j * THERMAL_BATCH_SIZE + f];
+    solveThomasBatchSIMD(*this);
+    applyBottomBCBatch(*this);
+    // Geothermal-equilibrium floor: identical to advanceTimestep.
+    for (int f = 0; f < n_faces; ++f) {
+        const double qb = Qb[f];
+        if (qb <= 0.0) continue;
+        const double T_geo = std::sqrt(std::sqrt(qb / (emissivity[f] * sigma_sb)));
+        if (T_geo <= ABSOLUTE_ZERO_K) continue;
+        for (int layer = 0; layer < n_layers; ++layer) {
+            double& Tlf = T[layer * THERMAL_BATCH_SIZE + f];
+            if (Tlf < T_geo) Tlf = T_geo;
+        }
+    }
+}
+
 // Initialize batch grid from z-grid vector
 void initializeBatchGrid(ThermalBatchSoA& batch, const std::vector<double>& z_grid,
                          const Planet& planet) {
