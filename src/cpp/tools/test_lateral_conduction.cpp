@@ -10,6 +10,8 @@
 //       independent residual evaluation (<= 1e-10); the mode's discrete eigenvalue is reported
 //   G10s spatial accuracy: free-decay rate of cos(pi y/H) vs kappa q^2 at 3 refinements, dt small
 //   G10t time accuracy at the production step dt = 7087 s and dt/4 (reported; see report text)
+//   G2  spatial convergence, structured vs skewed lattice (reported: TPFA non-orthogonality error)
+//   G3  erf step along a strip: <= 1% in the transition after one diffusion time
 //   F3  activation rule: symmetric; a small cold facet next to a large warm one is ACTIVE
 //
 // Exit 0 only if every gate with a stated bar passes. G10t is REPORTED against the 1% bar
@@ -28,7 +30,7 @@ using namespace ptm::lateral;
 
 static int g_fail = 0;
 static double g_last_be_residual = 0.0;
-static Scheme g_scheme = Scheme::BackwardEuler;
+static Scheme g_scheme = Scheme::BackwardEuler;   // decay diagnostics set it explicitly
 #define CHECK(cond, ...) do { if (!(cond)) { std::printf("  FAIL: "); std::printf(__VA_ARGS__); std::printf("\n"); ++g_fail; } } while (0)
 
 struct Mesh { std::vector<double> v; std::vector<int64_t> f; };
@@ -44,7 +46,7 @@ static Mesh lattice(int nrows, int ncols, double a, double jitter = 0.0, unsigne
         for (int c = 0; c <= ncols; ++c) {
             double x = c * a + ((r % 2) ? 0.5 * a : 0.0), y = r * hy;
             const bool edge_row = (r == 0 || r == nrows);
-            if (jitter > 0.0) {  // keep the straight top/bottom boundaries straight
+            if (jitter > 0.0 && c != 0 && c != ncols) {  // straight top/bottom; seam columns unjittered (periodic link)
                 x += jitter * a * U(rng);
                 if (!edge_row) y += jitter * hy * U(rng);
             }
@@ -173,8 +175,8 @@ static void testClosureAndMP() {
         const int capped = (run == 1);
         std::vector<double> Tw = T;
         SolverOptions opt;
+        opt.scheme = (run == 2) ? Scheme::TRBDF2 : Scheme::BackwardEuler;
         if (capped) opt.max_iter = 2;
-        if (run == 2) opt.scheme = Scheme::TRBDF2;
         Workspace ws;
         double E0 = 0.0, E1 = 0.0, worst = 0.0;
         for (size_t i = 0; i < nf; ++i) E0 += rc[i] * A.area[i] * 1.0e-3 * Tw[i];
@@ -184,6 +186,9 @@ static void testClosureAndMP() {
         for (int step = 0; step < 20; ++step) {
             StepStats st = backwardEulerStep(A, nullptr, Tw.data(), k.data(), rc.data(), 1.0e-3, 7087.0, opt, ws);
             saw_cap = saw_cap || st.capped;
+            if (st.capped && step == 0)
+                std::printf("    (capped step reports: its=%d residual=%.2e worst_face=%lld Fo_max=%.2f -> cap would be %d)\n",
+                            st.iterations, st.rel_residual, (long long)st.worst_face, st.Fo_max, iterationCap(st.Fo_max));
             if (st.sum_abs_Q > 0) worst = std::max(worst, std::fabs(st.sum_Q) / st.sum_abs_Q);
         }
         for (size_t i = 0; i < nf; ++i) {
@@ -312,6 +317,78 @@ static void testG10() {
     g_scheme = Scheme::BackwardEuler;
 }
 
+// G2: spatial convergence of the decay rate of cos(pi y/H), structured vs skewed (jittered)
+// periodic lattice, TR-BDF2 at lambda dt = 1e-3 (time error ~1e-7, negligible). Reports the
+// TPFA non-orthogonality error and the observed order; v1 does not block on it (Fermi).
+static double spatialRate(int nrows, int ncols, double jitter, double H, double kval, double rcval, unsigned seed) {
+    const double a = H / (nrows * std::sqrt(3.0) / 2.0);
+    Mesh m = lattice(nrows, ncols, a, jitter, seed);
+    Adjacency A = build(m.v, m.f, {});
+    makePeriodicX(m, nrows, ncols, A);
+    const size_t nf = m.f.size() / 3;
+    std::vector<double> y = centroidY(m), T(nf), k(nf, kval), rc(nf, rcval);
+    const double q = M_PI / H, lam = kval / rcval * q * q, dt = 1e-3 / lam;
+    for (size_t i = 0; i < nf; ++i) T[i] = 100.0 + std::cos(q * y[i]);
+    SolverOptions opt; opt.scheme = Scheme::TRBDF2; opt.rel_tol = 1e-13; opt.max_iter = 5000;
+    Workspace ws;
+    const double A0 = modeAmp(T, y, A.area, q);
+    const int n = 300;
+    for (int s2 = 0; s2 < n; ++s2) backwardEulerStep(A, nullptr, T.data(), k.data(), rc.data(), 1.0, dt, opt, ws);
+    return -std::log(modeAmp(T, y, A.area, q) / A0) / (n * dt) / lam - 1.0;
+}
+
+static void testG2() {
+    const double kval = 1.0e-3, rcval = 1100.0 * 600.0, H = 0.01;
+    std::printf("G2 spatial convergence, cos(pi y/H), H = 1 cm (report only; v1 does not block)\n");
+    for (double jit : {0.0, 0.2}) {
+        double prev = 0.0;
+        for (int nrows : {4, 8, 16, 32}) {
+            const int ncols = std::max(4, nrows / 2);
+            const double e = spatialRate(nrows, ncols, jit, H, kval, rcval, 5);
+            const double edge = 1e3 * H / (nrows * std::sqrt(3.0) / 2.0);
+            if (prev != 0.0)
+                std::printf("  jitter %.1f edge %.3f mm: rate error %+.4f%%  (observed order %.2f)\n", jit, edge, 100 * e,
+                            std::log(std::fabs(prev / e)) / std::log(2.0));
+            else
+                std::printf("  jitter %.1f edge %.3f mm: rate error %+.4f%%\n", jit, edge, 100 * e);
+            prev = e;
+        }
+    }
+}
+
+// G3: erf step along a strip. T = 90 K below y0, 110 K above; after t, compare with
+// T_an = 100 + 10 erf((y - y0)/(2 sqrt(kappa t))). Bar: max |T - T_an| / dT <= 1% over the
+// faces within 2 sqrt(kappa t) of y0 (the transition), with t = one diffusion time of the
+// half-width w = 2.5 mm (t = w^2/kappa).
+static void testG3() {
+    const double kval = 1.0e-3, rcval = 1100.0 * 600.0, kappa = kval / rcval;
+    const double w = 2.5e-3, t_end = w * w / kappa, L = 0.04, y0 = 0.02;
+    const int nrows = 320, ncols = 4;
+    const double a = L / (nrows * std::sqrt(3.0) / 2.0);
+    Mesh m = lattice(nrows, ncols, a);
+    Adjacency A = build(m.v, m.f, {});
+    makePeriodicX(m, nrows, ncols, A);
+    const size_t nf = m.f.size() / 3;
+    std::vector<double> y = centroidY(m), T(nf), k(nf, kval), rc(nf, rcval);
+    for (size_t i = 0; i < nf; ++i) T[i] = (y[i] < y0) ? 90.0 : 110.0;
+    SolverOptions opt; opt.scheme = Scheme::TRBDF2; opt.rel_tol = 1e-12;
+    Workspace ws;
+    const int n = 40;
+    for (int s2 = 0; s2 < n; ++s2) backwardEulerStep(A, nullptr, T.data(), k.data(), rc.data(), 1.0, t_end / n, opt, ws);
+    const double Ld = 2.0 * std::sqrt(kappa * t_end);
+    double worst = 0.0;
+    int nb = 0;
+    for (size_t i = 0; i < nf; ++i) {
+        if (std::fabs(y[i] - y0) > Ld) continue;
+        const double Tan = 100.0 + 10.0 * std::erf((y[i] - y0) / Ld);
+        worst = std::max(worst, std::fabs(T[i] - Tan) / 20.0);
+        ++nb;
+    }
+    std::printf("G3 erf strip: edge %.3f mm, t = %.0f s (one diffusion time of w = 2.5 mm), %d faces in the transition: "
+                "max |T - T_an|/dT = %.3f%%\n", 1e3 * a, t_end, nb, 100 * worst);
+    CHECK(worst <= 0.01, "G3 erf strip error %.3f%% > 1%%", 100 * worst);
+}
+
 static void testActivation() {
     std::printf("F3 activation: min(l_i,l_j) < c*max(D*_i,D*_j), c = 2\n");
     Mesh m = lattice(6, 6, 2.5e-3, 0.2, 3);
@@ -346,6 +423,8 @@ int main() {
     testAdjacency();
     testClosureAndMP();
     testG10();
+    testG2();
+    testG3();
     testActivation();
     std::printf(g_fail ? "\nRESULT: FAIL (%d)\n" : "\nRESULT: PASS (all stated bars)\n", g_fail);
     return g_fail ? 1 : 0;

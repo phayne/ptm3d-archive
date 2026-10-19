@@ -87,7 +87,12 @@ void pcgSolve(const Adjacency& adj, const std::vector<double>& G, const std::vec
     }
     st.iterations += it;
     st.rel_residual = std::max(st.rel_residual, rnorm / denom);
-    if (!(rnorm / denom <= opt.rel_tol)) st.capped = true;   // cap OR CG breakdown
+    if (!(rnorm / denom <= opt.rel_tol)) {   // cap OR CG breakdown
+        st.capped = true;
+        double worst = -1.0;
+        for (int64_t i = 0; i < nf; ++i)
+            if (std::fabs(ws.r[i]) > worst) { worst = std::fabs(ws.r[i]); st.worst_face = i; }
+    }
 }
 
 // Q_i = -w * sum_j G_ij (y_i - y_j): exactly antisymmetric pair fluxes (sum_i Q_i == 0 to round-off).
@@ -115,6 +120,7 @@ StepStats backwardEulerStep(const Adjacency& adj, const uint8_t* edge_active,
     ws.r.resize(nf); ws.z.resize(nf); ws.p.resize(nf); ws.Ap.resize(nf);
     std::vector<double>& Q = ws.b;   // b is free once a solve has consumed it
     for (int64_t i = 0; i < nf; ++i) ws.C[i] = rhocp[i] * adj.area[i] * h;
+    st.Fo_max = maxFourier(adj, ws.G, ws.C, dt);
 
     // final[i] = base[i] + Qsum[i] / C[i], all updates in conservative (flux) form
     std::vector<double> base(T, T + nf), Qsum(nf, 0.0);
@@ -174,6 +180,20 @@ StepStats backwardEulerStep(const Adjacency& adj, const uint8_t* edge_active,
         }
     }
     return st;
+}
+
+int iterationCap(double Fo_max) {
+    return std::max(200, static_cast<int>(std::ceil(50.0 * std::sqrt(1.0 + 4.0 * std::max(0.0, Fo_max)))));
+}
+
+double maxFourier(const Adjacency& adj, const std::vector<double>& G, const std::vector<double>& C, double dt) {
+    double fo = 0.0;
+    for (int64_t i = 0; i < adj.n_faces; ++i) {
+        if (!(C[i] > 0.0)) continue;
+        const double gs = G[3 * i] + G[3 * i + 1] + G[3 * i + 2];
+        fo = std::max(fo, dt * gs / C[i]);
+    }
+    return fo;
 }
 
 double conductionLength(double k, double rho, double cp, double emissivity, double T, double omega) {

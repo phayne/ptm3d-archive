@@ -30,10 +30,15 @@ namespace lateral {
 enum class Scheme { BackwardEuler, TRBDF2 };
 
 struct SolverOptions {
-    Scheme scheme = Scheme::BackwardEuler;   // Fermi: BE; TR-BDF2 if G10 fails at production dt
+    Scheme scheme = Scheme::TRBDF2;   // Fermi addendum 2026-10-18: TR-BDF2 at production dt; BE = documented fallback
     double rel_tol = 1e-8;   // ||b - A x||_2 / ||b||_2, per linear solve
-    int    max_iter = 2000;
+    int    max_iter = 2000;   // set per run with iterationCap(Fo_max)
 };
+
+// Fermi addendum: cap >= max(200, 50 sqrt(1 + 4 Fo_max)), Fo_max = max_i dt sum_j G_ij / C_i.
+int iterationCap(double Fo_max);
+// Fo_max of one node layer for step dt (what the cap and the log need).
+double maxFourier(const Adjacency& adj, const std::vector<double>& G, const std::vector<double>& C, double dt);
 
 struct StepStats {
     int    iterations = 0;
@@ -42,6 +47,8 @@ struct StepStats {
     double sum_Q = 0.0;             // sum_i C_i dT_i  (J/m of node... energy units); ~0
     double sum_abs_Q = 0.0;         // sum_i |C_i dT_i|
     double max_abs_dT = 0.0;
+    double Fo_max = 0.0;            // max_i dt sum_j G_ij / C_i for this step
+    int64_t worst_face = -1;        // face with the largest |residual| of the last solve (for the FATAL)
 };
 
 struct Workspace {                  // reused across calls (no per-step allocation)
@@ -53,8 +60,9 @@ struct Workspace {                  // reused across calls (no per-step allocati
 void assembleConductance(const Adjacency& adj, const uint8_t* edge_active,
                          const double* k, double h, std::vector<double>& G);
 
-// One lateral step of length dt on one depth node (BE, or TR-BDF2 per opt.scheme; both in
-// conservative flux form). T, k, rhocp: [n_faces].
+// One lateral step of length dt on one depth node (TR-BDF2 default, or BE, per opt.scheme;
+// both in conservative flux form). On st.capped the caller must FATAL, naming step, layer,
+// st.iterations, st.rel_residual and st.worst_face. T, k, rhocp: [n_faces].
 // Faces with no active edge or zero capacity are left untouched.
 StepStats backwardEulerStep(const Adjacency& adj, const uint8_t* edge_active,
                             double* T, const double* k, const double* rhocp,
