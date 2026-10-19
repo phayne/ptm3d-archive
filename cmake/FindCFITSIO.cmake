@@ -20,6 +20,7 @@ find_path(CFITSIO_INCLUDE_DIR
     ${PC_CFITSIO_INCLUDE_DIRS}
     /usr/include
     /usr/local/include
+    /opt/homebrew/include
     /opt/local/include
     $ENV{CONDA_PREFIX}/include
     PATH_SUFFIXES cfitsio
@@ -33,6 +34,7 @@ find_library(CFITSIO_LIBRARY
     ${PC_CFITSIO_LIBRARY_DIRS}
     /usr/lib
     /usr/local/lib
+    /opt/homebrew/lib
     /opt/local/lib
     $ENV{CONDA_PREFIX}/lib
 )

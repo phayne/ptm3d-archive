@@ -8,7 +8,12 @@
 #include <numeric>
 #include <chrono>
 #include <omp.h>
+// x86 only: clang's <immintrin.h> is an #error on any other target (arm64 /
+// Apple Silicon). Every use below is behind __AVX512F__ / __AVX2__, which are
+// never defined off x86, so non-x86 builds take the scalar branches.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>  // For AVX2 intrinsics
+#endif
 
 // Check for AVX support at compile time
 #ifdef __AVX512F__
