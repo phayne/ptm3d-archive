@@ -814,6 +814,15 @@ struct SimulationConfig {
         // >= 2 post-seed changes, i.e. >= 3 logged, so its contraction rate can be estimated without the cold-referenced
         // change 1). 0 = no minimum (default; byte-identical).
         int    min_coupling_iterations = 0;
+        // Warm start (Paul 2026-10-21: the DEFAULT for coupled runs whenever a seed artifact is present; Fermi's
+        // sequential pairing). warm_start_series: a PTMIDS01 converged indirect series; when set, every coupling
+        // iteration 0 takes it instead of its sweep (FATAL if the file is missing -- never a silent cold start).
+        // Empty (default): COLD start, announced as the explicit fallback. indirect_series_out: where the final
+        // series is written; "auto" (default) = <output.directory>/indirect_series.ids for a warm-started run and
+        // nothing for a cold one; "" = never; a path = always. PTM_INDIRECT_WARM_START / PTM_INDIRECT_SERIES_OUT
+        // override both.
+        std::string warm_start_series   = "";
+        std::string indirect_series_out = "auto";
         bool   anderson_acceleration = false;
         int    anderson_depth        = 4;
         double anderson_tikhonov     = 1e-10;

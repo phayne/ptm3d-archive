@@ -7043,6 +7043,9 @@ static bool cnSubstepDivRequested() {
 }
 
 // ---- PTM_INDIRECT_SERIES_OUT / PTM_INDIRECT_WARM_START (C1c cost, Fermi addendum 4 option 1) ----------------
+// radiation.warm_start_series / radiation.indirect_series_out (Paul 2026-10-21: warm start is the default whenever
+// a seed artifact is configured); set in main. The env variables take precedence.
+static std::string g_warm_start_cfg, g_series_out_cfg = "auto", g_output_dir_cfg;
 struct IndirectSeriesFile {
     bool ok = false; uint64_t nF = 0, nT = 0, t_lo = 0; bool bands = false;
     std::vector<float> tot, vis, ir;
@@ -7073,7 +7076,8 @@ static const IndirectSeriesFile& warmStartSeries(size_t n_faces, int t_lo, int t
     static bool tried = false;
     if (tried) return w;
     tried = true;
-    const char* p = std::getenv("PTM_INDIRECT_WARM_START");
+    const char* pe = std::getenv("PTM_INDIRECT_WARM_START");
+    const char* p = (pe && *pe) ? pe : (g_warm_start_cfg.empty() ? nullptr : g_warm_start_cfg.c_str());
     if (!p || !*p) return w;
     std::ifstream in(p, std::ios::binary);
     char mg[8] = {0}; uint8_t b = 0;
@@ -20567,6 +20571,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     g_rethermal_all_faces  = sim_config.thermal.rethermal_all_faces;
+    g_warm_start_cfg = sim_config.radiation.warm_start_series;
+    g_series_out_cfg = sim_config.radiation.indirect_series_out;
+    g_output_dir_cfg = sim_config.output.directory;
+    if (sim_config.radiation.enabled) {
+        const char* we = std::getenv("PTM_INDIRECT_WARM_START");
+        if ((we && *we) || !g_warm_start_cfg.empty())
+            std::cerr << "[warm-start] coupled run: WARM start from "
+                      << ((we && *we) ? std::string(we) + " (PTM_INDIRECT_WARM_START)" : g_warm_start_cfg + " (radiation.warm_start_series)")
+                      << std::endl;
+        else
+            std::cerr << "[warm-start] coupled run: COLD start (explicit fallback: no seed artifact configured; set "
+                         "radiation.warm_start_series to warm-start)" << std::endl;
+    }
     if (g_rethermal_all_faces && !g_lateral.enabled)
         std::cerr << "[rethermal] thermal.rethermal_all_faces: ON -- every coupling re-thermal integrates ALL faces "
                      "instead of the physics-selected subset (the lateral-OFF companion of a lateral-ON run)." << std::endl;
@@ -25814,7 +25831,13 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                if (const char* so = std::getenv("PTM_INDIRECT_SERIES_OUT")) {
+                const char* soe = std::getenv("PTM_INDIRECT_SERIES_OUT");
+                std::string so_path = (soe && *soe) ? std::string(soe)
+                    : (g_series_out_cfg == "auto" ? (warmStartSeries(num_faces, rad_sweep_t_lo, total_time_steps).ok
+                                                          ? g_output_dir_cfg + "/indirect_series.ids" : std::string())
+                                                  : g_series_out_cfg);
+                if (!so_path.empty()) {
+                    const char* so = so_path.c_str();
                     if (!writeIndirectSeries(so, indirect_flux_series, indirect_solar_series, indirect_ir_series,
                                              rad_sweep_t_lo, total_time_steps)) {
                         std::cerr << "[warm-start] FATAL: could not write PTM_INDIRECT_SERIES_OUT=" << so << std::endl;

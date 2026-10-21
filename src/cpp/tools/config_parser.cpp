@@ -959,6 +959,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_mode = getWithDefault(rad, "coupling_mode", config.radiation.coupling_mode);
             config.radiation.coupling_select_dt = getWithDefault(rad, "coupling_select_dt", config.radiation.coupling_select_dt);
             config.radiation.min_coupling_iterations = getWithDefault(rad, "min_coupling_iterations", config.radiation.min_coupling_iterations);
+            config.radiation.warm_start_series   = getWithDefault(rad, "warm_start_series",   config.radiation.warm_start_series);
+            config.radiation.indirect_series_out = getWithDefault(rad, "indirect_series_out", config.radiation.indirect_series_out);
             config.radiation.anderson_acceleration = getWithDefault(rad, "anderson_acceleration", config.radiation.anderson_acceleration);
             config.radiation.anderson_depth        = getWithDefault(rad, "anderson_depth",        config.radiation.anderson_depth);
             config.radiation.anderson_tikhonov     = getWithDefault(rad, "anderson_tikhonov",     config.radiation.anderson_tikhonov);
