@@ -7042,6 +7042,66 @@ static bool cnSubstepDivRequested() {
     return r;
 }
 
+// ---- PTM_INDIRECT_SERIES_OUT / PTM_INDIRECT_WARM_START (C1c cost, Fermi addendum 4 option 1) ----------------
+struct IndirectSeriesFile {
+    bool ok = false; uint64_t nF = 0, nT = 0, t_lo = 0; bool bands = false;
+    std::vector<float> tot, vis, ir;
+};
+static bool writeIndirectSeries(const char* path, const std::vector<std::vector<double>>& tot,
+                                const std::vector<std::vector<double>>& vis, const std::vector<std::vector<double>>& ir,
+                                int t_lo, int total_steps) {
+    std::ofstream o(path, std::ios::binary);
+    if (!o) return false;
+    const uint64_t nF = tot.size(), nT = static_cast<uint64_t>(total_steps - t_lo), lo = static_cast<uint64_t>(t_lo);
+    const uint8_t bands = (!vis.empty() && !ir.empty()) ? 1 : 0;
+    o.write("PTMIDS01", 8);
+    o.write(reinterpret_cast<const char*>(&nF), 8); o.write(reinterpret_cast<const char*>(&nT), 8);
+    o.write(reinterpret_cast<const char*>(&lo), 8); o.write(reinterpret_cast<const char*>(&bands), 1);
+    std::vector<float> row(nT);
+    auto put = [&](const std::vector<std::vector<double>>& a) {
+        for (uint64_t f = 0; f < nF; ++f) {
+            for (uint64_t k = 0; k < nT; ++k) row[k] = static_cast<float>(a[f][t_lo + k]);
+            o.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(nT * 4));
+        }
+    };
+    put(tot);
+    if (bands) { put(vis); put(ir); }
+    return static_cast<bool>(o);
+}
+static const IndirectSeriesFile& warmStartSeries(size_t n_faces, int t_lo, int total_steps) {
+    static IndirectSeriesFile w;
+    static bool tried = false;
+    if (tried) return w;
+    tried = true;
+    const char* p = std::getenv("PTM_INDIRECT_WARM_START");
+    if (!p || !*p) return w;
+    std::ifstream in(p, std::ios::binary);
+    char mg[8] = {0}; uint8_t b = 0;
+    if (!in.read(mg, 8) || std::string(mg, 8) != "PTMIDS01" || !in.read(reinterpret_cast<char*>(&w.nF), 8) ||
+        !in.read(reinterpret_cast<char*>(&w.nT), 8) || !in.read(reinterpret_cast<char*>(&w.t_lo), 8) ||
+        !in.read(reinterpret_cast<char*>(&b), 1)) {
+        std::cerr << "[warm-start] FATAL: " << p << " is not a PTMIDS01 file." << std::endl; std::exit(3);
+    }
+    if (w.nF != n_faces || w.t_lo != static_cast<uint64_t>(t_lo) || w.nT != static_cast<uint64_t>(total_steps - t_lo)) {
+        std::cerr << "[warm-start] FATAL: " << p << " holds " << w.nF << " faces x steps [" << w.t_lo << ", "
+                  << w.t_lo + w.nT << "); this run sweeps " << n_faces << " faces x [" << t_lo << ", " << total_steps
+                  << "). Refusing a mismatched warm start." << std::endl; std::exit(3);
+    }
+    w.bands = (b != 0);
+    const size_t N = static_cast<size_t>(w.nF * w.nT);
+    w.tot.resize(N);
+    in.read(reinterpret_cast<char*>(w.tot.data()), static_cast<std::streamsize>(N * 4));
+    if (w.bands) { w.vis.resize(N); w.ir.resize(N);
+        in.read(reinterpret_cast<char*>(w.vis.data()), static_cast<std::streamsize>(N * 4));
+        in.read(reinterpret_cast<char*>(w.ir.data()), static_cast<std::streamsize>(N * 4)); }
+    if (!in) { std::cerr << "[warm-start] FATAL: " << p << " is truncated." << std::endl; std::exit(3); }
+    w.ok = true;
+    std::cerr << "[warm-start] PTM_INDIRECT_WARM_START=" << p << ": every coupling iteration 0 takes this converged "
+                 "indirect series (" << w.nF << " faces x " << w.nT << " steps" << (w.bands ? ", with bands" : "")
+              << ") instead of its sweep. The fixed point is unchanged; only the start differs." << std::endl;
+    return w;
+}
+
 // thermal.rethermal_all_faces (C1c companion; lateral ON implies it). Set in main.
 static bool g_rethermal_all_faces = false;
 
@@ -9116,6 +9176,8 @@ bool runThermalModelsForAllFacesBatchSoA(
         ptm::lateral::Network lat_net;         // fused: every node layer per parallel region
         std::vector<double> LA, LB, LCc, LD;   // monolithic: the interior CN rows of every column
         long long lat_floor_clamps = 0;        // monolithic: node-steps the geothermal floor raised
+        double lat_cn_wmax = 0.0;              // monolithic: max CN explicit weight (b - 1); CN monotone iff <= 1
+        long long lat_cn_wover = 0;            // monolithic: node-steps with weight > 1 (Fermi addendum 4)
         std::vector<int> lat_iters;            // PCG iterations per substep (all layers)
         double lat_fo_max = 0.0, lat_closure_worst = 0.0, lat_expl_closure_worst = 0.0;
         long long lat_below_geo = 0;
@@ -9333,6 +9395,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                             }
                         }
                         timeOuterSave(batch, n_layers, tb.state.data());
+                    }
+                    {   // CN explicit weight (tau/2 rho c)(g1 k_{i-1} + g2 k_i) = b - 1 of every interior row
+                        double wm = 0.0; long long wo = 0;
+                        #pragma omp parallel for num_threads(n_threads_to) reduction(max:wm) reduction(+:wo)
+                        for (size_t q = 0; q < LB.size(); ++q) { const double w = LB[q] - 1.0; wm = std::max(wm, w); wo += (w > 1.0); }
+                        lat_cn_wmax = std::max(lat_cn_wmax, wm); lat_cn_wover += wo;
                     }
                     const ptm::lateral::Network::Stats mst =
                         lat_net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), dt_sub, g_lateral.cg_rel_tol, LT.data());
@@ -9647,7 +9715,11 @@ bool runThermalModelsForAllFacesBatchSoA(
               << (lat_below_geo ? "  <-- WARNING (G15 bar: never below T_geo)" : "")
               << (g_lateral.monolithic ? "; scheme MONOLITHIC (Picard passes " + std::to_string(g_lateral.picard) +
                                              "); node-steps raised by the geothermal floor: " +
-                                             std::to_string(lat_floor_clamps) : std::string("; scheme balanced"));
+                                             std::to_string(lat_floor_clamps) +
+                                             (lat_floor_clamps ? "  <-- NONZERO: energy creation, investigate (Fermi R-G15-1)" : "") +
+                                             "; CN explicit weight max " + std::to_string(lat_cn_wmax) +
+                                             ", node-steps with weight > 1 (CN non-monotone): " + std::to_string(lat_cn_wover)
+                                       : std::string("; scheme balanced"));
             std::cerr << m.str() << std::endl;
         }
     }
@@ -24484,6 +24556,9 @@ int main(int argc, char** argv) {
                     // the length of the LAST complete loop, not of all of them.
                     if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
                     if (iter == 0 && aa.on) aa.reset();
+                    // Warm start: iteration 0's sweep is REPLACED by the imported converged series.
+                    const IndirectSeriesFile& warm = warmStartSeries(num_faces, rad_sweep_t_lo, total_time_steps);
+                    const bool warm_now = warm.ok && iter == 0;
                     const std::chrono::steady_clock::time_point eqi_sweep_t0 =
                         std::chrono::steady_clock::now();
                     ptm::timing::begin("radiosity_sweep");
@@ -24635,6 +24710,24 @@ int main(int argc, char** argv) {
                         }
                         if (accumulate) g_src_albedo_valid = true;
                     };
+                    if (warm_now) {
+                        const size_t nT = static_cast<size_t>(warm.nT);
+                        const bool wb = warm.bands && !indirect_solar_series.empty();
+                        #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                        for (size_t f = 0; f < num_faces; f++)
+                            for (size_t k = 0; k < nT; ++k) {
+                                const size_t t = static_cast<size_t>(rad_sweep_t_lo) + k;
+                                const double v = warm.tot[f * nT + k];
+                                indirect_flux_series[f][t] = v;
+                                if (wb) { indirect_solar_series[f][t] = warm.vis[f * nT + k];
+                                          indirect_ir_series[f][t] = warm.ir[f * nT + k]; }
+                                if (v > max_indirect) max_indirect = v;
+                                total_indirect_sum += v;
+                            }
+                        if (wb) indirect_bands_available = true;
+                        std::cout << "  [warm-start] iteration 0: sweep replaced by the imported converged series." << std::endl;
+                    }
+                    if (!warm_now)
                     for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -25662,6 +25755,14 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                if (const char* so = std::getenv("PTM_INDIRECT_SERIES_OUT")) {
+                    if (!writeIndirectSeries(so, indirect_flux_series, indirect_solar_series, indirect_ir_series,
+                                             rad_sweep_t_lo, total_time_steps)) {
+                        std::cerr << "[warm-start] FATAL: could not write PTM_INDIRECT_SERIES_OUT=" << so << std::endl;
+                        return 1;
+                    }
+                    std::cerr << "[warm-start] wrote the final indirect series to " << so << std::endl;
+                }
                 // ---- PTM-57: re-archive the checkpoint POST-coupling --------
                 // thermal.final_state_file was already written by the iter-0
                 // solver, which returns BEFORE this block runs — so on disk it

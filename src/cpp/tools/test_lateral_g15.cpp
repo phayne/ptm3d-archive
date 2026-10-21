@@ -140,6 +140,7 @@ struct Sim {
                     LD[li * nf + j] = b.d_coef[li * BS + f];
                 }
         }
+        for (size_t q = 0; q < LB.size(); ++q) cn_w_max = std::max(cn_w_max, LB[q] - 1.0);   // CN explicit weight
         const lat::Network::Stats st = net.implicitCoupled(LA.data(), LB.data(), LC.data(), LD.data(), tau, tol, LT.data());
         if (st.capped) { std::fprintf(stderr, "FATAL: coupled PCG capped (%d its, residual %.2e)\n", st.capped_iterations, st.capped_rel_residual); std::exit(1); }
         coupled_its += st.iterations; ++coupled_calls;
@@ -149,11 +150,13 @@ struct Sim {
         for (auto& b : batches) thermal::applyBottomBCBatch(b);
     }
     long coupled_its = 0, coupled_calls = 0;
+    double cn_w_max = 0.0;   // max over substeps/nodes of (tau/2 rho c)(g1 k + g2 k) = b - 1 (CN monotone iff <= 1)
     double closure_worst = 0.0;
     void substep(double tau, double tol) {
         const int nf = L.nf;
         if (mono) { substepMono(tau, tol); return; }   // lat_off + mono: the coupled solver with NO edges
         if (lat_off) {
+            gather();   // T^n properties: what advanceTimestep uses (enthalpy check's C_used); state unchanged
             for (int bi = 0; bi < nb; ++bi) {
                 auto& b = batches[bi];
                 alignas(64) double fl[BS];
@@ -227,6 +230,48 @@ static void init(Sim& S, int nr, int nc, double a, double T0, double dT) {
     S.net.init(&S.L.adj, nullptr, S.hl, 1);
 }
 
+// c_p(T) by the batch's own material law (T-only; Gauss points for the exact enthalpy integral of the polynomial)
+static void cpOf(Sim& S, const std::vector<double>& Tin, std::vector<double>& cp) {
+    thermal::ThermalBatchSoA& b = S.batches[0];
+    std::vector<double> saveT(b.T, b.T + S.nl * BS), saveK(b.k, b.k + S.nl * BS), saveC(b.cp, b.cp + S.nl * BS);
+    cp.resize(Tin.size());
+    const size_t per = static_cast<size_t>(S.nl) * BS;
+    for (size_t o = 0; o < Tin.size(); o += per) {
+        const size_t n = std::min(per, Tin.size() - o);
+        for (size_t q = 0; q < per; ++q) b.T[q] = (q < n) ? Tin[o + q] : 100.0;
+        thermal::updateMaterialPropertiesBatchSIMD(b);
+        for (size_t q = 0; q < n; ++q) cp[o + q] = b.cp[q];
+    }
+    std::copy(saveT.begin(), saveT.end(), b.T); std::copy(saveK.begin(), saveK.end(), b.k); std::copy(saveC.begin(), saveC.end(), b.cp);
+}
+// sum over capacitive nodes of A h rho int_{a}^{b} c_p dT (3-point Gauss-Legendre: exact for the degree-4 c_p)
+static double enthalpyChange(Sim& S, const std::vector<double>& Ta, const std::vector<double>& Tb) {
+    const size_t N = Ta.size();
+    std::vector<double> pts(3 * N), cp;
+    const double g = std::sqrt(0.6);
+    for (size_t q = 0; q < N; ++q) {
+        const double m = 0.5 * (Ta[q] + Tb[q]), r = 0.5 * (Tb[q] - Ta[q]);
+        pts[3 * q] = m - g * r; pts[3 * q + 1] = m; pts[3 * q + 2] = m + g * r;
+    }
+    cpOf(S, pts, cp);
+    double H = 0.0;
+    const int nf = S.L.nf;
+    for (int l = 1; l <= S.nl - 2; ++l)
+        for (int i = 0; i < nf; ++i) {
+            const size_t q = static_cast<size_t>(l - 1) * nf + i;
+            const double r = 0.5 * (Tb[q] - Ta[q]);
+            const double integ = r * (5.0 / 9.0 * cp[3 * q] + 8.0 / 9.0 * cp[3 * q + 1] + 5.0 / 9.0 * cp[3 * q + 2]);
+            H += S.L.adj.area[i] * S.hl[l - 1] * S.batches[i / BS].rho[l * BS + i % BS] * integ;
+        }
+    return H;
+}
+static std::vector<double> interiorT(const Sim& S) {
+    std::vector<double> v(static_cast<size_t>(S.n_int) * S.L.nf);
+    for (int l = 1; l <= S.nl - 2; ++l)
+        for (int i = 0; i < S.L.nf; ++i) v[static_cast<size_t>(l - 1) * S.L.nf + i] = S.T(i, l);
+    return v;
+}
+
 // lateral anomaly norm: sqrt(sum_l sum_i A_i (T_i - nbr-mean_i)^2) over capacitive layers
 static double anomaly(const Sim& S) {
     double s = 0.0;
@@ -248,7 +293,7 @@ static double meanT(const Sim& S) {   // area- and h-weighted mean over capaciti
     return s / w;
 }
 
-struct Result { double its_per_call = 0.0, anomaly_1d = 0.0, global_viol = 0.0; double bound_worst, anomaly_worst_growth, d1_med, d1_max, dL_med, dL_max, mean_drift_1d, mean_drift_L,
+struct Result { double its_per_call = 0.0, anomaly_1d = 0.0, global_viol = 0.0, e_1d = 0.0, e_L = 0.0, cn_w = 0.0; double bound_worst, anomaly_worst_growth, d1_med, d1_max, dL_med, dL_max, mean_drift_1d, mean_drift_L,
                 fo_max; long n_bound_viol; bool ok; };
 
 static Result runCase(double T0, double dT, double mult, int n_div_ref) {
@@ -297,12 +342,45 @@ static Result runCase(double T0, double dT, double mult, int n_div_ref) {
         res.fo_max = probe.implicitBE(tmp.data(), tau, 1e-13).fo_max;
     }
     const double m0 = meanT(S);
+    // reference-free enthalpy closure (Fermi addendum 4): per substep, energy CREATED = true enthalpy change
+    // sum A h rho int c_p dT  minus the scheme's own boundary input sum A h C_used dT (lateral exchange sums to 0
+    // and the CN rows telescope, so the scheme's statement of what entered through the boundaries is exactly
+    // sum C_used dT). Normalized by the contrast enthalpy.
+    double e_created = 0.0, H_contrast = 0.0;
+    {
+        std::vector<double> Tc = interiorT(S), Tu(Tc.size(), T0);
+        // contrast enthalpy: |int_{T0}^{T_init} c_p dT| per node, summed (each half of the checkerboard)
+        std::vector<double> Ta = Tu, Tb = Tc;
+        const double g = std::sqrt(0.6);
+        std::vector<double> pts(3 * Tc.size()), cp;
+        for (size_t q = 0; q < Tc.size(); ++q) { const double m = 0.5 * (Ta[q] + Tb[q]), r = 0.5 * (Tb[q] - Ta[q]);
+            pts[3 * q] = m - g * r; pts[3 * q + 1] = m; pts[3 * q + 2] = m + g * r; }
+        cpOf(S, pts, cp);
+        for (int l = 1; l <= S.nl - 2; ++l)
+            for (int i = 0; i < S.L.nf; ++i) {
+                const size_t q = static_cast<size_t>(l - 1) * S.L.nf + i;
+                const double r = 0.5 * (Tb[q] - Ta[q]);
+                H_contrast += std::fabs(S.L.adj.area[i] * S.hl[l - 1] * S.batches[i / BS].rho[l * BS + i % BS] *
+                                        r * (5.0 / 9.0 * cp[3 * q] + 8.0 / 9.0 * cp[3 * q + 1] + 5.0 / 9.0 * cp[3 * q + 2]));
+            }
+    }
     for (int step = 1; step <= 360; ++step) {
         for (int k = 0; k < n_sub; ++k) {
             prevT = snapshot(S);
             const double gmin = *std::min_element(prevT.begin(), prevT.end()), gmax = *std::max_element(prevT.begin(), prevT.end());
             double gmin_new = 1e300, gmax_new = -1e300;
+            const std::vector<double> Tn_int = interiorT(S);
             S.substep(tau, 1e-12);
+            {
+                const std::vector<double> Tn1 = interiorT(S);
+                double Bsch = 0.0;   // the scheme's boundary input: sum A h C_used dT (C_used = rho c as solved)
+                for (int l = 1; l <= S.nl - 2; ++l)
+                    for (int i = 0; i < S.L.nf; ++i) {
+                        const size_t q = static_cast<size_t>(l - 1) * S.L.nf + i;
+                        Bsch += S.L.adj.area[i] * S.hl[l - 1] * S.LRC[q] * (Tn1[q] - Tn_int[q]);
+                    }
+                e_created += enthalpyChange(S, Tn_int, Tn1) - Bsch;
+            }
             // bounds: each capacitive node within [min, max] of its previous-step stencil +- 0.1 K
             for (int l = 1; l <= S.nl - 2; ++l)
                 for (int i = 0; i < S.L.nf; ++i) {
@@ -328,13 +406,17 @@ static Result runCase(double T0, double dT, double mult, int n_div_ref) {
             an_prev = an;
         }
         for (int k = 0; k < n_sub * n_div_ref; ++k) R.substep(tau / n_div_ref, 1e-12);
-        if (step == steps_day) { res.anomaly_1d = anomaly(S) / an0; compare(&res.d1_med, &res.d1_max); res.mean_drift_1d = (meanT(S) - m0) - (meanT(R) - m0); }
+        if (step == steps_day) { res.e_1d = std::fabs(e_created) / H_contrast; res.anomaly_1d = anomaly(S) / an0; compare(&res.d1_med, &res.d1_max); res.mean_drift_1d = (meanT(S) - m0) - (meanT(R) - m0); }
     }
     compare(&res.dL_med, &res.dL_max);
     res.mean_drift_L = meanT(S) - meanT(R);
     res.its_per_call = S.coupled_calls ? static_cast<double>(S.coupled_its) / S.coupled_calls : 0.0;
-    res.ok = res.n_bound_viol == 0 && res.anomaly_worst_growth <= 0.01 && res.d1_med <= 0.1 && res.d1_max <= 1.0 &&
-             res.dL_med <= 0.1 && res.dL_max <= 1.0;
+    res.e_L = std::fabs(e_created) / H_contrast;
+    res.cn_w = S.cn_w_max;
+    // Fermi addendum 4 (R-G15-1): GLOBAL bound (0.1 K), anomaly growth, reference comparison, and the
+    // reference-free enthalpy closure <= 1e-3 of the contrast enthalpy. The local stencil is reported only.
+    res.ok = res.global_viol <= 0.1 && res.anomaly_worst_growth <= 0.01 && res.d1_med <= 0.1 && res.d1_max <= 1.0 &&
+             res.dL_med <= 0.1 && res.dL_max <= 1.0 && res.e_L <= 1e-3;
     return res;
 }
 
@@ -351,7 +433,7 @@ int main() {
     const int ndiv = std::getenv("G15_REF_DIV") ? std::atoi(std::getenv("G15_REF_DIV")) : 64;
     int fails = 0;
     std::printf("G15 synthetic checkerboard (scheme %s; 288 faces; reference = same scheme at dt/%d)\n", std::getenv("G15_LATOFF") ? "LATERAL OFF (control)" : (std::getenv("G15_SCHEME") ? std::getenv("G15_SCHEME") : "balanced split"), ndiv);
-    for (double T0 : {60.0, 110.0})
+    for (double T0 : {40.0, 60.0, 110.0})
         for (double dT : {10.0, 30.0, 100.0})
             for (double m : mults) {
                 if (dT >= 2.0 * T0 - 20.0) continue;   // keep the cold side above ~10 K
@@ -362,8 +444,8 @@ int main() {
                 if (gated && !r.ok) ++fails;
                 std::printf("  T0=%3.0f dT=%5.1f Fo x%-6g (Fo_max %.2e): GLOBAL bound worst %+.3f K | local-stencil viol %ld (worst %+.3f K) | anomaly growth max %+.2e (norm/start at 1 day %.1e)"
                             " | 1 day |dT| med %.2e max %.2e | 1 lunation med %.2e max %.2e | mean drift vs ref 1d %+.3e"
-                            " lun %+.3e K | coupled CG its/substep %.1f  [%s%s]\n", T0, dT, m, r.fo_max, r.global_viol, r.n_bound_viol, r.bound_worst, r.anomaly_worst_growth, r.anomaly_1d,
-                            r.d1_med, r.d1_max, r.dL_med, r.dL_max, r.mean_drift_1d, r.mean_drift_L, r.its_per_call, r.ok ? "pass" : "FAIL",
+                            " lun %+.3e K | coupled CG its/substep %.1f | ENTHALPY created/contrast 1d %.2e lun %.2e | CN weight max %.2f  [%s%s]\n", T0, dT, m, r.fo_max, r.global_viol, r.n_bound_viol, r.bound_worst, r.anomaly_worst_growth, r.anomaly_1d,
+                            r.d1_med, r.d1_max, r.dL_med, r.dL_max, r.mean_drift_1d, r.mean_drift_L, r.its_per_call, r.e_1d, r.e_L, r.cn_w, r.ok ? "pass" : "FAIL",
                             gated ? "" : ", diagnostic");
             }
     std::printf(fails ? "\nRESULT: FAIL (%d gated cases)\n" : "\nRESULT: PASS (all gated cases)\n", fails);
