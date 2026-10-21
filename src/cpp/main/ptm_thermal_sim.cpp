@@ -25706,6 +25706,13 @@ int main(int argc, char** argv) {
                             : static_cast<double>(num_faces) * total_time_steps;
                         const double face_frac = static_cast<double>(count_changing) / frac_denom;
                         std::cout << "  Max temperature change: " << max_change_post << " K" << std::endl;
+                        {   // full precision for the a-posteriori contraction bound (Fermi addendum 6): the line
+                            // above inherits a sticky 2-decimal format and reads 0.02 / 0.01 / 0 near convergence
+                            std::ostringstream rp;
+                            rp << std::scientific << std::setprecision(6) << "  [residual] sweep " << (iter + 1)
+                               << " max temperature change (full precision): " << max_change_post << " K";
+                            std::cout << rp.str() << std::endl;
+                        }
                         timing_record_iteration(static_cast<double>(faces_to_rerun.size()),
                                                 timing_rethermal_s, max_change_post);
                         std::cout << (rad_coupling_physics_mode
