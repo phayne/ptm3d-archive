@@ -9280,7 +9280,19 @@ bool runThermalModelsForAllFacesBatchSoA(
                 latGatherStart(batch, tb);
             }
         }
+        const auto to_t0 = std::chrono::steady_clock::now();
+        const int to_n = std::max(1, total_time_steps - 1 - t_lo);
+        const int to_every = std::max(1, to_n / 20);   // progress every ~5 % (stderr only; products untouched)
         for (int t = t_lo; t < total_time_steps - 1; ++t) {
+            if ((t - t_lo) % to_every == 0 && t > t_lo) {
+                const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - to_t0).count();
+                const double frac = static_cast<double>(t - t_lo) / to_n;
+                std::ostringstream pm;
+                pm << std::fixed << std::setprecision(0) << "[SIMD Batch] TIME-OUTER progress: step " << (t - t_lo)
+                   << "/" << to_n << " (" << 100.0 * frac << " %), elapsed " << el << " s, ETA " << el * (1.0 - frac) / frac
+                   << " s" << (lat_on ? (g_lateral.monolithic ? " [lateral monolithic]" : " [lateral balanced]") : "");
+                std::cerr << pm.str() << std::endl;
+            }
             const double dt_output = times[t + 1] - times[t];
             const int n_sub = std::max(1,
                 static_cast<int>(std::ceil(dt_output / main_target_dt_to)));
