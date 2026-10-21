@@ -570,5 +570,213 @@ Network::Stats Network::implicitBE(double* T, double tau, double rel_tol) {
     return st;
 }
 
+Network::Stats Network::implicitCoupled(const double* A, const double* B, const double* Cc, const double* D,
+                                        double tau, double rel_tol, double* T_out) {
+    const Adjacency& adj = *adj_;
+    const int L = n_layers_;
+    const int64_t nf = nf_, nc = nc_;
+    auto U = [](int64_t v) { return static_cast<size_t>(v); };
+    Stats st;
+    // Fo (report + cap): max over layers and faces of tau sum G / C
+    for (int l = 0; l < L; ++l) {
+        const double* G = G_.data() + 3 * static_cast<int64_t>(l) * nf;
+        const double* C = C_.data() + static_cast<int64_t>(l) * nf;
+        for (int64_t i = 0; i < nf; ++i) {
+            if (!(C[i] > 0.0)) continue;
+            st.fo_max = std::max(st.fo_max, tau * (G[3 * i] + G[3 * i + 1] + G[3 * i + 2]) / C[i]);
+        }
+    }
+    const int cap = iterationCap(st.fo_max);
+    // scaled coefficients: s = C / tau; Ms x = s (a x[l-1] + b x[l] + c x[l+1]) + sum G (x_l - x_j)
+    // stored in the PCG work arrays: diag_ = s b + sum G ; rhs_ = s d ; Ap_ (reused) holds s a, z_ holds s c
+    // for the duration of the setup; the column preconditioner is built from them.
+    std::vector<double> sa(U(L) * U(nf)), sc(U(L) * U(nf));
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t c = 0; c < nc; ++c) {
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int l = 0; l < L; ++l) {
+            const int64_t o = static_cast<int64_t>(l) * nf;
+            const double* G = G_.data() + 3 * o;
+            for (int64_t i = lo; i < hi; ++i) {
+                const double s = C_[U(o + i)] / tau;
+                const double gs = G[3 * i] + G[3 * i + 1] + G[3 * i + 2];
+                sa[U(o + i)] = s * A[o + i];
+                sc[U(o + i)] = s * Cc[o + i];
+                diag_[U(o + i)] = s * B[o + i] + gs;
+                rhs_[U(o + i)] = s * D[o + i];
+                x_[U(o + i)] = D[o + i] / B[o + i];   // x0: the column's own diagonal guess (refined below)
+            }
+        }
+    }
+    // x0 = the uncoupled column solve (vertical CN alone): Thomas per face on (A, B, Cc, D)
+    auto thomasColumn = [&](const double* a, const double* b, const double* cc, const double* r, double* x,
+                            int64_t i, std::vector<double>& cp, std::vector<double>& dp) {
+        // a, b, cc, r, x: layer-major arrays; solves column i
+        double m = b[i];
+        cp[0] = cc[i] / m;
+        dp[0] = r[i] / m;
+        for (int l = 1; l < L; ++l) {
+            const int64_t o = static_cast<int64_t>(l) * nf + i;
+            m = b[o] - a[o] * cp[U(l - 1)];
+            cp[U(l)] = cc[o] / m;
+            dp[U(l)] = (r[o] - a[o] * dp[U(l - 1)]) / m;
+        }
+        x[static_cast<int64_t>(L - 1) * nf + i] = dp[U(L - 1)];
+        for (int l = L - 2; l >= 0; --l) {
+            const int64_t o = static_cast<int64_t>(l) * nf + i;
+            x[o] = dp[U(l)] - cp[U(l)] * x[o + nf];
+        }
+    };
+    #pragma omp parallel num_threads(nt_)
+    {
+        std::vector<double> cp(U(L)), dp(U(L));
+        #pragma omp for schedule(static)
+        for (int64_t c = 0; c < nc; ++c) {
+            const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+            for (int64_t i = lo; i < hi; ++i) thomasColumn(A, B, Cc, D, x_.data(), i, cp, dp);
+        }
+    }
+    // y = Ms v  (vertical scaled tridiagonal + lateral graph), per face chunk, all layers
+    auto applyM = [&](const std::vector<double>& v, std::vector<double>& y, int64_t c) {
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int l = 0; l < L; ++l) {
+            const int64_t o = static_cast<int64_t>(l) * nf;
+            const double* G = G_.data() + 3 * o;
+            for (int64_t i = lo; i < hi; ++i) {
+                double acc = diag_[U(o + i)] * v[U(o + i)];
+                if (l > 0) acc += sa[U(o + i)] * v[U(o + i - nf)];
+                if (l < L - 1) acc += sc[U(o + i)] * v[U(o + i + nf)];
+                for (int e = 0; e < 3; ++e) {
+                    const int64_t s = 3 * i + e;
+                    if (G[s] != 0.0) acc -= G[s] * v[U(o + adj.nbr[s])];
+                }
+                y[U(o + i)] = acc;
+            }
+        }
+    };
+    // preconditioner: per column, the scaled tridiagonal with diag_ (includes sum G): z = P^-1 r
+    auto precond = [&](std::vector<double>& cp, std::vector<double>& dp, int64_t c) {
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int64_t i = lo; i < hi; ++i) thomasColumn(sa.data(), diag_.data(), sc.data(), r_.data(), z_.data(), i, cp, dp);
+    };
+    auto dotPart = [&](const std::vector<double>& u, const std::vector<double>& v, int64_t c) {
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        double s = 0.0;
+        for (int64_t i = lo; i < hi; ++i)
+            for (int l = 0; l < L; ++l) { const size_t k = U(static_cast<int64_t>(l) * nf + i); s += u[k] * v[k]; }
+        return s;
+    };
+    auto sumParts = [&]() { double s = 0.0; for (int64_t c = 0; c < nc; ++c) s += part_[U(c)]; return s; };
+    std::vector<double> pb(U(nc), 0.0);
+    // r0 = b - M x0 ; ||b||
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t c = 0; c < nc; ++c) {
+        applyM(x_, Ap_, c);
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int l = 0; l < L; ++l)
+            for (int64_t i = lo; i < hi; ++i) { const size_t k = U(static_cast<int64_t>(l) * nf + i); r_[k] = rhs_[k] - Ap_[k]; }
+        pb[U(c)] = dotPart(rhs_, rhs_, c);
+        part_[U(c)] = dotPart(r_, r_, c);
+    }
+    double bn = 0.0; for (double v : pb) bn += v;
+    const double denom = (bn > 0.0) ? std::sqrt(bn) : 1.0;
+    double rnorm = std::sqrt(sumParts());
+    int it = 0;
+    if (rnorm / denom > rel_tol) {
+        double rz = 0.0;
+        #pragma omp parallel num_threads(nt_)
+        {
+            std::vector<double> cp(U(L)), dp(U(L));
+            #pragma omp for schedule(static)
+            for (int64_t c = 0; c < nc; ++c) {
+                precond(cp, dp, c);
+                const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+                for (int l = 0; l < L; ++l)
+                    for (int64_t i = lo; i < hi; ++i) { const size_t k = U(static_cast<int64_t>(l) * nf + i); p_[k] = z_[k]; }
+                part_[U(c)] = dotPart(r_, z_, c);
+            }
+        }
+        rz = sumParts();
+        for (it = 1; it <= cap; ++it) {
+            #pragma omp parallel for num_threads(nt_) schedule(static)
+            for (int64_t c = 0; c < nc; ++c) { applyM(p_, Ap_, c); part_[U(c)] = dotPart(p_, Ap_, c); }
+            const double pAp = sumParts();
+            if (!(pAp > 0.0)) break;
+            const double alpha = rz / pAp;
+            #pragma omp parallel for num_threads(nt_) schedule(static)
+            for (int64_t c = 0; c < nc; ++c) {
+                const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+                for (int l = 0; l < L; ++l)
+                    for (int64_t i = lo; i < hi; ++i) {
+                        const size_t k = U(static_cast<int64_t>(l) * nf + i);
+                        x_[k] += alpha * p_[k];
+                        r_[k] -= alpha * Ap_[k];
+                    }
+                part_[U(c)] = dotPart(r_, r_, c);
+            }
+            rnorm = std::sqrt(sumParts());
+            if (rnorm / denom <= rel_tol) break;
+            #pragma omp parallel num_threads(nt_)
+            {
+                std::vector<double> cp(U(L)), dp(U(L));
+                #pragma omp for schedule(static)
+                for (int64_t c = 0; c < nc; ++c) { precond(cp, dp, c); part_[U(c)] = dotPart(r_, z_, c); }
+            }
+            const double rz_new = sumParts();
+            const double beta = rz_new / rz;
+            rz = rz_new;
+            #pragma omp parallel for num_threads(nt_) schedule(static)
+            for (int64_t c = 0; c < nc; ++c) {
+                const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+                for (int l = 0; l < L; ++l)
+                    for (int64_t i = lo; i < hi; ++i) { const size_t k = U(static_cast<int64_t>(l) * nf + i); p_[k] = z_[k] + beta * p_[k]; }
+            }
+        }
+        if (it > cap) it = cap;
+    }
+    st.iterations = it;
+    if (!(rnorm / denom <= rel_tol)) {
+        st.capped = true; st.capped_layer = -1; st.cap = cap; st.capped_iterations = it;
+        st.capped_rel_residual = rnorm / denom; st.capped_fo = st.fo_max;
+        double worst = -1.0;
+        for (int64_t k = 0; k < static_cast<int64_t>(r_.size()); ++k)
+            if (std::fabs(r_[U(k)]) > worst) { worst = std::fabs(r_[U(k)]); st.worst_face = k % nf; st.capped_layer = static_cast<int>(k / nf); }
+        return st;
+    }
+    // exact-conservation finish: src = -(tau / C) sum_j G (x_i - x_j) (antisymmetric pair fluxes), then the
+    // exact column solve tridiag(T_out) = D + src. Closure = |sum C src| / sum |C src| per layer.
+    std::vector<double> pq(U(L) * U(nc), 0.0), pa(U(L) * U(nc), 0.0);
+    #pragma omp parallel num_threads(nt_)
+    {
+        std::vector<double> cp(U(L)), dp(U(L));
+        #pragma omp for schedule(static)
+        for (int64_t c = 0; c < nc; ++c) {
+            const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+            for (int l = 0; l < L; ++l) {
+                const int64_t o = static_cast<int64_t>(l) * nf;
+                const double* G = G_.data() + 3 * o;
+                double sq = 0.0, sab = 0.0;
+                for (int64_t i = lo; i < hi; ++i) {
+                    double q = 0.0;
+                    for (int e = 0; e < 3; ++e) {
+                        const int64_t s = 3 * i + e;
+                        if (G[s] != 0.0) q -= tau * G[s] * (x_[U(o + i)] - x_[U(o + adj.nbr[s])]);
+                    }
+                    sq += q; sab += std::fabs(q);
+                    r_[U(o + i)] = D[o + i] + ((C_[U(o + i)] > 0.0) ? q / C_[U(o + i)] : 0.0);   // r_ reused as the RHS
+                }
+                pq[U(l) * U(nc) + U(c)] = sq; pa[U(l) * U(nc) + U(c)] = sab;
+            }
+            for (int64_t i = lo; i < hi; ++i) thomasColumn(A, B, Cc, r_.data(), T_out, i, cp, dp);
+        }
+    }
+    for (int l = 0; l < L; ++l) {
+        double a = 0.0, sab = 0.0;
+        for (int64_t c = 0; c < nc; ++c) { a += pq[U(l) * U(nc) + U(c)]; sab += pa[U(l) * U(nc) + U(c)]; }
+        if (sab > 0.0) st.closure_worst = std::max(st.closure_worst, std::fabs(a) / sab);
+    }
+    return st;
+}
+
 }  // namespace lateral
 }  // namespace ptm

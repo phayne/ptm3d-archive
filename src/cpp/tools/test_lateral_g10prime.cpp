@@ -159,7 +159,7 @@ struct Arm { cd Xs, X3, Rs, R3; double periodic, rate_dt; int periods, n_sub, la
 static int envInt(const char* n, int d) { const char* e = std::getenv(n); return (e && *e) ? std::atoi(e) : d; }
 static double envD(const char* n, double d) { const char* e = std::getenv(n); return (e && *e) ? std::atof(e) : d; }
 
-enum class Split { Balanced, StrangTRBDF2, StrangBE, MonolithicCN };
+enum class Split { Balanced, StrangTRBDF2, StrangBE, MonolithicCN, MonolithicBE };
 
 static Arm runArm(const Case& cs, Split split, bool lat_on) {
     const int dtdiv = std::max(1, envInt("G10P_DTDIV", 1));
@@ -288,6 +288,42 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
             thermal::applyBottomBCBatch(b);   // Qb = 0: no geothermal floor applies
         }
     };
+    // MonolithicBE: the ENGINE's thermal.lateral_scheme: monolithic -- the CN rows of every column and a
+    // backward-Euler lateral term in one coupled solve (ptm::lateral::Network::implicitCoupled).
+    std::vector<double> LA(LT.size()), LB(LT.size()), LCc(LT.size()), LD(LT.size());
+    auto monoBESubstep = [&](double tau, const double* flA, const double* flB, double al) {
+        if (!lat_on) {
+            for (int bi = 0; bi < nb; ++bi) {
+                auto& b = batches[bi];
+                alignas(64) double fl2[BS];
+                for (int f = 0; f < BS; ++f) fl2[f] = (1.0 - al) * flA[bi * BS + f] + al * flB[bi * BS + f];
+                b.setFluxContiguous(fl2, BS);
+                b.advanceTimestep(tau);
+            }
+            return;
+        }
+        for (auto& b : batches) thermal::updateMaterialPropertiesBatchSIMD(b);
+        gather();
+        net.assemble(LK.data(), LRC.data());
+        for (int bi = 0; bi < nb; ++bi) {
+            auto& b = batches[bi];
+            alignas(64) double fl2[BS];
+            for (int f = 0; f < BS; ++f) fl2[f] = (1.0 - al) * flA[bi * BS + f] + al * flB[bi * BS + f];
+            b.setFluxContiguous(fl2, BS);
+            thermal::updateMaterialPropertiesBatchSIMD(b);
+            thermal::applySurfaceBCBatch(b, tau);
+            thermal::buildTridiagonalSystemBatch(b, tau);
+            for (int li = 0; li < n_int; ++li)
+                for (int f = 0; f < BS; ++f) {
+                    const int j = bi * BS + f;
+                    LA[li * N + j] = b.a_coef[li * BS + f]; LB[li * N + j] = b.b_coef[li * BS + f];
+                    LCc[li * N + j] = b.c_coef[li * BS + f]; LD[li * N + j] = b.d_coef[li * BS + f];
+                }
+        }
+        const lat::Network::Stats st = net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), tau, cg_tol, LT.data());
+        if (st.capped) { std::fprintf(stderr, "FATAL: coupled CG capped\n"); std::exit(1); }
+        scatterT();
+    };
     // Strang (superseded; diagnostic only): half lateral | CN substeps | half lateral
     lat::SolverOptions opt;
     opt.scheme = (split == Split::StrangBE) ? lat::Scheme::BackwardEuler : lat::Scheme::TRBDF2;
@@ -364,6 +400,8 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
             for (int k = 0; k < n_sub; ++k) balancedSubstep(dt_sub, flA.data(), flB.data(), (k + 0.5) / n_sub);
         } else if (split == Split::MonolithicCN) {
             for (int k = 0; k < n_sub; ++k) monolithicSubstep(dt_sub, flA.data(), flB.data(), (k + 0.5) / n_sub);
+        } else if (split == Split::MonolithicBE) {
+            for (int k = 0; k < n_sub; ++k) monoBESubstep(dt_sub, flA.data(), flB.data(), (k + 0.5) / n_sub);
         } else {
             lateralHalf(0.5 * dt);
             for (int bi = 0; bi < nb; ++bi) {
@@ -434,12 +472,14 @@ int main() {
     const std::string sps = sp ? sp : "balanced";
     std::vector<Split> splits;
     if (sps == "balanced") splits = {Split::Balanced};
+    else if (sps == "monolithic") splits = {Split::MonolithicBE};
     else if (sps == "strang") splits = {Split::StrangTRBDF2, Split::StrangBE};
-    else { std::fprintf(stderr, "G10P_SPLIT must be 'balanced' (default) or 'strang'\n"); return 2; }
+    else { std::fprintf(stderr, "G10P_SPLIT must be 'balanced' (default), 'monolithic' or 'strang'\n"); return 2; }
     int fails = 0, n_cases = 0, n_phase_gated = 0, split_fails = 0;
     double worst[2][4] = {{0}};   // [surf/node3][n index] worst normalized increment amplitude error
     for (Split split : splits) {
         std::printf("G10' %s  (production dt = P/360 x 1/%d, CG tol %.0e)\n",
+                    split == Split::MonolithicBE ? "MONOLITHIC (the engine's lateral_scheme: monolithic: CN rows + BE lateral, one coupled solve)" :
                     split == Split::Balanced ? "BALANCED split (the engine's: Network + advanceTimestepWithSource)"
                                              : (split == Split::StrangTRBDF2 ? "Strang, TR-BDF2 halves (superseded)"
                                                                             : "Strang, BE halves (superseded)"),
@@ -457,7 +497,7 @@ int main() {
                     const Arm off = runArm(cs, split, false);
                     // G10P_SPLITCHECK=1: the monolithic-CN arm (same vertical scheme, lateral in the same solve)
                     Arm mono{};
-                    const bool scheck = envInt("G10P_SPLITCHECK", 0) && split == Split::Balanced;
+                    const bool scheck = envInt("G10P_SPLITCHECK", 0) && (split == Split::Balanced || split == Split::MonolithicBE);
                     if (scheck) mono = runArm(cs, Split::MonolithicCN, true);
                     const double S = std::abs(on.Rs);
                     const cd Ds = on.Xs - off.Xs, Dsr = on.Rs - off.Rs;
@@ -486,7 +526,7 @@ int main() {
                     worst[0][ni] = std::max(worst[0][ni], std::fabs(es));
                     worst[1][ni] = std::max(worst[1][ni], std::fabs(e3));
                     ++n_cases;
-                    if (split == Split::Balanced && !ok) ++fails;
+                    if ((split == Split::Balanced || split == Split::MonolithicBE) && !ok) ++fails;
                     std::printf("  T0=%3.0f L=%5.1fmm n=%2d |Dref|/S surf %.3f node3 %.3f | INC surf d|D| %+.2e ph %+.3f%s"
                                 " node3 d|D| %+.2e ph %+.3f%s | ABS surf %+.2e %+.3f deg (node3 %+.2e %+.3f deg, logged)"
                                 " | OFF-arm abs surf %+.2e %+.3f deg node3 %+.2e %+.3f deg"

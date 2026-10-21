@@ -143,6 +143,21 @@ public:
     // is applied to any layer (T untouched): the caller must stop the run.
     Stats implicitBE(double* T, double tau, double rel_tol);
 
+    // MONOLITHIC substep (C1c, 2026-10-21, after G15): the production vertical Crank-Nicolson rows and a
+    // BACKWARD-EULER lateral term solved as ONE coupled system -- no splitting:
+    //     a x[l-1] + b x[l] + c x[l+1] + (tau / C_l) sum_j G_lj (x_l - x_j) = d        (per face, layer l)
+    // A, B, Cc, D: [n_layers * nf] the row-normalized CN coefficients of the interior nodes, exactly as
+    // thermal::buildTridiagonalSystemBatch leaves them (surface and bottom values folded into d; A of the
+    // top row and Cc of the bottom row are 0). Rows scaled by C/tau make the operator symmetric positive
+    // definite (h g1 = 1/dz_lo, h g2 = 1/dz_hi on PTM's node grid), solved by CG with an exact per-column
+    // tridiagonal (Thomas) preconditioner. Then, for EXACT lateral energy conservation, the lateral flux of
+    // the converged iterate (antisymmetric: sums to 0 to round-off) is applied as a source and every column
+    // is solved exactly: T_out = tridiag^-1 (D + src). Steady states are exact; the BE lateral term is
+    // L-stable (no lateral overshoot at any Fo). assemble(K, RC) at the substep-start state must precede.
+    // On Stats.capped nothing is written to T_out.
+    Stats implicitCoupled(const double* A, const double* B, const double* Cc, const double* D,
+                          double tau, double rel_tol, double* T_out);
+
 private:
     const Adjacency* adj_ = nullptr;
     const uint8_t* act_ = nullptr;

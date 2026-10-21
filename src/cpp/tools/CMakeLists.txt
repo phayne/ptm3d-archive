@@ -397,6 +397,18 @@ set_target_properties(test_lateral_network
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# C1c G15 transient stress, synthetic checkerboard (engine balanced split on a triangular lattice).
+add_executable(test_lateral_g15
+    test_lateral_g15.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh/lateral_adjacency.cpp
+)
+target_include_directories(test_lateral_g15 PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+target_link_libraries(test_lateral_g15 PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+set_target_properties(test_lateral_g15
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 add_executable(test_state_io test_state_io.cpp)
 target_link_libraries(test_state_io
     PRIVATE
