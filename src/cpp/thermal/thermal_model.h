@@ -1184,6 +1184,15 @@ void buildTridiagonalSystemBatch(ThermalBatchSoA& batch, double dt);
 void solveThomasBatchSIMD(ThermalBatchSoA& batch);
 void applySurfaceBCBatch(ThermalBatchSoA& batch, double dt);
 void applyBottomBCBatch(ThermalBatchSoA& batch);
+// C1c (2026-10-21): make the surface-node coupling of the TOP interior row implicit and linearized.
+// Call after applySurfaceBCBatch + buildTridiagonalSystemBatch. The surface balance
+// F + k0 (T1 - T0)/dz0 = eps sigma T0^4, linearized about the lagged T0* (the value applySurfaceBCBatch just
+// solved from T1^n), gives T0 = alpha + beta T1 with D = k0/dz0 + 4 eps sigma T0*^3,
+// alpha = (F + 3 eps sigma T0*^4) / D, beta = (k0/dz0) / D. The implicit half of the top row then uses
+// alpha + beta T1^{n+1} instead of the held T0*: b += a beta, d += a (T0* - alpha), a the row's original
+// coupling to the surface. The explicit half keeps T0*. Steady states are unchanged (T0* = alpha + beta T1
+// at a fixed point). Used only by the monolithic lateral scheme; every other path is untouched.
+void applyImplicitSurfaceCouplingBatch(ThermalBatchSoA& batch, double dt);
 
 // Batch flavor of outputSurfaceTemp(): the surface a frame must report for
 // face `face_idx` at an output epoch whose absorbed flux is Qs. Reads the

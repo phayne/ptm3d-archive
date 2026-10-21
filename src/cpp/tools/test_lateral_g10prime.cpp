@@ -322,6 +322,39 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
         }
         const lat::Network::Stats st = net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), tau, cg_tol, LT.data());
         if (st.capped) { std::fprintf(stderr, "FATAL: coupled CG capped\n"); std::exit(1); }
+        // thermal.lateral_picard (G10P_PICARD): the engine's midpoint passes, mirrored line for line
+        for (int pp = 0; pp < envInt("G10P_PICARD", 0); ++pp) {
+            for (int bi = 0; bi < nb; ++bi) {
+                auto& b = batches[bi];
+                alignas(64) double fl2[BS];
+                for (int f = 0; f < BS; ++f) fl2[f] = (1.0 - al) * flA[bi * BS + f] + al * flB[bi * BS + f];
+                b.setFluxContiguous(fl2, BS);
+                double Tn_int[thermal::MAX_THERMAL_LAYERS * BS];
+                for (int l = 1; l <= nl - 2; ++l)
+                    for (int f = 0; f < BS; ++f) {
+                        Tn_int[l * BS + f] = b.T[l * BS + f];
+                        b.T[l * BS + f] = 0.5 * (b.T[l * BS + f] + LT[(l - 1) * N + bi * BS + f]);
+                    }
+                thermal::updateMaterialPropertiesBatchSIMD(b);
+                for (int l = 1; l <= nl - 2; ++l)
+                    for (int f = 0; f < BS; ++f) {
+                        LK[(l - 1) * N + bi * BS + f] = b.k[l * BS + f];
+                        LRC[(l - 1) * N + bi * BS + f] = b.rho[l * BS + f] * b.cp[l * BS + f];
+                        b.T[l * BS + f] = Tn_int[l * BS + f];
+                    }
+                thermal::applySurfaceBCBatch(b, tau);
+                thermal::buildTridiagonalSystemBatch(b, tau);
+                for (int li = 0; li < n_int; ++li)
+                    for (int f = 0; f < BS; ++f) {
+                        const int j = bi * BS + f;
+                        LA[li * N + j] = b.a_coef[li * BS + f]; LB[li * N + j] = b.b_coef[li * BS + f];
+                        LCc[li * N + j] = b.c_coef[li * BS + f]; LD[li * N + j] = b.d_coef[li * BS + f];
+                    }
+            }
+            net.assemble(LK.data(), LRC.data());
+            const lat::Network::Stats pst = net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), tau, cg_tol, LT.data());
+            if (pst.capped) { std::fprintf(stderr, "FATAL: coupled CG capped (Picard)\n"); std::exit(1); }
+        }
         scatterT();
     };
     // Strang (superseded; diagnostic only): half lateral | CN substeps | half lateral

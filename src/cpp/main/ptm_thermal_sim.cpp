@@ -6650,6 +6650,8 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
 // thermal.lateral_conduction (+ activation c, CG tolerance), set in main from the parsed config.
 struct LateralConductionConfig {
     bool   monolithic = false;   // thermal.lateral_scheme: monolithic
+    int    picard = 0;           // thermal.lateral_picard (monolithic only)
+    bool   zero_coupling = false;   // thermal.lateral_zero_coupling (the companion)
     bool   enabled = false;
     double activation_c = 2.0;
     double cg_rel_tol = 1e-8;
@@ -7014,6 +7016,30 @@ static bool andersonUpdate(AndersonState& st, int iter, std::vector<std::vector<
     m << "; clipped to 0: " << n_clip << "; restarts " << st.restarts;
     std::cout << m.str() << std::endl;
     return true;
+}
+
+// PTM_CN_SUBSTEP_DIV=<n> (diagnostic; C1c gate G11 and the dt-convergence checks): the CPU SIMD main loop's
+// CN substep target is planet.day / (768 n) instead of planet.day / 768, in BOTH drivers (batch-outer and
+// time-outer). Default 1 (unset): byte-identical. Said once, loudly.
+static double cnSubstepDiv() {
+    static const double d = [] {
+        const char* e = std::getenv("PTM_CN_SUBSTEP_DIV");
+        if (!e || !*e) return 1.0;
+        const int n = std::atoi(e);
+        if (n < 1 || n > 1024) {
+            std::cerr << "FATAL: PTM_CN_SUBSTEP_DIV='" << e << "' (allowed 1..1024)" << std::endl;
+            std::exit(2);
+        }
+        std::cerr << "[cn-substep] PTM_CN_SUBSTEP_DIV=" << n << ": CN substep target = planet.day / " << 768 * n
+                  << " (diagnostic; production is 1)" << std::endl;
+        return static_cast<double>(n);
+    }();
+    return d;
+}
+
+static bool cnSubstepDivRequested() {
+    static const bool r = [] { const char* e = std::getenv("PTM_CN_SUBSTEP_DIV"); return e && *e && std::atoi(e) != 1; }();
+    return r;
 }
 
 // thermal.rethermal_all_faces (C1c companion; lateral ON implies it). Set in main.
@@ -8850,7 +8876,11 @@ bool runThermalModelsForAllFacesBatchSoA(
             // An earlier experiment with flux-transition-based adaptive
             // substepping gave only ~7% speedup at ~3x worse max error, so we
             // use a uniform target dt here.
-            const double main_target_dt = planet.day / 768.0;
+            // The production expression stays textually unchanged: under -ffast-math a fused
+            // "day / 768 / n" moved the last bit even for n = 1 and flipped the knife-edge ceil below
+            // (PTM-745) on Europa G5 (caught by G0b). The divisor is applied only when requested.
+            double main_target_dt = planet.day / 768.0;
+            if (cnSubstepDivRequested()) main_target_dt = main_target_dt / cnSubstepDiv();
             // Same caveat as the equilibration loop above: dt here is set by a
             // fixed steps-per-day, not by the grid.
             thermal::warnIfTopCellFourierHigh(ref_profile, main_target_dt,
@@ -9074,7 +9104,8 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
         int t_lo = total_time_steps;
         for (const auto& tb : to_batches) if (tb.active) t_lo = std::min(t_lo, tb.t_begin);
-        const double main_target_dt_to = planet.day / 768.0;
+        double main_target_dt_to = planet.day / 768.0;   // unchanged expression; see the batch-outer site (PTM-745)
+        if (cnSubstepDivRequested()) main_target_dt_to = main_target_dt_to / cnSubstepDiv();
 
         // ---- C1c lateral conduction: network, activation, buffers (thermal.lateral_conduction) ----
         const bool lat_on = g_lateral.enabled;
@@ -9138,7 +9169,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
             int64_t n_act = lat_adj.n_interior_edges;
-            if (g_lateral.activation_c > 0.0) lat_act = ptm::lateral::edgeActivation(lat_adj, Dstar, g_lateral.activation_c, &n_act);
+            if (g_lateral.zero_coupling) {   // the companion: every edge inactive
+                lat_act.assign(3 * n_faces, 0);
+                n_act = 0;
+            }
+            if (!g_lateral.zero_coupling && g_lateral.activation_c > 0.0)
+                lat_act = ptm::lateral::edgeActivation(lat_adj, Dstar, g_lateral.activation_c, &n_act);
             size_t n_cold = 0, n_cold_act = 0;
             for (size_t gf = 0; gf < n_faces; ++gf) {
                 if (!(Tref[gf] < 110.0)) continue;
@@ -9173,7 +9209,11 @@ bool runThermalModelsForAllFacesBatchSoA(
             int64_t n_act_total = 0;
             if (!lat_act_p) n_act_total = lat_adj.n_interior_edges;
             else for (uint8_t a : lat_act) n_act_total += a;
-            if (n_act_total == 0) {
+            if (n_act_total == 0 && g_lateral.zero_coupling && g_lateral.monolithic) {
+                std::cerr << "[lateral] zero-coupling companion: 0 active edges; the MONOLITHIC stages run anyway "
+                             "(column-only coupled solves with the same Picard passes) so the companion takes the "
+                             "lateral-ON code path." << std::endl;
+            } else if (n_act_total == 0) {
                 lat_stages = false;
                 std::cerr << "[lateral] NO edge is active on this mesh (every facet is larger than c*D*): the "
                              "lateral network is empty and its stages are skipped; the columns are uncoupled."
@@ -9294,7 +9334,64 @@ bool runThermalModelsForAllFacesBatchSoA(
                         return false;
                     }
                     lat_closure_worst = std::max(lat_closure_worst, mst.closure_worst);
-                    lat_iters.push_back(mst.iterations);
+                    int mono_iters = mst.iterations;
+                    // thermal.lateral_picard: re-solve with the properties at the midpoint (T^n + T*)/2; the rows
+                    // are rebuilt on T^n (the saved state) with those coefficients. The state is not saved here.
+                    for (int pp = 0; pp < g_lateral.picard; ++pp) {
+                        #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                        for (size_t bi = 0; bi < n_batches; ++bi) {
+                            TimeOuterBatch& tb = to_batches[bi];
+                            if (!tb.active || t < tb.t_begin) continue;
+                            thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                            batch.n_faces = tb.faces_in_batch;
+                            timeOuterLoad(batch, n_layers, tb.state.data());
+                            const double* fa = flux_column_major.data() + tb.start_face + static_cast<size_t>(t) * n_faces;
+                            const double* fb = fa + n_faces;
+                            alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
+                            for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
+                            for (int f = 0; f < tb.faces_in_batch; ++f)
+                                flux_step[f] = g_diag_flux_left_const ? fa[f] : one_m * fa[f] + alpha * fb[f];
+                            batch.setFluxContiguous(flux_step, tb.faces_in_batch);
+                            for (int l = 1; l <= n_layers - 2; ++l) {   // interior -> midpoint
+                                const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                                for (int f = 0; f < tb.faces_in_batch; ++f)
+                                    batch.T[l * BS + f] = 0.5 * (batch.T[l * BS + f] + LT[row + f]);
+                            }
+                            thermal::updateMaterialPropertiesBatchSIMD(batch);   // midpoint k, cp, kappa
+                            for (int l = 1; l <= n_layers - 2; ++l) {
+                                const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                                for (int f = 0; f < tb.faces_in_batch; ++f) {
+                                    LK [row + f] = batch.k[l * BS + f];
+                                    LRC[row + f] = batch.rho[l * BS + f] * batch.cp[l * BS + f];
+                                    batch.T[l * BS + f] = tb.state[static_cast<size_t>(l) * BS + f];   // back to T^n
+                                }
+                            }
+                            thermal::applySurfaceBCBatch(batch, dt_sub);
+                            thermal::buildTridiagonalSystemBatch(batch, dt_sub);
+                            for (int li = 0; li < n_int; ++li) {
+                                const size_t row = static_cast<size_t>(li) * n_faces + tb.start_face;
+                                for (int f = 0; f < tb.faces_in_batch; ++f) {
+                                    LA [row + f] = batch.a_coef[li * BS + f];
+                                    LB [row + f] = batch.b_coef[li * BS + f];
+                                    LCc[row + f] = batch.c_coef[li * BS + f];
+                                    LD [row + f] = batch.d_coef[li * BS + f];
+                                }
+                            }
+                        }
+                        lat_net.assemble(LK.data(), LRC.data());
+                        const ptm::lateral::Network::Stats pst =
+                            lat_net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), dt_sub, g_lateral.cg_rel_tol, LT.data());
+                        lat_fo_max = std::max(lat_fo_max, pst.fo_max);
+                        if (pst.capped) {
+                            std::cerr << "\n[lateral] FATAL: monolithic coupled CG (Picard pass " << (pp + 1) << ") did not converge -- "
+                                      << "output step " << t << ", substep " << s << ": " << pst.capped_iterations << " iterations (cap "
+                                      << pst.cap << "), relative residual " << pst.capped_rel_residual << ". Never applied." << std::endl;
+                            return false;
+                        }
+                        lat_closure_worst = std::max(lat_closure_worst, pst.closure_worst);
+                        mono_iters += pst.iterations;
+                    }
+                    lat_iters.push_back(mono_iters);
                     std::atomic<long long> clamps{0};
                     #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
                     for (size_t bi = 0; bi < n_batches; ++bi) {
@@ -9536,7 +9633,8 @@ bool runThermalModelsForAllFacesBatchSoA(
               << " (implicit), " << lat_expl_closure_worst << " (explicit stage); node-steps below the "
                  "geothermal floor after the lateral correction: " << lat_below_geo
               << (lat_below_geo ? "  <-- WARNING (G15 bar: never below T_geo)" : "")
-              << (g_lateral.monolithic ? "; scheme MONOLITHIC; node-steps raised by the geothermal floor: " +
+              << (g_lateral.monolithic ? "; scheme MONOLITHIC (Picard passes " + std::to_string(g_lateral.picard) +
+                                             "); node-steps raised by the geothermal floor: " +
                                              std::to_string(lat_floor_clamps) : std::string("; scheme balanced"));
             std::cerr << m.str() << std::endl;
         }
@@ -20329,6 +20427,12 @@ int main(int argc, char** argv) {
     g_lateral.activation_c = sim_config.thermal.lateral_activation_c;
     g_lateral.cg_rel_tol   = sim_config.thermal.lateral_cg_rel_tol;
     g_lateral.monolithic   = sim_config.thermal.lateral_scheme == "monolithic";
+    g_lateral.picard       = sim_config.thermal.lateral_picard;
+    g_lateral.zero_coupling = sim_config.thermal.lateral_zero_coupling;
+    if (g_lateral.enabled && g_lateral.zero_coupling)
+        std::cerr << "[lateral] thermal.lateral_zero_coupling: ON -- the lateral machinery runs with EVERY edge "
+                     "inactive (G = 0): this is the lateral-OFF COMPANION on the lateral-ON code path (same scheme, "
+                     "Picard passes, driver and all-faces re-thermal). No heat crosses any edge." << std::endl;
     if (g_lateral.enabled && g_lateral.monolithic && std::getenv("PTM_SOLVER_EQFIX")) {
         std::cerr << "[lateral] FATAL: PTM_SOLVER_EQFIX is refused on the CPU SIMD batch path (BUGS.md PTM-216), "
                      "including the monolithic lateral scheme." << std::endl;

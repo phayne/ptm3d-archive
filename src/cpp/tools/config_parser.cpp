@@ -723,6 +723,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.lateral_cg_rel_tol     = getWithDefault(thermal, "lateral_cg_rel_tol",     config.thermal.lateral_cg_rel_tol);
             config.thermal.rethermal_all_faces    = getWithDefault(thermal, "rethermal_all_faces",    config.thermal.rethermal_all_faces);
             config.thermal.lateral_scheme         = getWithDefault(thermal, "lateral_scheme",         config.thermal.lateral_scheme);
+            config.thermal.lateral_picard         = getWithDefault(thermal, "lateral_picard",         config.thermal.lateral_picard);
+            config.thermal.lateral_zero_coupling  = getWithDefault(thermal, "lateral_zero_coupling",  config.thermal.lateral_zero_coupling);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
@@ -1367,6 +1369,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "lateral_activation_c" << YAML::Value << config.thermal.lateral_activation_c;
             out << YAML::Key << "lateral_cg_rel_tol" << YAML::Value << config.thermal.lateral_cg_rel_tol;
             out << YAML::Key << "lateral_scheme" << YAML::Value << config.thermal.lateral_scheme;
+            out << YAML::Key << "lateral_picard" << YAML::Value << config.thermal.lateral_picard;
+            if (config.thermal.lateral_zero_coupling)
+                out << YAML::Key << "lateral_zero_coupling" << YAML::Value << true;
         }
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
@@ -1876,6 +1881,13 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
                          "'legacy'; got '" << config.thermal.spinup_seed << "'"
                       << std::endl;
+            valid = false;
+        }
+        if (config.thermal.lateral_conduction &&
+            (config.thermal.lateral_picard < 0 || config.thermal.lateral_picard > 4 ||
+             (config.thermal.lateral_picard > 0 && config.thermal.lateral_scheme != "monolithic"))) {
+            std::cerr << "Error: thermal.lateral_picard must be in [0, 4] and needs lateral_scheme: monolithic; got "
+                      << config.thermal.lateral_picard << " with scheme '" << config.thermal.lateral_scheme << "'" << std::endl;
             valid = false;
         }
         if (config.thermal.lateral_conduction && config.thermal.lateral_scheme != "balanced" &&

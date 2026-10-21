@@ -81,10 +81,44 @@ struct Sim {
     // the engine's balanced substep (time-outer driver, ptm_thermal_sim.cpp)
     bool lat_off = false;   // G15_LATOFF=1 control arm: the same columns with no lateral stage
     bool mono = false;      // G15_SCHEME=monolithic: vertical CN + BE lateral in one coupled solve
+    bool imp_surf = false;  // G15_IMPSURF=1: implicit linearized surface coupling in the coupled solve
     std::vector<double> LA, LB, LC, LD;
+    std::vector<uint8_t> zero_act;
+    int picard = 0;         // G15_PICARD=1: one midpoint-property Picard pass per substep
     void substepMono(double tau, double tol) {
+        if (picard <= 0) { substepMonoOnce(tau, tol, nullptr); return; }
         const int nf = L.nf;
-        gather();
+        // save T^n (all layers), first solve with properties at T^n
+        std::vector<double> Tn(static_cast<size_t>(nl) * nb * BS);
+        for (int bi = 0; bi < nb; ++bi) std::copy(batches[bi].T, batches[bi].T + nl * BS, Tn.begin() + static_cast<size_t>(bi) * nl * BS);
+        substepMonoOnce(tau, tol, nullptr);
+        for (int it = 0; it < picard; ++it) {
+            // midpoint state, its properties; then restore T^n and re-solve with those properties
+            std::vector<double> Tmid(Tn.size());
+            for (int bi = 0; bi < nb; ++bi)
+                for (int k = 0; k < nl * BS; ++k) {
+                    const size_t q = static_cast<size_t>(bi) * nl * BS + k;
+                    Tmid[q] = 0.5 * (Tn[q] + batches[bi].T[k]);
+                }
+            (void)nf;
+            substepMonoOnce(tau, tol, &Tn, &Tmid);
+        }
+    }
+    // one coupled solve; Tstate (if given) restores T^n into the batches after the properties are taken
+    // from Tprop (the midpoint), so the CN rows use T^n with midpoint coefficients.
+    void substepMonoOnce(double tau, double tol, const std::vector<double>* Tstate, const std::vector<double>* Tprop = nullptr) {
+        const int nf = L.nf;
+        if (Tprop) {
+            for (int bi = 0; bi < nb; ++bi) std::copy(Tprop->begin() + static_cast<size_t>(bi) * nl * BS,
+                                                     Tprop->begin() + static_cast<size_t>(bi + 1) * nl * BS, batches[bi].T);
+        }
+        gather();   // properties at the current batch T (T^n, or the midpoint)
+        if (Tstate) {
+            for (int bi = 0; bi < nb; ++bi) std::copy(Tstate->begin() + static_cast<size_t>(bi) * nl * BS,
+                                                     Tstate->begin() + static_cast<size_t>(bi + 1) * nl * BS, batches[bi].T);
+            for (int l = 1; l <= nl - 2; ++l)
+                for (int j = 0; j < nf; ++j) LT[(l - 1) * nf + j] = batches[j / BS].T[l * BS + j % BS];
+        }
         net.assemble(LK.data(), LRC.data());
         LA.resize(LT.size()); LB.resize(LT.size()); LC.resize(LT.size()); LD.resize(LT.size());
         for (int bi = 0; bi < nb; ++bi) {
@@ -92,9 +126,10 @@ struct Sim {
             alignas(64) double fl[BS];
             for (int f = 0; f < BS; ++f) fl[f] = Fbar;
             b.setFluxContiguous(fl, BS);
-            thermal::updateMaterialPropertiesBatchSIMD(b);
+            if (!Tprop) thermal::updateMaterialPropertiesBatchSIMD(b);   // midpoint: keep the gathered properties
             thermal::applySurfaceBCBatch(b, tau);
             thermal::buildTridiagonalSystemBatch(b, tau);
+            if (imp_surf) thermal::applyImplicitSurfaceCouplingBatch(b, tau);
             for (int li = 0; li < n_int; ++li)
                 for (int f = 0; f < BS; ++f) {
                     const int j = bi * BS + f;
@@ -117,7 +152,7 @@ struct Sim {
     double closure_worst = 0.0;
     void substep(double tau, double tol) {
         const int nf = L.nf;
-        if (mono && !lat_off) { substepMono(tau, tol); return; }
+        if (mono) { substepMono(tau, tol); return; }   // lat_off + mono: the coupled solver with NO edges
         if (lat_off) {
             for (int bi = 0; bi < nb; ++bi) {
                 auto& b = batches[bi];
@@ -177,6 +212,9 @@ static void init(Sim& S, int nr, int nc, double a, double T0, double dT) {
             for (int l = 0; l < S.nl; ++l) b.T[l * BS + f] = T0 + ((l >= 1 && l <= S.nl - 2) ? sgn * dT : 0.0);
         }
         b.n_faces = BS;
+        if (std::getenv("G15_LINEAR") && std::getenv("G15_LINEAR")[0] == '1') {   // diagnostic: T-independent cp, k
+            b.n_cp_coeffs = 0; b.cp0 = 600.0; b.R350_val = 0.0;
+        }
         thermal::updateMaterialPropertiesBatchSIMD(b);
         thermal::applyBottomBCBatch(b);
     }
@@ -221,6 +259,12 @@ static Result runCase(double T0, double dT, double mult, int n_div_ref) {
     init(R, nr, nc, a, T0, dT);
     S.lat_off = R.lat_off = std::getenv("G15_LATOFF") && std::getenv("G15_LATOFF")[0] == '1';
     S.mono = R.mono = std::getenv("G15_SCHEME") && std::string(std::getenv("G15_SCHEME")) == "monolithic";
+    S.imp_surf = R.imp_surf = std::getenv("G15_IMPSURF") && std::getenv("G15_IMPSURF")[0] == '1';
+    S.picard = R.picard = std::getenv("G15_PICARD") ? std::atoi(std::getenv("G15_PICARD")) : 0;
+    if (S.lat_off && S.mono) {   // the coupled solver with every edge inactive = column-only solves
+        S.zero_act.assign(3 * S.L.nf, 0); R.zero_act.assign(3 * R.L.nf, 0);
+        S.net.init(&S.L.adj, S.zero_act.data(), S.hl, 1); R.net.init(&R.L.adj, R.zero_act.data(), R.hl, 1);
+    }
     const double P = 29.530588 * 86400.0, dt = P / 360.0;
     thermal::Planet planet("Moon");
     const int n_sub = std::max(1, static_cast<int>(std::ceil(dt / (planet.day / 768.0))));

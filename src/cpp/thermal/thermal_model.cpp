@@ -3362,6 +3362,26 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     }
 }
 
+void applyImplicitSurfaceCouplingBatch(ThermalBatchSoA& batch, double dt) {
+    if (batch.n_layers < 3) return;
+    const double dz0 = batch.dz[0];
+    const double g1 = batch.g1[0];
+    const double sig = batch.sigma_sb;
+    for (int f = 0; f < batch.n_faces; ++f) {
+        const double T0s = batch.T[f];                       // layer 0 = the lagged surface solution
+        const double k0 = batch.k[f];                        // layer 0 conductivity (solveSurfaceBC's k0)
+        const double eps = batch.emissivity[f];
+        const double T03 = T0s * T0s * T0s;
+        const double D = k0 / dz0 + 4.0 * eps * sig * T03;
+        const double alpha_s = (batch.flux[f] + 3.0 * eps * sig * T03 * T0s) / D;
+        const double beta_s = (k0 / dz0) / D;
+        const double rc1 = batch.rho[THERMAL_BATCH_SIZE + f] * batch.cp[THERMAL_BATCH_SIZE + f];
+        const double a0 = -0.5 * (dt / rc1) * (g1 * k0);   // the top row's coupling to node 0 (folded away)
+        batch.b_coef[f] += a0 * beta_s;
+        batch.d_coef[f] += a0 * T0s - a0 * alpha_s;
+    }
+}
+
 void ThermalBatchSoA::advanceTimestepWithSource(double dt, const double* src) {
     static const bool refuse = solverEqFixEnabled();
     if (refuse) {

@@ -468,6 +468,15 @@ struct SimulationConfig {
         //   lateral_scheme: "balanced" (Douglas split per CN substep; Fermi addendum 2) or "monolithic"
         //                   (vertical CN + backward-Euler lateral in ONE coupled solve; G15 2026-10-21)
         std::string lateral_scheme  = "balanced";
+        //   lateral_picard: monolithic only -- N extra solves per CN substep with the material properties
+        //                   (k, rho c, hence G and the CN rows) taken at the midpoint (T^n + T*)/2 of the previous
+        //                   solve (G15 2026-10-21: lagged properties mis-conserve energy when a large contrast
+        //                   mixes within one substep; N = 2 meets the G15 dt/64 bars). 0 = off.
+        int         lateral_picard  = 0;
+        //   lateral_zero_coupling: the lateral machinery with EVERY edge inactive (G = 0) -- the lateral-OFF
+        //                   companion of a lateral-ON run on the SAME code path (scheme, Picard passes, time-outer
+        //                   driver, all-faces re-thermal), so ON - companion differs in the lateral term only.
+        bool        lateral_zero_coupling = false;
         // Radiation-coupling re-thermal of ALL faces instead of the physics-selected subset (C1c, Fermi
         // addendum 3: the lateral-OFF companion of a lateral-ON run must take the same all-faces path, so
         // ON - OFF differs in the lateral term only). Lateral ON implies it. Default OFF (selective).
