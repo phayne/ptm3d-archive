@@ -159,7 +159,7 @@ struct Arm { cd Xs, X3, Rs, R3; double periodic, rate_dt; int periods, n_sub, la
 static int envInt(const char* n, int d) { const char* e = std::getenv(n); return (e && *e) ? std::atoi(e) : d; }
 static double envD(const char* n, double d) { const char* e = std::getenv(n); return (e && *e) ? std::atof(e) : d; }
 
-enum class Split { Balanced, StrangTRBDF2, StrangBE };
+enum class Split { Balanced, StrangTRBDF2, StrangBE, MonolithicCN };
 
 static Arm runArm(const Case& cs, Split split, bool lat_on) {
     const int dtdiv = std::max(1, envInt("G10P_DTDIV", 1));
@@ -265,6 +265,29 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
             scatterT();
         }
     };
+    // MonolithicCN (split-isolation reference, G10P_SPLITCHECK): the production vertical CN step with the
+    // q-mode's lateral term -mu_i (T - T0) folded into the SAME Crank-Nicolson solve (no splitting). On the
+    // exact eigenvector the lateral operator IS that per-node sink, so balanced - monolithic isolates the
+    // splitting error with the vertical scheme common to both.
+    auto monolithicSubstep = [&](double tau, const double* flA, const double* flB, double al) {
+        for (int bi = 0; bi < nb; ++bi) {
+            auto& b = batches[bi];
+            alignas(64) double fl2[BS];
+            for (int f = 0; f < BS; ++f) fl2[f] = (1.0 - al) * flA[bi * BS + f] + al * flB[bi * BS + f];
+            b.setFluxContiguous(fl2, BS);
+            thermal::updateMaterialPropertiesBatchSIMD(b);
+            thermal::applySurfaceBCBatch(b, tau);
+            thermal::buildTridiagonalSystemBatch(b, tau);
+            if (lat_on)
+                for (int i = 1; i <= nl - 2; ++i)
+                    for (int f = 0; f < BS; ++f) {
+                        b.b_coef[(i - 1) * BS + f] += 0.5 * tau * mu[i];
+                        b.d_coef[(i - 1) * BS + f] += -0.5 * tau * mu[i] * b.T[i * BS + f] + tau * mu[i] * cs.T0;
+                    }
+            thermal::solveThomasBatchSIMD(b);
+            thermal::applyBottomBCBatch(b);   // Qb = 0: no geothermal floor applies
+        }
+    };
     // Strang (superseded; diagnostic only): half lateral | CN substeps | half lateral
     lat::SolverOptions opt;
     opt.scheme = (split == Split::StrangBE) ? lat::Scheme::BackwardEuler : lat::Scheme::TRBDF2;
@@ -339,6 +362,8 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
         for (int j = 0; j < N; ++j) { flA[j] = flux_at(t0, j); flB[j] = flux_at(t1, j); }
         if (split == Split::Balanced) {
             for (int k = 0; k < n_sub; ++k) balancedSubstep(dt_sub, flA.data(), flB.data(), (k + 0.5) / n_sub);
+        } else if (split == Split::MonolithicCN) {
+            for (int k = 0; k < n_sub; ++k) monolithicSubstep(dt_sub, flA.data(), flB.data(), (k + 0.5) / n_sub);
         } else {
             lateralHalf(0.5 * dt);
             for (int bi = 0; bi < nb; ++bi) {
@@ -411,7 +436,7 @@ int main() {
     if (sps == "balanced") splits = {Split::Balanced};
     else if (sps == "strang") splits = {Split::StrangTRBDF2, Split::StrangBE};
     else { std::fprintf(stderr, "G10P_SPLIT must be 'balanced' (default) or 'strang'\n"); return 2; }
-    int fails = 0, n_cases = 0, n_phase_gated = 0;
+    int fails = 0, n_cases = 0, n_phase_gated = 0, split_fails = 0;
     double worst[2][4] = {{0}};   // [surf/node3][n index] worst normalized increment amplitude error
     for (Split split : splits) {
         std::printf("G10' %s  (production dt = P/360 x 1/%d, CG tol %.0e)\n",
@@ -430,6 +455,10 @@ int main() {
                     const Case cs{T0, L, n};
                     const Arm on = runArm(cs, split, true);
                     const Arm off = runArm(cs, split, false);
+                    // G10P_SPLITCHECK=1: the monolithic-CN arm (same vertical scheme, lateral in the same solve)
+                    Arm mono{};
+                    const bool scheck = envInt("G10P_SPLITCHECK", 0) && split == Split::Balanced;
+                    if (scheck) mono = runArm(cs, Split::MonolithicCN, true);
                     const double S = std::abs(on.Rs);
                     const cd Ds = on.Xs - off.Xs, Dsr = on.Rs - off.Rs;
                     const cd D3 = on.X3 - off.X3, D3r = on.R3 - off.R3;
@@ -467,12 +496,33 @@ int main() {
                                 std::abs(off.Xs) / std::abs(off.Rs) - 1.0, n ? std::arg(off.Xs / off.Rs) * 180.0 / M_PI : 0.0,
                                 std::abs(off.X3) / std::abs(off.R3) - 1.0, n ? std::arg(off.X3 / off.R3) * 180.0 / M_PI : 0.0,
                                 on.periods, off.periods, per, ok ? "pass" : "FAIL");
+                    if (scheck) {
+                        // splitting error alone: balanced vs monolithic CN, both with the production vertical CN
+                        const double sa = (std::abs(on.Xs) - std::abs(mono.Xs)) / S, s3 = (std::abs(on.X3) - std::abs(mono.X3)) / S;
+                        const double sp = (n == 0) ? 0.0 : std::arg(on.Xs / mono.Xs) * 180.0 / M_PI;
+                        const double sp3 = (n == 0) ? 0.0 : std::arg(on.X3 / mono.X3) * 180.0 / M_PI;
+                        const double sc = std::abs(on.Xs - mono.Xs) / S, sc3 = std::abs(on.X3 - mono.X3) / S;
+                        // increment with BOTH arms on the same vertical scheme: (bal - off) vs (mono - off)
+                        const cd Dm = mono.Xs - off.Xs, Dm3 = mono.X3 - off.X3;
+                        const double ip = (n == 0) ? 0.0 : std::arg(Ds / Dm) * 180.0 / M_PI;
+                        const double ip3 = (n == 0) ? 0.0 : std::arg(D3 / Dm3) * 180.0 / M_PI;
+                        const double ia = (std::abs(Ds) - std::abs(Dm)) / S, ia3 = (std::abs(D3) - std::abs(Dm3)) / S;
+                        const bool sok = std::fabs(sa) <= bar_a && std::fabs(s3) <= bar_a && std::fabs(ia) <= bar_a
+                                         && std::fabs(ia3) <= bar_a && (n == 0 || (std::fabs(ip) <= bar_p && std::fabs(ip3) <= bar_p));
+                        std::printf("      SPLIT-ONLY (balanced vs monolithic CN): surf d|X| %+.2e ph %+.3f |dX| %.2e; node3 d|X| %+.2e"
+                                    " ph %+.3f |dX| %.2e | increment vs mono-increment: surf d|D| %+.2e ph %+.3f node3 d|D| %+.2e"
+                                    " ph %+.3f  [%s]\n", sa, sp, sc, s3, sp3, sc3, ia, ip, ia3, ip3, sok ? "split ok" : "SPLIT FAIL");
+                        if (!sok) ++split_fails;
+                    }
                 }
     }
     std::printf("\n(* = phase gated: |Dref| >= 0.1 S.)  %d cases, %d phase-gated increments.\n", n_cases, n_phase_gated);
     std::printf("worst |increment amplitude error| / S by harmonic n=0/1/3/10:  surface %.1e %.1e %.1e %.1e"
                 "  node3 %.1e %.1e %.1e %.1e\n", worst[0][0], worst[0][1], worst[0][2], worst[0][3],
                 worst[1][0], worst[1][1], worst[1][2], worst[1][3]);
+    if (envInt("G10P_SPLITCHECK", 0))
+        std::printf("SPLIT-ONLY check (balanced vs monolithic CN, same vertical scheme; Fermi bars on the difference and "
+                    "on the increment phase): %d case(s) fail\n", split_fails);
     std::printf(fails ? "\nRESULT: FAIL (%d balanced-split cases)\n" : "\nRESULT: PASS (all balanced-split cases)\n", fails);
     return fails ? 1 : 0;
 }
