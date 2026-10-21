@@ -88,5 +88,71 @@ double conductionLength(double k, double rho, double cp, double emissivity, doub
 std::vector<uint8_t> edgeActivation(const Adjacency& adj, const std::vector<double>& Dstar,
                                     double c, int64_t* n_active_edges);
 
+// -----------------------------------------------------------------------------------------------
+// Network: the balanced-split lateral stages on ALL capacitive node layers at once (C1c perf
+// fusion, 2026-10-21). The engine and the G10' harness both call this, so G10' measures the code
+// the engine runs.
+//
+// Arrays are layer-major, [layer * n_faces + face]. Every kernel is ONE parallel region over
+// (layer, 8192-face chunk) blocks instead of one region per layer per kernel (the per-layer form
+// cost 585 s wall / 6373 s sys on the n968 smoke, almost all OpenMP region overhead).
+//
+// ARITHMETIC CONTRACT: per layer, every value is computed by the same expression tree as the
+// single-layer functions above (assembleConductance, explicitIncrement, backwardEulerStep with
+// Scheme::BackwardEuler, iterationCap, maxFourier), and every reduction that feeds the state (the
+// PCG dot products) uses the same fixed 8192-element chunks, each summed in index order, chunk
+// partials summed serially in chunk order.
+//   - Thread count: results are BIT-IDENTICAL for any thread count (the per-block code does not
+//     depend on the thread; test_lateral_network N1).
+//   - Versus the single-layer path: equal to round-off, not bit-for-bit by construction, because
+//     libthermal is compiled with -ffast-math and the compiler may contract/reassociate the two
+//     loop shapes differently. Measured (test_lateral_network N2, 28,800 faces x 6 layers, 20
+//     steps): implicit-stage T bit-identical, explicit increment within 4.4e-16 K, identical PCG
+//     iteration counts; the n968 engine smoke's float32 outputs are byte-identical.
+//   - The closure DIAGNOSTIC (sum Q / sum |Q|) is chunked, so its last digits in the log differ
+//     from the serial face-order sum; it never feeds the state.
+class Network {
+public:
+    struct Stats {
+        int     iterations = 0;          // PCG iterations summed over layers (the engine's log unit)
+        double  fo_max = 0.0;            // max over layers of max_i dt sum_j G_ij / C_i
+        double  closure_worst = 0.0;     // max over layers of |sum_i Q_i| / sum_i |Q_i|
+        bool    capped = false;          // some layer hit its iteration cap (or CG broke down)
+        int     capped_layer = -1;       // first such layer (0-based node-layer index)
+        int     cap = 0;                 // that layer's iteration cap
+        int     capped_iterations = 0;
+        double  capped_rel_residual = 0.0;
+        int64_t worst_face = -1;         // that layer's largest-|residual| face
+        double  capped_fo = 0.0;
+    };
+
+    // adj and edge_active (may be null = every coupled edge) must outlive the network.
+    // h: [n_layers] control-volume thickness per node layer. n_threads <= 0 = OpenMP default.
+    void init(const Adjacency* adj, const uint8_t* edge_active, std::vector<double> h, int n_threads);
+    int     layers() const { return n_layers_; }
+    int64_t faces() const { return nf_; }
+
+    // Conductances G (all layers) from K, and capacities C = RC * area * h. K, RC: [n_layers * nf]
+    // at the substep-start state. Both stages below use these.
+    void assemble(const double* K, const double* RC);
+    // Explicit stage: inc = tau * sum_j G_ij (T_j - T_i) / C_i (0 where C_i <= 0). Returns the
+    // worst per-layer closure |sum q| / sum |q| of the increment's energy (round-off).
+    double explicitIncrement(const double* T, double tau, double* inc);
+    // Implicit stage: per layer, (C + tau L) x = C T by Jacobi-PCG (x0 = T, rel_tol, per-layer cap
+    // iterationCap(Fo_layer)), then T += Q / C with Q the flux form of x. On Stats.capped NOTHING
+    // is applied to any layer (T untouched): the caller must stop the run.
+    Stats implicitBE(double* T, double tau, double rel_tol);
+
+private:
+    const Adjacency* adj_ = nullptr;
+    const uint8_t* act_ = nullptr;
+    std::vector<double> h_;
+    int n_layers_ = 0, nt_ = 0;
+    int64_t nf_ = 0, nc_ = 0;                       // faces, chunks per layer
+    std::vector<double> G_, C_;                     // [L * 3nf], [L * nf]
+    std::vector<double> diag_, x_, r_, z_, p_, Ap_, rhs_;   // [L * nf]
+    std::vector<double> part_;                      // [L * nc] chunk partials
+};
+
 }  // namespace lateral
 }  // namespace ptm

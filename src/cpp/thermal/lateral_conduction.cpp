@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cmath>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace ptm {
 namespace lateral {
@@ -268,6 +271,303 @@ std::vector<uint8_t> edgeActivation(const Adjacency& adj, const std::vector<doub
         }
     if (n_active_edges) *n_active_edges = n;
     return act;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Network (see the header for the arithmetic contract).
+// ---------------------------------------------------------------------------------------------
+void Network::init(const Adjacency* adj, const uint8_t* edge_active, std::vector<double> h, int n_threads) {
+    adj_ = adj;
+    act_ = edge_active;
+    h_ = std::move(h);
+    n_layers_ = static_cast<int>(h_.size());
+    nf_ = adj->n_faces;
+    nc_ = (nf_ + kChunk - 1) / kChunk;
+#ifdef _OPENMP
+    nt_ = (n_threads > 0) ? n_threads : omp_get_max_threads();
+#else
+    nt_ = 1;
+    (void)n_threads;
+#endif
+    const size_t L = static_cast<size_t>(n_layers_);
+    const size_t N = L * static_cast<size_t>(nf_);
+    G_.assign(3 * N, 0.0);
+    C_.assign(N, 0.0);
+    diag_.assign(N, 0.0); x_.assign(N, 0.0); r_.assign(N, 0.0); z_.assign(N, 0.0);
+    p_.assign(N, 0.0); Ap_.assign(N, 0.0); rhs_.assign(N, 0.0);
+    part_.assign(L * static_cast<size_t>(nc_), 0.0);
+}
+
+void Network::assemble(const double* K, const double* RC) {
+    const Adjacency& adj = *adj_;
+    const int64_t nf = nf_, nc = nc_, nb = static_cast<int64_t>(n_layers_) * nc;
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t l = b / nc, c = b % nc;
+        const double h = h_[static_cast<size_t>(l)];
+        const double* k = K + l * nf;
+        const double* rc = RC + l * nf;
+        double* G = G_.data() + 3 * l * nf;
+        double* C = C_.data() + l * nf;
+        const int64_t hi = std::min(nf, (c + 1) * kChunk);
+        for (int64_t i = c * kChunk; i < hi; ++i) {
+            for (int e = 0; e < 3; ++e) {   // == assembleConductance
+                const int64_t s = 3 * i + e;
+                G[s] = 0.0;
+                const int32_t j = adj.nbr[s];
+                if (j < 0 || (act_ && !act_[s])) continue;
+                const int64_t sj = 3 * static_cast<int64_t>(j) + adj.nbr_slot[s];
+                const double ri = adj.d_half[s] / k[i];
+                const double rj = adj.d_half[sj] / k[j];
+                const double rsum = (i < j) ? (ri + rj) : (rj + ri);
+                G[s] = adj.edge_len[s] * h / rsum;
+            }
+            C[i] = rc[i] * adj.area[i] * h;   // == backwardEulerStep's ws.C
+        }
+    }
+}
+
+double Network::explicitIncrement(const double* T, double tau, double* inc) {
+    const Adjacency& adj = *adj_;
+    const int64_t nf = nf_, nc = nc_, nb = static_cast<int64_t>(n_layers_) * nc;
+    std::vector<double> pq(static_cast<size_t>(nb), 0.0), pa(static_cast<size_t>(nb), 0.0);
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t l = b / nc, c = b % nc;
+        const double* G = G_.data() + 3 * l * nf;
+        const double* C = C_.data() + l * nf;
+        const double* Tl = T + l * nf;
+        double* il = inc + l * nf;
+        double sq = 0.0, sa = 0.0;
+        const int64_t hi = std::min(nf, (c + 1) * kChunk);
+        for (int64_t i = c * kChunk; i < hi; ++i) {   // == explicitIncrement
+            double q = 0.0;
+            for (int e = 0; e < 3; ++e) {
+                const int64_t s = 3 * i + e;
+                if (G[s] != 0.0) q += G[s] * (Tl[adj.nbr[s]] - Tl[i]);
+            }
+            q *= tau;
+            il[i] = (C[i] > 0.0) ? q / C[i] : 0.0;
+            sq += q; sa += std::fabs(q);
+        }
+        pq[static_cast<size_t>(b)] = sq; pa[static_cast<size_t>(b)] = sa;
+    }
+    double worst = 0.0;
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        double a = 0.0, s = 0.0;
+        for (int64_t c = 0; c < nc; ++c) {
+            a += pq[static_cast<size_t>(l * nc + c)];
+            s += pa[static_cast<size_t>(l * nc + c)];
+        }
+        if (s > 0.0) worst = std::max(worst, std::fabs(a) / s);
+    }
+    return worst;
+}
+
+Network::Stats Network::implicitBE(double* T, double tau, double rel_tol) {
+    const Adjacency& adj = *adj_;
+    const int L = n_layers_;
+    const int64_t nf = nf_, nc = nc_, nb = static_cast<int64_t>(L) * nc;
+    auto U = [](int64_t v) { return static_cast<size_t>(v); };
+    Stats st;
+    // Per-layer cap from Fo (== maxFourier + iterationCap, evaluated per layer).
+    std::vector<int> cap(U(L));
+    std::vector<double> fo(U(L), 0.0);
+    for (int l = 0; l < L; ++l) {
+        const double* G = G_.data() + 3 * static_cast<int64_t>(l) * nf;
+        const double* C = C_.data() + static_cast<int64_t>(l) * nf;
+        double f = 0.0;
+        for (int64_t i = 0; i < nf; ++i) {
+            if (!(C[i] > 0.0)) continue;
+            const double gs = G[3 * i] + G[3 * i + 1] + G[3 * i + 2];
+            f = std::max(f, tau * gs / C[i]);
+        }
+        fo[U(l)] = f;
+        cap[U(l)] = iterationCap(f);
+        st.fo_max = std::max(st.fo_max, f);
+    }
+    // Setup: rhs = C T, x0 = T, diag = C + tau sum G.
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t l = b / nc, c = b % nc, o = l * nf;
+        const double* G = G_.data() + 3 * o;
+        const double* C = C_.data() + o;
+        const double* Tl = T + o;
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int64_t i = lo; i < hi; ++i) {
+            rhs_[U(o + i)] = C[i] * Tl[i];
+            x_[U(o + i)] = Tl[i];
+            double gs = 0.0;
+            for (int e = 0; e < 3; ++e) gs += G[3 * i + e];
+            diag_[U(o + i)] = C[i] + tau * gs;
+        }
+    }
+    // Ap = A x0, r = rhs - Ap; chunk partials of dot(rhs, rhs) and dot(r, r).
+    std::vector<double> pb(U(nb), 0.0);
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t l = b / nc, c = b % nc, o = l * nf;
+        const double* G = G_.data() + 3 * o;
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int64_t i = lo; i < hi; ++i) {   // == applyA, then r = rhs - Ap
+            double acc = diag_[U(o + i)] * x_[U(o + i)];
+            for (int e = 0; e < 3; ++e) {
+                const int64_t s = 3 * i + e;
+                if (G[s] != 0.0) acc -= tau * G[s] * x_[U(o + adj.nbr[s])];
+            }
+            Ap_[U(o + i)] = acc;
+            r_[U(o + i)] = rhs_[U(o + i)] - acc;
+        }
+        double sb = 0.0, sr = 0.0;
+        for (int64_t i = lo; i < hi; ++i) sb += rhs_[U(o + i)] * rhs_[U(o + i)];
+        for (int64_t i = lo; i < hi; ++i) sr += r_[U(o + i)] * r_[U(o + i)];
+        pb[U(b)] = sb;
+        part_[U(b)] = sr;
+    }
+    auto layerSum = [&](const std::vector<double>& p, int l) {
+        double s = 0.0;
+        for (int64_t c = 0; c < nc; ++c) s += p[U(l * nc + c)];
+        return s;
+    };
+    std::vector<double> denom(U(L)), rnorm(U(L)), rz(U(L), 0.0), alpha(U(L), 0.0), beta(U(L), 0.0);
+    std::vector<int> it(U(L), 0);
+    std::vector<uint8_t> run(U(L), 0);   // layer still iterating
+    int n_run = 0;
+    for (int l = 0; l < L; ++l) {
+        const double bnorm = std::sqrt(layerSum(pb, l));
+        denom[U(l)] = (bnorm > 0.0) ? bnorm : 1.0;
+        rnorm[U(l)] = std::sqrt(layerSum(part_, l));
+        if (rnorm[U(l)] / denom[U(l)] > rel_tol) { run[U(l)] = 1; it[U(l)] = 1; ++n_run; }
+    }
+    // z = r / diag (and p = z on the first pass), chunk partials of dot(r, z); running layers only.
+    auto zStep = [&](bool set_p) {
+        #pragma omp parallel for num_threads(nt_) schedule(static)
+        for (int64_t b = 0; b < nb; ++b) {
+            const int64_t l = b / nc, c = b % nc, o = l * nf;
+            if (!run[U(l)]) continue;
+            const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+            for (int64_t i = lo; i < hi; ++i) {
+                z_[U(o + i)] = (diag_[U(o + i)] > 0.0) ? r_[U(o + i)] / diag_[U(o + i)] : 0.0;
+                if (set_p) p_[U(o + i)] = z_[U(o + i)];
+            }
+            double s = 0.0;
+            for (int64_t i = lo; i < hi; ++i) s += r_[U(o + i)] * z_[U(o + i)];
+            part_[U(b)] = s;
+        }
+    };
+    if (n_run) {
+        zStep(true);
+        for (int l = 0; l < L; ++l) if (run[U(l)]) rz[U(l)] = layerSum(part_, l);
+    }
+    while (n_run > 0) {
+        // Ap = A p and chunk partials of dot(p, Ap)
+        #pragma omp parallel for num_threads(nt_) schedule(static)
+        for (int64_t b = 0; b < nb; ++b) {
+            const int64_t l = b / nc, c = b % nc, o = l * nf;
+            if (!run[U(l)]) continue;
+            const double* G = G_.data() + 3 * o;
+            const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+            for (int64_t i = lo; i < hi; ++i) {
+                double acc = diag_[U(o + i)] * p_[U(o + i)];
+                for (int e = 0; e < 3; ++e) {
+                    const int64_t s = 3 * i + e;
+                    if (G[s] != 0.0) acc -= tau * G[s] * p_[U(o + adj.nbr[s])];
+                }
+                Ap_[U(o + i)] = acc;
+            }
+            double s = 0.0;
+            for (int64_t i = lo; i < hi; ++i) s += p_[U(o + i)] * Ap_[U(o + i)];
+            part_[U(b)] = s;
+        }
+        for (int l = 0; l < L; ++l) {
+            if (!run[U(l)]) continue;
+            const double pAp = layerSum(part_, l);
+            if (!(pAp > 0.0)) { run[U(l)] = 0; --n_run; continue; }   // CG breakdown (reported below)
+            alpha[U(l)] = rz[U(l)] / pAp;
+        }
+        if (n_run == 0) break;
+        // x += alpha p, r -= alpha Ap, chunk partials of dot(r, r)
+        #pragma omp parallel for num_threads(nt_) schedule(static)
+        for (int64_t b = 0; b < nb; ++b) {
+            const int64_t l = b / nc, c = b % nc, o = l * nf;
+            if (!run[U(l)]) continue;
+            const double a = alpha[U(l)];
+            const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+            for (int64_t i = lo; i < hi; ++i) { x_[U(o + i)] += a * p_[U(o + i)]; r_[U(o + i)] -= a * Ap_[U(o + i)]; }
+            double s = 0.0;
+            for (int64_t i = lo; i < hi; ++i) s += r_[U(o + i)] * r_[U(o + i)];
+            part_[U(b)] = s;
+        }
+        for (int l = 0; l < L; ++l) {
+            if (!run[U(l)]) continue;
+            rnorm[U(l)] = std::sqrt(layerSum(part_, l));
+            if (rnorm[U(l)] / denom[U(l)] <= rel_tol) { run[U(l)] = 0; --n_run; }
+        }
+        if (n_run == 0) break;
+        zStep(false);
+        for (int l = 0; l < L; ++l) {
+            if (!run[U(l)]) continue;
+            const double rz_new = layerSum(part_, l);
+            beta[U(l)] = rz_new / rz[U(l)];
+            rz[U(l)] = rz_new;
+        }
+        #pragma omp parallel for num_threads(nt_) schedule(static)
+        for (int64_t b = 0; b < nb; ++b) {
+            const int64_t l = b / nc, c = b % nc, o = l * nf;
+            if (!run[U(l)]) continue;
+            const double bt = beta[U(l)];
+            const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+            for (int64_t i = lo; i < hi; ++i) p_[U(o + i)] = z_[U(o + i)] + bt * p_[U(o + i)];
+        }
+        for (int l = 0; l < L; ++l) {   // == the for (it = 1; it <= max_iter; ++it) loop + clamp
+            if (!run[U(l)]) continue;
+            if (++it[U(l)] > cap[U(l)]) { it[U(l)] = cap[U(l)]; run[U(l)] = 0; --n_run; }
+        }
+    }
+    for (int l = 0; l < L; ++l) {
+        st.iterations += it[U(l)];
+        const double rr = rnorm[U(l)] / denom[U(l)];
+        if (!(rr <= rel_tol) && !st.capped) {   // cap OR CG breakdown: report the first such layer
+            st.capped = true;
+            st.capped_layer = l;
+            st.cap = cap[U(l)];
+            st.capped_iterations = it[U(l)];
+            st.capped_rel_residual = rr;
+            st.capped_fo = fo[U(l)];
+            double worst = -1.0;
+            const int64_t o = static_cast<int64_t>(l) * nf;
+            for (int64_t i = 0; i < nf; ++i)
+                if (std::fabs(r_[U(o + i)]) > worst) { worst = std::fabs(r_[U(o + i)]); st.worst_face = i; }
+        }
+    }
+    if (st.capped) return st;   // nothing applied to any layer (see backwardEulerStep)
+    // T += Q / C with Q = -tau sum_j G_ij (x_i - x_j)  (== fluxForm + the BE update)
+    std::vector<double> pq(U(nb), 0.0), pa(U(nb), 0.0);
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t b = 0; b < nb; ++b) {
+        const int64_t l = b / nc, c = b % nc, o = l * nf;
+        const double* G = G_.data() + 3 * o;
+        const double* C = C_.data() + o;
+        double* Tl = T + o;
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        double sq = 0.0, sa = 0.0;
+        for (int64_t i = lo; i < hi; ++i) {
+            double q = 0.0;
+            for (int e = 0; e < 3; ++e) {
+                const int64_t s = 3 * i + e;
+                if (G[s] != 0.0) q -= tau * G[s] * (x_[U(o + i)] - x_[U(o + adj.nbr[s])]);
+            }
+            sq += q; sa += std::fabs(q);
+            if (C[i] > 0.0) Tl[i] = Tl[i] + q / C[i];
+        }
+        pq[U(b)] = sq; pa[U(b)] = sa;
+    }
+    for (int l = 0; l < L; ++l) {
+        double a = 0.0, s = 0.0;
+        for (int64_t c = 0; c < nc; ++c) { a += pq[U(l * nc + c)]; s += pa[U(l * nc + c)]; }
+        if (s > 0.0) st.closure_worst = std::max(st.closure_worst, std::fabs(a) / s);
+    }
+    return st;
 }
 
 }  // namespace lateral

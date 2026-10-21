@@ -8727,8 +8727,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         ptm::lateral::Adjacency lat_adj;
         std::vector<uint8_t> lat_act;
         std::vector<double> lat_h, LT, LK, LRC, LSRC;
-        ptm::lateral::Workspace lat_ws;
-        ptm::lateral::SolverOptions lat_opt;
+        ptm::lateral::Network lat_net;         // fused: every node layer per parallel region
         std::vector<int> lat_iters;            // PCG iterations per substep (all layers)
         double lat_fo_max = 0.0, lat_closure_worst = 0.0, lat_expl_closure_worst = 0.0;
         long long lat_below_geo = 0;
@@ -8805,10 +8804,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                 lat_h[l - 1] = 0.5 * (ref_profile.z()[l + 1] - ref_profile.z()[l - 1]);
             LT.assign(static_cast<size_t>(n_int) * n_faces, 0.0);
             LK = LT; LRC = LT; LSRC = LT;
-            lat_opt.scheme = ptm::lateral::Scheme::BackwardEuler;   // balanced split: BE correction (Fermi)
-            lat_opt.rel_tol = g_lateral.cg_rel_tol;
         }
         const uint8_t* lat_act_p = lat_act.empty() ? nullptr : lat_act.data();
+        // Balanced split: BE correction (Fermi addendum 2), all layers fused (Network).
+        if (lat_on) lat_net.init(&lat_adj, lat_act_p, lat_h, n_threads_to);
         // No active edge anywhere: the network is empty, so every lateral stage would be an exact
         // no-op (zero increment, zero correction). Skip it, and say so.
         bool lat_stages = lat_on;
@@ -8858,6 +8857,31 @@ bool runThermalModelsForAllFacesBatchSoA(
                 g_spinup_census->add(thermal::eqEstimateSpinup(ein), dark);
             }
         };
+        // Substep-start state of every capacitive node (T, k(T), rho c(T)): for the first substep
+        // here; afterwards the scatter loop of the previous substep refreshes it (same values: it
+        // runs the same material update on the same saved state).
+        auto latGatherStart = [&](const thermal::ThermalBatchSoA& batch, const TimeOuterBatch& tb) {
+            for (int l = 1; l <= n_layers - 2; ++l) {
+                const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                for (int f = 0; f < tb.faces_in_batch; ++f) {
+                    LT [row + f] = batch.T  [l * BS + f];
+                    LK [row + f] = batch.k  [l * BS + f];
+                    LRC[row + f] = batch.rho[l * BS + f] * batch.cp[l * BS + f];
+                }
+            }
+        };
+        if (lat_stages) {
+            #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+            for (size_t bi = 0; bi < n_batches; ++bi) {
+                const TimeOuterBatch& tb = to_batches[bi];
+                if (!tb.active) continue;
+                thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                batch.n_faces = tb.faces_in_batch;
+                timeOuterLoad(batch, n_layers, tb.state.data());
+                thermal::updateMaterialPropertiesBatchSIMD(batch);
+                latGatherStart(batch, tb);
+            }
+        }
         for (int t = t_lo; t < total_time_steps - 1; ++t) {
             const double dt_output = times[t + 1] - times[t];
             const int n_sub = std::max(1,
@@ -8867,33 +8891,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const double alpha = (s + 0.5) / static_cast<double>(n_sub);
                 const double one_m = 1.0 - alpha;
                 if (lat_stages) {
-                    // (1) substep-start state of every capacitive node: T, k(T), rho c(T)
-                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
-                    for (size_t bi = 0; bi < n_batches; ++bi) {
-                        const TimeOuterBatch& tb = to_batches[bi];
-                        if (!tb.active) continue;
-                        thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
-                        batch.n_faces = tb.faces_in_batch;
-                        timeOuterLoad(batch, n_layers, tb.state.data());
-                        thermal::updateMaterialPropertiesBatchSIMD(batch);
-                        for (int l = 1; l <= n_layers - 2; ++l) {
-                            const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
-                            for (int f = 0; f < tb.faces_in_batch; ++f) {
-                                LT [row + f] = batch.T  [l * BS + f];
-                                LK [row + f] = batch.k  [l * BS + f];
-                                LRC[row + f] = batch.rho[l * BS + f] * batch.cp[l * BS + f];
-                            }
-                        }
-                    }
-                    // (2) explicit lateral increment over the substep, per node layer
-                    for (int li = 0; li < n_int; ++li) {
-                        const size_t row = static_cast<size_t>(li) * n_faces;
-                        ptm::lateral::assembleConductance(lat_adj, lat_act_p, &LK[row], lat_h[li], lat_ws.G);
-                        double sq = 0.0, sa = 0.0;
-                        ptm::lateral::explicitIncrement(lat_adj, lat_ws.G, &LT[row], &LRC[row], lat_h[li], dt_sub,
-                                                        &LSRC[row], &sq, &sa);
-                        if (sa > 0.0) lat_expl_closure_worst = std::max(lat_expl_closure_worst, std::fabs(sq) / sa);
-                    }
+                    // (1) substep-start state T, k(T), rho c(T) of every capacitive node is already in
+                    //     LT/LK/LRC (prologue, or the previous substep's scatter loop).
+                    // (2) conductances + capacities at that state, and the explicit lateral increment.
+                    lat_net.assemble(LK.data(), LRC.data());
+                    lat_expl_closure_worst = std::max(lat_expl_closure_worst,
+                                                      lat_net.explicitIncrement(LT.data(), dt_sub, LSRC.data()));
                 }
                 #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
                 for (size_t bi = 0; bi < n_batches; ++bi) {
@@ -8930,48 +8933,33 @@ bool runThermalModelsForAllFacesBatchSoA(
                     if (!tb.census_scored) {
                         if (g_spinup_census) { scoreCensusTO(batch, tb, flux_base, flux_stride); tb.census_scored = true; }
                     }
+                    if (lat_stages) {   // (3a) BE right-hand side T* - inc (C applied by the network)
+                        for (int l = 1; l <= n_layers - 2; ++l) {
+                            const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                            for (int f = 0; f < faces_in_batch; ++f)
+                                LT[row + f] = batch.T[l * BS + f] - LSRC[row + f];
+                        }
+                    }
                     timeOuterSave(batch, n_layers, tb.state.data());
                 }
                 if (lat_stages) {
-                    // (3) remove the explicit increment and take the implicit BE lateral correction:
+                    // (3) remove the explicit increment (done in the vertical loop, 3a) and take the
+                    //     implicit BE lateral correction on every layer:
                     //     (C + tau L) T^{n+1} = C (T* - inc) with C, L at the substep-start state.
-                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
-                    for (size_t bi = 0; bi < n_batches; ++bi) {
-                        const TimeOuterBatch& tb = to_batches[bi];
-                        if (!tb.active) continue;
-                        for (int l = 1; l <= n_layers - 2; ++l) {
-                            const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
-                            for (int f = 0; f < tb.faces_in_batch; ++f)
-                                LT[row + f] = tb.state[static_cast<size_t>(l) * BS + f] - LSRC[row + f];
-                        }
+                    const ptm::lateral::Network::Stats st = lat_net.implicitBE(LT.data(), dt_sub, g_lateral.cg_rel_tol);
+                    lat_fo_max = std::max(lat_fo_max, st.fo_max);
+                    if (st.capped) {
+                        std::cerr << "\n[lateral] FATAL: lateral PCG did not converge -- output step " << t
+                                  << ", substep " << s << ", node layer " << (st.capped_layer + 1) << " (z = "
+                                  << ref_profile.z()[st.capped_layer + 1] << " m): " << st.capped_iterations
+                                  << " iterations (cap " << st.cap << "), relative residual "
+                                  << st.capped_rel_residual << " > " << g_lateral.cg_rel_tol << ", worst face "
+                                  << st.worst_face << ", Fo_max " << st.capped_fo
+                                  << ". An unconverged lateral step is never applied." << std::endl;
+                        return false;
                     }
-                    int iters_sub = 0;
-                    for (int li = 0; li < n_int; ++li) {
-                        const size_t row = static_cast<size_t>(li) * n_faces;
-                        lat_opt.max_iter = 1 << 30;   // set from Fo_max below, after the conductances exist
-                        ptm::lateral::assembleConductance(lat_adj, lat_act_p, &LK[row], lat_h[li], lat_ws.G);
-                        std::vector<double> Cl(n_faces);
-                        for (size_t gf = 0; gf < n_faces; ++gf) Cl[gf] = LRC[row + gf] * lat_adj.area[gf] * lat_h[li];
-                        const double fo = ptm::lateral::maxFourier(lat_adj, lat_ws.G, Cl, dt_sub);
-                        lat_fo_max = std::max(lat_fo_max, fo);
-                        lat_opt.max_iter = ptm::lateral::iterationCap(fo);
-                        const ptm::lateral::StepStats st = ptm::lateral::backwardEulerStep(
-                            lat_adj, lat_act_p, &LT[row], &LK[row], &LRC[row], lat_h[li], dt_sub, lat_opt, lat_ws);
-                        if (st.capped) {
-                            std::cerr << "\n[lateral] FATAL: lateral PCG did not converge -- output step " << t
-                                      << ", substep " << s << ", node layer " << (li + 1) << " (z = "
-                                      << ref_profile.z()[li + 1] << " m): " << st.iterations << " iterations (cap "
-                                      << lat_opt.max_iter << "), relative residual " << st.rel_residual
-                                      << " > " << lat_opt.rel_tol << ", worst face " << st.worst_face
-                                      << ", Fo_max " << st.Fo_max << ". An unconverged lateral step is never applied."
-                                      << std::endl;
-                            return false;
-                        }
-                        iters_sub += st.iterations;
-                        if (st.sum_abs_Q > 0.0)
-                            lat_closure_worst = std::max(lat_closure_worst, std::fabs(st.sum_Q) / st.sum_abs_Q);
-                    }
-                    lat_iters.push_back(iters_sub);
+                    lat_closure_worst = std::max(lat_closure_worst, st.closure_worst);
+                    lat_iters.push_back(st.iterations);
                     // (4) scatter, then re-apply the bottom BC (the bottom node is algebraic)
                     std::atomic<long long> below{0};
                     #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
@@ -8995,6 +8983,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                         if (nb) below.fetch_add(nb, std::memory_order_relaxed);
                         timeOuterSave(batch, n_layers, tb.state.data());
+                        // Next substep's start state, from exactly the state just saved (the material
+                        // update is NOT saved: the saved k/cp rows stay what the outputs read).
+                        thermal::updateMaterialPropertiesBatchSIMD(batch);
+                        latGatherStart(batch, tb);
                     }
                     lat_below_geo += below.load();
                 }

@@ -384,6 +384,19 @@ set_target_properties(test_lateral_g10prime
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# C1c lateral conduction: the fused all-layer Network (thread invariance, equivalence to the
+# single-layer path, capped-solve refusal). Links libthermal = the engine's own object code.
+add_executable(test_lateral_network
+    test_lateral_network.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh/lateral_adjacency.cpp
+)
+target_include_directories(test_lateral_network PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+target_link_libraries(test_lateral_network PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+set_target_properties(test_lateral_network
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 add_executable(test_state_io test_state_io.cpp)
 target_link_libraries(test_state_io
     PRIVATE
