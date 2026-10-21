@@ -44,6 +44,7 @@
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -290,7 +291,47 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
     const double t_spin = envD("G10P_EFOLDS", 30.0) / rate;
     const int steps_per_period = ((cs.harm == 0) ? 360 : 360 / cs.harm) * dtdiv;
     const int n_periods = std::max(3, static_cast<int>(std::ceil(t_spin / (steps_per_period * dt)))) + 2;
-    const long n_steps = static_cast<long>(n_periods) * steps_per_period;
+    // G10P_ENGINE_DUMP=<dir> (G10'-engine): run G10P_ENGINE_STEPS output steps from the uniform T0 start, with
+    // no spin-up, and write what ptm_thermal_sim needs to run the SAME case (chain.ply, flux.bin) plus this
+    // harness's surface series and final column for the comparison.
+    const char* dump_dir = std::getenv("G10P_ENGINE_DUMP");
+    const long n_steps = dump_dir ? std::max(1, envInt("G10P_ENGINE_STEPS", 360))
+                                  : static_cast<long>(n_periods) * steps_per_period;
+    std::vector<double> dump_surf;
+    if (dump_dir) {
+        const std::string d(dump_dir);
+        // chain.ply: the chain's vertices and faces, %.17g (the engine rebuilds the adjacency from them)
+        {
+            FILE* f = std::fopen((d + "/chain.ply").c_str(), "w");
+            if (!f) { std::fprintf(stderr, "FATAL: cannot write %s/chain.ply\n", d.c_str()); std::exit(2); }
+            const int ncols = N / 2, nv = 2 * (ncols + 1);
+            const double a = cs.Lambda / N, hy = a * std::sqrt(3.0) / 2.0;
+            std::fprintf(f, "ply\nformat ascii 1.0\nelement vertex %d\nproperty double x\nproperty double y\n"
+                            "property double z\nelement face %d\nproperty list uchar int vertex_indices\nend_header\n", nv, N);
+            for (int r = 0; r <= 1; ++r)
+                for (int c = 0; c <= ncols; ++c) std::fprintf(f, "%.17g %.17g %.17g\n", c * a + (r ? 0.5 * a : 0.0), r * hy, 0.0);
+            auto id = [&](int r, int c) { return r * (ncols + 1) + c; };
+            for (int c = 0; c < ncols; ++c) {
+                std::fprintf(f, "3 %d %d %d\n", id(0, c), id(0, c + 1), id(1, c));
+                std::fprintf(f, "3 %d %d %d\n", id(0, c + 1), id(1, c + 1), id(1, c));
+            }
+            std::fclose(f);
+        }
+        // flux.bin (PTMFLXR1): flux_at(t_k) for k = 0..n_steps (the engine's total_time_steps = n_steps + 1 frames)
+        {
+            std::ofstream o(d + "/flux.bin", std::ios::binary);
+            const uint64_t ns = static_cast<uint64_t>(n_steps) + 1, nf = static_cast<uint64_t>(N);
+            o.write("PTMFLXR1", 8);
+            o.write(reinterpret_cast<const char*>(&ns), 8);
+            o.write(reinterpret_cast<const char*>(&nf), 8);
+            for (uint64_t k = 0; k < ns; ++k)
+                for (int j = 0; j < N; ++j) { const double v = Fbar + amp * 0.5 * ch.x[j] * ((cs.harm == 0) ? 1.0 : std::sin(omega * k * dt)); o.write(reinterpret_cast<const char*>(&v), 8); }
+        }
+        for (int j = 0; j < N; ++j)
+            dump_surf.push_back(thermal::outputSurfaceTempBatch(batches[j / BS], j % BS, Fbar + amp * 0.5 * ch.x[j] * ((cs.harm == 0) ? 1.0 : 0.0)));
+        std::printf("G10'-engine dump: T0=%g L=%g mm n=%d amp=%g F_bar, %ld steps, dt=%.9g s, n_sub=%d -> %s\n",
+                    cs.T0, 1e3 * cs.Lambda, cs.harm, amp / Fbar, n_steps, dt, n_sub, dump_dir);
+    }
     std::vector<double> qs(steps_per_period), q3(steps_per_period), qs_prev(steps_per_period);
     std::vector<double> flA(N), flB(N);
     for (long s = 0; s < n_steps; ++s) {
@@ -312,6 +353,8 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
             }
             lateralHalf(0.5 * dt);
         }
+        if (dump_dir)
+            for (int j = 0; j < N; ++j) dump_surf.push_back(thermal::outputSurfaceTempBatch(batches[j / BS], j % BS, flux_at(t1, j)));
         // q-mode projections at t1: surface (forcing-epoch re-evaluation, as the driver outputs) and node 3
         double ps = 0.0, p3 = 0.0, xx = 0.0;
         for (int j = 0; j < N; ++j) {
@@ -324,6 +367,17 @@ static Arm runArm(const Case& cs, Split split, bool lat_on) {
         const long k = (s + 1) % steps_per_period;
         if (s + 1 >= n_steps - 2L * steps_per_period && s + 1 < n_steps - steps_per_period) qs_prev[k] = ps / xx;
         if (s + 1 >= n_steps - steps_per_period) { qs[k] = ps / xx; q3[k] = p3 / xx; }
+    }
+    if (dump_dir) {
+        const std::string d(dump_dir);
+        std::ofstream o(d + "/harness_surface.bin", std::ios::binary);   // float64 [n_steps + 1][N]
+        o.write(reinterpret_cast<const char*>(dump_surf.data()), static_cast<std::streamsize>(dump_surf.size() * 8));
+        std::ofstream o2(d + "/harness_final.bin", std::ios::binary);    // float64 [n_layers][N]
+        for (int l = 0; l < nl; ++l)
+            for (int j = 0; j < N; ++j) { const double v = batches[j / BS].T[l * BS + j % BS]; o2.write(reinterpret_cast<const char*>(&v), 8); }
+        o.close(); o2.close();   // std::exit skips the destructors: flush explicitly
+        if (!o || !o2) { std::fprintf(stderr, "FATAL: could not write the dump files in %s\n", d.c_str()); std::exit(2); }
+        std::exit(0);
     }
     cd Xs = 0.0, X3 = 0.0, Xp = 0.0;
     for (int k = 0; k < steps_per_period; ++k) {

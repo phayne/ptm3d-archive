@@ -6672,6 +6672,78 @@ struct TimeOuterBatch {
     std::vector<double> state;
 };
 
+// ---- PTM_FLUX_REPLAY (diagnostic; C1c gates G9 and G10'-engine) --------------------------------
+// PTM_FLUX_REPLAY=<file> REPLACES the composed absorbed flux of the CPU SIMD array path on every face
+// and every step with the file's values, so an independent solver (C1b) and the engine see the SAME
+// forcing. Format: 8-byte magic "PTMFLXR1", uint64 n_steps, uint64 n_faces, then float64
+// [n_steps][n_faces] absorbed flux, W/m^2, timestep-major. n_steps must equal the run's
+// total_time_steps, unless PTM_FLUX_REPLAY_PERIODIC=1, which reads step t from row t % n_steps and
+// REQUIRES a uniform time grid. Refused (FATAL) in main with radiation ON, the GPU, or the scalar path,
+// and here with streamed flux: replayed forcing must never be mixed silently with composed forcing.
+static const char* fluxReplayPath() {
+    static const char* p = [] { const char* e = std::getenv("PTM_FLUX_REPLAY"); return (e && *e) ? e : nullptr; }();
+    return p;
+}
+static bool loadFluxReplay(const char* path, size_t n_faces, int total_time_steps,
+                           const std::vector<double>& times, std::vector<double>& col_major) {
+    std::ifstream in(path, std::ios::binary);
+    char magic[8] = {0};
+    uint64_t ns = 0, nf = 0;
+    if (!in.read(magic, 8) || std::string(magic, 8) != "PTMFLXR1" ||
+        !in.read(reinterpret_cast<char*>(&ns), 8) || !in.read(reinterpret_cast<char*>(&nf), 8)) {
+        std::cerr << "[flux-replay] FATAL: " << path << " is not a PTMFLXR1 file." << std::endl;
+        return false;
+    }
+    if (nf != n_faces) {
+        std::cerr << "[flux-replay] FATAL: " << path << " has " << nf << " faces; the mesh has " << n_faces
+                  << "." << std::endl;
+        return false;
+    }
+    const char* pe = std::getenv("PTM_FLUX_REPLAY_PERIODIC");
+    const bool periodic = pe && pe[0] == '1';
+    if (ns == 0 || (!periodic && ns != static_cast<uint64_t>(total_time_steps))) {
+        std::cerr << "[flux-replay] FATAL: " << path << " has " << ns << " steps; the run has " << total_time_steps
+                  << " (set PTM_FLUX_REPLAY_PERIODIC=1 to tile a period on a UNIFORM grid)." << std::endl;
+        return false;
+    }
+    if (periodic && total_time_steps > 1) {
+        const double dt0 = times[1] - times[0];
+        for (int t = 1; t + 1 < total_time_steps; ++t)
+            if (std::fabs((times[t + 1] - times[t]) - dt0) > 1e-9 * std::fabs(dt0)) {
+                std::cerr << "[flux-replay] FATAL: PTM_FLUX_REPLAY_PERIODIC needs a uniform time grid; step " << t
+                          << " has dt " << (times[t + 1] - times[t]) << " s vs " << dt0
+                          << " s (equilibration steps on their own cadence?). Refusing." << std::endl;
+                return false;
+            }
+    }
+    std::vector<double> buf(static_cast<size_t>(ns) * nf);
+    if (!in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * sizeof(double)))) {
+        std::cerr << "[flux-replay] FATAL: " << path << " is truncated." << std::endl;
+        return false;
+    }
+    double mn = 1e300, mx = -1e300;
+    for (double v : buf) {
+        if (!std::isfinite(v) || v < 0.0) {
+            std::cerr << "[flux-replay] FATAL: " << path << " holds a negative or non-finite flux (" << v << ")."
+                      << std::endl;
+            return false;
+        }
+        mn = std::min(mn, v); mx = std::max(mx, v);
+    }
+    col_major.assign(n_faces * static_cast<size_t>(total_time_steps), 0.0);
+    for (int t = 0; t < total_time_steps; ++t) {
+        const size_t r = static_cast<size_t>(t) % static_cast<size_t>(ns);
+        std::copy(buf.begin() + static_cast<std::ptrdiff_t>(r * nf), buf.begin() + static_cast<std::ptrdiff_t>((r + 1) * nf),
+                  col_major.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(t) * n_faces));
+    }
+    std::cerr << "[flux-replay] PTM_FLUX_REPLAY=" << path << ": the composed absorbed flux is REPLACED on all "
+              << n_faces << " faces x " << total_time_steps << " steps by the file's " << ns << " step(s)"
+              << (periodic ? " (tiled periodically)" : "") << "; range [" << mn << ", " << mx
+              << "] W/m^2. Diagnostic: illumination-derived outputs (albedo, flux maps) do NOT describe this forcing."
+              << std::endl;
+    return true;
+}
+
 static size_t timeOuterStateLen(int n_layers) {
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     return static_cast<size_t>(n_layers) * BS * 6 + BS * 4;
@@ -6881,6 +6953,11 @@ bool runThermalModelsForAllFacesBatchSoA(
     const int eq_hi_streamed = std::min(equilibration_steps, total_time_steps);
     bool add_eq_indirect_streamed = false;
 
+    if (streamed && fluxReplayPath()) {
+        std::cerr << "[flux-replay] FATAL: PTM_FLUX_REPLAY is implemented for the array flux path only; this "
+                     "run streams its flux. Refusing." << std::endl;
+        return false;
+    }
     if (streamed) {
         // Same composer, same inputs, same tag semantics as the array path's
         // internal one (calculateAbsorbedFlux builds this exact object). Built
@@ -6975,6 +7052,9 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
     }
     std::vector<double>().swap(absorbed_flux_rowmajor);
+    if (fluxReplayPath() &&
+        !loadFluxReplay(fluxReplayPath(), n_faces, total_time_steps, times, flux_column_major))
+        return false;
 
     // Deep radiation-coupling: add the per-face time-mean indirect flux to the
     // EQUILIBRATION-phase forcing only, i.e. absolute steps
@@ -19903,6 +19983,16 @@ int main(int argc, char** argv) {
                   << (g_lateral.activation_c > 0.0 ? "" : " (<= 0: every edge coupled)")
                   << "; PCG rel tol " << g_lateral.cg_rel_tol << " (unconverged = FATAL). Time-outer driver."
                   << std::endl;
+    }
+    if (fluxReplayPath()) {
+        if (sim_config.radiation.enabled || sim_config.thermal.use_gpu ||
+            !config.getPropertyBool("use_simd_batch", true)) {
+            std::cerr << "[flux-replay] FATAL: PTM_FLUX_REPLAY needs radiation OFF (the coupling would add indirect "
+                         "flux on top of the replayed forcing), the CPU thermal path (thermal.use_gpu: false) and the "
+                         "SIMD batch solver. Refusing." << std::endl;
+            return 1;
+        }
+        std::cerr << "[flux-replay] armed: " << fluxReplayPath() << " (diagnostic; see the loader)." << std::endl;
     }
     if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled) {
         // Never silent (make-silence-impossible): with radiation off there is no
