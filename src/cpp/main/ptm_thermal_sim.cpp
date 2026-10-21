@@ -7102,6 +7102,27 @@ static const IndirectSeriesFile& warmStartSeries(size_t n_faces, int t_lo, int t
     return w;
 }
 
+// R-CLAMP-1 (Fermi addendum 5) clamp report, split by layer, with his bars:
+//   surface: deficit max <= 0.01 K (no mean bar: the bottom-BC k mismatch parks dark surfaces ~6 mK below T_geo);
+//   capacitive: per-face injected power (run average) <= 1e-3 Qb and per-event deficit <= 0.01 K;
+//   bottom: per-event deficit <= 0.01 K.
+static std::string clampSummary(const long long lc[3], const double ldsum[3], const double ldmax[3],
+                                const std::vector<double>& eface, double span_s, double qb) {
+    std::ostringstream m;
+    m << std::setprecision(3) << std::scientific;
+    const char* nm[3] = {"surface", "capacitive", "bottom"};
+    double pmax = 0.0;
+    for (double e : eface) pmax = std::max(pmax, e);
+    if (span_s > 0.0) pmax /= span_s;   // W m^-2, run-average injected power of the worst face
+    bool ok = ldmax[0] <= 0.01 && ldmax[1] <= 0.01 && ldmax[2] <= 0.01 && pmax <= 1e-3 * qb;
+    m << "; R-CLAMP-1 by layer:";
+    for (int g = 0; g < 3; ++g)
+        m << " " << nm[g] << " count " << lc[g] << " deficit sum " << ldsum[g] << " K max " << ldmax[g] << " K;";
+    m << " capacitive injected power, worst face (run average) " << pmax << " W m^-2 (bar 1e-3 Qb = " << 1e-3 * qb
+      << ") [" << (ok ? "R-CLAMP-1 pass" : "R-CLAMP-1 FAIL: investigate") << "]";
+    return m.str();
+}
+
 // thermal.rethermal_all_faces (C1c companion; lateral ON implies it). Set in main.
 static bool g_rethermal_all_faces = false;
 
@@ -9176,6 +9197,9 @@ bool runThermalModelsForAllFacesBatchSoA(
         ptm::lateral::Network lat_net;         // fused: every node layer per parallel region
         std::vector<double> LA, LB, LCc, LD;   // monolithic: the interior CN rows of every column
         long long lat_floor_clamps = 0;        // monolithic: node-steps the geothermal floor raised
+        long long lat_clamp_lc[3] = {0, 0, 0};             // by layer group: surface / capacitive / bottom
+        double lat_clamp_ldsum[3] = {0, 0, 0}, lat_clamp_ldmax[3] = {0, 0, 0};
+        std::vector<double> lat_clamp_eface;               // capacitive-clamp energy per face, J m^-2 (run)
         double lat_cn_wmax = 0.0;              // monolithic: max CN explicit weight (b - 1); CN monotone iff <= 1
         long long lat_cn_wover = 0;            // monolithic: node-steps with weight > 1 (Fermi addendum 4)
         std::vector<int> lat_iters;            // PCG iterations per substep (all layers)
@@ -9259,7 +9283,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 lat_h[l - 1] = 0.5 * (ref_profile.z()[l + 1] - ref_profile.z()[l - 1]);
             LT.assign(static_cast<size_t>(n_int) * n_faces, 0.0);
             LK = LT; LRC = LT; LSRC = LT;
-            if (g_lateral.monolithic) { LA = LT; LB = LT; LCc = LT; LD = LT; }
+            if (g_lateral.monolithic) { LA = LT; LB = LT; LCc = LT; LD = LT; lat_clamp_eface.assign(n_faces, 0.0); }
         }
         const uint8_t* lat_act_p = lat_act.empty() ? nullptr : lat_act.data();
         // Balanced split: BE correction (Fermi addendum 2), all layers fused (Network).
@@ -9486,6 +9510,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                         thermal::applyBottomBCBatch(batch);
                         long long nc = 0;   // geothermal-equilibrium floor, exactly as advanceTimestep
+                        // Fermi addendum 5 (R-CLAMP-1): split by layer -- 0 = surface (massless; output-only),
+                        // 1 = capacitive 1..N-2 (energy: rho c h x deficit per unit area), 2 = bottom (algebraic).
+                        long long lc[3] = {0, 0, 0};
+                        double ldsum[3] = {0, 0, 0}, ldmax[3] = {0, 0, 0};
                         for (int f = 0; f < batch.n_faces; ++f) {
                             const double qb = batch.Qb[f];
                             if (qb <= 0.0) continue;
@@ -9493,10 +9521,25 @@ bool runThermalModelsForAllFacesBatchSoA(
                             if (T_geo <= thermal::ABSOLUTE_ZERO_K) continue;
                             for (int layer = 0; layer < n_layers; ++layer) {
                                 double& Tlf = batch.T[layer * BS + f];
-                                if (Tlf < T_geo) { Tlf = T_geo; ++nc; }
+                                if (Tlf < T_geo) {
+                                    const double def = T_geo - Tlf;   // the clamp's deficit, K
+                                    const int g = (layer == 0) ? 0 : (layer == n_layers - 1 ? 2 : 1);
+                                    ++lc[g]; ldsum[g] += def; ldmax[g] = std::max(ldmax[g], def);
+                                    if (g == 1)   // injected energy per unit area, J m^-2, booked per face
+                                        lat_clamp_eface[tb.start_face + f] +=
+                                            batch.rho[layer * BS + f] * batch.cp[layer * BS + f] * lat_h[layer - 1] * def;
+                                    Tlf = T_geo; ++nc;
+                                }
                             }
                         }
-                        if (nc) clamps.fetch_add(nc, std::memory_order_relaxed);
+                        if (nc) {
+                            clamps.fetch_add(nc, std::memory_order_relaxed);
+                            #pragma omp critical(lat_clamp_stats)
+                            for (int g = 0; g < 3; ++g) {
+                                lat_clamp_lc[g] += lc[g]; lat_clamp_ldsum[g] += ldsum[g];
+                                lat_clamp_ldmax[g] = std::max(lat_clamp_ldmax[g], ldmax[g]);
+                            }
+                        }
                         if (!tb.census_scored && g_spinup_census) {
                             const double* flux_base = flux_column_major.data() + tb.start_face;
                             scoreCensusTO(batch, tb, flux_base, n_faces);
@@ -9716,7 +9759,8 @@ bool runThermalModelsForAllFacesBatchSoA(
               << (g_lateral.monolithic ? "; scheme MONOLITHIC (Picard passes " + std::to_string(g_lateral.picard) +
                                              "); node-steps raised by the geothermal floor: " +
                                              std::to_string(lat_floor_clamps) +
-                                             (lat_floor_clamps ? "  <-- NONZERO: energy creation, investigate (Fermi R-G15-1)" : "") +
+                                             clampSummary(lat_clamp_lc, lat_clamp_ldsum, lat_clamp_ldmax, lat_clamp_eface,
+                                                          (times.size() > 1 ? times.back() - times[t_lo] : 0.0), planet.Qb) +
                                              "; CN explicit weight max " + std::to_string(lat_cn_wmax) +
                                              ", node-steps with weight > 1 (CN non-monotone): " + std::to_string(lat_cn_wover)
                                        : std::string("; scheme balanced"));
