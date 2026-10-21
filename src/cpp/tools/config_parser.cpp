@@ -958,6 +958,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_select_safety = getWithDefault(rad, "coupling_select_safety", config.radiation.coupling_select_safety);
             config.radiation.coupling_mode = getWithDefault(rad, "coupling_mode", config.radiation.coupling_mode);
             config.radiation.coupling_select_dt = getWithDefault(rad, "coupling_select_dt", config.radiation.coupling_select_dt);
+            config.radiation.min_coupling_iterations = getWithDefault(rad, "min_coupling_iterations", config.radiation.min_coupling_iterations);
             config.radiation.anderson_acceleration = getWithDefault(rad, "anderson_acceleration", config.radiation.anderson_acceleration);
             config.radiation.anderson_depth        = getWithDefault(rad, "anderson_depth",        config.radiation.anderson_depth);
             config.radiation.anderson_tikhonov     = getWithDefault(rad, "anderson_tikhonov",     config.radiation.anderson_tikhonov);
@@ -1894,6 +1895,12 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             config.thermal.lateral_scheme != "monolithic") {
             std::cerr << "Error: thermal.lateral_scheme must be 'balanced' or 'monolithic'; got '"
                       << config.thermal.lateral_scheme << "'" << std::endl;
+            valid = false;
+        }
+        if (config.radiation.min_coupling_iterations < 0 ||
+            (config.radiation.min_coupling_iterations > config.radiation.max_coupling_iterations)) {
+            std::cerr << "Error: radiation.min_coupling_iterations must be in [0, max_coupling_iterations]; got "
+                      << config.radiation.min_coupling_iterations << std::endl;
             valid = false;
         }
         if (config.radiation.anderson_acceleration &&

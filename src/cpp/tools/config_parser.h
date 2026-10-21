@@ -810,6 +810,10 @@ struct SimulationConfig {
         // max |G(x) - x| / (4 eps sigma T^3) < coupling_temp_threshold AND one following PLAIN sweep moves
         // no surface temperature by more than coupling_temp_threshold (the quoted number).
         // m = 0 runs the Anderson bookkeeping with the legacy mixing and legacy stopping (byte-identity gate).
+        // Minimum coupling sweeps before the max-temperature exit may fire (Fermi addendum 6: a warm-started run needs
+        // >= 2 post-seed changes, i.e. >= 3 logged, so its contraction rate can be estimated without the cold-referenced
+        // change 1). 0 = no minimum (default; byte-identical).
+        int    min_coupling_iterations = 0;
         bool   anderson_acceleration = false;
         int    anderson_depth        = 4;
         double anderson_tikhonov     = 1e-10;

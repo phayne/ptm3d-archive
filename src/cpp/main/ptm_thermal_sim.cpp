@@ -25745,12 +25745,20 @@ int main(int argc, char** argv) {
                                       << " K)" << std::endl;
                             coupling_loop_done = true;
                         }
+                        // radiation.min_coupling_iterations (Fermi addendum 6): no exit before that many sweeps.
+                        if (coupling_loop_done && iter + 1 < sim_config.radiation.min_coupling_iterations) {
+                            std::cout << "  [min-sweeps] converged at sweep " << (iter + 1) << " but radiation.min_coupling_iterations = "
+                                      << sim_config.radiation.min_coupling_iterations << ": continuing (the tail must hold >= 2 "
+                                         "post-seed changes for the contraction-rate bound)." << std::endl;
+                            coupling_loop_done = false;
+                        }
                         // PTM-89: the face-fraction exit has NO error bound -- it
                         // stops while up to coupling_face_fraction of the mesh is
                         // still moving by an arbitrary amount, and the count is a
                         // max over the window, so a short window reaches it first.
                         // Retained only under coupling_mode: legacy.
                         if (!coupling_loop_done && rad_coupling_legacy_mode && !aa_steer
+                                && iter + 1 >= sim_config.radiation.min_coupling_iterations
                                 && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
