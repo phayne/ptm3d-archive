@@ -11,6 +11,7 @@
 //   N3  the PCG iteration counts agree with the single-layer path (same iterations per layer).
 //   N4  a capped solve (rel_tol < 0, unreachable) is reported and applies NOTHING to any layer.
 //   N5  closure: per step |sum C dT| / sum |C dT| <= 1e-12 on every layer.
+//   N6  implicitCoupled on a zero-area face with every edge inactive: no cap, == the exact column solve.
 // Mesh: skewed lattice with > 1 chunk per layer (so chunk boundaries are exercised).
 #include <algorithm>
 #include <chrono>
@@ -170,6 +171,55 @@ int main() {
                     st.capped, st.capped_layer, st.capped_iterations, st.cap, st.capped_rel_residual,
                     (long long)st.worst_face, T == T0 ? "yes" : "NO");
         CHECK(st.capped && T == T0, "a capped Network solve was applied (or not reported)");
+    }
+    // N6 implicitCoupled with a ZERO-AREA face and every edge inactive (the zero-coupling companion on a mesh
+    // with a degenerate triangle): must not cap, and must equal the exact per-column tridiagonal solve.
+    {
+        Mesh m2 = lattice(6, 6, 2.5e-3, 0.0, 1);
+        const int64_t nv0 = static_cast<int64_t>(m2.v.size() / 3);
+        m2.v.insert(m2.v.end(), {0.0, -1e-3, 0.0, 1e-3, -1e-3, 0.0, 2e-3, -1e-3, 0.0});   // collinear: area 0
+        m2.f.insert(m2.f.end(), {nv0, nv0 + 1, nv0 + 2});
+        Adjacency A2 = build(m2.v, m2.f, {});
+        const int64_t nf2 = A2.n_faces;
+        const std::vector<double> h2 = {1.6e-3, 3.4e-3, 9.0e-3};
+        const int L2 = static_cast<int>(h2.size());
+        std::vector<uint8_t> none(3 * nf2, 0);
+        std::vector<double> K2(L2 * nf2, 1e-3), RC2(L2 * nf2, 8e5), a(L2 * nf2), b(L2 * nf2), c(L2 * nf2), d(L2 * nf2);
+        for (int l = 0; l < L2; ++l)
+            for (int64_t i = 0; i < nf2; ++i) {
+                const int64_t k = l * nf2 + i;
+                a[k] = (l > 0) ? -0.3 : 0.0; c[k] = (l < L2 - 1) ? -0.25 : 0.0; b[k] = 1.6; d[k] = 100.0 + 0.1 * i + l;
+            }
+        // (a) every edge inactive (the companion: CG never iterates, x0 is exact); (b) every coupled edge ACTIVE,
+        // so CG iterates and the zero-area face's row reaches the preconditioner (the failure mode).
+        Network net2;
+        net2.init(&A2, none.data(), h2, 2);
+        net2.assemble(K2.data(), RC2.data());
+        std::vector<double> T2(L2 * nf2, 0.0);
+        const Network::Stats st2 = net2.implicitCoupled(a.data(), b.data(), c.data(), d.data(), 3322.0, 1e-8, T2.data());
+        Network net3;
+        net3.init(&A2, nullptr, h2, 2);
+        net3.assemble(K2.data(), RC2.data());
+        std::vector<double> T3(L2 * nf2, 0.0);
+        const Network::Stats st3 = net3.implicitCoupled(a.data(), b.data(), c.data(), d.data(), 3322.0, 1e-8, T3.data());
+        bool finite3 = true;
+        for (double v : T3) finite3 = finite3 && std::isfinite(v);
+        double worst = 0.0;
+        for (int64_t i = 0; i < nf2; ++i) {   // reference: Thomas per column
+            std::vector<double> cp(L2), dp(L2), x(L2);
+            double mm = b[i]; cp[0] = c[i] / mm; dp[0] = d[i] / mm;
+            for (int l = 1; l < L2; ++l) { const int64_t k = l * nf2 + i; mm = b[k] - a[k] * cp[l - 1]; cp[l] = c[k] / mm; dp[l] = (d[k] - a[k] * dp[l - 1]) / mm; }
+            x[L2 - 1] = dp[L2 - 1];
+            for (int l = L2 - 2; l >= 0; --l) x[l] = dp[l] - cp[l] * x[l + 1];
+            for (int l = 0; l < L2; ++l) worst = std::max(worst, std::fabs(T2[l * nf2 + i] - x[l]));
+            if (i == nf2 - 1)   // the degenerate face is isolated: its column must be the column solve in (b) too
+                for (int l = 0; l < L2; ++l) worst = std::max(worst, std::fabs(T3[l * nf2 + i] - x[l]));
+        }
+        std::printf("N6 zero-area face: degenerate faces %lld; (a) zero coupling capped %d; (b) all edges active capped %d, "
+                    "its %d, all finite %d; max |T - column solve| (all faces in a, the degenerate face in b) %.2e K\n",
+                    (long long)A2.n_degenerate_faces, st2.capped, st3.capped, st3.iterations, finite3, worst);
+        CHECK(A2.n_degenerate_faces >= 1 && !st2.capped && !st3.capped && st3.iterations > 0 && finite3 && worst <= 1e-10,
+              "implicitCoupled fails on a zero-area face");
     }
     std::printf("timing (%d steps): single-layer path %.3f s (1 thread), network %.3f s (1 thread), %.3f s (8 threads)\n",
                 nsteps, t_ref, w1, w8);

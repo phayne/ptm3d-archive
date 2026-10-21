@@ -598,7 +598,10 @@ Network::Stats Network::implicitCoupled(const double* A, const double* B, const 
             const int64_t o = static_cast<int64_t>(l) * nf;
             const double* G = G_.data() + 3 * o;
             for (int64_t i = lo; i < hi; ++i) {
-                const double s = C_[U(o + i)] / tau;
+                // C <= 0 (a zero-area, never-coupled face): scaling by C/tau would zero the whole row and the
+                // Thomas preconditioner would divide by zero; such a row has no lateral term (G = 0), so it is
+                // kept unscaled -- an isolated column the preconditioner solves exactly.
+                const double s = (C_[U(o + i)] > 0.0) ? C_[U(o + i)] / tau : 1.0;
                 const double gs = G[3 * i] + G[3 * i + 1] + G[3 * i + 2];
                 sa[U(o + i)] = s * A[o + i];
                 sc[U(o + i)] = s * Cc[o + i];

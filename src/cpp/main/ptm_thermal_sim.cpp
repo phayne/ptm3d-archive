@@ -20433,7 +20433,7 @@ int main(int argc, char** argv) {
         std::cerr << "[lateral] thermal.lateral_zero_coupling: ON -- the lateral machinery runs with EVERY edge "
                      "inactive (G = 0): this is the lateral-OFF COMPANION on the lateral-ON code path (same scheme, "
                      "Picard passes, driver and all-faces re-thermal). No heat crosses any edge." << std::endl;
-    if (g_lateral.enabled && g_lateral.monolithic && std::getenv("PTM_SOLVER_EQFIX")) {
+    if (g_lateral.enabled && g_lateral.monolithic && thermal::solverEqFixEnabled()) {
         std::cerr << "[lateral] FATAL: PTM_SOLVER_EQFIX is refused on the CPU SIMD batch path (BUGS.md PTM-216), "
                      "including the monolithic lateral scheme." << std::endl;
         return 1;
