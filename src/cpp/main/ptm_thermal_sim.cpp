@@ -9497,7 +9497,15 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
                     lat_iters.push_back(mono_iters);
                     std::atomic<long long> clamps{0};
-                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                    // R-CLAMP-1 layer-split stats as an OpenMP array REDUCTION, not a critical section: the
+                    // companion clamps nearly every dark column every substep, so a per-batch critical
+                    // serialized ~64k lock entries per substep across all threads (PTM-754: P0 prefix pass
+                    // ~17 h instead of ~1 h, workers ~97 % in __kmp_acquire_queuing_lock). Stats only:
+                    // temperatures are untouched by these accumulators.
+                    long long red_lc[3] = {0, 0, 0};
+                    double red_ldsum[3] = {0, 0, 0}, red_ldmax[3] = {0, 0, 0};
+                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64) \
+                        reduction(+ : red_lc[:3], red_ldsum[:3]) reduction(max : red_ldmax[:3])
                     for (size_t bi = 0; bi < n_batches; ++bi) {
                         TimeOuterBatch& tb = to_batches[bi];
                         if (!tb.active || t < tb.t_begin) continue;
@@ -9534,10 +9542,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                         if (nc) {
                             clamps.fetch_add(nc, std::memory_order_relaxed);
-                            #pragma omp critical(lat_clamp_stats)
                             for (int g = 0; g < 3; ++g) {
-                                lat_clamp_lc[g] += lc[g]; lat_clamp_ldsum[g] += ldsum[g];
-                                lat_clamp_ldmax[g] = std::max(lat_clamp_ldmax[g], ldmax[g]);
+                                red_lc[g] += lc[g]; red_ldsum[g] += ldsum[g];
+                                red_ldmax[g] = std::max(red_ldmax[g], ldmax[g]);
                             }
                         }
                         if (!tb.census_scored && g_spinup_census) {
@@ -9548,6 +9555,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                         timeOuterSave(batch, n_layers, tb.state.data());
                         thermal::updateMaterialPropertiesBatchSIMD(batch);
                         latGatherStart(batch, tb);
+                    }
+                    for (int g = 0; g < 3; ++g) {
+                        lat_clamp_lc[g] += red_lc[g]; lat_clamp_ldsum[g] += red_ldsum[g];
+                        lat_clamp_ldmax[g] = std::max(lat_clamp_ldmax[g], red_ldmax[g]);
                     }
                     lat_floor_clamps += clamps.load();
                     continue;
