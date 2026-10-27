@@ -23268,14 +23268,37 @@ int main(int argc, char** argv) {
                             const long spc = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
                             const long n_cyc = (spc > 0) ? (g_seed_indirect.t_hi - lo) / spc : 0;
                             if (n_cyc < 1) {
-                                std::cerr << "[FATAL] thermal.seed_indirect: series needs an output"
-                                             " window of at least ONE whole cycle (" << cyc
-                                          << " s = " << spc << " samples at " << dt_out
-                                          << " s); this one has " << (g_seed_indirect.t_hi - lo)
-                                          << " samples. A sub-cycle seed is the cold seed again"
-                                             " (PTM-727, Fermi R2). Use off, or a longer window.\n";
-                                return -1;
+                                // An EXPLICIT series request on a sub-cycle window is
+                                // refused. The DEFAULT reverts to the legacy seed with
+                                // one line, the same contract as every other case in
+                                // which the default cannot act (warm-started chunk, no
+                                // eq-indirect pass, CPU scalar solver).
+                                if (sim_config.thermal.seed_indirect_source != "default") {
+                                    std::cerr << "[FATAL] thermal.seed_indirect: series needs an output"
+                                                 " window of at least ONE whole cycle (" << cyc
+                                              << " s = " << spc << " samples at " << dt_out
+                                              << " s); this one has " << (g_seed_indirect.t_hi - lo)
+                                              << " samples. A sub-cycle seed is the cold seed again"
+                                                 " (PTM-727, Fermi R2). Use off, or a longer window.\n";
+                                    return -1;
+                                }
+                                const std::string why = "output window shorter than one whole cycle ("
+                                    + std::to_string(g_seed_indirect.t_hi - lo) + " of "
+                                    + std::to_string(spc) + " samples)";
+                                std::cout << "    [eq-seed] thermal.seed_indirect: series (default) is"
+                                             " inert here -- " << why
+                                          << "; the legacy seed applies." << std::endl;
+                                g_seed_indirect_record.effect = "inert: " + why;
+                                g_seed_indirect = SeedIndirectHandoff{};
                             }
+                        }
+                        if (g_seed_indirect.mode == SeedIndirectMode::Series) {
+                            const double cyc = planet.day;
+                            const int lo = g_seed_indirect.t_lo;
+                            const double dt_out = (lo + 1 < static_cast<int>(times.size()))
+                                ? times[lo + 1] - times[lo] : 0.0;
+                            const long spc = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
+                            const long n_cyc = (spc > 0) ? (g_seed_indirect.t_hi - lo) / spc : 0;
                             g_seed_indirect.t_hi = lo + static_cast<int>(n_cyc * spc);
                             // ---- Fermi R1: fold the series onto the eq steps -------
                             const int eqn = equilibration_steps;
@@ -23313,6 +23336,7 @@ int main(int argc, char** argv) {
                                                         " cadence took the NEAREST sample" : "")
                                       << " (R1)." << std::endl;
                         }
+                        if (g_seed_indirect.mode != SeedIndirectMode::Off) {   // not reverted above
                         double nz = 0.0;
                         for (size_t f = 0; f < num_faces; ++f) {
                             const auto& row = indirect_flux_series[f];
@@ -23331,6 +23355,7 @@ int main(int argc, char** argv) {
                                   << ", " << g_seed_indirect.t_hi << ") of " << total_time_steps
                                   << ", source " << source_desc << ", " << nz << "/" << num_faces
                                   << " faces with indirect." << std::endl;
+                        }
                     }
                     const bool ok = solveWholeMeshThermal(
                         eq_indirect_vec, direct_solar_values,
