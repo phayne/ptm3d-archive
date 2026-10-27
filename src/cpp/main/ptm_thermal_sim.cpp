@@ -7068,6 +7068,141 @@ static bool writeIndirectSeries(const char* path, const std::vector<std::vector<
     if (bands) { put(vis); put(ir); }
     return static_cast<bool>(o);
 }
+// ---- PTM_INDIRECT_SERIES_LATEST (Fermi addendum 9 F3): per-sweep, resumable export -------------------------------
+// After EVERY coupling sweep (and any Anderson mixing), the series the coming re-thermal consumes is written to
+// "<path>.sweep<K>.tmp", fsync'd, then rename()d over <path> (atomic on one filesystem), so <path> always holds ONE
+// complete sweep. A sidecar "<path>.info" (also tmp+rename) names the sweep. Resume = PTM_INDIRECT_WARM_START=<path>:
+// its iteration 0 re-thermals with that series, i.e. it redoes re-thermal K and continues the same contraction.
+// float32 like the end-of-run export, so a resume is equivalent to continuing up to float32 rounding of the series.
+// A failed write never stops the run, but it is LOUD and marks <path>.info STALE, so a stale file cannot pass as current.
+static bool fsyncPath(const std::string& p) {
+    FILE* fp = std::fopen(p.c_str(), "rb");
+    if (!fp) return false;
+    const int fd = ::fileno(fp);
+    const bool ok = fd >= 0 && ::fsync(fd) == 0;
+    std::fclose(fp);
+    return ok;
+}
+static void writeSweepInfo(const std::string& path, const std::string& body) {
+    const std::string tmp = path + ".info.tmp";
+    FILE* fp = std::fopen(tmp.c_str(), "w");
+    if (!fp) { std::cerr << "[sweep-export] ERROR: cannot write " << tmp << std::endl; return; }
+    std::fprintf(fp, "%s\n", body.c_str());
+    std::fflush(fp); const int fd = ::fileno(fp); if (fd >= 0) ::fsync(fd); std::fclose(fp);
+    if (std::rename(tmp.c_str(), (path + ".info").c_str()) != 0)
+        std::cerr << "[sweep-export] ERROR: cannot rename " << tmp << " -> " << path << ".info" << std::endl;
+}
+static void exportSweepSeries(int sweep, const std::vector<std::vector<double>>& tot,
+                              const std::vector<std::vector<double>>& vis, const std::vector<std::vector<double>>& ir,
+                              int t_lo, int total_steps) {
+    const char* e = std::getenv("PTM_INDIRECT_SERIES_LATEST");
+    if (!e || !*e) return;
+    const std::string path(e), tmp = path + ".sweep" + std::to_string(sweep) + ".tmp";
+    char ts[32];
+    { const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+      std::tm tm_utc{}; gmtime_r(&t, &tm_utc); std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc); }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = writeIndirectSeries(tmp.c_str(), tot, vis, ir, t_lo, total_steps) && fsyncPath(tmp)
+                    && std::rename(tmp.c_str(), path.c_str()) == 0;
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::ostringstream info;
+    if (ok) {
+        info << "sweep=" << sweep << " written=" << ts << " faces=" << tot.size() << " steps=" << (total_steps - t_lo)
+             << " t_lo=" << t_lo << " bands=" << ((!vis.empty() && !ir.empty()) ? 1 : 0)
+             << " (the series re-thermal " << sweep << " consumes; resume with PTM_INDIRECT_WARM_START=" << path << ")";
+        std::cerr << "[sweep-export] sweep " << sweep << " series -> " << path << " (" << std::fixed << std::setprecision(1)
+                  << dt << " s)" << std::endl;
+    } else {
+        std::remove(tmp.c_str());
+        info << "STALE: the sweep-" << sweep << " export FAILED at " << ts << "; " << path
+             << " (if present) holds an EARLIER sweep -- do not resume from it as sweep " << sweep;
+        std::cerr << "[sweep-export] ERROR: sweep " << sweep << " export to " << path << " FAILED (disk full?); the run "
+                     "continues, " << path << ".info is marked STALE." << std::endl;
+    }
+    writeSweepInfo(path, info.str());
+}
+// ---- Fermi A10 (3): per-sweep window statistics, KEPT for every sweep ------------------------------------------
+// "<PTM_INDIRECT_SERIES_LATEST>.sweeps/sweepNNN/{temperature_max,temperature_avg,temperature_min,indirect_ir_max,
+// indirect_ir_avg}.bin", each "uint32 n + float32[n]" exactly like statistics/*.bin, over the SAME integration window
+// (g_aeff_win_start/steps) -- so any sweep's field can be read with the ordinary tools if the run is stopped early.
+static bool writeU32F32(const std::string& path, const std::vector<float>& v) {
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return false;
+    const uint32_t n = static_cast<uint32_t>(v.size());
+    bool ok = std::fwrite(&n, 4, 1, fp) == 1 && std::fwrite(v.data(), 4, v.size(), fp) == v.size();
+    ok = (std::fclose(fp) == 0) && ok;
+    return ok;
+}
+static void exportSweepStats(int sweep, const std::vector<std::vector<double>>& T,
+                             const std::vector<std::vector<double>>& ir, const char* irname, int win_lo, int win_n) {
+    const char* e = std::getenv("PTM_INDIRECT_SERIES_LATEST");
+    if (!e || !*e) return;
+    char sub[32]; std::snprintf(sub, sizeof(sub), "sweep%03d", sweep);
+    const std::string dir = std::string(e) + ".sweeps/" + sub;
+    std::error_code ec; std::filesystem::create_directories(dir, ec);
+    const size_t nF = T.size();
+    if (win_n <= 0 || nF == 0) {
+        std::cerr << "[sweep-export] ERROR: sweep " << sweep << " stats skipped: integration window not set (" << win_lo
+                  << ", " << win_n << ")" << std::endl;
+        return;
+    }
+    std::vector<float> tmax(nF), tavg(nF), tmin(nF), imax(nF), iavg(nF);
+    const bool have_ir = ir.size() == nF;
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < nF; ++f) {
+        double mx = -1e300, mn = 1e300, sm = 0.0, im = 0.0, is = 0.0;
+        for (int t = win_lo; t < win_lo + win_n; ++t) {
+            const double v = T[f][static_cast<size_t>(t)];
+            mx = std::max(mx, v); mn = std::min(mn, v); sm += v;
+            if (have_ir) { const double q = ir[f][static_cast<size_t>(t)]; im = std::max(im, q); is += q; }
+        }
+        tmax[f] = static_cast<float>(mx); tmin[f] = static_cast<float>(mn); tavg[f] = static_cast<float>(sm / win_n);
+        imax[f] = static_cast<float>(im); iavg[f] = static_cast<float>(is / win_n);
+    }
+    bool ok = !ec && writeU32F32(dir + "/temperature_max.bin", tmax) && writeU32F32(dir + "/temperature_avg.bin", tavg)
+              && writeU32F32(dir + "/temperature_min.bin", tmin);
+    if (have_ir) ok = ok && writeU32F32(dir + "/" + irname + "_max.bin", imax) && writeU32F32(dir + "/" + irname + "_avg.bin", iavg);
+    if (ok) std::cerr << "[sweep-export] sweep " << sweep << " window stats (T max/avg/min" << (have_ir ? (std::string(", ") + irname + " max/avg") : std::string())
+                      << "; steps [" << win_lo << ", " << (win_lo + win_n) << ")) -> " << dir << std::endl;
+    else std::cerr << "[sweep-export] ERROR: sweep " << sweep << " window stats to " << dir << " FAILED" << std::endl;
+}
+// ---- Fermi A10 (3): cold-trap mask for the [residual] line: faces whose COMPANION window T_max < PTM_COLDTRAP_TK
+// (default 110 K), read from PTM_COLDTRAP_TMAX (a statistics temperature_max.bin of the same mesh). --------------
+struct ColdTrapMask { bool ok = false; double tk = 110.0; std::vector<uint8_t> m; size_t n = 0; std::string src; };
+static const ColdTrapMask& coldTrapMask(size_t nF) {
+    static ColdTrapMask c; static bool tried = false;
+    if (tried) return c;
+    tried = true;
+    const char* p = std::getenv("PTM_COLDTRAP_TMAX");
+    if (!p || !*p) return c;
+    if (const char* k = std::getenv("PTM_COLDTRAP_TK")) c.tk = std::atof(k);
+    c.src = p;
+    FILE* fp = std::fopen(p, "rb");
+    uint32_t n = 0;
+    if (!fp || std::fread(&n, 4, 1, fp) != 1 || n != nF) {
+        std::cerr << "[residual] WARNING: PTM_COLDTRAP_TMAX=" << p << " unreadable or not " << nF
+                  << " faces: the cold-trap max is NOT reported." << std::endl;
+        if (fp) std::fclose(fp);
+        return c;
+    }
+    std::vector<float> v(n);
+    const bool rd = std::fread(v.data(), 4, n, fp) == n; std::fclose(fp);
+    if (!rd) { std::cerr << "[residual] WARNING: " << p << " truncated: cold-trap max NOT reported." << std::endl; return c; }
+    c.m.assign(n, 0);
+    for (size_t f = 0; f < n; ++f) if (v[f] < c.tk) { c.m[f] = 1; ++c.n; }
+    c.ok = true;
+    std::cerr << "[residual] cold-trap mask: " << c.n << " of " << n << " faces with T_max < " << c.tk << " K in " << p << std::endl;
+    return c;
+}
+// ---- Fermi A10 (3): sentinels, checked at the start of EVERY coupling iteration, in PTM_SENTINEL_DIR -----------
+//   AA_OFF: Anderson -> plain Picard for the rest of the run (sticky, also across the eq-indirect restart).
+//   STOP:   leave the coupling loop now; the normal outputs of the last completed re-thermal are written.
+static bool sentinelPresent(const char* name) {
+    const char* d = std::getenv("PTM_SENTINEL_DIR");
+    if (!d || !*d) return false;
+    std::error_code ec;
+    return std::filesystem::exists(std::string(d) + "/" + name, ec);
+}
 static const IndirectSeriesFile& warmStartSeries(size_t n_faces, int t_lo, int total_steps) {
     static IndirectSeriesFile w;
     static bool tried = false;
@@ -24611,6 +24746,33 @@ int main(int argc, char** argv) {
                     // the length of the LAST complete loop, not of all of them.
                     if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
                     if (iter == 0 && aa.on) aa.reset();
+                    {   // Fermi A10 sentinels (PTM_SENTINEL_DIR)
+                        static bool aa_off_sticky = false, sentinel_banner = false;
+                        if (!sentinel_banner) {
+                            sentinel_banner = true;
+                            const char* d = std::getenv("PTM_SENTINEL_DIR");
+                            std::error_code ec;
+                            if (d && *d) std::cerr << "[sentinel] watching " << d << " for AA_OFF / STOP at every coupling iteration"
+                                                   << (std::filesystem::is_directory(d, ec) ? "" : " (WARNING: directory does not exist yet)") << std::endl;
+                        }
+                        if (!aa_off_sticky && aa.on && sentinelPresent("AA_OFF")) {
+                            aa_off_sticky = true;
+                            std::cout << "  [sentinel] AA_OFF found before sweep " << (iter + 1)
+                                      << ": Anderson DISABLED, plain Picard for the rest of this run." << std::endl;
+                            std::cerr << "[sentinel] AA_OFF applied before sweep " << (iter + 1) << std::endl;
+                        }
+                        if (aa_off_sticky) aa.disabled = true;
+                        if (sentinelPresent("STOP")) {
+                            std::cout << "  [sentinel] STOP found before sweep " << (iter + 1) << ": leaving the coupling loop after "
+                                      << iter << " completed sweep(s) -- NOT converged by the threshold; the outputs are the last "
+                                         "completed re-thermal's." << std::endl;
+                            std::cerr << "[sentinel] STOP applied before sweep " << (iter + 1) << std::endl;
+                            writeHeartbeat("STOP sentinel before rad_iter " + std::to_string(iter + 1));
+                            eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                            eqi_n_iter_loop = iter;
+                            break;
+                        }
+                    }
                     // Warm start: iteration 0's sweep is REPLACED by the imported converged series.
                     const IndirectSeriesFile& warm = warmStartSeries(num_faces, rad_sweep_t_lo, total_time_steps);
                     const bool warm_now = warm.ok && iter == 0;
@@ -24781,6 +24943,14 @@ int main(int argc, char** argv) {
                             }
                         if (wb) indirect_bands_available = true;
                         std::cout << "  [warm-start] iteration 0: sweep replaced by the imported converged series." << std::endl;
+                        {   // Fermi A9 T1: full-precision identity of the imported series (the job compares it with the
+                            // seed file's own max/mean; the sticky-format "Max/Mean indirect flux" lines cannot carry 0.1 %)
+                            std::ostringstream wl;
+                            wl << std::scientific << std::setprecision(9) << "  [warm-start] iteration-0 series (full precision): max "
+                               << max_indirect << " mean " << (total_indirect_sum / (static_cast<double>(num_faces) * static_cast<double>(nT)))
+                               << " W/m2 over " << num_faces << " faces x " << nT << " steps";
+                            std::cout << wl.str() << std::endl;
+                        }
                     }
                     if (!warm_now)
                     for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
@@ -25056,6 +25226,9 @@ int main(int argc, char** argv) {
                                             rad_coupling_temp_tol, "coupling"))
                             return 1;
                     }
+                    // Fermi A9 F3: resumable per-sweep export of the series re-thermal (iter + 1) will consume.
+                    exportSweepSeries(iter + 1, indirect_flux_series, indirect_solar_series, indirect_ir_series,
+                                      rad_sweep_t_lo, total_time_steps);
                     // Step 2: Per-face statistics + selection.
                     //
                     // Single pass over (face, timestep) computes everything
@@ -25266,6 +25439,12 @@ int main(int argc, char** argv) {
                     std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
                     ptm::timing::begin("rethermal");
                     const auto timing_rethermal_t0 = std::chrono::steady_clock::now();
+                    std::cout << "  [rethermal-span] re-thermal " << (iter + 1) << " reads indirect_flux_series over steps ["
+                              << rad_sweep_t_lo << ", " << total_time_steps << ") (equilibration span [" << rad_sweep_t_lo << ", "
+                              << equilibration_steps << ")), source: "
+                              << (warm_now ? "the IMPORTED warm-start series" : (aa.capturing(iter) && !aa.disabled
+                                     ? "this iteration's sweep after the Anderson update" : "this iteration's sweep"))
+                              << std::endl;
 
                     // Check if GPU thermal is enabled
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
@@ -25702,14 +25881,22 @@ int main(int argc, char** argv) {
                     {
                         double max_change_post = 0.0;
                         size_t count_changing = 0;  // faces (physics) / samples (legacy)
+                        size_t where_f = 0, n_gt1 = 0, n_gt5 = 0;   // Fermi A9 F3 / A10: where the change sits
+                        int where_t = 0;
+                        const ColdTrapMask& ctm = coldTrapMask(num_faces);
+                        double ct_max = 0.0;
                         for (size_t f = 0; f < num_faces; f++) {
                             double odT = 0.0;
+                            int ot = 0;
                             for (int t = 0; t < total_time_steps; t++) {
                                 const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
-                                if (dT > odT) odT = dT;
+                                if (dT > odT) { odT = dT; ot = t; }
                                 if (!rad_coupling_physics_mode && dT > rad_coupling_temp_tol) ++count_changing;
                             }
-                            if (odT > max_change_post) max_change_post = odT;
+                            if (odT > max_change_post) { max_change_post = odT; where_f = f; where_t = ot; }
+                            if (odT > 1.0) ++n_gt1;
+                            if (ctm.ok && ctm.m[f] && odT > ct_max) ct_max = odT;
+                            if (odT > 5.0) ++n_gt5;
                             if (rad_coupling_physics_mode && odT > rad_coupling_temp_tol) ++count_changing;
                         }
                         const double frac_denom = rad_coupling_physics_mode
@@ -25720,9 +25907,22 @@ int main(int argc, char** argv) {
                         {   // full precision for the a-posteriori contraction bound (Fermi addendum 6): the line
                             // above inherits a sticky 2-decimal format and reads 0.02 / 0.01 / 0 near convergence
                             std::ostringstream rp;
+                            // the value stays the FIRST number after "(full precision): " (bound.py / on_trips parse it)
                             rp << std::scientific << std::setprecision(6) << "  [residual] sweep " << (iter + 1)
-                               << " max temperature change (full precision): " << max_change_post << " K";
+                               << " max temperature change (full precision): " << max_change_post << " K; argmax face "
+                               << where_f << " step " << where_t << " (T " << std::fixed << std::setprecision(3)
+                               << (num_faces ? prev_temps[where_f][where_t] : 0.0) << " -> "
+                               << (num_faces ? surface_temps[where_f][where_t] : 0.0) << " K); faces > 1 K: " << n_gt1
+                               << ", > 5 K: " << n_gt5 << " of " << num_faces << "; cold-trap max ";
+                            if (ctm.ok) rp << std::scientific << std::setprecision(6) << ct_max << " K over " << ctm.n
+                                           << " faces (companion T_max < " << std::fixed << std::setprecision(0) << ctm.tk << " K)";
+                            else rp << "n/a (PTM_COLDTRAP_TMAX not set)";
                             std::cout << rp.str() << std::endl;
+                            {   // no band split -> the TOTAL indirect, named as such (never mislabeled as IR)
+                                const bool irb = indirect_bands_available && indirect_ir_series.size() == num_faces;
+                                exportSweepStats(iter + 1, surface_temps, irb ? indirect_ir_series : indirect_flux_series,
+                                                 irb ? "indirect_ir" : "indirect_total", g_aeff_win_start, g_aeff_win_steps);
+                            }
                         }
                         timing_record_iteration(static_cast<double>(faces_to_rerun.size()),
                                                 timing_rethermal_s, max_change_post);

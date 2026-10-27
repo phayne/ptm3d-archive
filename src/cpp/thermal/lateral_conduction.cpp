@@ -630,6 +630,9 @@ Network::Stats Network::implicitCoupled(const double* A, const double* B, const 
             x[o] = dp[U(l)] - cp[U(l)] * x[o + nf];
         }
     };
+    const size_t NN = U(L) * U(nf);
+    if (corr_.size() != NN) { corr_.assign(NN, 0.0); x0_.assign(NN, 0.0); have_corr_ = false; }
+    const bool use_corr = have_corr_;
     #pragma omp parallel num_threads(nt_)
     {
         std::vector<double> cp(U(L)), dp(U(L));
@@ -637,6 +640,12 @@ Network::Stats Network::implicitCoupled(const double* A, const double* B, const 
         for (int64_t c = 0; c < nc; ++c) {
             const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
             for (int64_t i = lo; i < hi; ++i) thomasColumn(A, B, Cc, D, x_.data(), i, cp, dp);
+            for (int l = 0; l < L; ++l)
+                for (int64_t i = lo; i < hi; ++i) {
+                    const size_t k = U(static_cast<int64_t>(l) * nf + i);
+                    x0_[k] = x_[k];                          // the Thomas guess, kept for the next correction
+                    if (use_corr) x_[k] += corr_[k];         // + the previous solve's lateral correction
+                }
         }
     }
     // y = Ms v  (vertical scaled tridiagonal + lateral graph), per face chunk, all layers
@@ -739,6 +748,7 @@ Network::Stats Network::implicitCoupled(const double* A, const double* B, const 
     }
     st.iterations = it;
     if (!(rnorm / denom <= rel_tol)) {
+        have_corr_ = false;                                  // never seed the next solve from an unconverged one
         st.capped = true; st.capped_layer = -1; st.cap = cap; st.capped_iterations = it;
         st.capped_rel_residual = rnorm / denom; st.capped_fo = st.fo_max;
         double worst = -1.0;
@@ -746,6 +756,14 @@ Network::Stats Network::implicitCoupled(const double* A, const double* B, const 
             if (std::fabs(r_[U(k)]) > worst) { worst = std::fabs(r_[U(k)]); st.worst_face = k % nf; st.capped_layer = static_cast<int>(k / nf); }
         return st;
     }
+    // the converged lateral correction seeds the next solve's starting guess
+    #pragma omp parallel for num_threads(nt_) schedule(static)
+    for (int64_t c = 0; c < nc; ++c) {
+        const int64_t lo = c * kChunk, hi = std::min(nf, (c + 1) * kChunk);
+        for (int l = 0; l < L; ++l)
+            for (int64_t i = lo; i < hi; ++i) { const size_t k = U(static_cast<int64_t>(l) * nf + i); corr_[k] = x_[k] - x0_[k]; }
+    }
+    have_corr_ = true;
     // exact-conservation finish: src = -(tau / C) sum_j G (x_i - x_j) (antisymmetric pair fluxes), then the
     // exact column solve tridiag(T_out) = D + src. Closure = |sum C src| / sum |C src| per layer.
     std::vector<double> pq(U(L) * U(nc), 0.0), pa(U(L) * U(nc), 0.0);

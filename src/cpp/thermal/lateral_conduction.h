@@ -167,6 +167,11 @@ private:
     std::vector<double> G_, C_;                     // [L * 3nf], [L * nf]
     std::vector<double> diag_, x_, r_, z_, p_, Ap_, rhs_;   // [L * nf]
     std::vector<double> part_;                      // [L * nc] chunk partials
+    // Fermi A10 (2): PCG starting guess = the uncoupled Thomas solve + the PREVIOUS converged solve's lateral
+    // correction (x_conv - x_thomas). Only the starting guess changes; tolerance and the exact-conservation finish do
+    // not. With zero coupling the finish re-solves every column from D alone, so T_out cannot depend on it.
+    std::vector<double> corr_, x0_;                 // [L * nf]
+    bool have_corr_ = false;
 };
 
 }  // namespace lateral
