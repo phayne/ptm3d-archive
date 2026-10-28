@@ -3894,7 +3894,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     // way: on an analytic sphere every radial normal already points outward, so the
     // overhang population this override exists to rescue is empty by construction.
     if (use_true_normals && mesh->analytic_radial_normals) {
-        std::cout << "[IlluminationModel] PTM-Class1 TRUE normals DECLINED (env "
+        std::cout << "[IlluminationModel] TRUE normals DECLINED (env "
                      "PTM_ILLUM_TRUE_NORMALS is set): this mesh carries ANALYTIC RADIAL "
                      "normals that MeshUtils::setupMesh deliberately substituted for the "
                      "geometric winding normals (the smooth-icosphere pentagon-vertex bias "
@@ -3959,7 +3959,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
         // 4. winding-consistency gate: a junk (non-manifold / inconsistent) winding cannot be oriented
         //    topologically -> WARN LOUDLY and fall back to the radial flip (never silently proceed).
         if (inconsistent > nfc / 100) {
-            std::cout << "[IlluminationModel] PTM-Class1 TRUE normals REFUSED: winding INCONSISTENT ("
+            std::cout << "[IlluminationModel] TRUE normals REFUSED: winding INCONSISTENT ("
                       << inconsistent << " same-direction manifold half-edges > 1% of " << nfc
                       << " faces); falling back to the radial-flip orientation.\n";
             use_true_normals = false;
@@ -4004,7 +4004,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
             // normalizing the same cross product -- read it together with the max
             // rotation. "reversed" is the physically meaningful subset: the faces whose
             // orientation the radial flip actually had backwards.
-            std::cout << "[IlluminationModel] PTM-Class1 TRUE (winding-consistent) normals ENABLED "
+            std::cout << "[IlluminationModel] TRUE (winding-consistent) normals ENABLED "
                          "(env PTM_ILLUM_TRUE_NORMALS): winding "
                       << (inconsistent==0 ? "GLOBALLY CONSISTENT" : "near-consistent") << " ("
                       << inconsistent << " inconsistent half-edges); illumination normal differs "
