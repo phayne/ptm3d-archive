@@ -262,7 +262,7 @@ static void test_kernel_bound_population() {
         std::cerr.rdbuf(err.rdbuf());
         bt.computeTransportProduct(g.centers, g.areas, T_hot, point, d0, 1e-10, o, nullptr);
         std::cerr.rdbuf(old);
-        const bool warned = err.str().find("PTM-643") != std::string::npos;
+        const bool warned = err.str().find("transport kernel cutoff") != std::string::npos;
         if (priv) {
             check(d0[anti] > 0.0 && !warned, "hot call with a call-local index reaches the antipode", d0[anti], 0.0);
         } else {
@@ -421,7 +421,7 @@ static void test_end_to_end(bool legacy_params) {
     const double res = legacy_params ? summaryValue(s, "sputter reservoir (non-escaping O2 + H2): ")
                                      : summaryValue(s, "sputter atmospheric loss (O2: ionization/dissociation/pickup): ");
     const double jea = summaryValue(s, "Sublimation Jeans escape: ");
-    const double lag = summaryValue(s, "Super-step lag (deposition in excess of step-mean sources; PTM-644): ");
+    const double lag = summaryValue(s, "Super-step lag (deposition in excess of step-mean sources): ");
     const bool have = std::isfinite(sub + dep + spu + red + esc + res + jea + lag);
     check(have, "evolution_summary.txt carries the sputter fates, Jeans and lag terms");
     if (have) {

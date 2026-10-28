@@ -930,12 +930,14 @@ int main() {
                       " unverified quantities by name");
             bool names_grid = false, names_epoch = false;
             for (const auto& u : v.unverified) {
-                if (u.find("PTM-STATE-GRID-BLIND") != std::string::npos) names_grid = true;
-                if (u.find("PTM-STATE-NO-EPOCH") != std::string::npos) names_epoch = true;
+                if (u.find("depth grid z[]") != std::string::npos &&
+                    u.find("accepted in silence") != std::string::npos) names_grid = true;
+                if (u.rfind("epoch", 0) == 0 &&
+                    u.find("cannot be") != std::string::npos) names_epoch = true;
             }
             check(names_grid && names_epoch,
-                  "G8: the v1 report names PTM-STATE-GRID-BLIND and "
-                  "PTM-STATE-NO-EPOCH explicitly");
+                  "G8: the v1 report names the unchecked depth grid and the "
+                  "unrecorded epoch explicitly");
         }
 
         // --- coupling provenance -------------------------------------------
@@ -944,9 +946,9 @@ int main() {
             r.coupled_run = true;
             sio::checkRestore(&file, sio::TrailerStatus::Ok, r, no_allow, v);
             check(v.ok() && v.warnings.size() == 1 &&
-                      v.warnings[0].find("PTM-57") != std::string::npos,
+                      v.warnings[0].find("PRE-coupling") != std::string::npos,
                   "G8: a PRE-coupling checkpoint into a coupled run warns, "
-                  "naming PTM-57");
+                  "saying so");
 
             sio::Trailer post = file;
             post.flags |= sio::flag::kPostCouplingComplete;
