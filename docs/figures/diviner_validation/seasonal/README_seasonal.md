@@ -1,5 +1,8 @@
 # PTM3D vs Diviner seasonal polar temperatures
 
+> Historical analysis notes: these four-site comparisons predate the corrected view factors
+> and sub-facet roughness used in the Moon3D revision. Current results: [docs/VALIDATION.md](../../../VALIDATION.md).
+
 Comparison of PTM3D against the Diviner **level-4 seasonal polar temperature
 product** (Williams et al. 2019, *JGR Planets* 124, 2505; data:
 `https://luna1.diviner.ucla.edu/~jpierre/diviner/level4_polar/`).
