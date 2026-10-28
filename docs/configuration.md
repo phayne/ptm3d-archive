@@ -718,8 +718,7 @@ A **single** cache — whether written as `cache_file:` or as a one-element
 `cache_files:` — keeps the historical `flux_cubes/flux_cubes.fcb` name and
 produces a byte-identical flux payload either way.
 
-**CLI-only for now.** There is no GUI surface for this section; whether to build
-one is decision DP-7 in [design/gui-update-plan.md](design/gui-update-plan.md).
+**Configuration file only.** The GUI does not expose this section.
 
 ## shadow_depth
 
@@ -797,7 +796,7 @@ which devices each pool may use. This is distinct from the per-solver
 `gpu_devices` / `gpu_device_ids` / `gpu_batch_size` keys, which tune a rung that
 has already been allowed. The full rationale, the platform-gating table and the
 cost of each guardrail are in
-[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
+[gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -831,7 +830,7 @@ lunar polar site B (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window 
 at all is that the GPU thermal pool allocates roughly 0.77 GiB per device on
 the *same* dies while the replica is resident, and the fit check does not count
 it. Set `thin_margin_policy: refuse` to give up the rung instead; see
-[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
+[gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md).
 
 `auto` only engages when **all** of: the thermal solver is on the GPU, the two
 device sets overlap, the margin is below `placement_margin_gib`, the host is

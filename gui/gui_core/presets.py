@@ -4,7 +4,7 @@
 them -- ``grep -rn load_preset gui/`` returned the definition and nothing else
 -- while ``gui/README.md`` advertised the feature. Stage 1 deleted the dead
 table rather than pretend it worked (GUI-PRESET-1); this is the replacement,
-built from §4.4 of ``docs/design/gui-update-plan.md``.
+built from §4.4 of ``the GUI update plan (docs/design/gui-update-plan.md in git history)``.
 
 Two rules govern the whole module:
 

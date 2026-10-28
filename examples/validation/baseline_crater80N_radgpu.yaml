@@ -1,6 +1,6 @@
 # PTM3D validation baseline arm: GPU radiosity pool (single- and multi-GPU).
 #
-# Part of the byte-identity regression suite (docs/validation-baselines.md,
+# Part of the byte-identity regression suite (docs/dev/validation-baselines.md,
 # section 1). Derived from examples/tutorial04_crater80N_coupled.yaml with the
 # minimum changes needed to REACH the GPU radiosity solver at all:
 #

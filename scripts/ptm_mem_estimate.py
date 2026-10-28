@@ -4,7 +4,7 @@ PTM3D memory estimator (portability Phase 1 §5).
 
 Computes the dominant resident-memory footprints BEFORE a run and warns/refuses
 when they exceed available RAM -- the laptop-portability guardrail. The two
-dominant terms (per the Phase 0 audit, docs/PORTABILITY-AUDIT.md §4):
+dominant terms (per the Phase 0 audit, the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history) §4):
 
   1. Absorbed-illumination series held resident before the thermal solve:
         n_faces x n_steps x n_components x sizeof(float64)

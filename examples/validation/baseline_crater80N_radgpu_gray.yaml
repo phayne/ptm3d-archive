@@ -1,6 +1,6 @@
 # PTM3D validation baseline arm: GRAY (non-band-separated) GPU radiosity.
 #
-# Part of the byte-identity regression suite (docs/validation-baselines.md,
+# Part of the byte-identity regression suite (docs/dev/validation-baselines.md,
 # section 7). Identical to baseline_crater80N_radgpu.yaml except
 # radiation.band_separated: false.
 #

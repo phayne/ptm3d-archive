@@ -72,7 +72,7 @@ and they are kept in separate modules for that reason.
 Adding a body
 -------------
 
-See ``docs/gui-curated-body-sources.md``. In short: add the kernel set to
+See ``docs/dev/gui-curated-body-sources.md``. In short: add the kernel set to
 ``BODY_KERNELS`` in ``scripts/fetch_kernels.py`` with its pinned sha256, ship
 the metakernel in ``data/kernels/``, add a ``CuratedBody`` below, and let
 ``src/python/tests/test_gui_curated_sources.py`` check that every path,

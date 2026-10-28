@@ -360,7 +360,7 @@ public:
     // the rank at max_svd_rank (default 50) and returns success even when the
     // requested tolerance was NOT met -- on a 12,800-face mesh that reference
     // came back with NEGATIVE view factors. Measured 2026-08-23; see
-    // docs/design/vf-unification.md.
+    // the view-factor unification design (docs/design/vf-unification.md in git history).
     void computeDenseReference(std::vector<double>& out);
 
     // Save/load compressed matrix

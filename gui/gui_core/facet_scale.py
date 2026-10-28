@@ -18,7 +18,7 @@ millimeter to a centimeter. Measured on the meshes this project actually runs:
     A3GT 3 km polar core              2,397,890 faces    3.46 m     ON
     moon3d_c...NEW_500k_clean           509,337 faces    1.96 mm    OFF
 
-The boundaries below are Ada's proposal from `docs/design/gui-update-plan.md`
+The boundaries below are Ada's proposal from `the GUI update plan (docs/design/gui-update-plan.md in git history)`
 section 4.4, approved as DP-4: refuse below 0.05 m (one decade above the top of
 the millimeter-to-centimeter band, so the 1.96 mm mesh is refused with margin),
 warn between 0.05 m and 1 m, allow at or above 1 m (so the 3.46 m A3GT core

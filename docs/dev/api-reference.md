@@ -13,7 +13,7 @@ The parsed configuration. Its nested structs mirror the YAML sections
 one-for-one (`time`, `mesh`, `thermal`, `illumination`, `radiation`, `output`,
 `generic_body`, `thermophysical`), and every field carries the default the
 parser applies when the key is absent. Key names and defaults are tabulated in
-[configuration.md](configuration.md).
+[configuration.md](../configuration.md).
 
 ```cpp
 namespace ptm {
@@ -41,7 +41,7 @@ program exits 1 rather than falling back to built-in defaults.
 
 The radiation module's own configuration, populated from
 `SimulationConfig::radiation`. Field-by-field documentation, including which
-defaults matter and why, is in [radiation-exchange.md §9](radiation-exchange.md).
+defaults matter and why, is in [radiation-exchange.md §9](../radiation-exchange.md).
 
 ```cpp
 namespace radiation {
@@ -107,7 +107,7 @@ public:
 `getFaceArea` returns native mesh units. Icosphere meshes are generated in
 kilometers and DEM meshes are imported in meters; the engine infers the unit at
 startup and refuses to run when the inference is ambiguous. See
-[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+[KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md).
 
 ## Thermal solver
 
@@ -186,7 +186,7 @@ std::array<double, 3>              getSunPosition(double et);
 The manager owns face classification, view-factor construction and the radiosity
 solver; the solver returns the absorbed indirect flux for every face. The
 physics and the solve sequence are documented in
-[radiation-exchange.md](radiation-exchange.md).
+[radiation-exchange.md](../radiation-exchange.md).
 
 ```cpp
 namespace radiation {
@@ -225,5 +225,5 @@ per-face thermal-state checkpoint written by `thermal.final_state_file` is
 `n_layers * n_faces` `float32` values in layer-major order.
 
 Field-by-field descriptions of every output directory are in
-[USER_GUIDE.md](USER_GUIDE.md) and
-[tutorials/06_interpreting_outputs.md](tutorials/06_interpreting_outputs.md).
+[USER_GUIDE.md](../USER_GUIDE.md) and
+[tutorials/06_interpreting_outputs.md](../tutorials/06_interpreting_outputs.md).

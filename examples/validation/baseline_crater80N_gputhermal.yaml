@@ -1,6 +1,6 @@
 # PTM3D validation baseline arm: GPU thermal pool, TWO-PHASE cadence.
 #
-# Part of the byte-identity regression suite (docs/validation-baselines.md,
+# Part of the byte-identity regression suite (docs/dev/validation-baselines.md,
 # section 1). Derived from examples/tutorial04_crater80N_coupled.yaml with two
 # deliberate changes, each of which turns on a code path the tutorial config
 # cannot reach:

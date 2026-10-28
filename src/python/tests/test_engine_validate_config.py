@@ -3,7 +3,7 @@
 
 The GUI's "Check configuration" hands a config to the engine and reports the
 ENGINE's own text, so it stops maintaining a second, weaker copy of rules that
-then disagrees with the engine (docs/design/gui-update-plan.md item 2.4, DP-6).
+then disagrees with the engine (the GUI update plan (docs/design/gui-update-plan.md in git history) item 2.4, DP-6).
 That is only worth anything if the mode really is what it claims:
 
 * it accepts a configuration the engine would accept,

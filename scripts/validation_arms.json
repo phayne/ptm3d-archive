@@ -1,7 +1,7 @@
 {
   "schema": "ptm3d-validation-suite/1",
   "description": [
-    "The arm set that docs/validation-baselines.md section 3 describes in prose.",
+    "The arm set that docs/dev/validation-baselines.md section 3 describes in prose.",
     "It lives here, in tracked source, because until 2026-09-05 the only",
     "executable copy of it was an untracked shell script under ~/projects that",
     "no clone had and no cleanup spared. `ptm_validate_baseline.py run` reads",

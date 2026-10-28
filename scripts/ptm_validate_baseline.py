@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bank and verify PTM3D byte-identity validation baselines.
 
-This is the tooling half of `docs/validation-baselines.md`. The doctrine half
+This is the tooling half of `docs/dev/validation-baselines.md`. The doctrine half
 explains *why*; this file is the part that runs.
 
 Four subcommands:
@@ -38,7 +38,7 @@ recorded run directories. It re-digested the banked runs and compared them with
 themselves. It printed `330/330 files byte-identical across 13 arm(s)`, every
 arm `IDENTICAL`, `VERDICT: BYTE-IDENTICAL`, from a tree nine merges past the
 bank, including GPU arms the accompanying document calls unreproducible. That
-was the exact command `docs/validation-baselines.md` section 5 printed and the
+was the exact command `docs/dev/validation-baselines.md` section 5 printed and the
 `ptm-validate` skill called the fast path. A gate that cannot fail is worse
 than no gate, because it is reported as a pass.
 
@@ -729,7 +729,7 @@ def write_do_not_delete(bank_dir: str, tag: str, manifests) -> None:
         fh.write(f"""# {DO_NOT_DELETE_MARKER} — DO NOT DELETE
 
 This directory is the **named validation baseline** `{tag}` that
-`docs/validation-baselines.md` section 2.1 resolves to. It is the reference a
+`docs/dev/validation-baselines.md` section 2.1 resolves to. It is the reference a
 byte-identity regression compares against; deleting it does not free a cache,
 it removes the project's only executable regression gate.
 

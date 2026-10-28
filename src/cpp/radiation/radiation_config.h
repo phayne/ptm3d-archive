@@ -43,7 +43,7 @@ constexpr int kMaxNearFieldQuadPoints = kMaxNearFieldQuadOrder * kMaxNearFieldQu
 // times larger -- in all four of its entry generators, as a candidate cull
 // before ray tracing, so the two builders disagreed about which pairs EXIST
 // before they could disagree about their values. Unified 2026-08-23; the
-// measured effect is in docs/design/vf-unification.md.
+// measured effect is in the view-factor unification design (docs/design/vf-unification.md in git history).
 constexpr double kGrazingCosCut = 1e-6;
 
 // Configuration for radiation exchange computation

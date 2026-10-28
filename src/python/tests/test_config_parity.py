@@ -79,7 +79,7 @@ EXPECTED_SECTIONS = (
     # SEQUENCE OF MAPS; its per-entry fields are deliberately absent from the
     # table because there is no dotted key for them -- see the note at the
     # locations block in config_parser.cpp.
-    # `gpu` is the cross-cutting GPU safety policy (docs/gpu-wedge-guardrails.md).
+    # `gpu` is the cross-cutting GPU safety policy (docs/dev/gpu-wedge-guardrails.md).
     # `shadow_depth` is the umbral-ceiling product (the maximum height above the
     # local surface at which the Sun is not even partially visible). Top level
     # for the same PTM-67 reason `flux_cubes` is.

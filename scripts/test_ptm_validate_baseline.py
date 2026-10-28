@@ -9,7 +9,7 @@ compare as `{k: v["run_dir"] for k, v in manifest["arms"].items()}` -- the
 manifest's own recorded directories -- so it re-digested the banked runs and
 reported `330/330 files byte-identical across 13 arm(s)`, `VERDICT:
 BYTE-IDENTICAL`, from a tree nine merges past the bank. That was the command
-`docs/validation-baselines.md` printed and the `ptm-validate` skill called the
+`docs/dev/validation-baselines.md` printed and the `ptm-validate` skill called the
 fast path. It could not fail, and it was read as a pass.
 
 A fix to a gate is worth nothing without an arm that fails when the gate does,

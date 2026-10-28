@@ -285,7 +285,7 @@ struct SimulationConfig {
         // Phase R (R4): mid-run thermal-state checkpoint cadence, in OUTPUT
         // steps. 0 (default) = off = checkpoint only at chunk boundaries (the
         // status quo). NOTE (architectural, documented in
-        // docs/PORTABILITY-AUDIT.md): true per-output-step full-mesh
+        // the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history)): true per-output-step full-mesh
         // checkpointing is INCOMPATIBLE with the current GPU persistent
         // solver, which is batch-outer/time-inner (each face-batch runs ALL
         // timesteps before the next batch starts), so no single wall-clock
@@ -994,7 +994,7 @@ struct SimulationConfig {
     // may use; the per-solver gpu_devices / gpu_device_ids / gpu_batch_size
     // keys decide how a rung that is allowed then runs. They came out of the
     // 2026-08-20/21 wedge forensics: see src/cpp/gpu/gpu_guardrails.h for the
-    // mechanism and docs/gpu-wedge-guardrails.md for the platform-gating table
+    // mechanism and docs/dev/gpu-wedge-guardrails.md for the platform-gating table
     // and the cost of each guardrail.
     struct GpuParams {
         // Floor on the per-device VRAM headroom a resident radiosity CSR
@@ -1020,7 +1020,7 @@ struct SimulationConfig {
         // by a lot in price on a large-matrix site. Measured on A3GT lunar polar site B,
         // the CPU radiosity rung cost 108.9 min/window against 31.4 min on the
         // GPU pool (+77.5 measured), while separation costs a derived
-        // +7-10 min. See docs/gpu-wedge-guardrails.md.
+        // +7-10 min. See docs/dev/gpu-wedge-guardrails.md.
         std::string thin_margin_policy = "separate";
         // The floor below which even `separate` refuses [GiB].
         double hard_min_vram_margin_gib = 0.25;

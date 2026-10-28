@@ -657,7 +657,7 @@ class ConfigManager:
     # thermal.use_gpu to true -- one of the two candidate explanations for the
     # 2026-08-14 flip that has never been reproduced.
     #
-    # docs/design/gui-update-plan.md item 2.3 designs the replacement: a
+    # the GUI update plan (docs/design/gui-update-plan.md in git history) item 2.3 designs the replacement: a
     # reachable list built from section 4.4, each preset stating which keys it
     # sets, and a preset that would violate the beaming facet-scale rule
     # refusing with the reason.

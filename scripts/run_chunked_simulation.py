@@ -187,7 +187,7 @@ def estimate_max_chunk_timesteps(n_faces: int, ram_gb: float,
 
 
 # --------------------------------------------------------------------------
-# GPU-wedge guardrails (see docs/gpu-wedge-guardrails.md)
+# GPU-wedge guardrails (see docs/dev/gpu-wedge-guardrails.md)
 #
 # Three defaults that used to live only in the campaign drivers, so a CLI or
 # GUI user got none of them:

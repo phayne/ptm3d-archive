@@ -8,7 +8,7 @@
 // moment at which all faces share the same output step, and a whole-mesh dump
 // taken mid-run banks un-solved faces. tools/config_parser.h says so at the key
 // `thermal.checkpoint_every_output_steps`, ptm_thermal_sim warns loudly if it is
-// set, and docs/PORTABILITY-AUDIT.md section 8 calls the partial dump "a resume
+// set, and the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history) section 8 calls the partial dump "a resume
 // hazard". Per-output-step checkpointing belongs to the CPU-first, time-outer
 // solver on the portability roadmap and is deliberately NOT implemented here.
 //

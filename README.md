@@ -345,10 +345,10 @@ crater with radiosity, and [docs/tutorials/](docs/tutorials/) goes deeper.
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | CLI reference, YAML schema, output formats, architecture, Python tools |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | Every `PTM_*` environment variable, with status tags |
 | [docs/configuration.md](docs/configuration.md) | Complete YAML configuration reference |
-| [docs/gpu-wedge-guardrails.md](docs/gpu-wedge-guardrails.md) | GPU-wedge signature, recovery, and every guardrail with its platform gate and cost (macOS + AMD) |
+| [docs/dev/gpu-wedge-guardrails.md](docs/dev/gpu-wedge-guardrails.md) | GPU-wedge signature, recovery, and every guardrail with its platform gate and cost (macOS + AMD) |
 | [docs/thermal-model.md](docs/thermal-model.md) · [docs/illumination-model.md](docs/illumination-model.md) · [docs/radiation-exchange.md](docs/radiation-exchange.md) | Physics and numerics of each stage |
-| [docs/api-reference.md](docs/api-reference.md) | C++ types for callers linking against the libraries |
-| [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) · [docs/PORTABILITY-AUDIT.md](docs/PORTABILITY-AUDIT.md) | What is known to be wrong, with measured magnitudes and who it affects; opens with "Is PTM3D right for my problem?" — **read this before your first production run** |
+| [docs/dev/api-reference.md](docs/dev/api-reference.md) | C++ types for callers linking against the libraries |
+| [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) · [the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history)](the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history)) | What is known to be wrong, with measured magnitudes and who it affects; opens with "Is PTM3D right for my problem?" — **read this before your first production run** |
 | [data/README.md](data/README.md) | Science-data catalog, provenance, licenses, `PTM_DATA_ROOT` |
 | [gui/README.md](gui/README.md) | The desktop GUI |
 

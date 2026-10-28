@@ -32,7 +32,7 @@ conda-forge packaging (Phase 4).
 Minimum useful machine: a **16 GB laptop** runs real science on **1k–100k-face meshes**
 (low-res bodies, asteroids). The 500k–1M-face class (micro-craters, high-resolution DEM
 sites) is workstation/cluster-scale, GPU recommended. See
-`docs/PORTABILITY-AUDIT.md` §4 for the memory scaling table, and estimate a run with:
+`the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history)` §4 for the memory scaling table, and estimate a run with:
 ```bash
 python3 scripts/ptm_mem_estimate.py --faces 100000 --steps 360   # -> ~0.80 GiB, OK on 16 GB
 ```
@@ -206,7 +206,7 @@ If a run wedges: the log stops mid-phase while the process stays alive, and afte
 reboot `pmset -g log | grep -i "shutdown cause"` reports a negative SMC code
 (`-108`/`-128`). `log show` needs sudo; `pmset -g log` does not and keeps about a week.
 The recovery procedure and the reasoning behind every guardrail — including which ones
-are macOS+AMD-only — are in [docs/gpu-wedge-guardrails.md](docs/gpu-wedge-guardrails.md).
+are macOS+AMD-only — are in [docs/dev/gpu-wedge-guardrails.md](docs/dev/gpu-wedge-guardrails.md).
 
 ### Embree ISA (performance)
 
@@ -459,6 +459,6 @@ not distributed.
   calibration (`--calibrate-gpu`) plus automatic splitting of long GPU work protect against GPU
   driver timeouts, which can otherwise hang the machine; on an uncalibrated machine the solver
   falls back to conservative limits and says so in the log. The wedge guardrails in
-  [docs/gpu-wedge-guardrails.md](docs/gpu-wedge-guardrails.md) are gated the same way: the ones
+  [docs/dev/gpu-wedge-guardrails.md](docs/dev/gpu-wedge-guardrails.md) are gated the same way: the ones
   that cost wall time or change a solver rung enforce on macOS+AMD and are advisory elsewhere,
   so they have **not** been exercised in their enforcing mode on any other platform.

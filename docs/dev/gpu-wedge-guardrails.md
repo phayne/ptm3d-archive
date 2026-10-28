@@ -337,10 +337,10 @@ have the resume script check for that first.
 
 ## 6. Related documents
 
-- [configuration.md](configuration.md) — the `gpu:` section reference
-- [ENVIRONMENT.md](ENVIRONMENT.md) — `PTM_GPU_MIN_VRAM_MARGIN_GIB`,
+- [configuration.md](../configuration.md) — the `gpu:` section reference
+- [ENVIRONMENT.md](../ENVIRONMENT.md) — `PTM_GPU_MIN_VRAM_MARGIN_GIB`,
   `PTM_RAD_RERUN_MAX_GPUS`, and the two test hooks
-- [../INSTALL.md](../INSTALL.md) — the GPU checklist, including the power
+- [../INSTALL.md](../../INSTALL.md) — the GPU checklist, including the power
   settings
-- [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) — what else is known to be
+- [KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md) — what else is known to be
   wrong, with measured magnitudes

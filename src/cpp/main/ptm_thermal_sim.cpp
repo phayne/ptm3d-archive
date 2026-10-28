@@ -16706,7 +16706,7 @@ int main(int argc, char** argv) {
     // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
     // knob is first-class, but true per-output-step full-mesh checkpointing is
     // architecturally incompatible with the batch-outer/time-inner GPU
-    // persistent solver (see config_parser.h + docs/PORTABILITY-AUDIT.md).
+    // persistent solver (see config_parser.h + the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history)).
     // Fail loud rather than silently no-op if a user sets it.
     if (sim_config.thermal.checkpoint_every_output_steps > 0) {
         std::cerr << "[Phase R/R4] WARNING: thermal.checkpoint_every_output_steps="
@@ -17713,7 +17713,7 @@ int main(int argc, char** argv) {
     // is ALLOWED and which dies each pool may use -- as distinct from the
     // per-solver gpu_devices / gpu_batch_size tuning keys. It is published into
     // the process-global policy record read by the radiosity solver's VRAM fit
-    // check. See src/cpp/gpu/gpu_guardrails.h and docs/gpu-wedge-guardrails.md.
+    // check. See src/cpp/gpu/gpu_guardrails.h and docs/dev/gpu-wedge-guardrails.md.
     // ----------------------------------------------------------------------
     {
         auto& gpol = gpu::guardrails::policy();
