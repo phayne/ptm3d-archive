@@ -13,5 +13,5 @@ are in [VALIDATION.md](VALIDATION.md) (Figs. 8 and 9).
   240 m site mesh.
 - **Current result.** At the Haworth SE-rim site, over 2,970 cold-trap cells, the median
   summer-maximum bias is −0.80 K (IQR 11.19 K) with beaming and −10.30 K (IQR 10.38 K)
-  without it. The view factors and the sub-facet emission model, not a missing rim heat source,
-  account for the earlier bias.
+  without it. The central-floor comparison of the first bullet has not been repeated with the
+  corrected view factors.
