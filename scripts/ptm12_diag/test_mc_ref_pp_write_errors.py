@@ -15,6 +15,7 @@ Three arms on the 3-face closed-form mesh from ensure_mc_ref_pp (24-byte .bin):
 import argparse
 import resource
 import signal
+import os
 import subprocess
 import sys
 import tempfile
@@ -31,9 +32,13 @@ def run(binary, work, outb, fsize=None):
         if fsize is not None:
             signal.signal(signal.SIGXFSZ, signal.SIG_IGN)   # inherited across exec
             resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
+    # The smoke inputs are a closed-form local-frame geometry, not a body-centered
+    # mesh, so the PTM-733 orientation rule would refuse them (exit 5) before any
+    # write happens. Trace the raw winding, as ensure_mc_ref_pp's own smoke test does.
+    env = dict(os.environ, PTM_PP_ORIENT="raw")
     return subprocess.run([str(binary), str(ply), str(tmax), str(fl), "2000", "1e-4", "0.2",
                            "1", str(outb)], capture_output=True, text=True,
-                          preexec_fn=limit, timeout=120)
+                          preexec_fn=limit, timeout=120, env=env)
 
 
 def main():
@@ -52,14 +57,14 @@ def main():
         fails += not ok
         r = run(binary, w, w / "short.bin", fsize=16)
         size = (w / "short.bin").stat().st_size if (w / "short.bin").exists() else -1
-        ok = r.returncode != 0 and "FATAL" in r.stderr
+        ok = r.returncode == 4 and " failed for " in r.stderr
         print(f"  [W1] short write (16 B) rc={r.returncode} bin={size} B   {'PASS' if ok else 'FAIL'}"
               + ("" if ok else "  <- a truncated output exited 0"))
         if r.stderr.strip():
             print("       " + [ln for ln in r.stderr.splitlines() if ln.strip()][-1])
         fails += not ok
         r = run(binary, w, w / "no_such_dir" / "x.bin")
-        ok = r.returncode != 0 and "FATAL" in r.stderr
+        ok = r.returncode == 4 and "fopen failed for" in r.stderr
         print(f"  [W2] unopenable output  rc={r.returncode}   {'PASS' if ok else 'FAIL'}")
         if r.stderr.strip():
             print("       " + [ln for ln in r.stderr.splitlines() if ln.strip()][-1])
