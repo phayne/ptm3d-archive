@@ -752,8 +752,8 @@ struct MultiTimescaleConfig {
         std::cout << "  Flux convergence threshold: " << (flux_convergence_threshold * 100.0) << "%" << std::endl;
         std::cout << "  Step deposition: "
                   << (superstep_consistent_deposition
-                      ? "consistent with the step's emission (PTM-644)"
-                      : "LEGACY start-of-step value (PTM-644 not applied; not mass-conserving)")
+                      ? "consistent with the step's emission"
+                      : "LEGACY start-of-step value (not applied; not mass-conserving)")
                   << std::endl;
         if (max_superstep_epochs > 0) {
             std::cout << "  Max super-step: " << max_superstep_epochs << " epochs" << std::endl;
@@ -1346,7 +1346,7 @@ struct EvolutionStatistics {
                 std::cout << "      sputter escaped:     " << total_sputter_escaped_mass << " kg" << std::endl;
                 std::cout << "      sputter reservoir:   " << total_sputter_reservoir_mass << " kg" << std::endl;
                 std::cout << "    Sublimation Jeans escape: " << total_sublimation_jeans_mass << " kg" << std::endl;
-                std::cout << "    Super-step lag (deposition in excess of step-mean sources; PTM-644): "
+                std::cout << "    Super-step lag (deposition in excess of step-mean sources): "
                           << total_superstep_lag_mass << " kg" << std::endl;
                 std::cout << "    (sublimated + sputtered - deposited = sputter escaped + reservoir + "
                           << "Jeans - lag)" << std::endl;
@@ -1379,8 +1379,8 @@ struct EvolutionStatistics {
                           << std::endl;
             }
             if (step_audit_count > 0) {
-                std::cout << "  Step conservation (PTM-644" << (superstep_consistent ? "" : "; LEGACY, not enforced")
-                          << "): not redeposited " << total_not_redeposited_mass << " kg, residual "
+                std::cout << "  Step conservation" << (superstep_consistent ? "" : " (LEGACY, not enforced)")
+                          << ": not redeposited " << total_not_redeposited_mass << " kg, residual "
                           << total_step_residual_mass << " kg (max step " << max_step_residual_rel
                           << " rel), layer overflow " << total_layer_overflow_mass << " kg" << std::endl;
             }
@@ -2378,7 +2378,7 @@ private:
         const bool lag = lagOn(ice_model, ice_state);
         const double ell = lag ? ice_model.getLagBarrierLength() : 0.0;
         if (lag && !config_.superstep_consistent_deposition) {
-            throw std::logic_error("evolveEpoch: the lag barrier requires the step-consistent deposition (PTM-644)");
+            throw std::logic_error("evolveEpoch: the lag barrier requires the step-consistent deposition");
         }
         // Garden mode (PTM-669): solveGardenFaceStep, the sputter split and the box.
         const bool garden = lag && ice_model.usesGardenMode();
@@ -2462,7 +2462,7 @@ private:
             for (int k = 0; k < 2; ++k) {
                 if (active[k] && D_base[k] > S_base[k] * rho_max[k] * (1.0 + 1e-6)) {
                     std::ostringstream m;
-                    m << std::scientific << std::setprecision(6) << "evolveEpoch (PTM-644): cached deposition "
+                    m << std::scientific << std::setprecision(6) << "evolveEpoch: cached deposition "
                       << D_base[k] << " kg/s exceeds its source's retainable share " << S_base[k] * rho_max[k]
                       << " kg/s (group " << k << ")";
                     throw std::runtime_error(m.str());
@@ -2485,7 +2485,7 @@ private:
                 if (++iterations > 40) {
                     std::ostringstream m;
                     m << std::scientific << std::setprecision(6)
-                      << "evolveEpoch (PTM-644): step deposition scale did not converge in 40 Newton iterations"
+                      << "evolveEpoch: step deposition scale did not converge in 40 Newton iterations"
                       << " (s = " << s[0] << ", " << s[1] << "; residual " << g[0] << ", " << g[1] << ")";
                     throw std::runtime_error(m.str());
                 }
@@ -2513,7 +2513,7 @@ private:
                 }
                 const double det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
                 if (!(std::abs(det) > 0.0) || !std::isfinite(det)) {
-                    throw std::runtime_error("evolveEpoch (PTM-644): singular Jacobian in the step deposition solve");
+                    throw std::runtime_error("evolveEpoch: singular Jacobian in the step deposition solve");
                 }
                 const double dx0 = (-g[0] * J[1][1] + g[1] * J[0][1]) / det;
                 const double dx1 = (-g[1] * J[0][0] + g[0] * J[1][0]) / det;
@@ -2740,7 +2740,7 @@ private:
         const double external = ((!active[0] && D_base[0] > 0.0) ? Ds : 0.0) +
                                 ((!active[1] && D_base[1] > 0.0) ? Dp : 0.0);
         if (external > 0.0 && stats_.total_external_deposition_mass == 0.0) {
-            std::cerr << "WARNING [PTM-644]: deposition with no cached source (external supply, "
+            std::cerr << "WARNING: deposition with no cached source (external supply, "
                       << std::scientific << std::setprecision(3) << external
                       << " kg/s); it is excluded from the step conservation audit and reported as "
                       << "external deposition" << std::fixed << std::endl;
@@ -2765,7 +2765,7 @@ private:
         if (consistent && !(std::abs(step_rel) <= 1e-6)) {
             std::ostringstream m;
             m << std::scientific << std::setprecision(6)
-              << "evolveEpoch (PTM-644): step conservation audit failed: deposited " << deposited
+              << "evolveEpoch: step conservation audit failed: deposited " << deposited
               << " kg/s vs retained emission " << retained << " kg/s (emitted " << emitted
               << "), residual " << step_rel << " relative (limit 1e-6)";
             throw std::runtime_error(m.str());

@@ -213,7 +213,7 @@ void applyConfigFile(Options& o) {
             std::cout << "[config] thermal.geothermal_heat_flow = " << v
                       << " W/m^2 -- NOT used. Qb is read out of the state's own\n"
                          "         bottom boundary condition and the two are "
-                         "compared below (BUGS.md PTM-161: this key was inert on\n"
+                         "compared below (: this key was inert on\n"
                          "         every solver entry point for the whole moon3d "
                          "campaign).\n";
         }
@@ -225,7 +225,7 @@ void applyConfigFile(Options& o) {
             tp["constant_thermal_inertia"].as<double>() > 0.0)
             refuse("this config uses constant_thermal_inertia > 0, which "
                    "silently zeroes chi and collapses kd->ks / rhod->rhos "
-                   "inside the engine (BUGS.md PTM-03). Reproducing that here "
+                   "inside the engine . Reproducing that here "
                    "would duplicate the rule; pass the resulting properties "
                    "explicitly instead.");
         if (tp["conductivity_model"] &&
@@ -250,7 +250,7 @@ void applyConfigFile(Options& o) {
         for (const char* key : kDead) if (tp[key]) present.push_back(key);
         if (!present.empty()) {
             std::cout << "[config] IGNORED (read by nothing in the engine either "
-                         "-- BUGS.md PTM-67): thermophysical.";
+                         "-- ): thermophysical.";
             for (std::size_t i = 0; i < present.size(); ++i)
                 std::cout << (i ? ", " : "") << present[i];
             std::cout << "\n         The run used the compiled " << o.body

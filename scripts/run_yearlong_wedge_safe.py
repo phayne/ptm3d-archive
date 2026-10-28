@@ -249,9 +249,9 @@ def gate_check_common(log_path: Path, expect_hole_seal_count: int | None = 30) -
     if "ABSOLUTE self-relief floor OVERRIDE h_eps = 0.00 mm" not in text:
         problems.append("RISE_HABS h_eps=0 did not engage")
     if expect_hole_seal_count is not None:
-        if f"PTM-18 interior hole-seal ENABLED: sealed {expect_hole_seal_count} interior hole" not in text:
+        if not re.search(rf"(?:PTM-18 )?interior hole-seal ENABLED: sealed {expect_hole_seal_count} interior hole", text):
             problems.append(f"PTM-18 seal count != {expect_hole_seal_count}")
-    elif not re.search(r"PTM-18 interior hole-seal ENABLED: sealed \d+ interior hole", text):
+    elif not re.search(r"(?:PTM-18 )?interior hole-seal ENABLED: sealed \d+ interior hole", text):
         problems.append("PTM-18 hole-seal banner missing entirely")
     return problems
 

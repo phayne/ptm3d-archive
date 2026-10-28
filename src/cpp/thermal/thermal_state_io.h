@@ -914,7 +914,7 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
             "mesh identity       -- whether these faces are this mesh's faces");
         v.unverified.push_back(
             "radiation coupling  -- whether the column is pre- or "
-            "post-coupling (PTM-57)");
+            "post-coupling ");
         return;
     }
 
@@ -1113,14 +1113,14 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
         v.warnings.push_back(
             "the writing run had a positive radiation coupling_select_dt, so "
             "its re-thermal selector could leave a face with nonzero indirect "
-            "flux frozen at its iter-0 column (BUGS.md PTM-89). Treat this "
+            "flux frozen at its iter-0 column . Treat this "
             "checkpoint as provisional.");
     }
     if (run.coupled_run && !(t->flags & flag::kPostCouplingComplete)) {
         v.warnings.push_back(
             "this checkpoint is the PRE-coupling (iter-0) column and this run "
             "couples radiation: the faces radiation feeds resume from an "
-            "un-coupled state. That is BUGS.md PTM-57.");
+            "un-coupled state. That is a known limitation.");
     } else if ((t->flags & flag::kPostCouplingComplete) &&
                !(t->flags & flag::kAllFacesPatched)) {
         v.warnings.push_back(

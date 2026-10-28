@@ -609,7 +609,7 @@ bool ViewFactorMatrix::readBinary(const std::string& filename) {
                      "-22% low on edge/vertex-touching pairs and\n      -3.9% "
                      "mass-weighted over the near field. This run reproduces THAT physics,"
                   << "\n      not the current estimator's. Rebuild the matrix to get the "
-                     "corrected near\n      field -- but check the size first: PTM-19 "
+                     "corrected near\n      field -- but check the size first: "
                      "forbids rebuilding a production\n      .vf by accident. ***\n"
                   << std::endl;
     }

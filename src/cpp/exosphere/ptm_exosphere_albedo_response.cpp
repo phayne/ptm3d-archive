@@ -267,7 +267,7 @@ bool PTMExosphereIntegration::prepareDiurnalAlbedoResponse(const ThermalColumn& 
         << ", p99 " << b_p99 << ", max on T_max > 110 K faces " << bw_max << " (limit: median 0.015)\n"
         << "    Faces on the 1/4-power law (no response): " << (n_bad_albedo + n_failed) << " (thermal albedo "
         << "outside [0, 1): " << n_bad_albedo << "; periodic solve failed: " << n_failed << ")\n"
-        << "    Trust region (PTM-675): re-anchor by an exact periodic solve when |ln(r / r_anchor)| > "
+        << "    Trust region: re-anchor by an exact periodic solve when |ln(r / r_anchor)| > "
         << diurnal_trust_ << (diurnal_trust_ > 0.0 ? "" : " (OFF: the 65cd8c5 law at every r)") << "\n";
     diurnal_response_report_ = rep.str();
     std::cout << "\nAlbedo response:\n" << diurnal_response_report_ << std::flush;

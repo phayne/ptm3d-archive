@@ -220,7 +220,7 @@ void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
         line << (i ? ", " : "") << dead[i];
     line << " -- editing them changes no result. Named properties are honored only under "
             "`generic_body.surface:`; on a built-in body use the `*_override` keys. "
-            "See docs/KNOWN_LIMITATIONS.md (PTM-67).";
+            "See docs/KNOWN_LIMITATIONS.md.";
     std::cerr << line.str() << std::endl;
 }
 
@@ -1792,7 +1792,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  body: \"Europa\"                      # Target body (Europa, Moon, Mercury, etc.)\n";
     out << "  spice_coverage_strict: false        # true = REFUSE when the loaded SPK does not span\n";
     out << "                                      # the run window (spin-up included); false = warn\n";
-    out << "                                      # and run on the Keplerian fallback (BUGS.md PTM-301)\n\n";
+    out << "                                      # and run on the Keplerian fallback\n\n";
     
     out << "# ========== Mesh Configuration ==========\n";
     out << "mesh:\n";

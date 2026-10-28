@@ -55,7 +55,7 @@ const char* kUsage =
 "    Prints the header, dimensions and structural validity of one or more\n"
 "    banked PTMT thermal states, plus per-layer temperature statistics and the\n"
 "    non-finite / unphysical counts that tell an all-zero cold-start column\n"
-"    (BUGS.md PTM-78) apart from a real integrated one.\n"
+"     apart from a real integrated one.\n"
 "\n"
 "    A PTMT v2 file carries an IDENTITY TRAILER -- the depth grid, the epoch,\n"
 "    the body, the grid parameters, a mesh geometry hash, a physics hash and\n"
@@ -76,7 +76,7 @@ const char* kUsage =
 "    geothermal flux read back out of the state's own bottom boundary\n"
 "    condition. Qb_from_state is MEASURED from the column, not configured, so\n"
 "    it is the way to tell whether a state was integrated with the Qb its\n"
-"    config claims (BUGS.md PTM-161: `geothermal_heat_flow` was inert on every\n"
+"    config claims (`geothermal_heat_flow` was inert on every\n"
 "    solver entry point for a whole campaign).\n"
 "\n"
 "OPTIONS\n"
@@ -577,7 +577,7 @@ int main(int argc, char** argv) {
                     (unsigned long long)all.n_below_cmb,
                     (unsigned long long)all.n_exact_zero);
         if (all.n_exact_zero > 0)
-            std::printf("  NOTE: exact zeros are the BUGS.md PTM-78 signature -- a\n"
+            std::printf("  NOTE: exact zeros are the  signature -- a\n"
                         "        checkpoint banked from a column that was never filled.\n");
         if (all.n_nonfinite > 0)
             std::printf("  NOTE: a non-finite value poisons every face it restores into.\n");
@@ -624,7 +624,7 @@ int main(int argc, char** argv) {
             std::printf("  Qb_from_state is MEASURED out of the state's own bottom BC\n"
                         "  (T[n-1] = T[n-2] + Qb*dz/k[n-1]). If it disagrees with the Qb\n"
                         "  the config claims, the config is not what was integrated --\n"
-                        "  that is BUGS.md PTM-161, which was inert for a whole campaign.\n");
+                        "  that is , which was inert for a whole campaign.\n");
         }
 
         // ---- the identity trailer, when the file carries one ---------------
@@ -734,7 +734,7 @@ int main(int argc, char** argv) {
                         "                             (PTM-STATE-NO-EPOCH)\n"
                         "  body, properties    no      mesh identity      no\n"
                         "  post-coupling flag  no  -- whether this state is pre- or\n"
-                        "                             post-radiation-coupling (PTM-57)\n"
+                        "                             post-radiation-coupling\n"
                         "  Re-bank this state on the current engine to get a v2 identity\n"
                         "  trailer, which records all of the above.\n");
         } else {

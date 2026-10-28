@@ -634,7 +634,7 @@ void RadiositySolver::setSolarSourceAlbedo(const std::vector<double>& source_alb
         std::cerr << "  [RadiositySolver::setSolarSourceAlbedo] WARNING: source-albedo size "
                   << source_albedo.size() << " != face count " << emissivity_.size()
                   << "; IGNORED (the visible-band source keeps the STATIC base albedo "
-                     "-- BUGS.md PTM-106 remains in force for this run)." << std::endl;
+                     "--  remains in force for this run)." << std::endl;
         return;
     }
     solar_albedo_source_ = source_albedo;
@@ -649,7 +649,7 @@ void RadiositySolver::setSolarSourceAlbedoBatch(
             std::cerr << "  [RadiositySolver::setSolarSourceAlbedoBatch] WARNING: a per-timestep "
                          "source-albedo vector has size " << v.size() << " != face count "
                       << emissivity_.size() << "; the WHOLE batch override is IGNORED (the "
-                         "visible-band source keeps the STATIC base albedo -- PTM-106)."
+                         "visible-band source keeps the STATIC base albedo)."
                       << std::endl;
             return;
         }
@@ -684,7 +684,7 @@ void RadiositySolver::checkSourceAlbedoGPURepresentable() {
     static bool warned = false;
     if (!warned) {
         warned = true;
-        std::cerr << "  [radiation.PTM-106] WARNING: " << n_bad
+        std::cerr << "  [radiation.albedo] WARNING: " << n_bad
                   << " face(s) carry an operator Bond albedo < " << A_OP_MIN
                   << ", so the incidence-dependent visible SOURCE albedo cannot be "
                      "represented on the GPU (which hard-wires source = A_op * Q). "
@@ -1710,7 +1710,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         solar_albedo_source_batch_.empty()
         || solar_albedo_source_batch_.size() == n_steps;
     if (!src_batch_ok) {
-        std::cerr << "  [radiation.PTM-106] WARNING: per-timestep source-albedo batch has "
+        std::cerr << "  [radiation.albedo] WARNING: per-timestep source-albedo batch has "
                   << solar_albedo_source_batch_.size() << " step(s) but the radiosity batch has "
                   << n_steps << "; running the serial per-timestep path instead of the pool "
                      "(correct results, slower) rather than pairing the wrong albedo."
@@ -2575,7 +2575,7 @@ FaceClassification FaceSelector::classify(
 
     // Never drop faces silently: say how many the legacy gate is zeroing.
     if (!select_all && result.exchange_faces < result.total_faces) {
-        std::cout << "  WARNING [PTM-98] radiation.exchange_selection='shadow': "
+        std::cout << "  WARNING radiation.exchange_selection='shadow': "
                   << (result.total_faces - result.exchange_faces) << " / "
                   << result.total_faces << " faces are EXCLUDED from radiation"
                      " exchange and will receive exactly 0 W/m^2 indirect flux."
@@ -2583,7 +2583,7 @@ FaceClassification FaceSelector::classify(
                   << (illumination_series.empty() ? 0 : illumination_series[0].size())
                   << " illumination samples), so the result depends on how the run"
                      " was chunked. Use exchange_selection: all (default) unless you"
-                     " are reproducing a pre-PTM-98 run." << std::endl;
+                     " are reproducing a pre-2026-08-05 run." << std::endl;
     }
 
     if (config_.verbose) {
@@ -2690,7 +2690,7 @@ void vfReplaceOrientationGate(const ptm::Mesh& mesh, bool illum_batch_path) {
               << engDigest << "; CSR: " << basis << ", digest " << csrDigest << "\n";
     if (csrDigest == engDigest) {
         std::cout << "  [VF-ORIENT] OK: the CSR was traced on the same side of every face that this run "
-                     "illuminates (PTM-733).\n";
+                     "illuminates.\n";
         return;
     }
     std::ostringstream msg;
@@ -2698,7 +2698,7 @@ void vfReplaceOrientationGate(const ptm::Mesh& mesh, bool illum_batch_path) {
         << "(CSR rule " << csrRule << ", digest " << csrDigest << "; engine rule " << eng.rule
         << ", digest " << engDigest << ", " << eng.n_reversed << "/" << eng.n_faces
         << " faces reversed vs raw winding). This is how the Moon3D 509k v4 matrix came to describe the "
-           "crater's UNDERSIDE (PTM-732). Rebuild the CSR with the referee under the SAME "
+           "crater's UNDERSIDE. Rebuild the CSR with the referee under the SAME "
            "PTM_ILLUM_TRUE_NORMALS setting as this run, or match this run to the CSR.";
     const char* ov = std::getenv("PTM_VF_ORIENT_OVERRIDE");
     if (ov && ov[0] == '1') {
@@ -3112,10 +3112,10 @@ bool RadiationExchangeManager::prepare(
     // based and therefore window-dependent, even though the exchange set no longer
     // is. Beaming is off by default; say so when it is on.
     if (beamingRequested()) {
-        std::cout << "  WARNING [PTM-101] rms_slope_deg=" << config_.rms_slope_deg
+        std::cout << "  WARNING rms_slope_deg=" << config_.rms_slope_deg
                   << " > 0: the Smith beamed-emission receiver and emitter sets are"
                      " selected from shadow fractions measured over THIS window, so a"
-                     " beaming run is still chunk-decomposition dependent. The PTM-98"
+                     " beaming run is still chunk-decomposition dependent. The"
                      " fix covers the radiation-exchange set only. REMEDY: run beaming"
                      " single-shot (one window, no chunking), or accept and state the"
                      " chunk dependence of the result." << std::endl;
@@ -3402,7 +3402,7 @@ void RadiationExchangeManager::setSolarSourceAlbedo(const std::vector<double>& s
         static bool warned = false;
         if (!warned) {
             warned = true;
-            std::cerr << "  [radiation.PTM-106] WARNING: setSolarSourceAlbedo() called before the "
+            std::cerr << "  [radiation.albedo] WARNING: setSolarSourceAlbedo() called before the "
                          "radiosity solver exists; the incidence-dependent visible SOURCE albedo "
                          "was DROPPED for this call (static base albedo in force)." << std::endl;
         }
@@ -3417,7 +3417,7 @@ void RadiationExchangeManager::setSolarSourceAlbedoBatch(
         static bool warned = false;
         if (!warned) {
             warned = true;
-            std::cerr << "  [radiation.PTM-106] WARNING: setSolarSourceAlbedoBatch() called before "
+            std::cerr << "  [radiation.albedo] WARNING: setSolarSourceAlbedoBatch() called before "
                          "the radiosity solver exists; DROPPED (static base albedo in force)."
                       << std::endl;
         }

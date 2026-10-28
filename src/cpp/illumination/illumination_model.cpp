@@ -118,7 +118,7 @@ inline void warnUnknownPrimaryOnce(const std::string& body,
     std::cerr << "[illumination] WARNING: primary body '" << body
               << "' is not one of EARTH / JUPITER / SATURN / MARS. " << context
               << ": " << consequence
-              << " (warned once; see docs/KNOWN_LIMITATIONS.md, PTM-45)." << std::endl;
+              << " (warned once; see docs/KNOWN_LIMITATIONS.md)." << std::endl;
 }
 
 // PTM-44 / Fermi F1: the horizon-oriented 5-point probe found nothing above the
@@ -555,7 +555,7 @@ bool IlluminationModel::initializeScene(
             const double cell = horizon_cell_scale_ * med_pitch;
             const double gate = (body_r>0.0) ? body_r*(0.25*M_PI/180.0) : 1e300;  // 0.25 deg of arc
             if (body_r>0.0 && extent>gate) {
-                std::cout << "[IlluminationModel] PTM-13 horizon cull DISABLED: mesh extent " << extent
+                std::cout << "[IlluminationModel] horizon cull DISABLED: mesh extent " << extent
                           << " m exceeds the single-up validity limit " << gate << " m (0.25 deg arc at "
                           << "body radius " << body_r << " m); curvature would invalidate the global-up "
                           << "skyline. Keeping the Embree shadow test.\n";
@@ -563,7 +563,7 @@ bool IlluminationModel::initializeScene(
             } else {
                 horizon_direct_.setSlackDeg(horizon_slack_deg_);
                 horizon_direct_.build(fcs, up, cell);
-                std::cout << "[IlluminationModel] PTM-13 local-horizon direct-shadow cull ENABLED (cell="
+                std::cout << "[IlluminationModel] local-horizon direct-shadow cull ENABLED (cell="
                           << cell*1000.0 << " mm, slack=" << horizon_slack_deg_ << " deg, " << Fh
                           << " faces, azimuth-specific skyline; resolution-independent).\n";
                 if (use_gpu_ray_tracer_)
@@ -593,7 +593,7 @@ bool IlluminationModel::initializeScene(
             const size_t ncore = faces.size();
             const double mean_nbr = (ncore > 0)
                 ? static_cast<double>(face_skip_nbr_.size()) / static_cast<double>(ncore) : 0.0;
-            std::cout << "[IlluminationModel] PTM-13 topological self-skip ENABLED (rings="
+            std::cout << "[IlluminationModel] topological self-skip ENABLED (rings="
                       << selfskip_rings_ << ", " << ncore << " core faces, mean " << mean_nbr
                       << " skip-ids/face incl self; ray starts AT face, eps_n=eps_d=0, tnear=0; build "
                       << std::chrono::duration<double, std::milli>(t_ss1 - t_ss0).count()
@@ -604,7 +604,7 @@ bool IlluminationModel::initializeScene(
                              "illumination path only; GPU ray tracing is active, so it will NOT engage. "
                              "Set illumination.use_gpu:false to apply it (or add the GPU mirror). The "
                              "GPU batch shadow origin additionally uses eps_d=8x "
-                             "(see docs/KNOWN_LIMITATIONS.md, PTM-13).\n";
+                             "(see docs/KNOWN_LIMITATIONS.md).\n";
         }
 
         // PTM-13 rise-epsilon: build the per-core-face facet scale for the out-of-plane-rise
@@ -648,18 +648,18 @@ bool IlluminationModel::initializeScene(
                 sum_e += em;
             }
             const double mean_e = (ncore > 0) ? sum_e / static_cast<double>(ncore) : 0.0;
-            std::cout << "[IlluminationModel] PTM-13 rise-epsilon self-relief discriminator ENABLED (k="
+            std::cout << "[IlluminationModel] rise-epsilon self-relief discriminator ENABLED (k="
                       << rise_keps_ << ", mean facet edge " << mean_e*1000.0 << " mm -> mean h_eps "
                       << rise_keps_*mean_e*1000.0 << " mm, " << ncore << " core faces; ray marches from "
                          "the centroid, a hit counts as a real occluder iff it rises >= h_eps out of the "
                          "source face plane). Separates ~0.12 mm self-relief from the ~2.47 mm rim the "
                          "1 cm offset hops.\n";
             if (rise_habs_ >= 0.0) {
-                std::cout << "[IlluminationModel] PTM-13 Class-2 fix: ABSOLUTE self-relief floor "
+                std::cout << "[IlluminationModel] Class-2 fix: ABSOLUTE self-relief floor "
                              "OVERRIDE h_eps = " << rise_habs_*1000.0 << " mm (env PTM_ILLUM_RISE_HABS), "
                              "replacing the edge-proportional " << rise_keps_ << "*edge (~"
                           << rise_keps_*mean_e*1000.0 << " mm). h_abs=0 => exact source-triangle-only "
-                             "self-exclusion (resolved relief shadows; Paul's scale ruling). Phase-2 "
+                             "self-exclusion (resolved relief shadows). "
                              "knob table: 0.2*edge kills 0.9% of grazing occlusions, h_abs=0 kills 100% "
                              "with 0 acne.\n";
             }
@@ -675,7 +675,7 @@ bool IlluminationModel::initializeScene(
                                                      vv[2] - scene_origin_offset_[2] }};
                     }
                 }
-                std::cout << "[IlluminationModel] PTM-13 rise-epsilon MULTI-HIT refinement (OPTION 3) "
+                std::cout << "[IlluminationModel] rise-epsilon MULTI-HIT refinement (OPTION 3) "
                              "ENABLED (bary_eps=" << rise_bary_eps_ << "): a hit ALSO blocks iff it is a "
                              "float64-INTERIOR crossing whose TRIANGLE max-vertex rise >= h_eps (catches "
                              "the near-coplanar occluder crossed near its shared edge; STEP-1 recall "
@@ -1620,11 +1620,11 @@ std::vector<std::array<int, 3>> IlluminationModel::buildInteriorHoleFill(
         ++n_holes;
     }
 
-    std::cout << "[IlluminationModel] PTM-18 interior hole-seal ENABLED: sealed " << n_holes
+    std::cout << "[IlluminationModel] interior hole-seal ENABLED: sealed " << n_holes
               << " interior hole(s) -> " << fills.size() << " shadow-only fill triangle(s); excluded "
               << n_skip_outer << " outer/spanning boundary component(s); skipped " << n_skip_open
               << " open/non-manifold boundary component(s) (NOT sealed -- a residual grazing-sun flash "
-                 "may persist there; see docs/KNOWN_LIMITATIONS.md, PTM-18). Default OFF -> "
+                 "may persist there; see docs/KNOWN_LIMITATIONS.md). Default OFF -> "
                  "byte-identical.\n";
     return fills;
 }
@@ -2976,7 +2976,7 @@ bool IlluminationModel::checkSpkCoverage(double et_start, double et_end, bool st
                      " unset: SPICE does not\n"
                      "  recognize human-readable small-body names from an SPK. Every"
                      " epoch would then be\n"
-                     "  served silently by the Keplerian fallback (BUGS.md PTM-301);"
+                     "  served silently by the Keplerian fallback;"
                      " the end-of-run fallback\n"
                      "  summary is the only remaining detector."
                   << std::endl;
@@ -3069,7 +3069,7 @@ bool IlluminationModel::checkSpkCoverage(double et_start, double et_end, bool st
                   << etToUtcString(ephemeris_report_.window_et_min) << " .. "
                   << etToUtcString(ephemeris_report_.window_et_max) << "\n"
                      "  Every epoch of this run will be served by the Keplerian"
-                     " fallback (BUGS.md PTM-301),\n"
+                     " fallback,\n"
                      "  which is NOT the ephemeris precision"
                      " `ephemeris_source: spice` advertises."
                   << std::endl;
@@ -3152,7 +3152,7 @@ bool IlluminationModel::checkSpkCoverage(double et_start, double et_end, bool st
         }
     }
     msg << "  Epochs outside the coverage are served by the Keplerian fallback"
-           " (BUGS.md PTM-301),\n"
+           ",\n"
            "  which is a two-body approximation, not the SPK's precision. The"
            " end-of-run summary\n"
            "  reports how many epochs it actually served.";
@@ -3211,7 +3211,7 @@ void IlluminationModel::reportEphemerisFallback() const {
         os << "\n  ...and there is no Keplerian propagator on this body, so those"
               " epochs received a ZERO Sun vector.";
     }
-    os << "\n  This run's ephemeris is NOT purely `spice`. BUGS.md PTM-301."
+    os << "\n  This run's ephemeris is NOT purely `spice`. ."
        << std::endl;
 }
 
@@ -4077,13 +4077,13 @@ bool IlluminationModel::calculateIlluminationFromMesh(
             if (side != ref.sign[i]) { if (disagree == 0) first = i; ++disagree; }
         }
         if (disagree) {
-            std::cerr << "[IlluminationModel] FATAL (PTM-733): illumination normals face a different side than "
+            std::cerr << "[IlluminationModel] FATAL: illumination normals face a different side than "
                          "the shared orientation rule " << ref.rule << " on " << disagree << " of "
                       << mesh->faces.size() << " faces (first: face " << first << "). The engine and the "
                          "view-factor referee would disagree about which side is the surface.\n";
             std::exit(3);
         }
-        std::cout << "[IlluminationModel] PTM-733 orientation self-check: illumination normals match the "
+        std::cout << "[IlluminationModel] orientation self-check: illumination normals match the "
                      "shared rule " << ref.rule << " on all " << mesh->faces.size() << " faces (reversed "
                   << ref.n_reversed << " vs raw winding, digest " << ptm::orient::hex16(ref.digest) << ").\n";
     }

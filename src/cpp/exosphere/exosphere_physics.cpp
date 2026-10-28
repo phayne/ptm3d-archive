@@ -2853,7 +2853,7 @@ void BallisticTransport::computeTransportProduct(
             local_index.build(face_centers, cell_size_deg, theta_max_global * 1.1);
             index = &local_index;
         } else {
-            std::cerr << "WARNING [PTM-643]: transport kernel cutoff " << std::fixed << std::setprecision(1)
+            std::cerr << "WARNING: transport kernel cutoff " << std::fixed << std::setprecision(1)
                       << (theta_max_global * 180.0 / M_PI) << " deg (T_max " << T_max
                       << " K) exceeds the spatial index query radius "
                       << (spatial_index_query_radius_ * 180.0 / M_PI)
@@ -3512,7 +3512,7 @@ const FixedKernelTransportOperator& ExosphereModel::fixedKernelOperator(double t
     if (!fixed_op_) fixed_op_ = std::make_unique<FixedKernelTransportOperator>();
     if (!fixed_op_->matches(face_centers_.size(), temperature_K, apply_jeans_escape)) {
         if (fixed_op_->built()) {
-            std::cerr << "WARNING [PTM-671]: fixed-temperature transport operator rebuilt: it was built for "
+            std::cerr << "WARNING: fixed-temperature transport operator rebuilt: it was built for "
                       << fixed_op_->temperatureK() << " K and is now requested at " << temperature_K
                       << " K (or EXO_XI_CUTOFF / the Jeans option changed)" << std::endl;
         }

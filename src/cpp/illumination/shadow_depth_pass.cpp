@@ -322,7 +322,7 @@ bool runShadowDepthPass(const PassInputs& in, std::string& err) {
         if (stale > 0) {
             std::cerr << "[shadow-depth] NOTE: removed " << stale << " stale shadow_depth_*.bin "
                          "frame(s) of a different index width from " << frames_dir
-                      << "/ (a previous run's; BUGS.md PTM-664)." << std::endl;
+                      << "/ (a previous run's; )." << std::endl;
         }
     }
 

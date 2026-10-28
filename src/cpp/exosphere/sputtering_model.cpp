@@ -156,7 +156,7 @@ void SputteringModel::initializeSpatialDistribution(
         spatial_initialized_ = true;
         const double min_w = *std::min_element(spatial_weight_.begin(), spatial_weight_.end());
         const double max_w = *std::max_element(spatial_weight_.begin(), spatial_weight_.end());
-        std::cout << "Sputtering ion flux (area-weighted normalization, PTM-649):" << std::endl;
+        std::cout << "Sputtering ion flux (area-weighted normalization):" << std::endl;
         std::cout << "  Pattern: " << (hasIonMap() ? ion_map_label_ :
                      "cosine " + std::to_string(config_.hemisphere_contrast) +
                      ":1 trailing/leading (Cassidy et al. 2013 apex ratio ~3, p. 64/69; the cosine form "
@@ -434,7 +434,7 @@ void SputteringModel::printConfig() const {
     }
     const bool legacy = config_.legacyParams();
     std::cout << "  Parameter set: " << (legacy ? "LEGACY (--sputter-legacy-params; pre-2026-09-23)"
-                                                : "current (PTM-649; citations in sputtering_model.h)") << std::endl;
+                                                : "current (citations in sputtering_model.h)") << std::endl;
     std::cout << "  Rate scale factor: " << config_.rate_scale << std::endl;
     if (!legacy && hasIonMap()) {
         std::cout << "  Ion map: " << ion_map_label_ << (ion_map_absolute_ ? " (absolute)" : " (pattern)") << std::endl;
@@ -499,7 +499,7 @@ void SputteringModel::printConfig() const {
         std::cout << "\n  Mass accounting: LEGACY escape-only (--sputter-legacy-escape-only). Only the "
                   << (100.0 * config_.escapeShare()) << "% escaping share leaves the surface; the other "
                   << (100.0 * (1.0 - config_.escapeShare())) << "% is neither removed nor transported "
-                  << "(NOT mass-conserving; PTM-642)." << std::endl;
+                  << "(NOT mass-conserving)." << std::endl;
     } else {
         std::cout << "\n  Mass accounting (share of gross sputtered mass" << (legacy ? "" : ", at T_ref") << "):"
                   << std::endl;

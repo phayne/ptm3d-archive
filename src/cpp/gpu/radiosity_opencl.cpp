@@ -1083,7 +1083,7 @@ void RadiosityOpenCLSolver::buildChunkedCsrT(
                         " has " + std::to_string(row_nnz) +
                         " non-zeros, exceeding the per-chunk budget of " +
                         std::to_string(max_chunk_nnz) +
-                        " nnz (2^31-byte GPU addressing wall, PTM-25). This "
+                        " nnz (2^31-byte GPU addressing wall). This "
                         "matrix cannot run on this GPU without a wider SpMV "
                         "kernel; use CPU radiosity.");
                 }
@@ -1204,7 +1204,7 @@ double RadiosityOpenCLSolver::benchmarkSpMV(int n_reps, int mode)
     if (use_chunked_csr_) {
         throw std::runtime_error(
             "benchmarkSpMV: this matrix (" + std::to_string(nnz_) +
-            " nnz) was uploaded through the CHUNKED CSR path (PTM-25), so the "
+            " nnz) was uploaded through the CHUNKED CSR path, so the "
             "single-buffer CSR buffers this benchmark drives do not exist. "
             "Benchmarking it here would time the kernels against null buffers "
             "and report a meaningless number. Use the solver's own per-solve "

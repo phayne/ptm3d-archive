@@ -103,7 +103,7 @@ static void clearOtherWidthFrames(const std::string& output_dir,
             std::cerr << tag << " NOTE: removed " << n << " stale " << fld
                       << "_*.bin frame(s) of a different index width from " << output_dir
                       << "/" << fld << "/ (a previous run's; this run writes "
-                      << w << "-digit names, BUGS.md PTM-664).\n";
+                      << w << "-digit names).\n";
         }
     }
 }
@@ -2505,8 +2505,8 @@ static void accumulateEffectiveAlbedoGPU(size_t n_faces,
     if (n_faces == 0 || total_time_steps <= 0) return;
     if (!g_aeff_win_set) {
         std::cerr << "[GPU Thermal] WARNING: integration window not published before the "
-                     "thermal solve; skipping the PTM-107(a) effective-albedo accumulation "
-                     "(statistics/effective_albedo.bin will be absent and the PTM-106 "
+                     "thermal solve; skipping the effective-albedo accumulation "
+                     "(statistics/effective_albedo.bin will be absent and the albedo "
                      "self-check will report SKIPPED)." << std::endl;
         return;
     }
@@ -2574,8 +2574,8 @@ static void reportSourceAlbedoConsistency() {
         // source IS the operator by construction, and each of those paths already
         // announces which albedo feeds the radiosity.
         if (!g_ptm106_expected) return;
-        std::cerr << "  [radiation.PTM-106] WARNING: source-vs-BC albedo self-check SKIPPED "
-                     "although the PTM-106 source override IS active -- "
+        std::cerr << "  [radiation.albedo] WARNING: source-vs-BC albedo self-check SKIPPED "
+                     "although the source override IS active -- "
                   << (g_src_albedo_valid
                         ? "the surface-BC effective-albedo accumulator is EMPTY (no thermal "
                           "flux path published it; streamed thermal storage does not)"
@@ -2597,21 +2597,21 @@ static void reportSourceAlbedoConsistency() {
         ++n_cmp;
     }
     if (n_cmp == 0) {
-        std::cerr << "  [radiation.PTM-106] WARNING: source-vs-BC albedo self-check had NO "
+        std::cerr << "  [radiation.albedo] WARNING: source-vs-BC albedo self-check had NO "
                      "comparable faces (accumulators empty). The fix may be installed but "
                      "UNVERIFIED for this run -- do not quote it as consistent." << std::endl;
         return;
     }
     std::ios_base::fmtflags fl(std::cout.flags());
     std::streamsize pr = std::cout.precision();
-    std::cout << "[albedo] PTM-106 source-vs-BC albedo self-check over " << n_cmp
+    std::cout << "[albedo] source-vs-BC albedo self-check over " << n_cmp
               << " ever-lit faces: max |A_radiosity - A_BC| = "
               << std::scientific << std::setprecision(3) << max_abs
               << " (face " << worst << ")";
     if (max_abs > 1e-9) {
         std::cout << "  <-- NOT CONSISTENT; the visible source is NOT the BC albedo."
                   << std::endl;
-        std::cerr << "  [radiation.PTM-106] WARNING: radiosity source albedo disagrees with the "
+        std::cerr << "  [radiation.albedo] WARNING: radiosity source albedo disagrees with the "
                      "surface-BC albedo by up to " << max_abs
                   << "; reflected-solar energy does not close per face." << std::endl;
     } else {
@@ -2631,7 +2631,7 @@ static bool writeEffectiveAlbedo(const std::string& output_dir) {
                      "effective-albedo accumulator was never filled (no thermal flux path "
                      "published it; streamed thermal storage does not). Any energy-closure "
                      "audit of this run has to treat the BC albedo as a free parameter again "
-                     "(BUGS.md PTM-107a)." << std::endl;
+                     "." << std::endl;
         return false;
     }
     if (!g_aeff_win_set) {
@@ -2661,7 +2661,7 @@ static bool writeEffectiveAlbedo(const std::string& output_dir) {
         std::ofstream out(fn, std::ios::binary);
         if (!out) {
             std::cerr << "WARNING: could not open " << fn
-                      << " for the PTM-107(a) effective-albedo output." << std::endl;
+                      << " for the effective-albedo output." << std::endl;
             return false;
         }
         // SAME on-disk convention as every other statistics/*.bin: uint32 face
@@ -2677,7 +2677,7 @@ static bool writeEffectiveAlbedo(const std::string& output_dir) {
         out.close();
         std::ios_base::fmtflags fl(std::cout.flags());
         std::streamsize pr = std::cout.precision();
-        std::cout << "[albedo] PTM-107(a) effective surface albedo (flux-weighted over the "
+        std::cout << "[albedo] effective surface albedo (flux-weighted over the "
                      "DIRECT beam, the value the BC absorbed with): global A_eff = "
                   << std::defaultfloat << std::setprecision(6)
                   << (den_tot > 0.0 ? num_tot / den_tot
@@ -2694,7 +2694,7 @@ static bool writeEffectiveAlbedo(const std::string& output_dir) {
         std::cout.precision(pr);
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "WARNING: PTM-107(a) effective-albedo output failed: "
+        std::cerr << "WARNING: effective-albedo output failed: "
                   << e.what() << std::endl;
         return false;
     }
@@ -2713,9 +2713,9 @@ static inline bool legacyRadiosityStaticAlbedo() {
         const char* e = std::getenv("PTM_LEGACY_RADIOSITY_STATIC_ALBEDO");
         bool on = (e && std::string(e) != "0" && e[0] != '\0');
         if (on) {
-            std::cerr << "[radiation.PTM-106] PTM_LEGACY_RADIOSITY_STATIC_ALBEDO=1: the two-band "
+            std::cerr << "[radiation.albedo] PTM_LEGACY_RADIOSITY_STATIC_ALBEDO=1: the two-band "
                          "visible SOURCE reverts to the STATIC base albedo. This REINSTATES the "
-                         "PTM-106 energy leak at grazing incidence (reflected sunlight is lost "
+                         "energy leak at grazing incidence (reflected sunlight is lost "
                          "from the budget). Use for A/B comparison only.\n";
         }
         return on;
@@ -3884,7 +3884,7 @@ void AbsorbedFluxComposer::resolveAngularModel(const thermal::Planet* planet,
                       << "\") carries albedo " << fmtSig(planet->albedo)
                       << ", which DISAGREES with the operative "
                       << fmtSig(default_visible_albedo)
-                      << " used to build face_albedos. See docs/KNOWN_LIMITATIONS.md (PTM-55)."
+                      << " used to build face_albedos. See docs/KNOWN_LIMITATIONS.md."
                       << std::endl;
         }
         if (use_hapke_albedo) {
@@ -4255,7 +4255,7 @@ struct CpuStateCheckpoint {
             std::cerr << "\n" << tag << " FATAL: " << refusals.load() << " of "
                       << n_faces << " faces produced no T(z) column.\n"
                       << "  Writing the checkpoint anyway would bank dead columns "
-                         "that the next chunk resumes from (BUGS.md PTM-78). "
+                         "that the next chunk resumes from. "
                          "Refusing to write '" << out_path << "'." << std::endl;
             return false;
         }
@@ -5517,7 +5517,7 @@ static bool refuseDepthMapOnPath(const char* path_name,
                  "for statistics/depth_map_z.json to report. Reporting one "
                  "face's numbers as the manifest for a map assembled from many "
                  "would be the wrong-depth failure this product's refusals "
-                 "exist to prevent (BUGS.md PTM-76).\n"
+                 "exist to prevent.\n"
                  "  Setting output.map_depth_snap_to_node: false would fix the "
                  "file NAME -- every face would be interpolated to exactly the "
                  "requested depth -- but not the manifest, which is "
@@ -5770,8 +5770,7 @@ bool runThermalModelsForAllFacesStreamed(
                      "thermal.ADAPTIVE_GRID is on, so the CPU scalar solver this "
                      "path calls gives each face its OWN depth grid.\n"
                   << "  A T(z) checkpoint carries one shape for the whole mesh "
-                     "and no depths, so it cannot represent that (BUGS.md "
-                     "PTM-76).\n"
+                     "and no depths, so it cannot represent that.\n"
                   << "  Use the GPU persistent solver, or drop the checkpoint "
                      "keys." << std::endl;
         return false;
@@ -6015,8 +6014,7 @@ bool runThermalModelsForAllFaces(
                      "thermal.ADAPTIVE_GRID is on, so the CPU scalar solver "
                      "gives each face its OWN depth grid.\n"
                   << "  A T(z) checkpoint carries one shape for the whole mesh "
-                     "and no depths, so it cannot represent that (BUGS.md "
-                     "PTM-76).\n"
+                     "and no depths, so it cannot represent that.\n"
                   << "  Use the CPU SIMD-batch solver or the GPU persistent "
                      "solver -- both put every face on one reference grid -- or "
                      "drop the checkpoint keys." << std::endl;
@@ -6983,10 +6981,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                          "(warm start); the checkpoint restore supplies the starting columns.\n";
         } else if (is_subset && rt_mode == CpuRethermalMode::SeedSeries) {
             std::cerr << "[Re-thermal] PTM_CPU_RETHERMAL=seed-series: re-thermal pass re-seeds with the "
-                         "PTM-727 lumped series seed from this pass's own composed flux, then re-equilibrates"
+                         "lumped series seed from this pass's own composed flux, then re-equilibrates"
                       << (g_rt_series_hi > g_rt_series_lo ? "" :
                           (cpuRethermalExplicit()
-                               ? " -- WARNING: no PTM-727 series window was armed (thermal.seed_indirect is not "
+                               ? " -- WARNING: no series window was armed (thermal.seed_indirect is not "
                                  "'series'), so the legacy re-seed is used"
                                : " -- no series window was armed on this run (thermal.seed_indirect off or "
                                  "inert), so this is the legacy re-seed"))
@@ -7045,8 +7043,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "footprint, not a knob:\n"
                      "      each ThermalBatchSoA is ~"
                   << (thermal::MAX_THERMAL_LAYERS * 8 * 10 * sizeof(double)) / 1024
-                  << " KiB per thread today).\n"
-                     "  BUGS.md PTM-302." << std::endl;
+                  << " KiB per thread today)." << std::endl;
         return false;
     }
 
@@ -7198,7 +7195,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         dbg_eqflux_sum.assign(n_faces, 0.0);
         dbg_eqflux_max.assign(n_faces, 0.0);
         dbg_eqflux_n.assign(n_faces, 0);
-        std::cout << "[PTM-51 dump] PTM_DUMP_EQ_SEED=" << eq_seed_dump_path
+        std::cout << "[dump] PTM_DUMP_EQ_SEED=" << eq_seed_dump_path
                   << " -- per-face equilibration seed + forcing will be written"
                   << std::endl;
     }
@@ -7413,7 +7410,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                             "would\n      integrate a different length than "
                             "the one it resumed from)\n" : "")
                   << (dump_eq_seed
-                          ? "    - the PTM-51 equilibration-seed dump "
+                          ? "    - the equilibration-seed dump "
                             "(PTM_DUMP_EQ_SEED), whose CSV would carry zeros "
                             "for every\n      restored face\n" : "")
                   << "  Refusing rather than shipping a product that means "
@@ -8702,11 +8699,11 @@ bool runThermalModelsForAllFacesBatchSoA(
     if (dump_eq_seed && !is_subset) {
         std::ofstream fh(eq_seed_dump_path);
         if (!fh) {
-            std::cerr << "[PTM-51 dump] WARNING: cannot open '" << eq_seed_dump_path
+            std::cerr << "[dump] WARNING: cannot open '" << eq_seed_dump_path
                       << "' for writing; NO dump produced." << std::endl;
         } else {
             fh << std::setprecision(10);
-            fh << "# PTM-51 equilibration-seed diagnostic\n"
+            fh << "# equilibration-seed diagnostic\n"
                << "# body=" << planet.name
                << " emissivity=" << planet.emissivity
                << " Qb=" << planet.Qb
@@ -8738,7 +8735,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                    << dbg_eqflux_n[gf] << ','
                    << t_final << '\n';
             }
-            std::cout << "[PTM-51 dump] wrote " << n_faces << " rows to "
+            std::cout << "[dump] wrote " << n_faces << " rows to "
                       << eq_seed_dump_path << std::endl;
         }
     }
@@ -9966,7 +9963,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                       << fmtSig(default_visible_albedo)
                       << ". The operative value is what the flux uses; the "
                          "solver-scope Planet's albedo is used for nothing else. "
-                         "See docs/KNOWN_LIMITATIONS.md (PTM-55)." << std::endl;
+                         "See docs/KNOWN_LIMITATIONS.md." << std::endl;
             std::cerr.flags(f);
             std::cerr.precision(pr);
         }
@@ -10019,7 +10016,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // because a chunked GPU series carries it at every seam.
         std::cerr << "[GPU Thermal] WARNING: warm start -- output frame 0 of this "
                      "window is the checkpoint's RAW surface node, not the surface "
-                     "re-solved at this epoch (BUGS.md PTM-662, open on the GPU "
+                     "re-solved at this epoch (a known limitation of the GPU "
                      "path). It can differ from the unchunked run's frame at the "
                      "same epoch by a few tenths of a kelvin; frames 1.. are "
                      "unaffected. Overlap chunks by one step and drop frame 0, or "
@@ -10193,7 +10190,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << " requested, but this is a WARM-START chunk "
                      "(initial_state_file set). The loaded T(z) is already "
                      "equilibrated and the window is integrated EXACTLY ONCE "
-                     "(PTM-54/57/78); the knob is IGNORED here.\n";
+                     "; the knob is IGNORED here.\n";
     } else if (eq_cycles_explicit && !two_phase) {
         std::cerr << "[GPU Thermal] WARNING: equilibration_cycles=" << eq_passes
                   << " on a SINGLE-PHASE run: the cycled array is the FULL "
@@ -12605,7 +12602,7 @@ bool runThermalForSelectedFaces_GPU(
                           << batch_T_final.size() << ", active=" << active
                           << ", batch_n=" << batch_n << ", n_layers=" << n_layers
                           << "); the chunk checkpoint keeps iter-0's un-coupled column"
-                             " for these faces (BUGS.md PTM-57)\n";
+                             " for these faces\n";
             }
         }
 
@@ -12635,7 +12632,7 @@ bool runThermalForSelectedFaces_GPU(
             std::cout << "  [Re-thermal] PTM_RETHERMAL_WARMUP_SKIP="
                       << kReThermalWarmupSkip << ": the first "
                       << kReThermalWarmupSkip << " output step(s) keep iter-0's"
-                         " UN-COUPLED temperature (legacy PTM-54 behavior)"
+                         " UN-COUPLED temperature (legacy behavior)"
                       << std::endl;
         }
         // That legacy mode splices two different integrations into one frame
@@ -14202,7 +14199,7 @@ MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
               << r.median << " but median |vertex| = " << vmedian
               << " (ratio " << ratio << "). Face centers are vertex averages, so "
                  "these cannot legitimately differ. Something rescaled one array "
-                 "and not the other -- if mesh.scale_factor is set, that is PTM-65 "
+                 "and not the other -- if mesh.scale_factor is set, that is a known defect "
                  "(the vertices are scaled, the face centers/areas/normals are not, "
                  "and the run prints 'Applied scale factor' anyway).";
             r.fatal = true; r.message = m.str();
@@ -14245,7 +14242,7 @@ MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
           << (radius_says_km ? "KILOMETERS" : "METERS") << " -- but the heuristic "
           << "every consumer uses says " << (r.meters ? "METERS" : "KILOMETERS")
           << ". Running would scale SPICE positions and shadow radii by 1000x in "
-             "the wrong direction (this is PTM-36).";
+             "the wrong direction .";
         r.fatal = true; r.message = m.str();
         return r;
     }
@@ -14293,7 +14290,7 @@ void showUsage(const char* programName) {
     std::cout << "Usage: " << programName << " [options]\n\n";
     
     std::cout << "═══════════════════════════════════════════════════════════════\n";
-    std::cout << "  Configuration File Options (NEW!)\n";
+    std::cout << "  Configuration File Options\n";
     std::cout << "═══════════════════════════════════════════════════════════════\n";
     std::cout << "  --config FILE              Load parameters from YAML config file\n";
     std::cout << "  --generic-body-config FILE Load generic body config from YAML\n";
@@ -14358,7 +14355,7 @@ void showUsage(const char* programName) {
     std::cout << "                             so the integrated total is unchanged and only the\n";
     std::cout << "                             flux RAM and illumination cost fall (by N).\n";
     std::cout << "                             Before 2026-08-11 the default was 2 and the total\n";
-    std::cout << "                             was N x equilibration-orbits (BUGS.md PTM-146).\n";
+    std::cout << "                             was N x equilibration-orbits.\n";
     std::cout << "                             Env override: PTM_EQUILIBRATION_CYCLES.\n";
     std::cout << "  --equilibration-steps-per-day N   Explicit equilibration cadence (steps/Earth-day);\n";
     std::cout << "                             -1 (default) = auto (use --equilibration-samples-per-diurnal).\n";
@@ -14428,7 +14425,7 @@ void showUsage(const char* programName) {
     std::cout << "  --rad-coupling-flux-tol W  Flux change threshold [W/m2] for LEGACY mode (default: 0.1)\n";
     std::cout << "  --rad-coupling-face-frac F Face fraction still changing to stop (default: 0.01)\n";
     std::cout << "                                   LEGACY coupling mode only (see --rad-coupling-mode).\n";
-    std::cout << "  --rad-coupling-mode MODE   PTM-89 chunk-decomposition independence:\n";
+    std::cout << "  --rad-coupling-mode MODE   chunk-decomposition independence:\n";
     std::cout << "                                   bounded (default): absolute selection threshold, no\n";
     std::cout << "                                     face-fraction exit -- a chunked run reproduces the\n";
     std::cout << "                                     single-shot field.\n";
@@ -16626,7 +16623,7 @@ int main(int argc, char** argv) {
                       << "  Refusing to run. Continuing on built-in defaults would "
                          "silently replace the body, mesh, timesteps, thermophysical "
                          "properties and output directory you configured.\n"
-                      << "  See docs/KNOWN_LIMITATIONS.md (PTM-66)." << std::endl;
+                      << "  See docs/KNOWN_LIMITATIONS.md." << std::endl;
             return 1;
         }
     }
@@ -16694,7 +16691,7 @@ int main(int argc, char** argv) {
                          "Europa's radius, metakernel and thermophysical "
                          "properties for the body you named, and produce a "
                          "complete-looking output directory with zero absorbed "
-                         "flux on every face (BUGS.md ENG-BODY-UNBACKED-RUN)."
+                         "flux on every face."
                       << std::endl;
             return 1;
         }
@@ -17588,10 +17585,10 @@ int main(int argc, char** argv) {
                 && rad_coupling_mode != "legacy") {
             std::cerr << "FATAL [coupling]: radiation.coupling_mode='" << rad_coupling_mode
                       << "' is not one of bounded|fixed|legacy.\n"
-                         "  bounded (default) = PTM-89 fix: absolute selection threshold, no"
+                         "  bounded (default) = fix: absolute selection threshold, no"
                          " face-fraction exit.\n"
                          "  fixed             = as bounded, plus a fixed iteration count.\n"
-                         "  legacy            = pre-PTM-89 behavior, for reproducing published"
+                         "  legacy            = pre-2026-08-05 behavior, for reproducing published"
                          " runs." << std::endl;
             return 1;
         }
@@ -17627,22 +17624,22 @@ int main(int argc, char** argv) {
         if (rad_exchange_selection != "all" && rad_exchange_selection != "shadow") {
             std::cerr << "FATAL [exchange]: radiation.exchange_selection='"
                       << rad_exchange_selection << "' is not one of all|shadow.\n"
-                         "  all (default) = PTM-98 fix: every face keeps the indirect flux the\n"
+                         "  all (default) = fix: every face keeps the indirect flux the\n"
                          "                  radiosity solve computed for it. Window-independent.\n"
-                         "  shadow        = pre-PTM-98 shadow-fraction gate, for reproducing\n"
+                         "  shadow        = pre-2026-08-05 shadow-fraction gate, for reproducing\n"
                          "                  published runs. Window-DEPENDENT." << std::endl;
             return 1;
         }
         if (rad_exchange_selection == "shadow") {
             std::cout << "[exchange] WARNING: radiation.exchange_selection='shadow' re-introduces"
-                         " PTM-98 — the set of faces that receive indirect flux is measured over"
+                         " the set of faces that receive indirect flux is measured over"
                          " THIS window (equilibration + output steps), so the result depends on"
-                         " how the run was chunked. Use it only to reproduce a pre-PTM-98 run,"
+                         " how the run was chunked. Use it only to reproduce a pre-2026-08-05 run,"
                          " and pair it with coupling_mode: legacy." << std::endl;
             if (rad_coupling_mode != "legacy") {
                 std::cout << "[exchange] NOTE: exchange_selection='shadow' with coupling_mode='"
-                          << rad_coupling_mode << "' reproduces NEITHER the pre-PTM-98 nor the"
-                             " current behavior exactly; pre-PTM-98 reproduction needs"
+                          << rad_coupling_mode << "' reproduces NEITHER the pre-2026-08-05 nor the"
+                             " current behavior exactly; pre-2026-08-05 reproduction needs"
                              " coupling_mode: legacy as well." << std::endl;
             }
             if (!(rad_min_shadow_fraction >= 0.0 && rad_min_shadow_fraction <= 1.0)) {
@@ -18726,8 +18723,8 @@ int main(int argc, char** argv) {
                          "radius via the generic-body shape block.\n"
                       << "  mesh.scale_factor will NOT fix this: it scales the vertices "
                          "only and leaves face centers/areas/normals unscaled, which is "
-                         "itself a fatal inconsistency here (PTM-65).\n"
-                      << "  See docs/KNOWN_LIMITATIONS.md (PTM-37, PTM-36, PTM-65)."
+                         "itself a fatal inconsistency here.\n"
+                      << "  See docs/KNOWN_LIMITATIONS.md."
                       << std::endl;
             return 1;
         }
@@ -18783,7 +18780,7 @@ int main(int argc, char** argv) {
                              "facets are meters across.\n"
                           << "  Refusing rather than returning a doubly-counted "
                              "roughness that looks like a result "
-                             "(BUGS.md ENG-BEAM-SCALE-1)." << std::endl;
+                             "" << std::endl;
                 return 1;
             }
             if (fs.p05_m < kBeamWarnBelowM || fs.mean_m < kBeamWarnBelowM) {
@@ -18795,7 +18792,7 @@ int main(int argc, char** argv) {
                           << " m the engine runs but does not vouch for the "
                              "result: confirm this mesh does not resolve "
                              "sub-facet slopes before quoting it. "
-                             "(BUGS.md ENG-BEAM-SCALE-1)" << std::endl;
+                             "" << std::endl;
             }
         }
     }
@@ -19428,7 +19425,7 @@ int main(int argc, char** argv) {
         // indirect flux and no eq-indirect pass, so the option cannot act.
         std::cerr << "[eq-seed] WARNING: thermal.seed_indirect: "
                   << sim_config.thermal.seed_indirect << " has NO effect: radiation is off,"
-                     " so there is no indirect flux to seed with (PTM-727)." << std::endl;
+                     " so there is no indirect flux to seed with." << std::endl;
     }
     config.spinup_seed          = resolved_seed_mode;
     config.seed_anchor          = resolved_seed_anchor;
@@ -19771,7 +19768,7 @@ int main(int argc, char** argv) {
                              "no single resolved depth for the file name and no "
                              "single (node, weight) pair or error figure for "
                              "statistics/depth_map_z.json. Reusing the reference "
-                             "grid's weights there is BUGS.md PTM-76's failure "
+                             "grid's weights there is 's failure "
                              "exactly.\n"
                              "  Run the shipped default CPU SIMD-batch solver or the "
                              "GPU solver, drop the property map, or drop "
@@ -20063,7 +20060,7 @@ int main(int argc, char** argv) {
     g_solar_irr_per_step.clear();
     if (legacyFixedSolarConst()) {
         std::cerr << "[solar-const] PTM_LEGACY_FIXED_SOLARCONST=1: incidence albedo "
-                     "uses the FIXED 1-AU solar constant (legacy; PTM-28 sawtooth "
+                     "uses the FIXED 1-AU solar constant (legacy; sawtooth "
                      "may reappear near perihelion under GPU+Hapke)\n";
     } else {
         g_solar_irr_per_step.assign(static_cast<size_t>(total_time_steps), 0.0);
@@ -20084,11 +20081,11 @@ int main(int argc, char** argv) {
         if (n_ok != static_cast<size_t>(total_time_steps)) {
             std::cerr << "[solar-const] WARNING: only " << n_ok << "/" << total_time_steps
                       << " timesteps have a valid sun distance; the rest fall back to the "
-                         "fixed 1-AU solar constant (PTM-28 incidence fix partially inactive)\n";
+                         "fixed 1-AU solar constant (incidence fix partially inactive)\n";
         }
         if (n_ok > 0) {
             std::cerr << "[solar-const] incidence albedo uses the INSTANTANEOUS heliocentric "
-                         "solar constant (PTM-28 fix, default ON); S_inst range ["
+                         "solar constant (fix, default ON); S_inst range ["
                       << std::fixed << std::setprecision(1) << s_min << ", " << s_max
                       << "] W/m^2\n";
         }
@@ -20169,7 +20166,7 @@ int main(int argc, char** argv) {
                           ? "no write" : "write")
                   << ". Every solver path reads and writes the same 'PTMT' "
                      "format; a failure on either side aborts the run rather "
-                     "than degrading to a cold start (BUGS.md PTM-76)."
+                     "than degrading to a cold start."
                   << std::endl;
     }
 
@@ -21786,7 +21783,7 @@ int main(int argc, char** argv) {
                           << (geothermal_heat_flow        > 0.0 ? " geothermal_heat_flow" : "")
                           << "\n"
                           << "  The run would have reported the override and silently used the "
-                             "body defaults (BUGS.md PTM-53).\n"
+                             "body defaults.\n"
                           << "  Refusing to write results." << std::endl;
                 return 1;
             }
@@ -22018,7 +22015,7 @@ int main(int argc, char** argv) {
                                      " 'Using provided albedo map' / 'Failed to load explicit"
                                      " albedo_map' line above), the surface boundary condition"
                                      " and the radiosity source albedo are DIFFERENT fields in"
-                                     " this run. See BUGS.md PTM-454." << std::endl;
+                                     " this run. See ." << std::endl;
                     } else {
                         std::cout << "  Albedo map loading disabled (use_albedo_map: false):"
                                      " radiation coupling uses the uniform albedo "
@@ -22055,7 +22052,7 @@ int main(int argc, char** argv) {
                               << fmt_albedo(default_visible_albedo)
                               << " (difference " << std::scientific << std::setprecision(3)
                               << std::abs(planet.albedo - default_visible_albedo)
-                              << std::defaultfloat << "). See BUGS.md PTM-55." << std::endl;
+                              << std::defaultfloat << "). See ." << std::endl;
                 }
 
                 // Never substitute silently: if no per-face map resolved, this path is
@@ -22097,7 +22094,7 @@ int main(int argc, char** argv) {
                     std::cerr << "\n[radiation] FATAL: use_albedo_map is FALSE but the"
                                  " radiation coupling still loaded the per-face map "
                               << albedo_source_rad << ".\n"
-                                 "  That is the mixed-albedo state BUGS.md PTM-454 removed;"
+                                 "  That is the mixed-albedo state  removed;"
                                  " reaching it means the\n"
                                  "  gate on the map search above was bypassed. Refusing"
                                  " rather than running two\n"
@@ -22148,13 +22145,13 @@ int main(int argc, char** argv) {
                     (planet.albedoCoef.size() >= 2 && planet.S > 0.0) || planet.use_hapke_albedo;
                 if (incidence_on) {
                     if (legacyRadiosityStaticAlbedo()) {
-                        std::cout << "  [radiation.band_separated] PTM-106 source albedo: LEGACY "
+                        std::cout << "  [radiation.band_separated] source albedo: LEGACY "
                                      "(static base A0) -- incidence-dependent albedo is active, so "
                                      "reflected sunlight (A(theta)-A0)*Q is LOST from the budget at "
                                      "grazing incidence. Diffuse operator/absorptivity = A0."
                                   << std::endl;
                     } else {
-                        std::cout << "  [radiation.band_separated] PTM-106 source albedo: FIXED -- "
+                        std::cout << "  [radiation.band_separated] source albedo: FIXED -- "
                                      "the visible-band SOURCE uses the same per-face, per-timestep "
                                      "A(theta) the surface BC absorbs with ("
                                   << (planet.use_hapke_albedo ? "Hapke" : "Hayne 2017")
@@ -22162,7 +22159,7 @@ int main(int argc, char** argv) {
                                   << std::endl;
                     }
                 } else {
-                    std::cout << "  [radiation.band_separated] PTM-106 source albedo: base A0 "
+                    std::cout << "  [radiation.band_separated] source albedo: base A0 "
                                  "(no incidence-dependent albedo on this body -- source == "
                                  "operator == A0 by construction)." << std::endl;
                 }
@@ -22182,7 +22179,7 @@ int main(int argc, char** argv) {
                     std::cerr << "  [radiation.band_separated] WARNING: GRAY radiosity "
                                  "(band_separated: false) with an incidence-dependent surface BC ("
                               << (planet.use_hapke_albedo ? "Hapke" : "Hayne 2017")
-                              << "). The PTM-106 visible-source consistency fix does NOT apply on "
+                              << "). The visible-source consistency fix does NOT apply on "
                                  "the gray path: the gray solve has no separate visible band, and "
                                  "with no per-face Bond albedo installed its reflected-solar "
                                  "source falls back to the THERMAL reflectivity 1-eps = "
@@ -22283,10 +22280,10 @@ int main(int argc, char** argv) {
                 std::cout << std::defaultfloat << std::setprecision(6);
                 std::cout << "  Coupling mode: " << rad_coupling_mode
                           << (rad_coupling_legacy_mode
-                                  ? "  (PRE-PTM-89: window-dependent selection + unbounded"
+                                  ? "  (PRE-2026-08-05: window-dependent selection + unbounded"
                                     " face-fraction exit -- results depend on how the window"
                                     " was chunked)"
-                                  : "  (PTM-89: absolute selection threshold, no face-fraction"
+                                  : "  (absolute selection threshold, no face-fraction"
                                     " exit)")
                           << std::endl;
                 if (!rad_coupling_legacy_mode) {
@@ -22294,7 +22291,7 @@ int main(int argc, char** argv) {
                               << " K (absolute predicted ΔT; 0 = every face carrying"
                                  " indirect flux)" << std::endl;
                     if (rad_coupling_select_dt > 0.0) {
-                        std::cout << "  WARNING [PTM-89]: coupling_select_dt > 0 re-introduces"
+                        std::cout << "  WARNING: coupling_select_dt > 0 re-introduces"
                                      " chunk-decomposition dependence at up to ~"
                                   << rad_coupling_select_dt
                                   << " K per face. Set 0 for decomposition independence."
@@ -22312,7 +22309,7 @@ int main(int argc, char** argv) {
                     const auto rad_defaults = decltype(sim_config.radiation){};
                     if (std::abs(rad_coupling_face_frac
                                  - rad_defaults.coupling_face_fraction) > 1e-12) {
-                        std::cout << "  WARNING [PTM-89]: radiation.coupling_face_fraction="
+                        std::cout << "  WARNING: radiation.coupling_face_fraction="
                                   << rad_coupling_face_frac
                                   << " is IGNORED in coupling_mode='" << rad_coupling_mode
                                   << "' (the face-fraction exit has no error bound). Use"
@@ -22320,7 +22317,7 @@ int main(int argc, char** argv) {
                     }
                     if (std::abs(rad_coupling_select_safety
                                  - rad_defaults.coupling_select_safety) > 1e-12) {
-                        std::cout << "  WARNING [PTM-89]: radiation.coupling_select_safety="
+                        std::cout << "  WARNING: radiation.coupling_select_safety="
                                   << rad_coupling_select_safety
                                   << " is IGNORED in coupling_mode='" << rad_coupling_mode
                                   << "' (the selection threshold is the absolute"
@@ -22328,7 +22325,7 @@ int main(int argc, char** argv) {
                                      " coupling_temp_threshold)." << std::endl;
                     }
                     if (rad_coupling_select_mode != "physics") {
-                        std::cout << "  WARNING [PTM-89]: coupling_select_mode='"
+                        std::cout << "  WARNING: coupling_select_mode='"
                                   << rad_coupling_select_mode
                                   << "' selects on an absolute flux threshold taken over the"
                                      " window, which remains chunk-dependent. Only"
@@ -22363,7 +22360,7 @@ int main(int argc, char** argv) {
                         std::cerr << "\nFATAL: radiation coupling is enabled but the thermal solver"
                                      " returned no post-equilibration T(z) hand-off.\n"
                                   << "  Every coupling iteration would re-thermal from an undefined"
-                                     " state (BUGS.md PTM-78).\n"
+                                     " state.\n"
                                   << "  Refusing to write results." << std::endl;
                         return 1;
                     }
@@ -22377,7 +22374,7 @@ int main(int argc, char** argv) {
                                   << " faces carry a sub-1 K surface in the post-equilibration"
                                      " hand-off (n_layers=" << nl_seed << ").\n"
                                   << "  The radiation re-thermal would integrate them from a dead"
-                                     " column and report the ramp as physics (BUGS.md PTM-78).\n"
+                                     " column and report the ramp as physics.\n"
                                   << "  Refusing to write results." << std::endl;
                         return 1;
                     }
@@ -22504,14 +22501,14 @@ int main(int argc, char** argv) {
                         } else {
                             if (!explicit_si) {
                                 // The ONE loud line a user cannot miss (PTM-727 default change).
-                                std::cerr << "[eq-seed] DEFAULT CHANGED (PTM-727): this coupled run"
+                                std::cerr << "[eq-seed] DEFAULT CHANGED: this coupled run"
                                              " seeds the spin-up WITH indirect flux (thermal.seed_indirect:"
                                           << si << "); results differ from runs before the change."
                                              " Reproduce them with thermal.seed_indirect: off or"
                                              " --seed-indirect off." << std::endl;
                             }
                             std::cout << "  [eq-seed] thermal.seed_indirect: " << si << " (" << src
-                                      << ", PTM-727): the eq-indirect re-solve seeds every column"
+                                      << "): the eq-indirect re-solve seeds every column"
                                       << (seed_indirect_mode == SeedIndirectMode::Series
                                               ? " from its absorbed flux + the time-varying indirect"
                                                 " flux of the sweep it reads, over the output window,"
@@ -23316,7 +23313,7 @@ int main(int argc, char** argv) {
                                               << " s = " << spc << " samples at " << dt_out
                                               << " s); this one has " << (g_seed_indirect.t_hi - lo)
                                               << " samples. A sub-cycle seed is the cold seed again"
-                                                 " (PTM-727, Fermi R2). Use off, or a longer window.\n";
+                                                 ". Use off, or a longer window.\n";
                                     return -1;
                                 }
                                 const std::string why = "output window shorter than one whole cycle ("
@@ -23378,7 +23375,7 @@ int main(int argc, char** argv) {
                         for (size_t f = 0; f < num_faces; ++f) {
                             const auto& row = indirect_flux_series[f];
                             if (static_cast<int>(row.size()) < g_seed_indirect.t_hi) {
-                                std::cerr << "[FATAL] PTM-727 seed: indirect series of face " << f
+                                std::cerr << "[FATAL] seed: indirect series of face " << f
                                           << " has " << row.size() << " steps, needs "
                                           << g_seed_indirect.t_hi << ".\n";
                                 return -1;
@@ -24114,7 +24111,7 @@ int main(int argc, char** argv) {
                         if (!rad_post_eq_T_expected || rad_post_eq_T.empty()) {
                             std::cerr << "\nFATAL: the GPU re-thermal was selected but no solver"
                                          " produced the post-equilibration T(z) hand-off it seeds"
-                                         " from (BUGS.md PTM-78, PTM-94).\n"
+                                         " from.\n"
                                       << "  Refusing to write results." << std::endl;
                             return 1;
                         }
@@ -24340,7 +24337,7 @@ int main(int argc, char** argv) {
                             std::cerr << "  [Re-thermal] WARNING: CPU re-thermal path — no T(z)"
                                          " column is available, so the chunk checkpoint keeps"
                                          " iter-0's UN-COUPLED column for these "
-                                      << faces_to_rerun.size() << " faces (BUGS.md PTM-57)."
+                                      << faces_to_rerun.size() << " faces."
                                          " The next chunk will cold-start them.\n";
                         }
                         // Disclosed from `use_gpu_thermal_rerun` itself -- the
@@ -24603,7 +24600,7 @@ int main(int argc, char** argv) {
                                                               tr_err) ==
                                thermal::state_io::TrailerStatus::Ok);
                     if (ok && !have_tr && !tr_err.empty()) {
-                        std::cerr << "[PTM-57] WARNING: the iter-0 checkpoint's "
+                        std::cerr << " WARNING: the iter-0 checkpoint's "
                                      "identity trailer did not verify -- "
                                   << tr_err
                                   << ". The re-archived state will be written "
@@ -24625,14 +24622,14 @@ int main(int argc, char** argv) {
                         // too: the coupled end-of-window T(z) hand-off exists
                         // only on the GPU path, so on CPU there is nothing to
                         // patch in. Say what the file actually holds.
-                        std::cerr << "[PTM-57] The coupled end-of-window T(z) hand-off is"
+                        std::cerr << " The coupled end-of-window T(z) hand-off is"
                                      " empty (CPU thermal path). '" << spath
                                   << "' therefore holds the UN-COUPLED iter-0 column;"
                                      " the next chunk resumes radiation-fed faces from"
-                                     " it. This is BUGS.md PTM-57 on the CPU path, not a"
+                                     " it. This is  on the CPU path, not a"
                                      " write failure.\n";
                     } else if (!ok) {
-                        std::cerr << "[PTM-57] WARNING: cannot re-read the iter-0 checkpoint -- "
+                        std::cerr << " WARNING: cannot re-read the iter-0 checkpoint -- "
                                   << st_err
                                   << "; the archived state stays PRE-COUPLING and the next"
                                      " chunk will cold-start its radiation-fed faces.\n";
@@ -24643,14 +24640,14 @@ int main(int argc, char** argv) {
                         // pre-coupling. Rewrite the same body with the flags
                         // stamped; the write is atomic, so the worst case is
                         // the file that is already there.
-                        std::cout << "[PTM-57] No face was re-thermal'd; the checkpoint is"
+                        std::cout << " No face was re-thermal'd; the checkpoint is"
                                      " already the coupled state." << std::endl;
                         if (have_tr) {
                             stamp_coupling_flags(/*all_patched=*/true);
                             if (!thermal::state_io::write(spath, num_faces, f_nl,
                                                           merged, &keep_tr,
                                                           st_err)) {
-                                std::cerr << "[PTM-57] WARNING: " << st_err
+                                std::cerr << " WARNING: " << st_err
                                           << "; the archived state's coupling "
                                              "flags stay UNSET.\n";
                             }
@@ -24668,10 +24665,10 @@ int main(int argc, char** argv) {
                                                       merged,
                                                       have_tr ? &keep_tr : nullptr,
                                                       st_err)) {
-                            std::cerr << "[PTM-57] WARNING: " << st_err
+                            std::cerr << " WARNING: " << st_err
                                       << "; the archived state stays PRE-COUPLING.\n";
                         } else {
-                            std::cout << "[PTM-57] Re-archived POST-coupling T(z) checkpoint: "
+                            std::cout << " Re-archived POST-coupling T(z) checkpoint: "
                                       << n_touched << "/" << num_faces
                                       << " faces carry the coupled column -> " << spath
                                       << (have_tr ? " (PTMT v2, coupling flags stamped)"
@@ -25122,7 +25119,7 @@ int main(int argc, char** argv) {
                           << stat_last << ") does NOT cover all written output frames ["
                           << out_first << "," << out_last << "); statistics/_max, _min and"
                              " _avg are reduced over that SUBSET only and can under-report"
-                             " the per-frame extrema (PTM-15). Set integration_days >= the"
+                             " the per-frame extrema. Set integration_days >= the"
                              " output span (and integration_offset_days=0) for a full-window"
                              " reduction.\n";
             }

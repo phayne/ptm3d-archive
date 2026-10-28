@@ -3134,7 +3134,7 @@ void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, co
                      "  Run the SCALAR solver instead (--no-simd-batch): it allocates the depth\n"
                      "  grid on the heap (thermal::Profile) and has NO layer ceiling. Otherwise\n"
                      "  lower thermal.thermal_m / thermal.thermal_b, or raise MAX_THERMAL_LAYERS\n"
-                     "  in thermal_model.h. BUGS.md PTM-302." << std::endl;
+                     "  in thermal_model.h. ." << std::endl;
         std::exit(1);
     }
     n_layers = layers;
@@ -3201,7 +3201,7 @@ void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile,
                      "lower\n"
                      "  thermal.thermal_m / thermal.thermal_b, or raise "
                      "MAX_THERMAL_LAYERS in\n"
-                     "  thermal_model.h. BUGS.md PTM-302." << std::endl;
+                     "  thermal_model.h. ." << std::endl;
         std::exit(1);
     }
     n_layers = ref_profile.nlayers;

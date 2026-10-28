@@ -2387,7 +2387,7 @@ int main(int argc, char** argv)
             std::cout << "                         count-normalized weights). Reproduces earlier products\n";
             std::cout << "  --sputter-escape-h2o F / --sputter-escape-o2 F / --sputter-escape-h2 F\n";
             std::cout << "  --sputter-launch-temperature K  Legacy parameters only (the current set derives them)\n";
-            std::cout << "  --sputter-legacy-escape-only  Pre-PTM-642 accounting: remove only the escaping\n";
+            std::cout << "  --sputter-legacy-escape-only  Legacy accounting: remove only the escaping\n";
             std::cout << "                         share, no transport, 0.10/0.05 O2/H2 split (NOT mass-\n";
             std::cout << "                         conserving; reproduces old products; implies\n";
             std::cout << "                         --sputter-legacy-params)\n\n";
@@ -2411,7 +2411,7 @@ int main(int argc, char** argv)
             std::cout << "  --max-superstep-epochs N  Cap one super-step at N epochs (default: none; for\n";
             std::cout << "                         step-size refinement checks)\n";
             std::cout << "  --albedo-refresh-global  Recompute the full transport at every albedo refresh\n";
-            std::cout << "                         (pre-PTM-657; slower). Default: face-local update of the\n";
+            std::cout << "                         (legacy; slower). Default: face-local update of the\n";
             std::cout << "                         sources whose emission/temperature moved\n";
             std::cout << "  --albedo-refresh-tolerance T  Face-local refresh: sources left stale may differ\n";
             std::cout << "                         from the current field by at most T of the totals\n";
@@ -2430,15 +2430,15 @@ int main(int argc, char** argv)
             std::cout << "                         and --sputter-legacy-escape-only unless given)\n";
             std::cout << "  --albedo-response-trust X  Diurnal law trust radius in |ln(r / r_anchor)| (default 0.35):\n";
             std::cout << "                         beyond it a face is re-anchored by an exact periodic solve at its\n";
-            std::cout << "                         current r (PTM-675). 0 = never (the 65cd8c5 law, degrades above\n";
+            std::cout << "                         current r. 0 = never (the 65cd8c5 law, degrades above\n";
             std::cout << "                         |ln r| ~ 0.4: +0.5 K and +15% HK at r ~ 3)\n";
             std::cout << "  --garden-subcycle-kappa K  Garden mode: integrate a face whose box ice turns over within\n";
             std::cout << "                         the step in substeps of at most K x its turnover time, with the\n";
             std::cout << "                         gardening entrainment inside the step (default 0.1; 0 = off,\n";
-            std::cout << "                         the pre-PTM-676 single call, whose equilibrium on such faces\n";
+            std::cout << "                         the legacy single call, whose equilibrium on such faces\n";
             std::cout << "                         depends on the super-step length)\n";
             std::cout << "  --no-albedo-step-limit  Do not end super-steps when a face's albedo would pass the\n";
-            std::cout << "                         refresh threshold (pre-PTM-640; reproduces earlier products)\n";
+            std::cout << "                         refresh threshold (legacy; reproduces earlier products)\n";
             std::cout << "  --no-lag-barrier       Legacy well-mixed layer: lost ice becomes non-ice volume and\n";
             std::cout << "                         nothing limits sublimation but the exposed ice area (for\n";
             std::cout << "                         comparison; default: the lag-layer diffusion barrier). Products\n";
@@ -2454,10 +2454,10 @@ int main(int argc, char** argv)
             std::cout << "  --lag-tortuosity T     Lag tortuosity tau (default 2)\n";
             std::cout << "  --lag-optical-depth D  Albedo e-folding lag thickness delta_opt [m] (default 1e-5)\n";
             std::cout << "  --no-gardening         No micrometeoroid gardening (v_m = 0, fixed 5 cm box)\n";
-            std::cout << "  --no-sputter-shield    H2O sputter ejection not barriered by the lag (PTM-659)\n";
+            std::cout << "  --no-sputter-shield    H2O sputter ejection not barriered by the lag\n";
             std::cout << "  --no-sputter-operator-cache  Recompute the sputtered-H2O transport kernel at every\n";
             std::cout << "                         refresh (683f1cc behavior). Default: build the fixed-launch-\n";
-            std::cout << "                         temperature operator once and reuse it (PTM-671)\n";
+            std::cout << "                         temperature operator once and reuse it\n";
             std::cout << "  --gardening-rate V     Lag/veneer gardening rate v_m [um/yr] (default 0.3; Johnson\n";
             std::cout << "                         et al. 2004 Table 20.2, citing Cooper et al. 2001; arm 1.2)\n";
             std::cout << "  --gardening-case A|B   Costello et al. 2021 secondary rate for the box depth\n";
@@ -2470,7 +2470,7 @@ int main(int argc, char** argv)
             std::cout << "  --lag-source-refresh-tol X  Refresh the transport when the emission pattern has\n";
             std::cout << "                         moved by X (total variation; default 0.02)\n";
             std::cout << "  --superstep-legacy-deposition  Hold deposition at its start-of-step value over\n";
-            std::cout << "                         each super-step (pre-PTM-644; not mass-conserving;\n";
+            std::cout << "                         each super-step (legacy; not mass-conserving;\n";
             std::cout << "                         reproduces earlier products only)\n";
             std::cout << "  --diurnal-stride N     Use every Nth timestep in diurnal averaging (default: 1)\n";
             std::cout << "                         stride=4 gives ~4x faster diurnal computation, <2%% error\n\n";
@@ -2508,8 +2508,8 @@ int main(int argc, char** argv)
             std::cout << "                      thermal run used there, so composition and temperature\n";
             std::cout << "                      agree; faces with no usable value get 1 - --dust-fraction\n";
             std::cout << "      uniform         every fill face gets exposed ice fraction 1 - --dust-fraction\n";
-            std::cout << "                      (pre-PTM-637 behavior; disagrees with the thermal albedo)\n";
-            std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80, Fermi's base case)\n";
+            std::cout << "                      (legacy behavior; disagrees with the thermal albedo)\n";
+            std::cout << "  --ice-albedo A     ice endmember Bond albedo (default: 0.80)\n";
             std::cout << "  --nonice-albedo A  pin the non-ice endmember Bond albedo (e.g. 0.3814); overrides\n";
             std::cout << "                     the default, which is the map's area-weighted percentile below.\n";
             std::cout << "                     Pin it when the map is uniform (its percentile is the map value)\n";
@@ -2732,7 +2732,7 @@ int main(int argc, char** argv)
         return 1;
     }
     if (sputter_cfg.legacyParams() && sputtering_enabled) {
-        std::cerr << "WARNING [PTM-649]: legacy sputter parameters (f_H2O 0.85, escape 0.10/0.90/0.95, "
+        std::cerr << "WARNING: legacy sputter parameters (f_H2O 0.85, escape 0.10/0.90/0.95, "
                   << "stepped tau(T) on the whole yield with a 50 K cutoff, count-normalized weights). "
                   << "Reproduces earlier products only." << std::endl;
     }
@@ -2751,7 +2751,7 @@ int main(int argc, char** argv)
             return 1;
         }
         if (!multiscale_enabled && !sputter_cfg.legacy_escape_only) {
-            std::cerr << "WARNING [PTM-642]: the per-timestep (non --multiscale) path still removes only "
+            std::cerr << "WARNING: the per-timestep (non --multiscale) path still removes only "
                       << "the escaping share of sputtered mass and does not transport the rest; the "
                       << "mass-conserving sputter accounting is implemented in --multiscale only." << std::endl;
         }
@@ -2925,11 +2925,11 @@ int main(int argc, char** argv)
         integrator.setSuperstepConsistentDeposition(!superstep_legacy_deposition);
         if (sputtering_enabled && sputter_cfg.legacy_escape_only && !no_albedo_step_limit) {
             no_albedo_step_limit = true;
-            std::cerr << "WARNING [PTM-640]: --sputter-legacy-escape-only implies --no-albedo-step-limit "
+            std::cerr << "WARNING: --sputter-legacy-escape-only implies --no-albedo-step-limit "
                       << "(reproduces pre-fix products)" << std::endl;
         }
         if (no_albedo_step_limit && albedo_coupling_enabled) {
-            std::cerr << "WARNING [PTM-640]: --no-albedo-step-limit: super-steps are not limited by the albedo "
+            std::cerr << "WARNING: --no-albedo-step-limit: super-steps are not limited by the albedo "
                       << "change, so the temperature refresh can lag by a whole step (the answer then depends "
                       << "on the step size). Reproduces earlier products only." << std::endl;
         }
@@ -2937,16 +2937,16 @@ int main(int argc, char** argv)
         if (sputtering_enabled && sputter_cfg.legacy_escape_only) albedo_refresh_global = true;
         integrator.setLocalAlbedoRefresh(!albedo_refresh_global, albedo_refresh_tol, albedo_refresh_fraction);
         if (!albedo_refresh_global && albedo_refresh_fraction > 0.0 && albedo_coupling_enabled) {
-            std::cerr << "WARNING [PTM-657]: --albedo-refresh-fraction " << albedo_refresh_fraction
+            std::cerr << "WARNING: --albedo-refresh-fraction " << albedo_refresh_fraction
                       << ": faces are re-based at different times, which injects face-scale temperature "
                       << "jitter; the albedo-sublimation feedback is linearly unstable on warm faces "
-                      << "(PTM-658) and amplifies it, so local extremes can differ from the coherent "
+                      << " and amplifies it, so local extremes can differ from the coherent "
                       << "refresh (phase 0 cosine case: max non-ice 35.9% vs 18.2%)." << std::endl;
         }
         integrator.setMaxSuperstepEpochs(max_superstep_epochs);
         integrator.setGardenSubcycle(garden_subcycle_kappa, 1024);
         if (garden_subcycle_kappa == 0.0) {
-            std::cerr << "WARNING [PTM-676]: --garden-subcycle-kappa 0: garden-step subcycling OFF (pre-PTM-676; "
+            std::cerr << "WARNING: --garden-subcycle-kappa 0: garden-step subcycling OFF (legacy; "
                       << "exhausted-box faces then depend on the super-step length)" << std::endl;
         }
         // Lag-layer diffusion barrier (default on). The legacy reproduction modes imply
@@ -2975,7 +2975,7 @@ int main(int argc, char** argv)
         if (!lag_cfg.garden_K99_explicit) lag_cfg.box_K99 = lag_cfg.costelloK99();
         lag_cfg.sputter_shield = lag_cfg.enabled && !no_sputter_shield && sputtering_enabled;
         if (lag_cfg.enabled && !lag_cfg.gardenMode()) {
-            std::cerr << "WARNING [PTM-669]: --no-gardening --no-sputter-shield: the PTM-659 lag model "
+            std::cerr << "WARNING: --no-gardening --no-sputter-shield: the lag model "
                       << "(no gardening, fixed 5 cm box, H2O ejection unbarriered)" << std::endl;
         }
         integrator.setLagBarrier(lag_cfg);

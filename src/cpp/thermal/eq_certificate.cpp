@@ -245,7 +245,7 @@ bool EqSpinupCensus::report(std::ostream& os, double n_configured) const {
           "  CONSERVATIVE -- it over-warns rather than leaving you short. Pinned\n"
           "  by build/bin/test_eq_spinup gate 4. tau1 is a property of THIS grid\n"
           "  and state: never compare a number from one grid against a\n"
-          "  measurement from another (that error is what BUGS.md PTM-219 was).\n";
+          "  measurement from another (that error is what  was).\n";
     line(os, "dark  (Qs=0)", zero_,  sec_per_cycle_);
     line(os, "lit   (Qs>0)", forced_, sec_per_cycle_);
 

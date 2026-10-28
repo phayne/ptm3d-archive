@@ -367,7 +367,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
               << (c.h.height_factor > 0.0 ? "site-relative" : "ABSOLUTE override") << ")\n";
     if (!in.source_albedo)
         std::cout << "[flux-cubes] NOTE: no incidence-albedo function supplied; the visible "
-                     "source albedo falls back to the Bond value (legacy pre-PTM-106 "
+                     "source albedo falls back to the Bond value (legacy "
                      "behavior). Recorded in the file header.\n";
     if (in.primary_radius_km <= 0.0)
         std::cout << "[flux-cubes] NOTE: primary body treated as a POINT source "
