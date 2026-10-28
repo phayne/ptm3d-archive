@@ -26,6 +26,7 @@ Run directly::
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -380,11 +381,21 @@ def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
         "the geothermal heat-flow fix has regressed, the GUI control and the docs both need to say "
         "so again")
 
+    # The geothermal-floor item must present the key as a live setting. A stale
+    # "parsed but discarded" limitation is what disabled this control once already.
     limits = (REPO_ROOT / "docs" / "KNOWN_LIMITATIONS.md").read_text()
-    section = limits.split("## 4.", 1)[1].split("\n## ", 1)[0]
-    assert "FIXED" in section, (
-        "KNOWN_LIMITATIONS.md section 4 no longer records that the geothermal heat-flow defect is "
-        "fixed; a stale limitation is what disabled this control once already")
+    item = re.search(r"^\d+\. \*\*No temperature below the geothermal floor\.\*\*"
+                     r"(.*?)(?=^\d+\. \*\*|^## )", limits, re.M | re.S)
+    assert item, ("KNOWN_LIMITATIONS.md has no geothermal-floor item; it is where "
+                  "the docs say how Q_b is set")
+    text = " ".join(item.group(1).split())
+    assert "thermal.geothermal_heat_flow" in text, (
+        "the geothermal-floor item no longer names thermal.geothermal_heat_flow as "
+        "the way to set Q_b")
+    stale = [w for w in ("ignored", "discarded", "not applied", "no effect")
+             if w in text.lower()]
+    assert not stale, (f"the geothermal-floor item describes Q_b as {stale}, but the "
+                       "key is live on every body")
 
 
 def test_validate_never_raises_on_a_scalar_the_engine_accepts():

@@ -39,7 +39,8 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
 
 6. **No temperature below the geothermal floor.** Every layer is bounded below by
    T = (Q_b/εσ)^(1/4): 24.04 K on the Moon at the default Q_b = 0.018 W/m² (25.28 K at
-   0.022 W/m²). A value at the floor is the bound, not a solution.
+   0.022 W/m²). A value at the floor is the bound, not a solution. Q_b is constant in time:
+   one value per run (`thermal.geothermal_heat_flow`), or one per face with a heat-flow mask.
 
 7. **View factors follow the engine's face-orientation rule.** By default each face normal is
    flipped radially outward; with `PTM_ILLUM_TRUE_NORMALS=1` the triangle winding is kept, with
