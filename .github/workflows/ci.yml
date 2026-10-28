@@ -341,7 +341,7 @@ jobs:
           fi
 
       # The bowl-crater gate above scores an INLINE analytic centroid kernel; it
-      # never calls radiation::ViewFactorCalculator. That is why FC-08 -- a 2x
+      # never calls radiation::ViewFactorCalculator. That is why a 2x
       # far-field inflation -- lived for months under a green run of it. This
       # step scores the production calculator itself against two closed forms
       # (Ingersoll spherical cap, coaxial parallel disks) and against reciprocity
@@ -362,7 +362,7 @@ jobs:
 
       # Two independent view-factor implementations, subtracted. The two gates
       # above and vf-assembler-gate below each score ONE implementation against
-      # closed forms in isolation, which is necessary and not sufficient: FC-08
+      # closed forms in isolation, which is necessary and not sufficient: the divisor defect
       # (offline, 2x far field) and the M2 near-field bias (in-engine, -21.7% on
       # touching pairs) each survived every in-isolation invariant. This step
       # runs the in-engine sparse builder and the mc_ref_pp + assemble_vf_haworth
@@ -375,8 +375,8 @@ jobs:
       # reduce --nrays further without re-reading [X0]: at 40,000 rays NOT ONE
       # entry on this cap reaches lambda = 50 and the per-entry arm goes vacuous.
       #
-      # BOTH polarities run. --referee-divisor hits reinstates the FC-08 defect
-      # and arm [X6] -- the low-ray-budget arm, the only regime where FC-08
+      # BOTH polarities run. --referee-divisor hits reinstates the view-factor divisor defect
+      # and arm [X6] -- the low-ray-budget arm, the only regime where the divisor defect
       # EXISTS -- must go red. Without that second invocation this step would
       # pass just as happily with the defect present.
       - name: Cross-agreement -- in-engine builder vs offline referee
@@ -402,7 +402,7 @@ jobs:
             --jobs 2 --nrays 100000 --referee-divisor hits \
             > vf_xagree_control.log 2>&1 || rc=$?
           if [ "$rc" -eq 0 ]; then
-            echo '::error::the cross gate PASSED with the FC-08 divisor defect reinstated. Do not trust the green run above.'
+            echo '::error::the cross gate PASSED with the view-factor divisor defect reinstated. Do not trust the green run above.'
             tail -40 vf_xagree_control.log
             exit 1
           fi
@@ -410,16 +410,16 @@ jobs:
             echo '::error::the control run did not announce itself; it may not have been applied.'
             exit 1
           }
-          echo "OK: FC-08 divisor rejected (exit $rc). Verdicts that fired:"
+          echo "OK: divisor defect rejected (exit $rc). Verdicts that fired:"
           grep -E '^\s+\[X[0-9]+[ab]?\].*FAILED' vf_xagree_control.log
 
       # Anti-tautology. A gate that has never been seen to go red is not a gate.
-      # Scale every far-field entry by 2 -- FC-08's exact signature -- and require
+      # Scale every far-field entry by 2 -- the divisor defect's exact signature -- and require
       # a nonzero exit. The injection is applied to the assembled matrix inside
       # the test binary, after the production calculator has returned, so nothing
       # in the engine is perturbed. Note which verdicts do NOT fire: reciprocity
       # and closure both still pass on the doubled matrix, which is the whole
-      # reason they could not catch FC-08.
+      # reason they could not catch the divisor defect.
       - name: Negative control -- a 2x far-field inflation must FAIL the gate
         env:
           PTM_VFGATE_INJECT_SCALE: '2.0'
@@ -548,7 +548,7 @@ jobs:
 
   # ==========================================================================
   # The OFFLINE view-factor pipeline. A different code path from everything
-  # above, and the one FC-08 actually broke.
+  # above, and the one the divisor defect actually broke.
   # ==========================================================================
   # test_vf_production (in build-and-test) scores the IN-ENGINE calculator.
   # Neither it nor test_bowl_crater ever invokes scripts/ptm12_diag/mc_ref_pp +
@@ -591,7 +591,7 @@ jobs:
       # The geometry is reduced from the shipped defaults so the job fits CI, and
       # the reduction was validated by measurement, not assumed: see the SIZING
       # note in the script's docstring. Do not shrink it further without
-      # re-measuring A2/B2 -- the FC-08 defect is invisible on a coarse mesh.
+      # re-measuring A2/B2 -- the view-factor divisor defect is invisible on a coarse mesh.
       - name: FC-08 closed-form + ray-budget + back-face-cull gate
         run: |
           set -uo pipefail

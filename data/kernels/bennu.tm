@@ -11,8 +11,8 @@ KPL/MK
    mercury.tm) so that generic_body.spice_metakernel resolves it with no
    further configuration. An absolute path, or a path relative to the working
    directory, also resolves -- see docs/configuration.md, "How
-   generic_body.spice_metakernel is resolved". (Before BUGS.md PTM-145 was
-   fixed, only the bare-filename form worked; older notes saying so are stale.)
+   generic_body.spice_metakernel is resolved". (Before the generic-body metakernel
+   fix, only the bare-filename form worked; older notes saying so are stale.)
 
    BENNU'S EPHEMERIS IS NOT IN GIT. Like de440s.bsp it is fetched:
 
