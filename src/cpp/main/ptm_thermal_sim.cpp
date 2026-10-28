@@ -6458,25 +6458,33 @@ struct GpuSharedSeedContext {
 // left-endpoint flux over every substep of an interval, as the GPU thermal kernel does
 // (thermal_kernels.cl Q_surf = flux_all[tg]), instead of interpolating linearly. Default off.
 // PTM-728 phase 2: how a CPU re-thermal (face-subset) pass starts its columns.
-//   reseed       (default, unchanged): re-seed every pass from scratch on the warm-bracket
-//                fallback, then re-equilibrate over the full span.
+//   reseed       (the default before release/r1-engine): re-seed every pass from scratch on
+//                the warm-bracket fallback, then re-equilibrate over the full span.
 //   resume       restore the column state the last WHOLE-mesh pass reached at the end of
 //                equilibration (times[equilibration_steps]) and integrate only the output
 //                window -- the GPU re-thermal's state hand-off. FATAL if no valid capture.
-//   seed-series  re-seed every pass with the PTM-727 lumped series seed from this pass's own
-//                composed flux (it already carries the current indirect), then re-equilibrate.
-// Env PTM_CPU_RETHERMAL; any other value is FATAL.
+//   seed-series  (DEFAULT) re-seed every pass with the lumped series seed from this pass's
+//                own composed flux (it already carries the current indirect), then
+//                re-equilibrate. Where no series window was armed (thermal.seed_indirect off
+//                or inert on this run) it IS reseed, by control flow.
+// Env PTM_CPU_RETHERMAL (unset = seed-series); any other value is FATAL.
 enum class CpuRethermalMode { Reseed, Resume, SeedSeries };
 static CpuRethermalMode cpuRethermalMode() {
     static const CpuRethermalMode m = [] {
         const char* e = std::getenv("PTM_CPU_RETHERMAL");
-        if (!e || !*e || std::string(e) == "reseed") return CpuRethermalMode::Reseed;
+        if (!e || !*e) return CpuRethermalMode::SeedSeries;   // default
+        if (std::string(e) == "reseed") return CpuRethermalMode::Reseed;
         if (std::string(e) == "resume") return CpuRethermalMode::Resume;
         if (std::string(e) == "seed-series") return CpuRethermalMode::SeedSeries;
         std::cerr << "FATAL: PTM_CPU_RETHERMAL='" << e << "' (allowed: reseed, resume, seed-series)\n";
         std::exit(2);
     }();
     return m;
+}
+// True when PTM_CPU_RETHERMAL was set, false when the default applies.
+static bool cpuRethermalExplicit() {
+    const char* e = std::getenv("PTM_CPU_RETHERMAL");
+    return e && *e;
 }
 // Column state at times[equilibration_steps] from the last whole-mesh CPU SIMD pass
 // (layer-major, layer * n_faces + face) and the surface value that pass filed there.
@@ -6975,8 +6983,11 @@ bool runThermalModelsForAllFacesBatchSoA(
             std::cerr << "[Re-thermal] PTM_CPU_RETHERMAL=seed-series: re-thermal pass re-seeds with the "
                          "PTM-727 lumped series seed from this pass's own composed flux, then re-equilibrates"
                       << (g_rt_series_hi > g_rt_series_lo ? "" :
-                          " -- WARNING: no PTM-727 series window was armed (thermal.seed_indirect is not "
-                          "'series'), so the legacy re-seed is used")
+                          (cpuRethermalExplicit()
+                               ? " -- WARNING: no PTM-727 series window was armed (thermal.seed_indirect is not "
+                                 "'series'), so the legacy re-seed is used"
+                               : " -- no series window was armed on this run (thermal.seed_indirect off or "
+                                 "inert), so this is the legacy re-seed"))
                       << ".\n";
         }
     }
@@ -24989,7 +25000,11 @@ int main(int argc, char** argv) {
         if (pv) {
             pv << "seed_indirect=" << g_seed_indirect_record.mode << "\n"
                << "seed_indirect_source=" << g_seed_indirect_record.source << "\n"
-               << "seed_indirect_effect=" << g_seed_indirect_record.effect << "\n";
+               << "seed_indirect_effect=" << g_seed_indirect_record.effect << "\n"
+               << "cpu_rethermal=" << (cpuRethermalMode() == CpuRethermalMode::Reseed ? "reseed"
+                                       : cpuRethermalMode() == CpuRethermalMode::Resume ? "resume"
+                                       : "seed-series")
+               << (cpuRethermalExplicit() ? " (PTM_CPU_RETHERMAL)" : " (default)") << "\n";
         } else {
             std::cerr << "[eq-seed] WARNING: cannot append seed_indirect to "
                       << output_dir << "/provenance.txt" << std::endl;
