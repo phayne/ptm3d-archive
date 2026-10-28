@@ -226,4 +226,4 @@ per-face thermal-state checkpoint written by `thermal.final_state_file` is
 
 Field-by-field descriptions of every output directory are in
 [USER_GUIDE.md](../USER_GUIDE.md) and
-[tutorials/06_interpreting_outputs.md](../tutorials/06_interpreting_outputs.md).
+[tutorials/03_outputs.md](../tutorials/03_outputs.md).

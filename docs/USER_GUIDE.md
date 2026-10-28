@@ -4,7 +4,7 @@ The working reference for running PTM3D: the simulation workflow, code
 architecture, complete command-line reference, YAML configuration schema,
 output formats, GUIs, and the Python post-processing tools. For installation
 see [../INSTALL.md](../INSTALL.md); for a first run see
-[../README.md](../README.md) and [../TUTORIAL.md](../TUTORIAL.md); for the
+[../README.md](../README.md) and [tutorials/](tutorials/README.md); for the
 `PTM_*` environment variables see [ENVIRONMENT.md](ENVIRONMENT.md).
 
 ---

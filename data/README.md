@@ -7,7 +7,7 @@ with the bundled script:
 
 ```bash
 python3 scripts/fetch_data.py --list          # show available datasets
-python3 scripts/fetch_data.py --core          # everything needed by the shipped examples (~1.7 GB)
+python3 scripts/fetch_data.py --core          # everything needed by the shipped examples (about 1.4 GB)
 python3 scripts/fetch_data.py --dataset moon-topo
 ```
 
@@ -30,7 +30,7 @@ citations in each subdirectory README) alongside the software.
 | `albedo_maps/` | Moon + Europa albedo maps | `fetch_data.py --dataset albedo-maps` |
 | `dem/validation/` | Diviner-validation crater meshes + view factors | `fetch_data.py --dataset validation-meshes` |
 | `dem/copernicus/` | Copernicus crater DEM crop (SLDEM2015) | `fetch_data.py --dataset copernicus-dem` |
-| `meshes/` | tutorial crater meshes (shipped) + the Moon3D global mesh (fetched) | shipped / `fetch_data.py --dataset moon3d-mesh` |
+| `meshes/` | tutorial crater meshes (shipped) + the Moon3D testbed scan (fetched) | shipped / `fetch_data.py --dataset moon3d-mesh` |
 | `spice/` | mission trajectory SPKs (Artemis-2, Clipper EGA) | shipped (small) |
 | `horizons_cache/` | small-body ephemerides from JPL Horizons | self-populates on first use; the 3 committed bodies are provenance only (see its README) |
 | `locations/`, `diviner_seasonal/` | small analysis inputs | shipped |

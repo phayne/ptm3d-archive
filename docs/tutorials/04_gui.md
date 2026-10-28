@@ -1,19 +1,17 @@
-# Tutorial 07 — The PTM3D GUI, end to end
+# Tutorial 4: the PTM3D GUI, end to end
 
 **Application:** [`gui/run_gui.py`](../../gui/run_gui.py) (the thermal simulation
 app, `gui/ptm3d_gui.py`)
 **Cost of the walkthrough run:** one quickstart-class Moon simulation —
 1,280 faces, one lunation, CPU only. Measured 3.8 s of engine time on a 48-core
 workstation; expect a minute or two on a laptop.
-**Verified:** 2026-08-07 against `origin/main` (7fd214f), PyQt6 6.7.1 / Qt 6.7.1.
+**Last checked:** 2026-08-07 with PyQt6 6.7.1 (Qt 6.7.1). The engine has changed since; numbers shown in the GUI follow the current engine.
 
 This tutorial covers the same ground as the command-line tutorials, through
 the graphical front end. The GUI drives the engine binary, so build PTM3D
 first ([INSTALL.md](../../INSTALL.md)).
 
-The figures below were rendered from the live panels. The five marked
-**[SCREENSHOT-PAUL #n]** remain to be captured on a live display; they are
-tabulated at the end.
+The figures below were rendered from the GUI panels.
 
 ---
 
@@ -67,10 +65,6 @@ On the **first launch only**, the app asks which target body you want
 (`gui/ptm3d_gui.py:163-191`). You can change it any time on the Simulation
 tab; the prompt does not appear again.
 
-> **[SCREENSHOT-PAUL #1]** — the first-launch "Select target body" dialog. To
-> make it appear again, quit the GUI and run
-> `defaults delete com.ptm3d.PTM3DSimulator bodyPickerShown`, then relaunch.
-> Frame the dialog with the body list open.
 
 ---
 
@@ -86,11 +80,6 @@ Three regions:
 The divider between left and right is draggable; ``Ctrl+` `` toggles the
 console, and **View > Reset Layout** puts everything back.
 
-> **[SCREENSHOT-PAUL #2]** — the whole window immediately after launch, before
-> any run: config panel on the left with the Simulation page selected, the empty
-> 3D view on the right, the console at the bottom showing "PTM3D Console Ready".
-> Frame the full window so the toolbar, status bar, and all three regions are
-> visible.
 
 Keyboard shortcuts: `F5` run, `Shift+F5` stop, `Ctrl+T`
 check configuration (the GUI's checks plus the engine's own), `Ctrl+S` save
@@ -243,7 +232,7 @@ Under **Advanced thermal** (collapsed by default, expanded in the figure):
 
 ## 4. Your first run
 
-This is [tutorial 02](02_lunar_diurnal_icosphere.md)'s lunar diurnal run, done
+This is [tutorial 02](01_quickstart.md)'s lunar diurnal run, done
 through the GUI.
 
 1. **Body**: Moon (the default). Duration stays at one synodic day.
@@ -326,10 +315,6 @@ The **Run** button grays out, **Stop** becomes available, a progress bar appears
 in the status bar, and the indicator on the right turns yellow **Running**. The
 console streams the engine's output.
 
-> **[SCREENSHOT-PAUL #3]** — a run in progress. Start the quickstart run above
-> and catch it mid-way. Frame the bottom-right of the window so the status bar
-> shows the progress bar partly filled and the yellow "Running" badge, with the
-> console streaming "Progress N/144" lines above it.
 
 Two notes on the console:
 
@@ -389,21 +374,14 @@ present in the loaded directory — statistics fields from `statistics/*.bin`,
 per-step fields from the per-field subdirectories — so only fields the run
 wrote are selectable (`gui/ptm3d_gui.py:947-997`).
 
-> **[SCREENSHOT-PAUL #4]** — the 3D Visualization tab after loading
-> `output/gui_tutorial_moon_quickstart`, with Field = "Annual Max Temperature
-> (K)". Rotate so the sub-solar hemisphere is visible. Frame the 3D view plus
-> the toolbar row above it, so the Timestep and Field selectors are readable.
 
-> **[SCREENSHOT-PAUL #5]** — the 2D Plots tab on the same results: the
-> temperature histogram and the temperature-vs-latitude scatter. Frame the whole
-> right-hand panel.
 
 For exporting to other tools, the **Export Data** button on the visualization
 panel writes **GeoTIFF**, **HDF5**, both, or **VTU/PVD** (`ExportDataDialog`,
 `gui/gui_panels/visualization_panel.py:2125`); the 2D Plots tab has its own
 **Export Data (ASCII)** button for the plotted series. For reading the raw
 binaries yourself, see
-[06_interpreting_outputs.md](06_interpreting_outputs.md).
+[03_outputs.md](03_outputs.md).
 
 ---
 
@@ -635,7 +613,7 @@ reached the run:
    `Loaded view factors from: ...`, `Face count: ...`) and warns when a set
    value is ignored. If a setting is never mentioned, check the YAML.
 4. **Compare the outputs.** For anything that should change temperatures, run
-   both arms and difference them, as [tutorial 04](04_crater_radiosity.md)
+   both arms and difference them, as [tutorial 04](02_crater_radiosity.md)
    does.
 
 ---
@@ -693,29 +671,3 @@ is affected; the rest of the app works without it.
 engine warning saying the value is ignored.
 
 ---
-
-## Regenerating the figures
-
-The panel figures in this tutorial are rendered offscreen, straight from the GUI
-object model:
-
-```bash
-python scripts/make_gui_tutorial_screenshots.py          # panels only
-python scripts/make_gui_tutorial_screenshots.py --run    # + one tiny CPU run
-```
-
-It never opens a window on your display. The **whole window** and the
-**3D/2D result views** cannot be captured this way: constructing
-`VisualizationPanel` under the offscreen platform crashes inside headless
-PyVista/VTK (SIGSEGV), and the main window constructs one. Those figures are
-the `[SCREENSHOT-PAUL]` items above.
-
-## Screenshots still to be taken on a live display
-
-| # | What to set up | What to frame |
-|---|---|---|
-| 1 | Quit the GUI, run `defaults delete com.ptm3d.PTM3DSimulator bodyPickerShown`, relaunch | The first-launch "Select target body" dialog, body list visible |
-| 2 | Fresh launch, Simulation page selected, nothing loaded | The whole window: toolbar, config panel, empty 3D view, console, status bar |
-| 3 | Run the section-4 quickstart and catch it mid-run | Status bar with a partly-filled progress bar and the yellow "Running" badge, console streaming `Progress N/144` |
-| 4 | Load `output/gui_tutorial_moon_quickstart`, 3D tab, Field = "Annual Max Temperature (K)", sub-solar hemisphere toward the camera | The 3D view plus the toolbar row (Timestep and Field selectors readable) |
-| 5 | Same results, 2D Plots tab | The whole right-hand panel: temperature histogram and temperature-vs-latitude scatter |

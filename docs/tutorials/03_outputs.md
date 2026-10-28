@@ -1,12 +1,12 @@
-# Tutorial 06 — Interpreting the outputs
+# Tutorial 3: the output files
 
 What every file in a PTM3D output directory means and how to read it,
-using the runs from tutorials [02](02_lunar_diurnal_icosphere.md) and
-[04](04_crater_radiosity.md).
+using the runs from tutorials [1](01_quickstart.md) and
+[2](02_crater_radiosity.md).
 
 ## Directory layout
 
-From the tutorial-04 coupled run:
+From the tutorial 2 coupled run:
 
 ```
 output/tutorial04_crater80N_coupled/
@@ -18,7 +18,7 @@ output/tutorial04_crater80N_coupled/
 ├── body_positions.csv        # Sun / primary-body vectors per output step
 ├── heartbeat.txt             # liveness file for monitoring — see note below
 ├── statistics/               # per-face min/avg/max over the output window
-├── temperature/              # per-timestep snapshots: temperature_0000.bin ...
+├── temperature/              # per-step snapshots: temperature_000000.bin ...
 ├── illumination/             #   total absorbed flux per step
 ├── direct_solar/             #   direct solar component
 ├── primary_reflected/        #   reflected light from the primary body
@@ -74,11 +74,11 @@ excluded). Interpretation differs by moment:
   trust first.
 - **`temperature_min`** — the pre-dawn (or eternal-shadow) floor. In PSRs with
   radiation off this approaches the geothermal floor; with radiation on it is
-  set by indirect heating (see tutorial 04). The solver enforces the geothermal
+  set by indirect heating (see tutorial 2). The solver enforces the geothermal
   floor `(Q_b/εσ)^(1/4)` as a hard lower bound on every layer — 24.04 K on the
   Moon, 27.69 K on Europa — so a value sitting exactly there is the bound rather
   than a converged temperature, and nothing below it can be reported at all. See
-  [`KNOWN_LIMITATIONS.md`](../KNOWN_LIMITATIONS.md) section 2 before using a
+  [`KNOWN_LIMITATIONS.md`](../KNOWN_LIMITATIONS.md), item 6, before using a
   statistic near it.
 
 Statistics exist for `temperature`, `illumination` (total), `direct_solar`,
@@ -99,20 +99,23 @@ from:
 
 The two sum to the total indirect flux used by the thermal solve. Their ratio
 is diagnostic: scattered sunlight matters near sunlit walls at noon, thermal
-IR dominates in deep shadow and at night. In the tutorial-04 coupled run the
-shadowed faces peak at a median **3.3 W/m² indirect solar** but **28.6 W/m²
-indirect IR** (measured 2026-08-05 over the 1,422-face shadowed set defined in
-[04_crater_radiosity.md](04_crater_radiosity.md), from
-`statistics/indirect_{solar,ir}_max.bin`) — the warm rim's thermal emission,
+IR dominates in deep shadow and at night. In the tutorial 2 coupled run the
+shadowed faces peak at a median **4.5 W/m² indirect solar** but **28.7 W/m²
+indirect IR** (over the 1,423-face shadowed set defined in
+[02_crater_radiosity.md](02_crater_radiosity.md), from
+`statistics/indirect_{solar,ir}_max.bin`): the warm rim's thermal emission,
 not scattered sunlight, is what heats this crater's floor.
 
 ## Per-timestep series
 
-`temperature/temperature_0000.bin` … `temperature_0117.bin` are snapshots at
-each output step (same header + float32 format). The index is **zero-based and
-zero-padded to four digits**, so a 118-step run ends at `_0117`, not `_00118`;
-`metadata.txt` lists the face count, the step count and which components were
-exported.
+`temperature/temperature_000000.bin` … `temperature_000117.bin` are snapshots
+at each output step (same header + float32 format). The index is **zero-based
+and zero-padded to at least six digits** (more if a run has more frames), so
+every frame of a run has the same width and an alphabetical listing is in time
+order. Runs from older builds used four digits, which roll over to five at frame
+10,000; read frames by their parsed integer index (`ptm.readers.sorted_frame_files()`
+does). `metadata.txt` lists the face count, the step count and which components
+were exported.
 
 **`provenance.txt` and `config_used.yaml`.** `provenance.txt` is `key=value`,
 one per line, like `metadata.txt`, and it answers "which binary produced this
@@ -135,11 +138,15 @@ engine_binary_md5=2884834efa55f531771f80b9d354ade6
 engine_shared_libraries=false
 command_line=./build/bin/ptm_thermal_sim --config moon.yaml --albedo 0.24
 body=Moon
+seed_indirect=series
+seed_indirect_source=default
+seed_indirect_effect=acted (iteration-0 sweep)
+cpu_rethermal=seed-series (default)
 mesh_faces=20480
 mesh_length_unit=kilometers
 ```
 
-`engine_shared_libraries` is the honest caveat on the checksum: when it is
+`engine_shared_libraries` qualifies the checksum: when it is
 `false` — the default build — the executable is the whole engine and its md5
 is a complete identity. Under `-DBUILD_SHARED_LIBS=ON` a change confined to one
 project library would move that library and leave the executable's md5
@@ -149,13 +156,13 @@ unchanged, and the field says so.
 on a run made before the engine wrote the file, the same fields appear under
 `not_recorded` rather than being guessed at.
 
-**Timing columns.** In `time_steps.txt`, column 1 is **seconds past the J2000
-epoch** (SPICE ephemeris time), *not* elapsed time from the start of the run —
-note that the file's own header comment mislabels it. Column 2 is a UTC label
-anchored to the configured `simulation.start_time`. In the tutorial-04 control
-run (`start_time: 2026-04-05T00:00:00`) the first row reads
-`828630100.682384  2026-04-05T03:00:31.497`, and consecutive rows differ by
-21714.19 s = the configured ~6 h cadence. For elapsed time, subtract the first
+**Timing columns.** In `time_steps.txt`, column 1 is **ephemeris time, seconds past
+J2000** (SPICE ET), not elapsed time from the start of the run; files from builds
+before this release label it wrongly as elapsed time in their header comment.
+Column 2 is the UTC label. In the tutorial 2 control run
+(`start_time: 2026-04-05T00:00:00`) the first row reads
+`828619269.185657  2026-04-05T00:00:00.000`, and consecutive rows differ by
+21621.97 s, the configured ~6 h cadence. For elapsed time, subtract the first
 column-1 value; for a calendar axis, use column 2 (or `body_positions.csv`,
 whose `time` column carries the same UTC).
 

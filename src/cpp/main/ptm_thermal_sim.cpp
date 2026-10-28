@@ -23359,7 +23359,7 @@ int main(int argc, char** argv) {
                                 n_src += dst.size();
                             }
                             std::cout << "    [eq-seed] seed window: " << n_cyc << " whole cycle(s) = "
-                                      << (g_seed_indirect.t_hi - lo) << " samples (R2); equilibration"
+                                      << (g_seed_indirect.t_hi - lo) << " samples; equilibration"
                                          " forcing folded from them by phase onto " << eqn
                                       << " eq steps, box average of " << std::fixed
                                       << std::setprecision(2)
@@ -23368,7 +23368,7 @@ int main(int argc, char** argv) {
                                       << (n_nearest ? ", " + std::to_string(n_nearest)
                                                       + " eq step(s) shorter than the output"
                                                         " cadence took the NEAREST sample" : "")
-                                      << " (R1)." << std::endl;
+                                      << "." << std::endl;
                         }
                         if (g_seed_indirect.mode != SeedIndirectMode::Off) {   // not reverted above
                         double nz = 0.0;
