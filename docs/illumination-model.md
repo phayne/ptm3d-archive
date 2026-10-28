@@ -94,7 +94,7 @@ scattered and re-emitted flux reaching shadowed floors of craters smaller than a
 off in every shipped configuration, and it should stay off on meshes that resolve the terrain,
 where the radiation-exchange module computes this flux directly. Its implementation has known
 errors: it omits the emissivity factor that Ingersoll's Eq. 8 carries (the absorbed shadow flux
-should be $E_\odot \sin e_0\,(1-A) f/(1-Af)\,[\varepsilon + A(1-f)]$), and it adds the
+should be $E_\odot \sin e_0\thinspace(1-A) f/(1-Af)\thinspace[\varepsilon + A(1-f)]$), and it adds the
 result to the direct-solar channel.
 
 ## Primary Body Thermal Infrared Flux
@@ -105,11 +105,11 @@ $$\Omega_\mathrm{p} = 2\pi\left(1 - \cos\alpha_\mathrm{p}\right), \qquad \alpha_
 
 The irradiance view factor from a planar face to a sphere of angular radius $\alpha_\mathrm{p}$, for a face that sees the whole disk, is
 
-$$\mathcal{F}_i = \sin^2\alpha_\mathrm{p}\,\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right) \approx \frac{\Omega_\mathrm{p}}{\pi}\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right),$$
+$$\mathcal{F}_i = \sin^2\alpha_\mathrm{p}\thinspace\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right) \approx \frac{\Omega_\mathrm{p}}{\pi}\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right),$$
 
 where $\hat{\mathbf{p}}_i$ is the unit vector from face $i$ toward the primary center. Faces oriented away from the primary ($\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i \leq 0$) receive zero flux. The incident thermal infrared flux is
 
-$$F_{\mathrm{IR},i} = M_\mathrm{p}\,\mathcal{F}_i,$$
+$$F_{\mathrm{IR},i} = M_\mathrm{p}\thinspace\mathcal{F}_i,$$
 
 where $M_\mathrm{p} = \sigma T_\mathrm{p}^4$ is the flux emitted at the primary's surface (13.8 W m⁻² for Jupiter, $T_\mathrm{p} = 124.9$ K). Terrain visibility is checked by ray tracing, and the face absorbs $\varepsilon F_{\mathrm{IR},i}$.
 
@@ -135,10 +135,10 @@ where $A$ is the surface Bond albedo, which depends on the incidence angle (Hayn
 To avoid self-intersection, each shadow ray starts offset from the face center along the face
 normal and along the ray direction, by multiples of
 
-$$\epsilon = \max\negthinspace\left(16\,\mathrm{ulp}(r),\ \max\negthinspace\left(10^{-6}\thinspace r,\ 0.01\ \text{m}\right)\right),$$
+$$\epsilon = \max\negthinspace\left(16\thinspace\mathrm{ulp}(r),\ \max\negthinspace\left(10^{-6}\thinspace r,\ 0.01\ \text{m}\right)\right),$$
 
 where $r$ is the distance of the face center from the scene origin (the scene is recentered on
-the mesh before tracing). The origin is $\mathbf{r}_i + 2\epsilon\,\hat{\mathbf{n}}_i + k\epsilon\,\hat{\mathbf{s}}$ with
+the mesh before tracing). The origin is $\mathbf{r}_i + 2\epsilon\thinspace\hat{\mathbf{n}}_i + k\epsilon\thinspace\hat{\mathbf{s}}$ with
 $k = 1$ on the single-face path and $k = 8$ on the batched path used in production.
 
 The 1 cm minimum is much larger than the relief of millimeter-scale terrain: on such meshes a
