@@ -281,7 +281,7 @@ class BodyCard(BaseConfigTab):
     #:
     #: It is one number on purpose. ``simulation.duration_days`` used to be
     #: shown at FOUR decimals by the Simulation tab and at SIX by these cards
-    #: (GUI-DURATION-DECIMALS-4-VS-6), so the same configuration read
+    #: so the same configuration read
     #: differently depending on which screen you were on: the shipped Europa
     #: duration 3.551181 d displayed as "3.5512" on one and "3.551181" on the
     #: other. Measured 2026-08-28, the stored value survives -- displaying does
@@ -564,8 +564,7 @@ class BodyCard(BaseConfigTab):
         have been moved off days before a reload -- so it was reachable, not
         theoretical, and it silently divided ``simulation.duration_days`` by
         the synodic day. It became unmissable here only because the window
-        control now OPENS in diurnal periods. Reported as
-        GUI-DURATION-DISPLAY-UNITS-STORED.
+        control now OPENS in diurnal periods.
         """
         state = self._duration_state().get(key)
         if state is None:
@@ -711,7 +710,7 @@ class BodyCard(BaseConfigTab):
         has no "span" -- a window series is N separate runs, each with its own
         `simulation.start_time` and `simulation.duration_days` -- so binding a
         span control to a dotted key would write a key into the emitted YAML
-        that nothing reads, which is the defect PTM-67 names. It lives on the
+        that nothing reads, which is the unread-config-key defect. It lives on the
         card, in days, and is converted for display through the SAME
         `_unit_days` every other duration on this card converts through.
         """
@@ -1238,7 +1237,7 @@ class BodyCard(BaseConfigTab):
     #: emissivity_override, H_override, incidence_angle_albedo, kd_override,
     #: ks_override, use_default_albedo` (`config_parser.cpp:170-182`), and
     #: anything else under that block draws a "read by nothing and have NO
-    #: effect" warning at parse time. That is PTM-67, and it is why the
+    #: effect" warning at parse time. That is the unread-config-key defect, and it is why the
     #: Properties tab's `thermophysical.ks` cannot be reused here -- those keys
     #: are honored only under `generic_body.surface:`.
     #:
@@ -1277,7 +1276,7 @@ class BodyCard(BaseConfigTab):
 
         The tick is deliberately NOT a configuration key: the engine has no
         `use_default_*_override`, and inventing one would put a key in the
-        emitted YAML that nothing reads -- the very defect PTM-67 names.
+        emitted YAML that nothing reads -- the very unread-config-key defect.
         """
         from ptm.body_table import BODY_CAPABILITIES
 
@@ -2963,8 +2962,7 @@ class MoonCard(BodyCard):
         # The label argument is DEAD for this key: `_resolve_text` prefers
         # `gui_tooltips.LABELS`, which spells it "Shadow-only surrounding
         # mesh:". Kept identical to the rendered text so the call site cannot
-        # be read as a second, disagreeing answer (BUGS.md
-        # GUI-CARD-LABEL-LITERAL-DEAD).
+        # be read as a second, disagreeing answer.
         self.add_file_field(grid, 4, "Shadow-only surrounding mesh:",
                             "mesh.occluder_file",
                             "Meshes (*.ply *.obj *.vtk);;All Files (*)")
@@ -4342,7 +4340,7 @@ class GenericBodyCard(BodyCard):
 
         Anything else the user or their file chose is left exactly as it is.
 
-        WHY EACH BRANCH IS SCOPED THE WAY IT IS (PTM-444). `load_card` runs on
+        WHY EACH BRANCH IS SCOPED THE WAY IT IS. `load_card` runs on
         BOTH paths: ``ConfigurationPanel.load_from_config`` mirrors whichever
         card is ACTIVE, and ``ptm3d_gui.open_project`` calls that
         (``ptm3d_gui.py:597``) BEFORE ``land_on_loaded_config``
@@ -4575,7 +4573,7 @@ class GenericBodyCard(BodyCard):
         # here rather than as a side effect of the `load_from_config` below,
         # for two measured reasons:
         #   * that door is also the one an OPENED FILE comes through, and it is
-        #     now shut (`_repair_body_name`, PTM-444);
+        #     now shut (`_repair_body_name`);
         #   * it never covered this case properly anyway. `_repair_body_name`
         #     writes only over a built-in name or the `Custom` placeholder, so
         #     looking up a SECOND body left the FIRST one in `simulation.body`:
@@ -4607,7 +4605,7 @@ class GenericBodyCard(BodyCard):
         lines = [result.message]
         lines.extend(result.notes)
 
-        # PTM-145. A kernel that does not span the run is not an error the
+        # Generic-body metakernel coverage. A kernel that does not span the run is not an error the
         # engine reports: it substitutes Keplerian elements for the epochs
         # outside coverage and logs NOTHING, which is how fourteen of fifteen
         # Justitia configurations "passed". If this body brought a kernel, its
@@ -4724,7 +4722,7 @@ class GenericBodyCard(BodyCard):
     def _apply_fetch(self, result, note):
         """Write what a fetch returned, and report every key of it.
 
-        A refusal writes NOTHING. That is the whole of PTM-145 in one branch:
+        A refusal writes NOTHING. That is the whole of the generic-body metakernel fix in one branch:
         the kernel is on disk and is a perfectly good kernel, it simply does
         not cover this run, and the engine would serve the uncovered epochs
         from orbital elements without a word.

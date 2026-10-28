@@ -42,7 +42,7 @@ failure from that campaign, and a file picker offers all of them:
   Diffuse polar terrain does NOT prune safely."
 * **Rebuilding, instead of loading, is the wedge.** A multi-gigabyte matrix
   rebuilt on a full core+ring lunar mesh hard-wedged the graphics cards on
-  2026-07-03 and needed a reboot. That is what PTM-19 exists to prevent, and a
+  2026-07-03 and needed a reboot. That is what the never-rebuild rule exists to prevent, and a
   wrong or missing cache path is how it happens by accident.
 
 So an entry here is not a convenience. Each is a set that RAN, to completion,

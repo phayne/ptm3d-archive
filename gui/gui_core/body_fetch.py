@@ -41,7 +41,7 @@ Two things this module refuses to do quietly
 coverage back out of the file it just downloaded and compares it with the run
 window INCLUDING the equilibration reach-back. If it does not span it, the
 result is a refusal and ``generic_body.ephemeris_source`` is NOT set to
-``spice``. That is PTM-145/PTM-300: the committed Justitia SPK covered 30 days
+``spice``. That is the committed Justitia SPK covered 30 days
 of 2034 while every Justitia configuration targeted 2035, and all fifteen ran
 100 percent on the engine's per-epoch Keplerian fallback -- which logs nothing
 at all (``illumination_model.cpp:2793-2818``), so every one of them "passed".
@@ -55,7 +55,7 @@ whichever file was at the destination and regenerate the metakernel beside it,
 with no check of either -- and on 2026-08-31 that replaced Justitia's committed
 899-day kernel with a 762-day one spanning NONE of the campaign windows, and
 rewrote two committed metakernels to machine-absolute ``PATH_VALUES`` that each
-file's own header forbids (GUI-FETCH-CLOBBERS-COMMITTED-KERNELS). Worse, the
+file's own header forbids. Worse, the
 metakernel half needed no download at all: a cache HIT rewrote them too.
 :func:`tracked_by_git` now decides, and the default is to save the new kernel
 BESIDE the tracked one and point the configuration at the copy. See
@@ -71,7 +71,7 @@ failed.
 **A shape model is not fetched without saying where it will live.** ``.obj``
 is matched by this project's ``.gitignore`` line 14 -- a rule written for C
 object files that swallows every asteroid shape model in the repository
-(PTM-303: it is why a Justitia shape went missing). A fetched shape is
+(it is why a Justitia shape went missing). A fetched shape is
 therefore written with a ``shape_provenance.json`` sidecar carrying its md5,
 its DAMIT model id, its source URL and its vertex and face counts. The sidecar
 is NOT ignored, so the shape's identity survives even when the shape does not,
@@ -118,7 +118,7 @@ DAMIT_TIMEOUT_S = 45
 
 #: How far beyond the run window a fetched kernel is asked to reach, at each
 #: end. Generous ON PURPOSE. An SPK is a few tens of kilobytes whether it spans
-#: a month or a decade, and the failure it prevents is silent: PTM-300's
+#: a month or a decade, and the failure it prevents is silent: the committed
 #: Justitia kernel covered 2034-10-12 to 2034-11-11 while the configurations
 #: targeted 2035-08-24 onward, which no output distinguishes from a good run.
 #: Paying a kilobyte to remove that class of failure is not a trade-off.
@@ -1170,7 +1170,7 @@ def _both_spans(old_coverage, new_coverage):
 def _ensure_metakernel(spk_path, metakernel_path, name, project_root=None):
     """``(path, wrote, warnings)`` -- a usable metakernel, without clobbering one.
 
-    The write itself reuses ``SPKGenerator``, which carries the PTM-145 fixes:
+    The write itself reuses ``SPKGenerator``, which carries the generic-body metakernel fixes:
     ``PATH_VALUES`` points at the shared ``data/kernels`` tree rather than at
     the body's own directory, and long paths are split with SPICE's '+'
     continuation so ``furnsh`` does not silently truncate them. It also emits
@@ -1476,12 +1476,12 @@ def fetch_curated_shape(entry, project_root):
         warnings.append(
             f"This file is TRACKED in git and ships with the repository, even "
             f"though *.obj is matched by .gitignore line 14 (a rule written "
-            f"for C object files -- PTM-303). It was force-added; a re-fetched "
+            f"for C object files). It was force-added; a re-fetched "
             f"copy would need `git add -f` to go back in.")
     else:
         warnings.append(
             f"This file is NOT tracked in git: *.obj is matched by .gitignore "
-            f"line 14 (PTM-303), so it exists in one copy on this machine. "
+            f"line 14, so it exists in one copy on this machine. "
             f"Back it up, or add it with `git add -f {shape.relpath}`.")
 
     return FetchResult(

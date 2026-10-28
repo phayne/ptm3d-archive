@@ -465,7 +465,7 @@ class ConfigManager:
             # docs/radiation-exchange.md 8.4 -- see gui_core.facet_scale.
             "beaming": False,
             "rms_slope_deg": 0.0,
-            # PTM-102: bounded (default) | fixed | legacy. coupling_face_fraction
+            # bounded (default) | fixed | legacy. coupling_face_fraction
             # is consulted ONLY under legacy; the engine says so at runtime.
             "coupling_mode": "bounded",
             "max_coupling_iterations": 16,
@@ -1673,7 +1673,7 @@ class ConfigManager:
         # thermophysical: branch below. They used to read
         # `generic_body_active()` separately, which is how a single stale
         # `generic_body.name` also suppressed the thermophysical cleanup and
-        # put the whole dead 19-key block back into the file (PTM-67).
+        # put the whole dead 19-key block back into the file.
         generic_active = (self.generic_body_active()
                           and not self.last_body_identity_conflict)
         out = {}
@@ -2378,7 +2378,7 @@ class ConfigManager:
         # solver. The engine forwards it through std::to_string -- six decimal
         # places -- so anything under 5e-7 arrives as "0.000000", fails the
         # receiving positive-value check, and the run silently keeps a
-        # PLACEHOLDER property instead (BUGS.md PTM-201; measured, ks = kd =
+        # PLACEHOLDER property instead (measured, ks = kd =
         # 4e-7 and ks = 0.0096, kd = 0.05 give byte-identical statistics -- a
         # 24000-fold conductivity error with nothing said).
         #

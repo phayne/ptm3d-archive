@@ -716,7 +716,7 @@ class SimulationTab(BaseConfigTab):
     # binaries, and was entirely fictitious -- Europa's radius, Europa's
     # metakernel, Europa's albedo, and 0.000000000 W/m^2 of solar flux on every
     # face at every timestep, with one `Note:` line on stderr
-    # (BUGS.md ENG-BODY-UNBACKED-RUN / GUI-BODY-DROPDOWN-UNBACKED). The engine
+    # (the unknown-body fallback). The engine
     # now refuses those names outright; offering them here would be offering a
     # choice that cannot start. Anything not in this list is a Custom Body.
     from ptm.body_table import IMPLEMENTED_BODIES as _IMPLEMENTED
@@ -1200,9 +1200,9 @@ class SimulationTab(BaseConfigTab):
           it, and the selection fires this handler with the author's own
           duration already loaded. Overwriting it there is what planned a
           rewrite of all fourteen Justitia windows (3.75 / 3.0 / 6.0 / 2.0 d)
-          to one Justitia synodic period, 1.3816 d, on open --
-          GUI-DURATION-SILENT-OVERWRITE. Displaying a file is not an edit to
-          it, and the same handler runs on both paths.
+          to one Justitia synodic period, 1.3816 d, on open.
+          Displaying a file is not an edit to it, and the same handler
+          runs on both paths.
         * **A new run may seed.** This panel has no
           `open_card(apply_defaults=True)` entry point, so "setting up a new
           run" is exactly "there is no file yet" -- neither opened NOR saved,
@@ -1906,7 +1906,7 @@ class ThermalTab(BaseConfigTab):
         # spinup_seed selects the initial condition; `legacy` exists to
         # reproduce a pre-2026-08-11 baseline digit-for-digit. The GUI used to
         # defeat that on the GPU path by injecting PTM_EQ_PERFACE_FLUX into
-        # every run (PTM-276); it no longer injects it, so `legacy` here means
+        # every run; it no longer injects it, so `legacy` here means
         # what it says.
         seed_group = QGroupBox("Initial Condition")
         seed_layout = QGridLayout()
@@ -2094,7 +2094,7 @@ class ThermalTab(BaseConfigTab):
             # paths never receive it, so the engine prints "[Ice stability]
             # WARNING: requested but accumulator not ready" and writes NOTHING.
             # A user who ticks this box on the CPU path gets a normal-looking
-            # run and no product. Owed as ENG-ICE-CPU-1.
+            # run and no product. A CPU ice-depth accumulator is still owed.
             self.ice_note.setStyleSheet("color: #FFB74D; font-size: 10px;")
             self.ice_note.setText(
                 "This product needs the GPU thermal solver. Measured on this "
@@ -2214,7 +2214,7 @@ class ThermalTab(BaseConfigTab):
 
         This control was briefly disabled on built-in bodies on the strength of
         docs/KNOWN_LIMITATIONS.md section 4, which describes the value being
-        parsed, announced and then discarded. That was PTM-161, and PTM-161 was
+        parsed, announced and then discarded. That was a real defect, and it was
         fixed by commit 2e06a70 -- an ancestor of this branch. Measured here to
         settle it rather than trusting either document: Moon ico3, 48 steps,
         Qb -1 vs 0.05 W/m^2, max |dT_min| = 0.8421 K, and the run prints
@@ -2723,7 +2723,7 @@ class RadiationTab(BaseConfigTab):
         coupling_layout = QGridLayout(coupling_widget)
         coupling_layout.setColumnStretch(1, 1)
 
-        # PTM-102. The mode was unreachable while the field it gates was
+        # Coupling-mode control. The mode was unreachable while the field it gates was
         # visible, so a user could set a "Face Fraction (legacy mode only)"
         # that the engine then announced it was ignoring.
         self.add_combo_field(coupling_layout, 0, "Coupling Mode:",
@@ -3732,7 +3732,7 @@ class ThermophysicalTab(BaseConfigTab):
         # incidence_angle_albedo (there is no per-property "Use Default"
         # checkbox gating it, unlike the numeric rows above), so a saved
         # per-project Hayne/Hapke selection would be clobbered on reload
-        # unless we re-apply it afterward. See PTM-33.
+        # unless we re-apply it afterward.
         self.update_to_body_defaults()
 
         if has_saved_ica:
@@ -4742,8 +4742,7 @@ class IlluminationTab(BaseConfigTab):
         # The MESH decides which albedo branch the engine takes, so it is part
         # of the question. Without it this display promised a per-face map for
         # every imported-mesh configuration, and the engine rejected it on a
-        # size mismatch and fell back to a single value, on stdout
-        # (GUI-ALBEDO-STATUS-IGNORES-MESH).
+        # size mismatch and fell back to a single value, on stdout.
         status = datasets.albedo_status(
             body, res, root,
             import_file=self.config_manager.get_value("mesh.import_file", ""))
@@ -5200,7 +5199,7 @@ class EngineFlagsTab(BaseConfigTab):
     value, add extra flags (e.g. PTM_HMATRIX_THREADS), or clear a value
     (blank = do not set). Stored under config key 'engine_env'; exported by
     build_engine_env() at launch AND read by the engine itself at startup
-    (ConfigParser::applyEngineEnv, PTM-42). The two agree by construction --
+    (ConfigParser::applyEngineEnv). The two agree by construction --
     the engine leaves an already-exported variable alone -- so a GUI launch
     logs them as "already set (identical)".
     """

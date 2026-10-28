@@ -43,7 +43,7 @@ LUNAR_RMS_SLOPE_DEG = 32.5
 #: Clearing it also restores the `thermophysical:` cleanup, which
 #: `_config_for_yaml` gates on the same "is a generic body active" question --
 #: that is why the same run also emitted the dead 19-key thermophysical block
-#: (PTM-67) instead of the `*_override` keys.
+#: instead of the `*_override` keys.
 #:
 #: `illumination.include_primary_reflection` is here for the mirror-image
 #: reason. The generic-body cards set it FALSE, which is right for a

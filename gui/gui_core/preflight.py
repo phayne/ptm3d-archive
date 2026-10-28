@@ -15,7 +15,7 @@ computation. This module performs cheap, stat-only checks BEFORE launch:
   * cloud-path detection (/Library/CloudStorage/) with explicit user override
   * output directory free-disk check
   * radiation view-factor guard: file exists and its face count matches the
-    mesh (PTM-19: an accidental VF rebuild from the current mesh is forbidden)
+    mesh (an accidental VF rebuild from the current mesh is forbidden)
   * executable discovery with md5 + mtime reported to the console
 
 All filesystem probing is stat/os.scandir only -- nothing here opens data
@@ -44,8 +44,8 @@ from pathlib import Path
 # ON. GUI runs get them by default; the Engine Flags table in the
 # configuration panel can override or extend them (config key "engine_env").
 #
-#   PTM_ILLUM_TRUE_NORMALS=1  flipped-normal overhang shadowing fix (PTM-13
-#                             Phase-2, commit dd09cb8; Fermi gate PASS)
+#   PTM_ILLUM_TRUE_NORMALS=1  flipped-normal overhang shadowing fix
+#                             (illumination phase 2, commit dd09cb8; passed review)
 #   PTM_ILLUM_RISE_EPS=1      enables the rise-epsilon grazing-incidence path
 #                             (traceOccludedRiseEps). It is the GATE: without
 #                             it, RISE_KEPS and RISE_HABS below are never read
@@ -53,11 +53,11 @@ from pathlib import Path
 #   PTM_ILLUM_RISE_KEPS=0.2   the rise-epsilon scale factor validated with it
 #   PTM_ILLUM_RISE_HABS=0     grazing rise-floor leak fix: h_abs = 0 kills
 #                             100% of leaks with zero shadow acne (same gate)
-#   PTM_ILLUM_SEAL_HOLES=1    PTM-18 interior mesh-hole penumbra flash fix
+#   PTM_ILLUM_SEAL_HOLES=1    interior mesh-hole seal (penumbra flash fix)
 #
 # This is the [recommended-ON] set of docs/ENVIRONMENT.md MINUS one variable:
 #
-#   PTM_EQ_PERFACE_FLUX       deliberately NOT injected (PTM-276). On the CPU
+#   PTM_EQ_PERFACE_FLUX       deliberately NOT injected. On the CPU
 #                             path the engine itself reports it has "NO effect
 #                             on this run"; on the GPU path with
 #                             thermal.spinup_seed: legacy it is LIVE and
@@ -236,7 +236,7 @@ class PreflightReport:
     cloud_paths: list = field(default_factory=list)  # (field, path) on cloud storage
     warnings: list = field(default_factory=list)     # non-blocking
     info: list = field(default_factory=list)         # console notes (exe hash etc.)
-    vf_rebuild_warning: str = ""                     # PTM-19 guard text, if triggered
+    vf_rebuild_warning: str = ""                     # VF-rebuild guard text, if triggered
     beaming_warning: str = ""                        # facet-scale rule text, if triggered
     vf_cost_line: str = ""                           # advisory VF cost headline
     flux_cube_line: str = ""                         # cube count and product size
@@ -615,7 +615,7 @@ def radiation_coupling_albedo_map(config, illum, project_root):
     This load is a SECOND, independent read of the albedo map, separate from
     the absorbed-flux composer's.
 
-    It now HONORS ``illumination.use_albedo_map`` (BUGS.md PTM-454, fixed
+    It now HONORS ``illumination.use_albedo_map`` (fixed
     2026-08-30): with the switch off the coupling keeps the uniform body albedo
     and no file is searched for at all. Before that fix no configuration key
     stopped it, which is why this helper and its caller used to warn about two
@@ -1012,7 +1012,7 @@ def build_engine_env(config, base_env=None):
     Setting is not enough. The launching shell may already export
     ``PTM_EQ_PERFACE_FLUX=1``, and merely declining to add it would leave the
     child running with it -- so a config that says "no fix flags", or a
-    ``thermal.spinup_seed: legacy`` run that must not be overridden (PTM-276),
+    ``thermal.spinup_seed: legacy`` run that must not be overridden,
     would silently get it anyway while this function reported an empty
     environment. Managed variables the plan omits are therefore REMOVED from the
     inherited environment, and the removal is reported.
@@ -1420,7 +1420,7 @@ def run_preflight(config, find_executable, project_root=None,
     except OSError as e:
         report.warnings.append(f"could not check disk space for {out_dir}: {e}")
 
-    # -- Radiation / view-factor guard (PTM-19) ------------------------------
+    # -- Radiation / view-factor guard ------------------------------
     rad = config.get("radiation", {})
     if rad.get("enabled", False):
         vf_val = rad.get("view_factor_file", "")
@@ -1446,7 +1446,7 @@ def run_preflight(config, find_executable, project_root=None,
                 # 2026-08-28 on europa_lat00_pwyll.yaml -- so the GUI could not
                 # run a configuration the command line runs happily.
                 #
-                # It still goes through the PTM-19 gate (an explicit override
+                # It still goes through the VF-rebuild gate (an explicit override
                 # checkbox plus the cost estimate below), because an accidental
                 # multi-GB rebuild is the thing that guard exists to prevent.
                 # What changes is that it is a decision the user makes rather
@@ -1534,7 +1534,7 @@ def run_preflight(config, find_executable, project_root=None,
             "imported mesh) for it to have something to exchange with.")
 
     # -- Two albedo fields in one run ----------------------------------------
-    # RETIRED 2026-08-30 with the engine fix it described (BUGS.md PTM-454).
+    # RETIRED 2026-08-30 with the engine fix it described.
     # This block used to warn that the radiation-coupling albedo load ignored
     # illumination.use_albedo_map, and it advised turning the map ON so both
     # paths would use it -- advice that CHANGES THE PHYSICS of the run. The
@@ -1574,7 +1574,7 @@ def run_preflight(config, find_executable, project_root=None,
     # millimeter-scale mesh, and nothing outside that tab would ever mention it
     # again. The tab deliberately does NOT rewrite the setting -- silently
     # changing someone's physics is the failure this stage exists to remove --
-    # so the launch is where it has to be asked. Same shape as the PTM-19
+    # so the launch is where it has to be asked. Same shape as the VF-rebuild
     # view-factor guard: a warning with an explicit override.
     if rad.get("beaming", False) and not rad.get("enabled", False):
         # Inert, and the run would say nothing about it. Warn rather than let
@@ -1703,7 +1703,7 @@ def confirm_preflight(parent, report):
     errors / dataless  -> blocking dialog, no override (dataless files WILL
                           hang the engine; hydrate or relocate first)
     cloud paths        -> warning with an explicit override checkbox
-    VF rebuild (PTM-19)-> warning with an explicit override checkbox
+    VF rebuild-> warning with an explicit override checkbox
     """
     from PyQt6.QtWidgets import QMessageBox, QCheckBox
 

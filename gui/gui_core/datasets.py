@@ -194,8 +194,7 @@ def albedo_status(body, resolution, project_root, env=None, manifest=None,
 
     Ignoring the mesh is why this function used to promise a per-face map for a
     lunar crater configuration that the engine would then reject, falling back
-    to a single albedo and saying so only on stdout (BUGS.md
-    GUI-ALBEDO-STATUS-IGNORES-MESH). Callers that genuinely have no mesh in
+    to a single albedo and saying so only on stdout. Callers that genuinely have no mesh in
     hand may still omit the argument; callers that do have one must pass it.
     """
     body_lc = str(body).strip().lower()

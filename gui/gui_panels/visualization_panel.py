@@ -52,7 +52,7 @@ from gui_core._ptm_bootstrap import ensure_ptm_importable  # noqa: E402
 ensure_ptm_importable()
 from ptm.results import describe_mesh_frame  # noqa: E402
 # Per-step frames are listed and resolved NUMERICALLY, never by an alphabetical
-# sort: pre-PTM-664 runs roll over from 4 to 5 digits at frame 10,000.
+# sort: pre-fix runs roll over from 4 to 5 digits at frame 10,000.
 from ptm.readers import frame_path, sorted_frame_files  # noqa: E402
 
 # The pointer record. OFF unless `PTM_GUI_TRACE=1` -- the SAME switch the flux
@@ -139,7 +139,7 @@ SHADOW_FRACTION_FIELDS = frozenset((
 #: Everything the off-scale treatment applies to.
 SHADOW_SENTINEL_FIELDS = SHADOW_DEPTH_FIELDS | SHADOW_FRACTION_FIELDS
 
-#: `effective_albedo` (PTM-107(a)) carries the OTHER sentinel, on its own. It is
+#: `effective_albedo` carries the OTHER sentinel, on its own. It is
 #: NaN wherever the face was never lit during the integration window, because
 #: the ratio it reports has no denominator there and the engine writes no number
 #: rather than inventing one. No +inf -- the quantity is bounded -- so these
@@ -220,7 +220,7 @@ OFF_SCALE_MIN_RGB_DISTANCE = 0.25
 #:     nearly matches. That is a real defect, it is NOT introduced here, and
 #:     fixing it means choosing this color against the ramp the way
 #:     `off_scale_above_color` does -- which changes what those fields look
-#:     like. Owed ledger row: PTM-GUI-NAN-GRAY-COLLIDES-WITH-RAMP.
+#:     like. That fix is still owed.
 OFF_SCALE_NAN_COLOR = '#808080'
 
 
@@ -274,7 +274,7 @@ def nan_color_collision_warning(cmap_name):
     This does not change any color. It says, in front of the user, that two
     things on screen are hard to tell apart, which is the difference between a
     known limitation and a silent one. The fix is to choose the NaN color
-    against the ramp as well: PTM-GUI-NAN-GRAY-COLLIDES-WITH-RAMP.
+    against the ramp as well (the NaN gray can collide with the ramp).
     """
     if not MATPLOTLIB_AVAILABLE or not cmap_name:
         return ""
@@ -539,8 +539,7 @@ class PyVistaWidget(QWidget):
         # (interactor, observer_id) pairs, so a rebind REMOVES the old
         # observers instead of stacking a second copy on a new interactor.
         # `export_animation` replaces the plotter, and the observers used to
-        # stay bound to the retired one while every flag still read "on"
-        # (PTM-GUI-PICKING-DEAD-AFTER-EXPORT).
+        # stay bound to the retired one while every flag still read "on".
         self._interactor_observers = []
 
         # Color scale state
@@ -1342,7 +1341,7 @@ class PyVistaWidget(QWidget):
         The observers stayed on the retired one while `picking_active`,
         `picking_enabled` and the "Select Face Mode" button all still read as
         on, so face selection silently stopped working after any animation
-        export (PTM-GUI-PICKING-DEAD-AFTER-EXPORT). Anything that rebinds
+        export. Anything that rebinds
         `self.plotter` must call this.
 
         It also fixes a second, older defect: the previous code added a fresh
@@ -2563,7 +2562,7 @@ class PyVistaWidget(QWidget):
                 # or deleted here -- tearing down a live VTK render window is
                 # not something this change can test without a display, and a
                 # crash on export would be worse than the widget it retires.
-                # See PTM-GUI-RETIRED-INTERACTOR-LEAK.
+                # Otherwise the retired interactor leaks.
                 retired.hide()
             except Exception:
                 pass
@@ -2585,7 +2584,7 @@ class PyVistaWidget(QWidget):
         # observers stay on the retired one, the coordinate readout freezes and
         # face selection stops working, while `picking_active`,
         # `picking_enabled` and the "Select Face Mode" button all still read as
-        # on (PTM-GUI-PICKING-DEAD-AFTER-EXPORT).
+        # on.
         self._bind_interactor_observers()
         self.hover_face_id = None
         self.hover_highlight_actor = None
@@ -3579,7 +3578,7 @@ class ExportDataDialog(QDialog):
         # deg -- 30.3 m on the Moon -- so on a meter-scale site mesh the
         # "auto-detected" number is coarser than the data by a large factor and
         # nothing said so. The dialog now says so. See
-        # PTM-EXPORT-NICE-RESOLUTION-FLOOR.
+        # Export resolution floor.
         self.raw_face_spacing_deg = None
         if SCIPY_AVAILABLE and mesh_data:
             self.auto_resolution, self.raw_face_spacing_deg = \
@@ -4404,8 +4403,8 @@ class VisualizationPanel(QWidget):
     # What was fixed instead is the thing duplication actually cost: the gate
     # now proves BOTH directions against every catalog `ptm.results` publishes,
     # and separately proves that every product in a real run directory is
-    # offered. Owed ledger row for the remaining duplication:
-    # PTM-GUI-FIELD-REGISTRY-DUP, narrowed, not closed.
+    # offered. The remaining duplication in the field registry is
+    # narrowed, not closed.
     # Curated set of matplotlib colormaps for the toolbar Colormap dropdown.
     # Order: perceptually-uniform sequential first, then classic sequentials,
     # cyclic, diverging, qualitative, then their _r reversed counterparts.
@@ -4487,7 +4486,7 @@ class VisualizationPanel(QWidget):
                                                                        'cividis'),
         'shadow_unresolved_frac': ('Fraction of Epochs Umbral Above the '
                                    'Search Ceiling',                   'magma'),
-        # PTM-107(a): the flux-weighted albedo the surface boundary condition
+        # the flux-weighted albedo the surface boundary condition
         # absorbed with, over the integration window. Dimensionless, so no unit
         # in the title -- same as the two fractions above. Single per-face
         # value; file: statistics/effective_albedo.bin.
