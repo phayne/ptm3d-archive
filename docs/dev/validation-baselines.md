@@ -64,7 +64,7 @@ what the engine looked like when someone last cared.
 ```
 
 ⛔ **Never delete this directory without the maintainer's approval.** Its predecessor
-(`postmerge-baseline-2026-08-24`, at `~/projects/ada_postmerge_2026-08-24/`)
+(`postmerge-baseline-2026-08-24`, at `<workdir>/postmerge_2026-08-24/`)
 was removed in a routine disk cleanup on 2026-09-03 because nothing on disk
 said it was load-bearing, taking the corrected `crater80N_sparse.vf` with it and
 leaving the project with no executable regression gate at all. Two things now
@@ -156,14 +156,14 @@ The one-flipped-bit arm is the load-bearing one. A gate that has never been
 observed to fail is not known to be a gate.
 
 The predecessor bank, `postmerge-baseline-2026-08-24` at `51bf168`, is **GONE
-from disk** — the whole `~/projects/ada_postmerge_2026-08-24/` directory,
+from disk** — the whole `<workdir>/postmerge_2026-08-24/` directory,
 including the manifests below, which are recorded here only so that a reference
 to them is recognizable as a reference to something that no longer exists:
 
 ```
-~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json          GONE
-~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu_archnative.json  GONE
-~/projects/ada_postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json          GONE
+<workdir>/postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu.json                GONE
+<workdir>/postmerge_2026-08-24/bank/baseline_manifest_postmerge_cpu_archnative.json        GONE
+<workdir>/postmerge_2026-08-24/bank/baseline_manifest_postmerge_gpu.json                GONE
 ```
 
 The rest of this section records what that bank measured, which remains the
@@ -641,7 +641,7 @@ why they cannot simply be re-verified: their input was wrong, so their bytes ble
 the wrong physics. The seven copies of it are quarantined, not deleted, at
 `~/projects/quarantine_zero-occlusion-vf_2026-08-24/` with a reversal manifest,
 and a corrected replacement sits at
-`~/projects/ada_postmerge_2026-08-24/crater80N_sparse.vf`.
+`<workdir>/postmerge_2026-08-24/crater80N_sparse.vf`.
 
 A missing `.vf` is not a hazard here: `ptm_thermal_sim` announces
 `Early View Factor Computation`, builds the matrix, prints its occlusion counts,

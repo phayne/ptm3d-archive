@@ -743,7 +743,7 @@ Written by `scripts/ptm_validate_baseline.py bank`, {datetime.now(timezone.utc)
     .isoformat(timespec='seconds')}.
 
 ⛔ **Never delete without Paul's explicit word.** The previous bank
-(`postmerge-baseline-2026-08-24`, at `~/projects/ada_postmerge_2026-08-24/`)
+(`postmerge-baseline-2026-08-24`, at `<workdir>/postmerge_2026-08-24/`)
 was removed in a routine disk cleanup on 2026-09-03 because nothing on disk
 said it was load-bearing, and with it went the corrected `crater80N_sparse.vf`
 that its GPU arms consumed. This file exists so that cannot happen silently

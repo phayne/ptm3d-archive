@@ -47,7 +47,7 @@ namespace radiation {
 // used the GEOMETRIC MEAN: Ns = r / (A_i A_j)^(1/4) <= adaptive_ns_threshold
 // (5). The geometric mean cannot see an area contrast. Measured M1 error
 // against the same quadrature run to convergence (m = 32, ~1.05e6 evaluations
-// per pair; ~/projects/ada_vfunify_2026-08-23/probe/window_curve.py):
+// per pair, with a standalone probe script):
 //
 //   A_j/A_i        at the OLD cut (Ns = 5)     at THIS cut (w = 4)
 //   1              Ns 5,      M1 +3.49%        Ns 8,      M1 +1.38%

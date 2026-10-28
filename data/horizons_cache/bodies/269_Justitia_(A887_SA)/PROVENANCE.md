@@ -73,7 +73,7 @@ pre-tracking backup, under the original file name, is at
 `~/projects/shape_backup_2026-08-31/shape.obj` (same md5).
 
 Reproduce the comparison with
-`~/projects/ada_justitia_verify_2026-08-31/compare_shapes.py`.
+`<workdir>/justitia_verify_2026-08-31/compare_shapes.py`.
 
 ## `ephemeris.spk` and `metakernel.tm`
 
