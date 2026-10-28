@@ -423,7 +423,7 @@ initial composition relates to the albedo map that drove the thermal run:
   temperature agree. Fill faces without a usable value, or every fill face with
   `--fill-ice-fraction=uniform` (the earlier behavior, which warns), get
   $f = 1 - f_{\mathrm{dust}}$. The run reports the fill faces' share of the final-state
-  sublimation rate separately, with their count and area. Defaults: ice $A_B = 0.80$ (Fermi's base
+  sublimation rate separately, with their count and area. Defaults: ice $A_B = 0.80$ (the base
   case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (Paul,
   2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
   $g = 0$ for both; $r = 10$.

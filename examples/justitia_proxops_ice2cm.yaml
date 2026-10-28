@@ -3,8 +3,7 @@
 # walking up from THIS FILE's directory to the one holding
 # data/data_manifest.json (src/cpp/tools/config_parser.cpp, findRepoRootForData
 # / resolveDataPath), so these resolve from any working directory and honor
-# $PTM_DATA_ROOT. They previously named an absolute OneDrive path that does not
-# exist on every machine. Do not re-absolutize them.
+# $PTM_DATA_ROOT. Do not make them absolute.
 #
 # ONE EXCEPTION, and it is a real one: the paths INSIDE
 # data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm are resolved
@@ -65,8 +64,7 @@ thermophysical:
   # mechanism: the smooth two-layer profile k(z)=kd+(ks-kd)*exp(-z/H),
   # rho(z)=rhod+(rhos-rhod)*exp(-z/H). PTM3D has NO native discrete-step /
   # tabulated depth-profile capability (confirmed by source inspection of
-  # thermal_model.h/.cpp and thermal_property_map.cpp) -- FLAGGED for
-  # Fermi/Paul, see session note. kd=2.5 W/m/K, rhod=920 kg/m3 (bulk water
+  # thermal_model.h/.cpp and thermal_property_map.cpp). kd=2.5 W/m/K, rhod=920 kg/m3 (bulk water
   # ice); H=0.02 m places the e-folding "center" of the transition AT the
   # requested 2cm depth (a convention choice, NOT a sharp step -- k(z) is
   # already ~22% ice-like by z=0.5cm and ~63% ice-like AT z=2cm, not 0%
@@ -100,7 +98,7 @@ thermophysical:
   # porous radiative pathway) and has the wrong sign of T-dependence vs
   # real ice conductivity. Left at chi=2.7 (case-1-identical) rather than
   # silently zeroing it, so this is a known, quantified artifact in the
-  # ice-affected depths -- NOT a code fix, flagged for Fermi/Paul.
+  # ice-affected depths, not a code fix.
   chi: 2.7
 radiation:
   enabled: false

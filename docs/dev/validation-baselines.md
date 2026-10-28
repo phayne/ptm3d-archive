@@ -376,7 +376,7 @@ grep -E 'Using sparse view factor matrix|Building H-matrix' <log>   # must appea
 grep -E 'Loading view factor'                              <log>   # must NOT
 ```
 
-Sensitivity is verified, not assumed. Flipping
+Sensitivity is checked directly. Flipping
 `radiation.nearfield_quadrature_order` from 3 to 1 — which makes the near field
 a bare M1 centroid estimate — moves **9 of 32 output files** on BOTH arms
 (`temperature_avg/min/max`, `indirect_solar_max`, and their `_raw` counterparts);

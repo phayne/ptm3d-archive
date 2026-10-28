@@ -1165,7 +1165,7 @@ what every pre-2026-08-25 beaming run actually paid.)
 
 ### 8.7 Cost table
 
-Every number below is measured, not modeled. The engine prints its own `[beam-cost]` block at the
+Every number below is a measurement. The engine prints its own `[beam-cost]` block at the
 end of any run with beaming on, so this is re-measurable on any mesh without differencing two runs.
 
 **Production wall time** — `sunlit_radcore_r50` arms, 140,091 faces, 573.0 M-nonzero referee CSR,

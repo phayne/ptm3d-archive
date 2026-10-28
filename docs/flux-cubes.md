@@ -517,7 +517,7 @@ made "the same point" mean two slightly different points.
 
 ## 13. Known limitations and disclosure (post-gate)
 
-### Zenith terrain-IR — FC-08 RESOLVED, cube EXONERATED
+### Zenith terrain-IR: resolved, the cube is correct
 An earlier version of this document flagged the zenith `terrain_ir` column as not
 engineering-grade, on a measured 0.51× parity between the cube's ray-traced upward view-factor row
 and the model's own row for the same facet. **That flag is withdrawn.**
