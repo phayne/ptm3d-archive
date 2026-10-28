@@ -12,7 +12,7 @@ Results change for radiation-coupled runs; see "Behavior changes".
   Every face of a coupled run starts closer to its converged state (measured on the shipped
   80°N crater with a 1-cycle spin-up: lit-face mean temperature within 0.36 K of a 40-cycle
   reference instead of 1.79 K). Where it cannot act (radiation off, a warm-started chunk, the
-  CPU scalar solver, an output window shorter than one diurnal cycle) the run says so and uses
+  CPU scalar solver, zero indirect flux, an output window shorter than one diurnal cycle) the run says so and uses
   the previous seed. `provenance.txt` records `seed_indirect`, where it came from, and whether it
   acted. Previous behavior: `thermal.seed_indirect: off` or `--seed-indirect off`.
 - **CPU coupling passes re-seed with the same series seed** (`PTM_CPU_RETHERMAL=seed-series` is

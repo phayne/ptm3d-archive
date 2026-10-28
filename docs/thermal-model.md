@@ -14,7 +14,7 @@ $$\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t}  =  \frac{\pa
 
 where $\rho$ is bulk density (kg m⁻³), $c_p$ is specific heat capacity (J kg⁻¹ K⁻¹), $k$ is bulk thermal conductivity (W m⁻¹ K⁻¹), $z$ is depth below the surface (m, positive downward), and $t$ is time (s). The PDE is parabolic and quasi-linear: nonlinearity enters only through the temperature dependence of $c_p$ and $k$. There is no internal volumetric source term; all heat input is supplied through the boundary conditions (§5).
 
-The 1D-vertical assumption is justified when the diurnal thermal skin depth (§4.1, $\delta_1 \lesssim 10$ cm on the Moon) is small compared with the lateral size of mesh faces: face edges of a kilometer or more on global meshes and a meter or more on regional site meshes. It does **not** hold on millimeter- to centimeter-scale meshes such as the Moon3D testbed scan (~3 mm facets): there, small cold traps are warmed by lateral conduction from their surroundings, which the model omits (see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 1).
+The 1D-vertical assumption is justified when the diurnal thermal skin depth (§4.1, $\delta_1 \lesssim 10$ cm on the Moon) is small compared with the lateral size of mesh faces: face edges of a kilometer or more on global meshes and a meter or more on regional site meshes. It does **not** hold on millimeter- to centimeter-scale meshes such as the Moon3D testbed scan (509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across): there, small cold traps are warmed by lateral conduction from their surroundings, which the model omits (see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 1).
 
 ## 3. Thermophysical Properties
 

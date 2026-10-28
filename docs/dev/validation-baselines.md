@@ -1,4 +1,4 @@
-# Validation baselines — what section 1 of `ptm-validate` actually consumes
+# Validation baselines: what `scripts/ptm_validate_baseline.py` consumes
 
 Byte-identical regression is the contract for any change that claims "no behavior
 change": a solver, GPU, BVH, radiosity, or mesh-pipeline refactor must reproduce
@@ -43,7 +43,7 @@ git merge-base --is-ancestor validate-baseline-2026-08-15 origin/main \
 
 **Recovery, if it ever orphans again.** Do not retag and do not force. Cut a
 *new* dated tag on current `main`, re-bank the arms on that commit, update this
-document and the `ptm-validate` skill to name it, and leave the orphaned tag in
+document to name it, and leave the orphaned tag in
 place as history. Superseding beats deleting: an orphaned tag still tells you
 what the engine looked like when someone last cared.
 
@@ -460,8 +460,8 @@ With no `--arm` it resolved the runs to compare as the manifest's own recorded
 run directories, re-digested the banked runs, and reported `330/330 files
 byte-identical`, `VERDICT: BYTE-IDENTICAL`, on every arm, from any tree, at any
 commit — including GPU arms this very document calls unreproducible. That was
-the command printed here until 2026-09-05 and the one the `ptm-validate` skill
-called the fast path. **It now exits 2 and prints no verdict at all.** So does
+the command printed here until 2026-09-05 and the documented
+fast path. **It now exits 2 and prints no verdict at all.** So does
 any `--arm` that points at a banked directory. If you find that command written
 down anywhere, it is stale; the tool will tell you so rather than pass.
 
@@ -792,7 +792,7 @@ Stated explicitly, because the value of a gate is bounded by what it touches:
 
 - **Scientific accuracy.** Byte-identity is a *refactor* contract. It says the
   numbers did not move; it says nothing about whether they were right. Diviner
-  cross-validation (section 4 of the `ptm-validate` skill) is the data-anchored
+  cross-validation (`scripts/divval_orchestrate.py`) is the data-anchored
   check, and the Ingersoll bowl-crater test is the analytic one.
   Concretely: the flagship arms use a deliberately short shape (600
   equilibration steps, 20 output steps) built for cost and equivalence probing,

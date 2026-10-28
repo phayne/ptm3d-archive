@@ -275,7 +275,7 @@ def _cli():
     if not a.pairs.exists():
         raise SystemExit(f"FATAL: pair distribution not found: {a.pairs}\n"
                          "It is a measurement, not a repo artifact -- regenerate it with "
-                         "Fermi's calc10_geom.py against the run you want to characterize, "
+                         "a pair-geometry script (calc10_geom.py) against the run you want to characterize, "
                          "or point --pairs at an existing copy. Refusing to invent one.")
     PAIRS = a.pairs
     main(a.samples)

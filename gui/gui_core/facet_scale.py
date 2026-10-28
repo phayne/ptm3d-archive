@@ -15,19 +15,18 @@ millimeter to a centimeter. Measured on the meshes this project actually runs:
 
     sunlit_radcore_r50                  140,091 faces     237 m     ON
     haworth_radcore_r32c                 99,665 faces     181 m     ON
-    A3GT 3 km polar core              2,397,890 faces    3.46 m     ON
+    3 km lunar polar site core        2,397,890 faces    3.46 m     ON
     moon3d_c...NEW_500k_clean           509,337 faces    1.96 mm    OFF
 
-The boundaries below are Ada's proposal from `the GUI update plan (docs/design/gui-update-plan.md in git history)`
-section 4.4, approved as DP-4: refuse below 0.05 m (one decade above the top of
+The boundaries below come from the GUI design plan (section 4.4, in git
+history as docs/design/gui-update-plan.md): refuse below 0.05 m (one decade above the top of
 the millimeter-to-centimeter band, so the 1.96 mm mesh is refused with margin),
-warn between 0.05 m and 1 m, allow at or above 1 m (so the 3.46 m A3GT core
+warn between 0.05 m and 1 m, allow at or above 1 m (so the 3.46 m site core
 passes cleanly), and lunar bodies only, because w = 32.5 deg is calibrated on
 lunar regolith and section 8.4 declines to carry it to icy or small bodies.
 
-**Not an engine-side guard.** ENG-BEAM-SCALE-1 in `BUGS.md` records that a CLI
-user still has nothing between them and the same mistake. This module is the
-GUI's half only.
+**The GUI's half of the rule.** The engine applies the same rule at load time
+(the beaming facet-scale refusal), so a command-line user is covered too.
 
 Unit assumption, stated because it decides an answer: an imported mesh is read
 in its own frame and assumed to be in METERS, which is the lunar and Europa DEM

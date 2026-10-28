@@ -339,7 +339,7 @@ def cmd_horizon(args):
 
     print("  steps                        : %d" % nt)
     print("  face-steps with A > 0        : %d" % apos)
-    print("  ... of those, primary_ir == 0: %d   <-- Fermi F1 acceptance: must be 0"
+    print("  ... of those, primary_ir == 0: %d   <-- acceptance: must be 0"
           % bad)
     if bad:
         print("  largest analytic A among them: %.6g" % worst_A)
@@ -369,7 +369,7 @@ def main(argv=None):
     c.add_argument("after_dir")
     c.set_defaults(func=cmd_compare)
 
-    h = sub.add_parser("horizon", help="Fermi F1 acceptance: A>0 faces must not "
+    h = sub.add_parser("horizon", help="acceptance check: A>0 faces must not "
                                        "be zeroed, census == geometric count")
     h.add_argument("run_dir")
     h.add_argument("--primary", default="JUPITER", choices=sorted(PRIMARY))

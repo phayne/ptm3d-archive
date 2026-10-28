@@ -12,7 +12,7 @@ the 509,337-face Moon3D testbed crater scan placed at the IM-2 landing site (84.
 Settings worth knowing: an 8-cycle spin-up with the default indirect-aware seed, the CPU solver
 (`thermal.use_gpu: false`), `thermal_b: 32` (a deeper grid for the annual wave), a basal heat
 flow of 0.022 W/m² (the engine's lunar default is 0.018 W/m²), the Hapke incidence-dependent
-albedo, no sub-facet roughness (this mesh's ~3 mm facets already resolve it), and the validated
+albedo, no sub-facet roughness (this mesh, 509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across, already resolves it), and the validated
 fine-mesh illumination settings in an `engine_env:` block.
 
 ## Inputs you must supply

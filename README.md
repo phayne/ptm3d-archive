@@ -9,10 +9,10 @@ infrared. It runs on ordinary CPUs; an OpenCL GPU is optional.
 
 ![Moon3D testbed crater: mean temperature and the warming from radiation exchange](docs/figures/moon3d_testbed_tavg_coupling.png)
 
-*Moon3D testbed crater scan (509,337 faces, about 3 mm resolution) placed at the IM-2 landing
+*Moon3D testbed crater scan (509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across) placed at the IM-2 landing
 site (84.79°S): (a) time-averaged surface temperature over one synodic month with
 face-to-face radiation exchange; (b) the warming that radiation exchange adds relative to an
-otherwise identical run without it. From the Moon3D revision (JGR Planets, Fig. 12).*
+otherwise identical run without it. (Hayne et al., JGR Planets, in revision; Fig. 12).*
 
 ## Install
 

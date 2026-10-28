@@ -54,7 +54,7 @@ radiation:
   captured_energy_target: 0.95
   max_neighbors: 500
   min_neighbors: 20
-  # Sub-facet roughness (beaming) stays OFF here: this mesh's ~3 mm facets
+  # Sub-facet roughness (beaming) stays OFF here: this mesh's facets (mean edge about 2.5 mm)
   # already resolve the roughness scale the beaming model stands in for.
   beaming: false
   # The revision runs replaced the H-matrix with a precomputed sky-side

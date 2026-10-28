@@ -6,7 +6,7 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
 ## Physics and numerics
 
 1. **No lateral heat conduction.** Each face is an independent 1D column. Where facets are
-   smaller than a few centimeters (the Moon3D testbed mesh has ~3 mm facets), small cold traps
+   smaller than a few centimeters (the Moon3D testbed mesh: 509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across), small cold traps
    are warmed by their neighbors in reality but not in the model; for a pit with
    depth-to-diameter 0.1 at 85°S, the 110 K cold trap disappears below about 5 cm diameter.
 
