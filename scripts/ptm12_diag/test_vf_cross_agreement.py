@@ -6,20 +6,20 @@ WHY THIS EXISTS
 PTM3D computes view factors by two entirely separate implementations and, until
 2026-08-23, never compared their answers:
 
-  * IN-ENGINE   src/cpp/radiation/view_factor.cpp -- analytic pair integrals,
+  * IN-ENGINE src/cpp/radiation/view_factor.cpp -- analytic pair integrals,
                 Embree occlusion, M1 centroid far field + M2 double-area near
                 field. Gated against closed forms by test_vf_production.
-  * OFFLINE     scripts/ptm12_diag/mc_ref_pp.cpp + assemble_vf_haworth.py --
+  * OFFLINE scripts/ptm12_diag/mc_ref_pp.cpp + assemble_vf_haworth.py --
                 cosine-weighted Halton ray gather, then a symmetrized assembly.
                 Gated against closed forms by test_vf_assembler_gate.py.
 
 Each gate is necessary and neither is sufficient, and the project has now paid
 for that twice in one week:
 
-  FC-08 (2026-08-19)  the offline assembler inflated the far field by up to
+  the view-factor divisor fix (2026-08-19) the offline assembler inflated the far field by up to
       exactly 2x. Reciprocity passed. Sum_j F_ij <= 1 passed. The Ingersoll
       bowl gate passed -- it never calls that pipeline at all.
-  M2    (2026-08-23)  the in-engine near-field estimator read -21.7 percent on
+  M2 (2026-08-23) the in-engine near-field estimator read -21.7 percent on
       edge/vertex-touching pairs. Reciprocity failed, but only after somebody
       thought to look; no gate scored the MAGNITUDE of a near-field entry.
 
@@ -41,8 +41,8 @@ every face, so a repeat-seed or split-half spread does not exist to be measured
 discrepancy, which is a function of the ray budget, and the budget doubling is
 therefore the right and only handle on it. (This also makes the noise arm a
 free re-run of the assembler gate's ray-budget-invariance check: an estimator
-whose weight depends on whether a direction happened to register a hit -- FC-08
--- is not budget-invariant, and shows up here as a large "noise" that then
+whose weight depends on whether a direction happened to register a hit (the
+divisor defect) is not budget-invariant, and shows up here as a large "noise" that then
 swallows the tolerance. So the gate also prints the noise, and a noise figure
 that has grown is itself a finding.)
 
@@ -53,19 +53,19 @@ a few tens an entry is a coin flip, not a measurement. Comparing those would
 report on the ray budget, not on either estimator. The cut is stated, applied
 to BOTH sides symmetrically, and the number of entries it removes is printed.
 
-  [X0]  the per-entry population is not empty (a vacuous arm is not a PASS)
-  [X1]  mean row-sum (terrain view factor) difference
-  [X2]  worst per-face row-sum difference
-  [X3]  p99 per-entry relative difference over lambda-resolved entries
-  [X4]  BOTH sides against the Ingersoll closed form -- an absolute anchor, so
+  [X0] the per-entry population is not empty (a vacuous arm is not a PASS)
+  [X1] mean row-sum (terrain view factor) difference
+  [X2] worst per-face row-sum difference
+  [X3] p99 per-entry relative difference over lambda-resolved entries
+  [X4] BOTH sides against the Ingersoll closed form -- an absolute anchor, so
         the gate cannot be satisfied by two implementations agreeing on the
         same wrong answer
-  [X5]  the referee's own self-relief filter, scored rather than assumed away
-  [X6]  the same cross-comparison at a LOW ray budget, where FC-08 lives
+  [X5] the referee's own self-relief filter, scored rather than assumed away
+  [X6] the same cross-comparison at a LOW ray budget, where the divisor defect lives
 
-FC-08 IS INVISIBLE IN THE WELL-SAMPLED REGIME, SO THE GATE GOES LOOKING FOR IT
+THE DIVISOR DEFECT IS INVISIBLE IN THE WELL-SAMPLED REGIME, SO THE GATE GOES LOOKING FOR IT
 ------------------------------------------------------------------------------
-The FC-08 assembler defect divides the symmetrized pair by the number of ray
+The assembler divisor defect divides the symmetrized pair by the number of ray
 directions that HIT rather than by 2, so its inflation factor is
 2 - (p1 + p2)/2, p_k = P(direction k registers at least one hit). The control
 variable is lambda = NRAYS * F_ij. At lambda >> 1 both directions always hit,
@@ -74,7 +74,7 @@ at NRAYS = 400,000 on a cap whose largest F_ij is 8.7e-4, i.e. lambda ~ 80
 everywhere -- measured 2026-08-23, reinstating the defect
 (--referee-divisor hits) moves the mean row sum by 4e-8 and every one of those
 arms still PASSES. That is the same blindness the Ingersoll bowl gate has, and
-shipping it unremarked would be the FC-08 story a second time.
+shipping it unremarked would be the divisor-defect story a second time.
 
 [X6] therefore repeats the row-sum comparison at --nrays-fc08 (default 2,000),
 where lambda ~ 0.4 and the defect is at its full strength. The correct
@@ -92,16 +92,16 @@ face CENTROID, while the in-engine builder integrates over the launch face's
 AREA, and on a curved faceted surface those are different quantities at first
 order in the facet size. Measured on this cap at NRAYS = 400,000, keps = 0.01:
 
-    faces   engine     referee    gap (1e-3)   engine vs f   referee vs f
-      342   0.141417   0.139674      1.743       +2.527%       +1.264%
-      648   0.139915   0.138817      1.098       +1.438%       +0.642%
-     1404   0.138797   0.138197      0.600       +0.628%       +0.193%
+    faces engine referee gap (1e-3) engine vs f referee vs f
+      342 0.141417 0.139674 1.743 +2.527% +1.264%
+      648 0.139915 0.138817 1.098 +1.438% +0.642%
+     1404 0.138797 0.138197 0.600 +0.628% +0.193%
 
 The gap falls like the mesh refines and both sides converge on the closed form,
-so it is discretization, not a scale error -- an FC-08-shaped defect would hold
+so it is discretization, not a scale error -- a divisor-shaped defect would hold
 its size (or grow with lambda) instead. So [X1] and [X2] are scored against the
 DISCRETIZATION scale, self-calibrated per mesh as
-    --disc-factor  x  max(|engine - f|, |referee - f|)
+    --disc-factor x max(|engine - f|, |referee - f|)
 i.e. the two implementations may not disagree with EACH OTHER by more than they
 each disagree with the truth. The measured ratio is 0.50 / 0.55 / 0.69 across a
 4x range of mesh resolution, so 1.5 is roughly 2x headroom and shrinks nothing.
@@ -293,13 +293,13 @@ def main():
     p.add_argument("--closed-form-tol-pct", type=float, default=2.0)
     p.add_argument("--nrays-fc08", type=int, default=2000,
                    help="ray budget for arm [X6]. Small ON PURPOSE: lambda = NRAYS*F "
-                        "must be of order 1 for the FC-08 defect to exist at all")
+                        "must be of order 1 for the divisor defect to exist at all")
     p.add_argument("--fc08-tol-pct", type=float, default=15.0,
                    help="arm [X6] row-sum agreement. Loose by design: it separates a "
                         "1x from a 2x, and 2,000 rays is genuinely noisy")
     p.add_argument("--referee-divisor", choices=("tried", "hits"), default="tried",
                    help="NEGATIVE CONTROL ONLY. 'hits' restores the pre-2026-08-19 "
-                        "FC-08 assembler defect (divide the symmetrized pair by the "
+                        "assembler divisor defect (divide the symmetrized pair by the "
                         "number of ray directions that HIT, not by 2), which inflates "
                         "the far field by up to 2x. The gate must go RED.")
     p.add_argument("--mc-ref-pp", default="")
@@ -358,7 +358,7 @@ def main():
     print("\n=== REFEREE: mc_ref_pp sweep + assemble_vf_haworth.py, two ray budgets ===")
     if a.referee_divisor != "tried":
         print(f"  *** NEGATIVE CONTROL: assembler symmetrization divisor = "
-              f"'{a.referee_divisor}'. This is the FC-08 defect, reinstated on purpose. "
+              f"'{a.referee_divisor}'. This is the divisor defect, reinstated on purpose. "
               f"A PASS below would mean the gate cannot see a 2x far-field inflation. ***")
     nr_lo, nr_hi = a.nrays, 2 * a.nrays
     ref = {}
@@ -471,7 +471,7 @@ def main():
     lam_typ = a.nrays_fc08 * float(np.median(Rhi[Rhi > 0]))
     fc_err = 100.0 * (Rfc.sum(1).mean() / E.sum(1).mean() - 1.0)
     print(f"  low-budget arm: NRAYS = {a.nrays_fc08}, median lambda = NRAYS * F_ij = "
-          f"{lam_typ:.2f}  (the FC-08-sensitive regime)")
+          f"{lam_typ:.2f}  (the divisor-sensitive regime)")
     print(f"  referee mean row sum {Rfc.sum(1).mean():.6f} against engine "
           f"{E.sum(1).mean():.6f}: {fc_err:+.3f}%")
     verdict("X6", "engine vs referee row sums at low ray budget", abs(fc_err),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Re-register the lunar Bond-albedo FITS map that is offset 180 deg in longitude.
 
-BUG (PTM-34): ``data/albedo_maps/Moon-BondAlbedo.fits`` is a mislabeled data file.
+BUG: ``data/albedo_maps/Moon-BondAlbedo.fits`` is a mislabeled data file.
 Its WCS header declares ``CRVAL1=0, CRPIX1=1, CDELT1=1`` -- i.e. image column 0 =
 IAU_MOON longitude 0 (east-positive, 0..360). But the raster data is actually laid
 out as a "-180..180 centered" world map: IAU longitude 0 (the mean sub-Earth prime
@@ -10,7 +10,7 @@ reader (``src/cpp/maps/fits_reader.cpp:193``) honors the (wrong) header, so the
 albedo is sampled 180 deg off: the dark nearside maria land on the bright farside
 highlands and vice-versa.
 
-Ground truth used to prove it (summarized in docs/KNOWN_LIMITATIONS.md, PTM-34):
+Ground truth used to prove it (summarized in docs/KNOWN_LIMITATIONS.md):
   * The topographic mesh (topo_moon_ico*.bin) is CORRECT vs IAU_MOON -- South
     Pole-Aitken basin (53S, 191E) is the deepest point (-5.9 km), every nearside
     mare is low, the farside is high.
@@ -183,17 +183,17 @@ def main(argv=None):
 
     # Preserve the header (CRVAL1=0 is now HONEST for the rolled data) and record
     # the correction in HISTORY so the provenance is not silent.
-    header.add_history("PTM-34: rolled longitude axis by nx/2 (+180 deg) to correct "
+    header.add_history("Rolled longitude axis by nx/2 (+180 deg) to correct "
                        "a -180..180-centered raster mislabeled as 0..360 east. "
                        "Now data col 0 = IAU_MOON lon 0. "
-                       "See docs/KNOWN_LIMITATIONS.md, PTM-34.")
+                       "Verify with scripts/verify_moon_albedo_registration.py.")
     fits.writeto(path, rolled.astype(orig_dtype), header, overwrite=True)
     print(f"[fix-moon-albedo] WROTE corrected map -> {path} (dtype {orig_dtype}, "
           "longitude-only change)")
     print("[fix-moon-albedo] NOTE: per-face camera .bin maps (Moon_Albedo_res*.bin, "
           "Moon_Albedo_res9_camera.bin) were sampled from the OLD FITS and are also "
           "180 deg off; regenerate them from this corrected FITS before any camera "
-          "render (docs/KNOWN_LIMITATIONS.md, PTM-35). The thermal loader collapses .bin "
+          "render. The thermal loader collapses .bin "
           "to a uniform "
           "mean, so thermal runs are unaffected by the .bin.")
     print("[fix-moon-albedo] NOTE: the distributed copy (fetch_data.py --dataset "

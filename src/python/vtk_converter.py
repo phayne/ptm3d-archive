@@ -16,7 +16,7 @@ from pathlib import Path
 import time
 import numpy as np
 
-# Per-step frames under either naming generation (BUGS.md PTM-664): >= 6-digit
+# Per-step frames under either naming generation: >= 6-digit
 # indices from current engines, 4-digit from older runs.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ptm.readers import frame_path as _frame_path  # noqa: E402

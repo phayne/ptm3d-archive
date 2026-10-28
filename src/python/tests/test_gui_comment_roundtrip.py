@@ -77,7 +77,7 @@ COMMENTED_EXAMPLES = [
 #: IlluminationTab.refresh_builtin_albedo falls the source back from Built-in
 #: to None rather than promising a map that does not exist. Pre-existing on
 #: main (faa5bb8); invisible before the comment-preserving save, because Save
-#: rewrote everything anyway. Owed as GUI-ALBEDO-FALLBACK-EDIT.
+#: rewrote everything anyway. Still owed.
 ANNOUNCED_ON_OPEN = {
     "justitia_generic-test.yaml": {
         "illumination.use_albedo_map",
@@ -147,7 +147,7 @@ def test_comments_survive_an_edit():
             n_after = len(_comment_lines(after))
             assert n_after == n_before, (
                 f"{rel}: comment lines {n_before} -> {n_after} after editing "
-                f"one key. This is the defect (GUI-COMMENT-LOSS) the round "
+                f"one key. This is the comment-loss defect the round "
                 f"trip exists to fix.")
             assert "timesteps: 999" in after, (
                 f"{rel}: the edit did not reach the file")

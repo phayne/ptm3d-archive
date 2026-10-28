@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`ptm_qa.py thermal`: the never-lit gate must fail the right runs (PTM-462).
+"""`ptm_qa.py thermal`: the never-lit gate must fail the right runs.
 
 The gate used to be one line -- ``std(Tmin) <= 3 K`` over every face with
 ``direct_solar_max == 0`` -- calibrated on 623 Chimaera, a run with no
@@ -208,7 +208,7 @@ def test_a_radiation_coupled_run_whose_faces_track_their_flux_passes():
     never = [t for t, d in zip(tmin, direct) if d <= 0]
     assert st.pstdev(never) > 3.0, (
         f"this synthetic run's never-lit std is {st.pstdev(never):.2f} K, "
-        f"inside the old 3 K threshold -- it does not exercise PTM-462")
+        f"inside the old 3 K threshold -- it does not exercise the never-lit coherence check")
 
 
 def test_faces_colder_than_their_own_forcing_fail():
@@ -252,8 +252,8 @@ def test_coupling_without_band_statistics_is_a_warning_not_a_verdict():
     """"I cannot tell" said out loud, rather than a coin toss either way.
 
     Gray-radiosity and multi-GPU-pool runs couple indirect flux and write no
-    band statistics (ptm_thermal_sim.cpp:21754). Failing them is PTM-462;
-    passing them silently is PTM-462 with the sign flipped.
+    band statistics (ptm_thermal_sim.cpp:21754). Failing them is the never-lit coherence defect;
+    passing them silently is the same defect with the sign flipped.
     """
     _, direct = _coherent_shadow_field()
     n_never = sum(1 for d in direct if d <= 0)

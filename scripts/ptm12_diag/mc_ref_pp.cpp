@@ -1,10 +1,10 @@
-// PTM-12 CORRECTED occlusion-aware MC VF referee (Fermi's corrections folded in).
+// CORRECTED occlusion-aware MC VF referee (view-factor row-sum overshoot study).
 //   - 0.1 mm ray offset (default; param)
-//   - face orientation by the ENGINE's rule (PTM-733, src/cpp/mesh/face_orientation.h):
+//   - face orientation by the ENGINE's rule (src/cpp/mesh/face_orientation.h):
 //     radial_per_face by default, winding_majority under PTM_ILLUM_TRUE_NORMALS=1 -- the same
 //     env var and the same code the engine's illumination uses. Before 2026-10-15 this tool
 //     traced along the RAW winding (this line used to claim 'forced-outward normals', which the
-//     code never did), so an inward-wound mesh silently gave the UNDERSIDE view factor (PTM-732).
+//     code never did), so an inward-wound mesh silently gave the UNDERSIDE view factor.
 //     A reversal of more than PTM_PP_ORIENT_MAX_REVERSED_PCT (default 1) % of faces is FATAL
 //     unless PTM_PP_ORIENT_EXPECT_REVERSAL=1 acknowledges it. PTM_PP_ORIENT=raw restores the
 //     raw-winding behavior (A/B and v4 reproduction only; loud WARNING).
@@ -29,12 +29,12 @@
 #include <fstream>
 #include <sstream>
 #include <embree4/rtcore.h>
-#include "../../src/cpp/mesh/face_orientation.h"  // PTM-733: shared with the engine
+#include "../../src/cpp/mesh/face_orientation.h"  // shared with the engine
 #include <unordered_map>
 #include <algorithm>  // std::max/min({...}) initializer-list overloads: NOT transitive on Linux libstdc++
 #include <chrono>
 using V3=std::array<double,3>;
-// PTM-723: every write is checked. A full disk or a quota used to truncate the partner
+// every write is checked. A full disk or a quota used to truncate the partner
 // .bin silently and exit 0; the assembler then saw a short final record (or a clean
 // boundary) and the sweep looked complete. Now any failed open/write/flush/close is FATAL
 // with exit status 4, naming the file and errno.
@@ -142,7 +142,7 @@ int main(int argc,char**argv){
     const char* ply=argv[1]; const char* tf=argv[2]; const char* fl=argv[3]; int NR=atoi(argv[4]);
     double OFF=(argc>5)?atof(argv[5]):1e-4; double KEPS=(argc>6)?atof(argv[6]):0.2;
     double THR_ARG=(argc>7)?atof(argv[7]):1e-5; const char* OUTB=(argc>8)?argv[8]:"pp_out.bin";
-    // 2026-07-21 fix (Sagan-approved, Fig-8/Haworth VF design): the keep-rule was a FIXED
+    // 2026-07-21 fix (approved Fig-8/Haworth VF design): the keep-rule was a FIXED
     // FRACTION of rays (hits/tot>=THR), so raising NR with THR held fixed made the absolute
     // detection floor STRICTER, not looser -- measured on haworth_radcore_r32c.ply: 200k vs
     // 2M rays made the far-field-below-threshold fraction WORSE (99.4%->99.9%), and >99% of a
@@ -176,17 +176,17 @@ int main(int argc,char**argv){
         V3 n=nrm(cross(e1,e2)); nn[i]=n; /* RAW winding = builder normal, NO radial flip */
         double l1=std::sqrt(dot(e1,e1)),l2=std::sqrt(dot(e2,e2)),l3=std::sqrt(dot(e3,e3));
         double mx=std::max({l1,l2,l3}),mn=std::min({l1,l2,l3}); edge[i]=l1+l2+l3-mx-mn; }  // median edge
-    // ---- PTM-733: orient every face by the ENGINE's rule, never by the raw winding alone ----
+    // ---- orient every face by the ENGINE's rule, never by the raw winding alone ----
     // nn[] is both the launch-hemisphere axis and the back-face test normal, so one sign flip here
     // moves the whole referee to the surface side the engine illuminates. A mesh the rule leaves
-    // untouched (every reversal sign +1) is byte-identical to the pre-PTM-733 tool.
+    // untouched (every reversal sign +1) is byte-identical to the pre-fix tool.
     ptm::orient::FaceOrientation ORI;
     { const char* om=getenv("PTM_PP_ORIENT"); const std::string mode=(om&&om[0])?om:"engine";
       if(mode=="raw"){
           ORI.rule="raw_winding"; ORI.rule_requested="raw_winding"; ORI.n_faces=nf; ORI.sign.assign(nf,1);
           ORI.digest=ptm::orient::signDigest(ORI.sign);
-          fprintf(stderr,"# *** WARNING: PTM_PP_ORIENT=raw -- tracing along the RAW winding (pre-PTM-733 "
-                         "behavior). On an inward-wound mesh this is the UNDERSIDE view factor (PTM-732). "
+          fprintf(stderr,"# *** WARNING: PTM_PP_ORIENT=raw -- tracing along the RAW winding (the behavior "
+                         "before the shared surface-side rule). On an inward-wound mesh this is the UNDERSIDE view factor. "
                          "A/B and v4 reproduction only; the engine will refuse the resulting CSR unless its "
                          "own orientation equals the raw winding on every face. ***\n");
       } else if(mode=="engine"){
@@ -207,7 +207,7 @@ int main(int argc,char**argv){
           if(!acked){
               fprintf(stderr,"FATAL: orientation rule %s REVERSES %.3f%% of faces relative to the raw winding "
                              "(limit %.3g%%, PTM_PP_ORIENT_MAX_REVERSED_PCT). The mesh is wound against the "
-                             "engine's surface side (PTM-732). If that is expected, set "
+                             "engine's surface side. If that is expected, set "
                              "PTM_PP_ORIENT_EXPECT_REVERSAL=1 to proceed on the engine's side.\n",
                       ORI.rule.c_str(),ORI_REV_PCT,maxpct);
               std::exit(5);
@@ -246,7 +246,7 @@ int main(int argc,char**argv){
       t.read((char*)tmax.data(),nf*4); }
     const double SIG=5.670374419e-8, EPS=0.95;
     std::vector<long> want; { std::ifstream L(fl); long x; while(L>>x)want.push_back(x); }
-    // FC-08 follow-up (2026-08-19, Paul's ruling): BACK-FACE CULL, default ON.
+    // View-factor divisor follow-up (2026-08-19): BACK-FACE CULL, default ON.
     // A ray that strikes the BACK of a core face has reached the underside of an opaque,
     // one-sided surface. That face cannot radiate toward the source and cannot receive from
     // it, so it is NOT a radiative partner -- but the surface is still opaque, so the ray is

@@ -26,7 +26,7 @@ from matplotlib.lines import Line2D
 
 
 def _frame_file(directory, name, t):
-    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+    """Frame ``t`` of ``name`` under either naming.
 
     Current engines pad the index to >= 6 digits; runs written before used 4.
     """

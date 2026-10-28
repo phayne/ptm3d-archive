@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Gate for assemble_vf_haworth.py --symmetrize-divisor pooled (Fermi 2026-10-15). No external data.
+"""Gate for assemble_vf_haworth.py --symmetrize-divisor pooled. No external data.
 
 (a) EXACT synthetic: small faces (area a) paired with large faces (area 7a), true exchange G per pair.
     Directed hits are drawn binomially, h_ij ~ Bin(NR, G/A_i), h_ji ~ Bin(NR, beta * G/A_j), and fed
-    through the real assembler as chunk files. beta = 1 (unbiased reverse) and beta = 0.914 (Fermi's
+    through the real assembler as chunk files. beta = 1 (unbiased reverse) and beta = 0.914 (the physics review's
     measured 509k reverse deficit). Checks:
       - reciprocity exact for both estimators (A_i F_ij == A_j F_ji to float32);
       - beta = 1: both unbiased on the small-face row sums (|mean bias| < 4 SE), pooled variance lower;

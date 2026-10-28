@@ -15,7 +15,7 @@ contours read as the primary signal. NO on-figure data tables/annotations
 (bias/RMSE/N) -- those live in the companion .caption.md, per crew convention
 (`~/.claude/ptm-crew-conventions.md` SS3).
 
-Per Fermi's finding, winter-max stratification on the winter Diviner reference
+Per the physics review's finding, winter-max stratification on the winter Diviner reference
 is noise-selecting -- the scatter sidesteps this entirely by not stratifying
 at all: every panel plots ALL valid core cells, no PSR/sunlit split.
 

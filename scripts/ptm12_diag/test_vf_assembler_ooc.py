@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Byte-identity gate: assemble_vf_ooc.py vs assemble_vf_haworth.py (Ada, 2026-10-15).
+"""Byte-identity gate: assemble_vf_ooc.py vs assemble_vf_haworth.py.
 
 Synthetic, no external data. A small radially placed grid mesh and synthetic referee chunk
 files whose F values are large enough that many rows exceed 1, so the symmetric cap actually

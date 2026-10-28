@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Single-source the OpenCL thermal kernel (Phase R / Fermi F5).
+Single-source the OpenCL thermal kernel.
 
 The authoritative kernel source is the embedded raw-string literal
 `getEmbeddedKernelSource()` in src/cpp/gpu/thermal_opencl.cpp (it is what the

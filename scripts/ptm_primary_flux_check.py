@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""PTM-41 / PTM-44 acceptance harness for the primary-body ("Jupiter-shine",
+"""Primary reflected-light acceptance harness for the primary-body ("Jupiter-shine",
 "Earthshine") flux paths.
 
 Two independent checks, both on a finished run's own outputs.
 
-PHASE-LAW GATE (PTM-41)
+PHASE-LAW GATE
 -----------------------
 Compares the engine's ``primary_reflected`` against the closed-form
 Lambert-sphere law
@@ -20,14 +20,14 @@ Lambert-sphere law
 
 Both terms carry the SAME ``<cos theta>`` and the same terrain visibility, so
 the ratio cancels them.  The gate therefore needs no face normals, is immune to
-PTM-44, and isolates the photometry alone.  That matters: on a global icosphere
+the primary-body occlusion probe, and isolates the photometry alone.  That matters: on a global icosphere
 the face normal is only approximately the radial direction, and a gate that had
 to assume it would be testing the mesh instead of the physics.
 
 A body orbiting its primary sweeps the full phase range every orbit (Europa:
 0 to 180 deg in 1.77 d), so ONE diurnal run exercises the whole phase curve.
 
-QUANTIZATION GATE (PTM-44)
+QUANTIZATION GATE
 --------------------------
 Given two runs of the same config, one from a build BEFORE the fix and one
 after, reports the distribution of ``primary_ir_after / primary_ir_before``.
@@ -54,7 +54,7 @@ import numpy as np
 
 
 def _frame_file(directory, name, t):
-    """Frame ``t`` of ``name`` under either naming (BUGS.md PTM-664).
+    """Frame ``t`` of ``name`` under either naming.
 
     Current engines pad the index to >= 6 digits; runs written before used 4.
     """
@@ -303,7 +303,7 @@ def cmd_compare(args):
 
 
 def cmd_horizon(args):
-    """Fermi F1 acceptance: no face whose analytic horizon clip A > 0 may be
+    """Horizon-clip acceptance: no face whose analytic horizon clip A > 0 may be
     reported with primary_ir == 0, and the engine's `below horizon` census must
     equal the purely geometric count."""
     run = args.run_dir
@@ -353,7 +353,7 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("phase", help="PTM-41 Lambert-sphere phase-law gate")
+    p = sub.add_parser("phase", help="Lambert-sphere phase-law gate")
     p.add_argument("run_dir")
     p.add_argument("--primary", default="JUPITER", choices=sorted(PRIMARY))
     p.add_argument("--tol", type=float, default=2e-3,
@@ -364,7 +364,7 @@ def main(argv=None):
     p.add_argument("--min-steps", type=int, default=10)
     p.set_defaults(func=cmd_phase)
 
-    c = sub.add_parser("compare", help="PTM-44 quantization footprint, two runs")
+    c = sub.add_parser("compare", help="finite-disk quantization footprint, two runs")
     c.add_argument("before_dir")
     c.add_argument("after_dir")
     c.set_defaults(func=cmd_compare)

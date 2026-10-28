@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""PTM-723 regression test: mc_ref_pp must exit nonzero when its output cannot be written.
+"""Write-check regression test: mc_ref_pp must exit nonzero when its output cannot be written.
 
 Three arms on the 3-face closed-form mesh from ensure_mc_ref_pp (24-byte .bin):
   [W0] control: unrestricted write -> rc 0, 24-byte record.
   [W1] SHORT WRITE: RLIMIT_FSIZE = 16 bytes with SIGXFSZ ignored, so the kernel
        returns EFBIG instead of killing the process -- the same failure a full disk
        (ENOSPC) produces at the same call. Must exit nonzero with a FATAL line.
-       (Before PTM-723 the binary exited 0 here and left a truncated 16-byte file.)
+       (Before the write checks the binary exited 0 here and left a truncated 16-byte file.)
   [W2] UNOPENABLE OUTPUT: the .bin path is inside a non-existent directory. Must exit
        nonzero with a FATAL line (before: fwrite on a NULL FILE*).
 
@@ -33,7 +33,7 @@ def run(binary, work, outb, fsize=None):
             signal.signal(signal.SIGXFSZ, signal.SIG_IGN)   # inherited across exec
             resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
     # The smoke inputs are a closed-form local-frame geometry, not a body-centered
-    # mesh, so the PTM-733 orientation rule would refuse them (exit 5) before any
+    # mesh, so the shared surface-side rule orientation rule would refuse them (exit 5) before any
     # write happens. Trace the raw winding, as ensure_mc_ref_pp's own smoke test does.
     env = dict(os.environ, PTM_PP_ORIENT="raw")
     return subprocess.run([str(binary), str(ply), str(tmax), str(fl), "2000", "1e-4", "0.2",

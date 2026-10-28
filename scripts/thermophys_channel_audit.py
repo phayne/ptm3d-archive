@@ -7,7 +7,7 @@ the temperature-field difference. A key whose max |dT| over all faces is
 identically zero did not reach the solver, whatever the log said.
 
 This exists because a log line that says "override applied" is not evidence:
-BUGS.md PTM-53 and PTM-123/161 are both cases where the banner announced a
+The built-in-body override and geothermal heat-flow defects are cases where the banner announced a
 change the solver never saw.
 
 Usage (from the repository root):
@@ -185,7 +185,7 @@ CASES = [
       {"thermophysical.use_default_albedo": False},
       note="sets only the albedo_explicit flag"),
 
-    # ---- thermophysical: plainly-named keys (PTM-67 suspects) ---------------
+    # ---- thermophysical: plainly-named keys (unread-config-key suspects) ---------------
     C("plain_albedo", MOON_BASE, {"thermophysical.albedo": 0.30},
       note="plain name, not *_override", expect="DEAD"),
     C("plain_emissivity", MOON_BASE, {"thermophysical.emissivity": 0.80},
@@ -215,7 +215,7 @@ CASES = [
       {"thermal.heat_flow_mask_file": "HEATMASK", "thermal.heat_flow_mask_value": 5.0},
       note="per-face Qb map, all faces", expect="LIVE"),
     C("thermal_m", MOON_BASE, {"thermal.thermal_m": 20}, note="grid layers/skin"),
-    C("thermal_n", MOON_BASE, {"thermal.thermal_n": 50}, note="PTM-165 suspect",
+    C("thermal_n", MOON_BASE, {"thermal.thermal_n": 50}, note="suspected unread",
       expect="DEAD"),
     C("thermal_b", MOON_BASE, {"thermal.thermal_b": 30}, note="skin depths deep"),
     C("misspelled_section_key", MOON_BASE, {"thermal.equilibration_orbit": 8.0},
@@ -309,7 +309,7 @@ CASES = [
     C("ast_ti200_const", AST_BASE, args=["--constant-thermal-inertia", "200"],
       ref="ast_base"),
 
-    # ---- PTM-60: the gb_* forwarding still uses the 6-decimal setter --------
+    # ---- the gb_* forwarding still uses the 6-decimal setter --------
     # generic_body.surface.ks and thermophysical.ks_override request the SAME
     # physical value; only the second travels at full precision.
     C("prec_gb_ks", AST_BASE, {"generic_body.surface.ks": 1.2345e-5,

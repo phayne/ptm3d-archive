@@ -12,7 +12,7 @@ Measured on the fourteen shipped Justitia configurations, one fresh panel each:
 all fourteen planned `simulation.duration_days` -> 1.3815675119109634, over
 authored windows of 3.75 d (the six ice-depth studies), 2.0 d (six proxops),
 3.0 d (descent) and 6.0 d (high). Opening a file and pressing Save would have
-rewritten the run window of every one of them -- GUI-DURATION-SILENT-OVERWRITE.
+rewritten the run window of every one of them.
 
 WHAT IS HELD HERE. The seeding rule, from both sides, driven through the REAL
 combo box rather than by calling the handler:

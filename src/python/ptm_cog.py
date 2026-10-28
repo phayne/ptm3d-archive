@@ -587,7 +587,7 @@ def export_field(output_path, face_values, regridder, field_name,
             lost that way, but no unresolved one is ever answered, which is the
             safe direction. Bounding it needs a regridder that can drop a
             vertex from the triangulation; that is the open
-            ``PTM-REGRID-SENTINEL-UNSAFE``, not something this function can do.
+            regrid-sentinel issue, not something this function can do.
 
             ⚠️ Deliberately OPT-IN, not defaulted to ``~isfinite(face_values)``.
             Defaulting it would close the same hole for every NaN-carrying

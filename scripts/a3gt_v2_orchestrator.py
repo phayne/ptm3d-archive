@@ -82,7 +82,7 @@ def require_default_dem():
 # fallbacks so an in-flight campaign on a machine without a local build keeps
 # working. Which one was picked is PRINTED -- silently running a different
 # mesh generator than the one in the tree is how meshes and view factors drift
-# apart. See BUGS.md PTM-04 and docs/dem-to-mesh-workflow.md.
+# apart. See docs/dem-to-mesh-workflow.md.
 DTM_TOOL_REPO = REPO / "build" / "bin" / "dtm_to_ply_delaunay"
 DTM_TOOL_LOCAL = Path("/tmp/dtm_to_ply_delaunay")
 DTM_TOOL_REMOTE = Path(os.environ.get("PTM_DTM_TOOL", "/nonexistent/dtm_to_ply_delaunay"))
@@ -1085,7 +1085,7 @@ def read_hmat_dims(path: Path) -> tuple[int, int] | None:
 
 def read_hmat_dims_and_blocks(path: Path) -> tuple[int, int, int] | None:
     """Return (n_rows, n_cols, num_blocks) from a .hmat file's 32-byte
-    header. num_blocks==0 is Ada's "truly empty" base VF signature (matches
+    header. num_blocks==0 is the "truly empty" base VF signature (matches
     the current HMATRIX_MAGIC/VERSION=2 layout -- confirmed via direct hex
     dump of polar_site_A_base_empty.vf, 2026-07-23)."""
     import struct
@@ -1116,7 +1116,7 @@ def stage_base_vf(site_id: str, core_mesh: Path, vf_target: Path,
     if n_faces <= 0:
         return False, f"could not read face count from core mesh {core_mesh}"
     candidate = None
-    for pattern in (f"{site_id}_base_empty.vf",  # Ada's naming (base_vf_manifest.tsv)
+    for pattern in (f"{site_id}_base_empty.vf",  # the naming (base_vf_manifest.tsv)
                     f"{site_id}.hmat", f"{site_id}.vf"):
         c = vf_base_dir / pattern
         if c.is_file():
@@ -1155,7 +1155,7 @@ def stage_base_vf(site_id: str, core_mesh: Path, vf_target: Path,
 def vf_replace_path(vf_replace_dir: Path | None, site_id: str) -> Path | None:
     if vf_replace_dir is None:
         return None
-    # Ada's assemble_and_verify.sh layout: <vf_replace_dir>/<site>/<site>_corrected_vf.csr
+    # the assemble_and_verify.sh layout: <vf_replace_dir>/<site>/<site>_corrected_vf.csr
     # (a per-site subdirectory, alongside her sweep/ scratch) -- checked first.
     # Flat <vf_replace_dir>/<site>.csr (or .vf) is also accepted for a simpler
     # staging layout if one is ever used instead.

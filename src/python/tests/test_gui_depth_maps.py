@@ -952,7 +952,7 @@ def test_a_depth_list_that_is_not_a_list_is_refused_and_does_not_crash():
     A hand-edited `map_depths_m: 0.05` -- a forgotten pair of brackets -- USED
     TO make the engine complete the run, exit 0, and write NO subsurface maps,
     saying nothing at all. The engine refuses it at config load now
-    (PTM-DEPTHMAP-SCALAR-SILENT-OFF, config_parser.cpp), and this refusal stays
+    (config_parser.cpp), and this refusal stays
     here as well: it is answered beside the control that caused it rather than
     after a queued run has been dispatched, and a run started from an older
     binary still behaves the old way.
@@ -1002,8 +1002,7 @@ def test_a_statistic_list_that_is_not_a_list_is_refused():
 
     They stop it for DIFFERENT reasons, and until 2026-09-06 they reported the
     same one: the scalar reached "output.map_depth_stats is empty", which is a
-    misdiagnosis of a file that plainly named a statistic
-    (PTM-DEPTHMAP-STATS-SCALAR-MISDIAGNOSED). The scalar is now refused at
+    misdiagnosis of a file that plainly named a statistic. The scalar is now refused at
     config load as a shape error; the null still reaches the empty-list clause,
     where that sentence is true.
     """

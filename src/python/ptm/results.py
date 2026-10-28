@@ -94,7 +94,7 @@ STATISTICS_FIELDS = {
     'shadow_depth':      {'label': 'Shadow Depth', 'units': 'm'},
     # scalar=True: single per-face value (no avg/max/min split).
     'ice_depth':         {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
-    # PTM-107(a): the flux-weighted albedo the surface boundary condition
+    # the flux-weighted albedo the surface boundary condition
     # actually absorbed with, reduced over the same integration window as every
     # other map here, so an energy-closure audit may divide the two directly.
     # Dimensionless.
@@ -1275,7 +1275,7 @@ class Results:
 
     def field(self, field='temperature', step=0):
         """One per-step per-face field, e.g. ``field('temperature', 120)``."""
-        # Either naming generation (BUGS.md PTM-664).
+        # Either naming generation.
         return self._read(readers.frame_path(self.path / field, field, step))
 
     def albedo_map(self, path):

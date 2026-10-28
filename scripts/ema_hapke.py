@@ -3,7 +3,7 @@
 
 PROVENANCE / HONESTY (read before trusting or "improving" this):
 
-Recovered 2026-07-09 (see $PTM/BUGS.md EMA-01). The only copy of these helpers
+Recovered 2026-07-09. The only copy of these helpers
 lived in /tmp/ema_sweep_driver.py, a scratch module destroyed with /tmp on reboot,
 so every `fit` path that imported it was dead. The formula itself survived because
 it was written into a comment at scripts/ema_campaign_driver.py:45-48:
@@ -11,7 +11,7 @@ it was written into a comment at scripts/ema_campaign_driver.py:45-48:
     r0 = (1 - gamma) / (1 + gamma),  gamma = sqrt(1 - w)
     disk_p_from_w(w) = w/8 + 0.49*r0 + 0.196*r0**2
 
-Fermi derived and validated it. This file transcribes it verbatim. It is NOT to
+The physics review derived and validated it. This file transcribes it verbatim. It is NOT to
 be re-derived or "corrected" here -- doing so silently rewrites every sweep
 directory name on disk (they encode `p`, see below).
 
@@ -21,7 +21,7 @@ Three things are recorded honestly rather than quietly cleaned up:
    The `+ w/8` term hardwires a single-scattering opposition bracket
    `(1 + B0) * P(0) = 2` (i.e. w/4 halved into the disk integral). The true
    opposition-EXCLUDED isotropic geometric albedo is `(r0/2)*(1 + r0/3)`, which
-   Fermi verified against the exact Chandrasekhar H-function integral to < 0.5%.
+   the physics review verified against the exact Chandrasekhar H-function integral to < 0.5%.
    The `p` returned here is 1.47x-1.90x that opposition-excluded value over the
    campaign's w range. `disk_p_from_w_physical` below spells out the difference.
 
@@ -66,7 +66,7 @@ def disk_p_from_w(w):
 
         p = w/8 + 0.49*r0 + 0.196*r0**2,  r0 = _r0(w)
 
-    Verbatim from Fermi (see module docstring for the non-canonical-coefficient
+    Verbatim from the physics review (see module docstring for the non-canonical-coefficient
     and opposition-convention caveats). Strictly monotonic increasing on (0, 1),
     which is what makes `w_from_disk_p` a well-posed bisection."""
     r0 = _r0(w)
@@ -115,7 +115,7 @@ def disk_p_from_w_physical(w, B0=0.0, P0=1.0):
         p_phys = (w/8) * ((1 + B0) * P0 - 1) + 0.5 * r0 * (1 + r0/3)
 
     The `0.5 * r0 * (1 + r0/3)` term is the true opposition-EXCLUDED isotropic
-    geometric albedo (Fermi: matches the exact Chandrasekhar H-function integral
+    geometric albedo (the physics review: matches the exact Chandrasekhar H-function integral
     to < 0.5%); the `(w/8) * ((1 + B0)*P0 - 1)` term adds back only the excess
     opposition brightening beyond the isotropic single-scattering baseline.
 

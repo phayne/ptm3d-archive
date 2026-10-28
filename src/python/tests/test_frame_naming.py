@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Per-step frame names: old (4-digit) and new (>= 6-digit) runs both load.
 
-BUGS.md PTM-664. Engines before the fix zero-padded the frame index to FOUR
+Frame-name width. Engines before the fix zero-padded the frame index to FOUR
 digits -- a minimum width, so frame 10000 was written ``10000`` -- and an
 alphabetical sort of a run with more than 10,000 frames came out
 0000 ... 1000, 10000, 10001, ..., 1001. That scrambled a Justitia TWG Case 4
@@ -50,7 +50,7 @@ def _write_bin(path, values):
 
 
 def _legacy_name(k):
-    return f"temperature_{k:04d}.bin"          # what pre-PTM-664 engines wrote
+    return f"temperature_{k:04d}.bin"          # what pre-fix engines wrote
 
 
 def _new_name(k, n):

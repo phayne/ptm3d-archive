@@ -5,7 +5,7 @@ PTM3D configs may carry an ``engine_env:`` mapping recording the environment
 variables a run needs (``PTM_ILLUM_TRUE_NORMALS``, ``PTM_ILLUM_RISE_HABS``, ...).
 
 **Since 2026-08-04 the engine reads and applies that block itself**
-(``ConfigParser::applyEngineEnv``, PTM-42), so for ``ptm_thermal_sim`` this
+(``ConfigParser::applyEngineEnv``), so for ``ptm_thermal_sim`` this
 runner is no longer required.  It is kept because it still does two things the
 engine deliberately does not:
 

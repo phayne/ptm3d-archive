@@ -165,7 +165,7 @@ def test_a_config_can_decline_the_flags():
 
     # Declining has to survive a shell that already exports the variable.
     # Setting-only would leave the child running with it while this function
-    # reported an empty environment -- the PTM-276 hole, from the other side.
+    # reported an empty environment -- the injected-variable hole, from the other side.
     inherited = {"PTM_EQ_PERFACE_FLUX": "1", "PTM_ILLUM_RISE_EPS": "1",
                  "PATH": "/usr/bin"}
     env, applied = build_engine_env({"engine_env": {}}, base_env=inherited)
@@ -256,7 +256,7 @@ def test_loading_a_config_does_not_re_add_the_flags():
 
 
 def test_a_shell_export_cannot_re_enable_the_dropped_variable():
-    """PTM-276 from the other side, in the default (no engine_env:) case.
+    """The injected-variable hole from the other side, in the default (no engine_env:) case.
 
     The GUI stopped injecting PTM_EQ_PERFACE_FLUX. That is worth nothing if a
     user who once exported it in their shell still hands it to every GUI run,

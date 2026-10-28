@@ -20,7 +20,7 @@ Subcommands
 -----------
   thermal   <run_dir>                 statistics/*.bin: coherence, inversions, ranges
                                       (never-lit faces are judged against the
-                                       indirect flux they receive -- PTM-462)
+                                       indirect flux they receive -- the never-lit coherence check)
   derived   --parent P --derived D    a derived product must differ from its parent
   signal    <fits|dir>                on-body field is non-zero; degeneracy metrics
   manifest  <out_dir> --binary B      record what produced an output directory
@@ -59,7 +59,7 @@ except ModuleNotFoundError:  # actionable instead of a bare traceback
 #     fixed  binary 79f091e -> std =  0.96 K
 # 3.0 K sits ~3x above the good run and ~6x below the broken one.
 #
-# PTM-462: this threshold is only meaningful on faces that receive NO indirect
+# this threshold is only meaningful on faces that receive NO indirect
 # flux. Applied to every never-lit face it fails valid radiation-coupled runs --
 # measured on the site A flux-cube run (2,397,890 faces, corrected VF v3): 10,707
 # never-lit faces, std 8.17 K, of which the 9 with identically zero indirect flux
@@ -141,7 +141,7 @@ def mesh_face_count(run_dir):
 def stat(run_dir, name):
     """Read a statistics binary.
 
-    FORMAT (see docs/KNOWN_LIMITATIONS.md, PTM-06):
+    FORMAT (see docs/KNOWN_LIMITATIONS.md):
         [int32 n_faces][float32 x n_faces]
     The naive `np.fromfile(p, dtype="<f4")` recipe -- which is what `ptm-analyze`'s
     SKILL.md prescribed -- reads that 4-byte header as a *temperature* and shifts every
@@ -272,7 +272,7 @@ def _read(fp, ext):
 
 # ------------------------------------------------------------------ thermal
 def _never_lit_checks(r, run, args, valid, tv, never):
-    """PTM-462. Judge never-lit faces against the forcing they actually get.
+    """The never-lit coherence check. Judge never-lit faces against the forcing they actually get.
 
     The original check was one line -- ``std(Tmin) <= 3 K`` over every face with
     ``direct_solar_max == 0`` -- and it was right about the run it was calibrated
@@ -341,7 +341,7 @@ def _never_lit_checks(r, run, args, valid, tv, never):
             # coupled indirect flux and did not record the bands -- radoff is
             # not this, but gray radiosity and the multi-GPU pool are -- has
             # never-lit faces whose scatter is unattributable. Failing it is
-            # what PTM-462 was; passing it silently would be the same defect
+            # what the never-lit coherence check was; passing it silently would be the same defect
             # with the sign flipped.
             r.add("never-lit face coherence (std of Tmin)", "WARN",
                   measured=f"{std:.2f} K", threshold=f"<= {args.coherence_max_k} K",
@@ -846,7 +846,7 @@ def _toplevel(path):
 def _resolve_repo():
     """`(repo, note)` -- the checkout precommit will diff, or `(None, refusal)`.
 
-    PTM-287: the repo was taken from `$PTM`, or from the script's own parent
+    The repo was taken from `$PTM`, or from the script's own parent
     directory, and NEVER cross-checked against where the command was actually
     run. From a worktree that silently snapshotted and diffed a DIFFERENT
     checkout and printed a PASS about a tree it never looked at -- three
@@ -882,7 +882,7 @@ def _resolve_repo():
             f"  {source} resolves to : {asked_top}\n"
             f"  the current directory: {here_top}\n"
             f"A diff of the first tree says nothing about the second, and that "
-            f"silence is what shipped false PASSes (PTM-287). Re-run with "
+            f"silence is what shipped false PASSes. Re-run with "
             f"PTM={here_top} , or cd into the tree you meant.")
     return asked_top, ""
 

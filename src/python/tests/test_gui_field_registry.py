@@ -76,8 +76,8 @@ names carry the depth, so no static catalog can hold them, and ``FIELD_INFO``
 is static -- a run with ``output.map_depths_m`` writes maps the 3D viewer's
 field menu cannot offer, exactly as the three products above could not be
 offered. The disk arm skips them BY NAME and says so; making the menu carry them
-means making it dynamic, which is a feature and not a test change. Owed ledger
-row: ``PTM-GUI-DEPTH-MAPS-UNVIEWABLE``.
+means making it dynamic, which is a feature and not a test change. That work
+is still owed.
 
 Run directly::
 
@@ -364,7 +364,7 @@ KNOWN_LABEL_DIFFERENCES = {
     # ⛔ "Annual" is a claim about the window, and it is FALSE on any run
     # shorter than a year -- these statistics are reduced over the run's own
     # integration window, which was 7 days at 1 h cadence on the run this was
-    # measured against. Owed row: PTM-GUI-ANNUAL-LABEL-FALSE.
+    # measured against. The annual-label wording is still owed.
     "temperature_max": "Annual Max Temperature (K)",
     "temperature_avg": "Annual Mean Temperature (K)",
     "temperature_min": "Annual Min Temperature (K)",
@@ -414,8 +414,8 @@ def test_the_per_step_catalog_is_a_subset_of_the_statistics_catalog():
     so the GeoTIFF/HDF5 export dialog's per-step Fields list cannot offer them.
     That gap is REAL and is not closed here, because closing it routes the
     `+inf`-bearing `shadow_depth` series into the raster exporter, which is a
-    nodata decision that belongs to the exporter. Owed row:
-    PTM-GUI-STEP-FIELD-CATALOG-INCOMPLETE.
+    nodata decision that belongs to the exporter. The per-step
+    field catalog is still owed.
 
     What must never happen is the two disagreeing about a field they SHARE.
     """
@@ -437,7 +437,7 @@ def test_the_per_step_catalog_is_a_subset_of_the_statistics_catalog():
         f"the set of per-step products missing from `ptm.results.FIELD_INFO` "
         f"moved to {missing}. If something was ADDED to that gap, the export "
         f"dialog silently stopped offering it; if something was removed, update "
-        f"this arm and PTM-GUI-STEP-FIELD-CATALOG-INCOMPLETE.")
+        f"this arm and the per-step field catalog note.")
 
 
 def test_the_viewer_labels_agree_with_the_shared_registry():
@@ -924,8 +924,8 @@ def products_on_disk(run_dir):
 
     ``skipped`` holds the subsurface depth maps, by name, with the reason. They
     cannot be in a static catalog (the name carries the depth) and the viewer's
-    menu is static, so they are a known gap and not a silent one:
-    PTM-GUI-DEPTH-MAPS-UNVIEWABLE.
+    menu is static, so they are a known gap and not a silent one
+    (depth maps in the GUI viewer).
     """
     from ptm.results import STAT_TYPES, depth_of_field
     run = Path(run_dir)
@@ -965,7 +965,7 @@ def _disk_arm(run_dir, label):
     if skipped:
         print(f"     [{label}] {len(skipped)} subsurface depth map(s) on disk "
               f"are excluded by name, not offered by the menu, and owed "
-              f"PTM-GUI-DEPTH-MAPS-UNVIEWABLE: {sorted(skipped)[:3]}...")
+              f"depth maps are not in the GUI viewer: {sorted(skipped)[:3]}...")
     return panel, keys
 
 
@@ -1093,8 +1093,7 @@ def test_the_view_says_when_the_nan_gray_is_in_the_ramp():
     colormaps the toolbar offers, 9 come within `OFF_SCALE_MIN_RGB_DISTANCE`
     of it -- including `cividis_r`, which is the DEFAULT for every shadow-depth
     field and for `ice_depth`, and whose statistics are ~52% NaN on the
-    reference run. This arm holds the disclosure, not the fix
-    (PTM-GUI-NAN-GRAY-COLLIDES-WITH-RAMP).
+    reference run. This arm holds the disclosure, not the fix.
     """
     try:
         from gui_panels.visualization_panel import (

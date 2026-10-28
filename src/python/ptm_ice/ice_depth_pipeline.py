@@ -543,7 +543,7 @@ def load_statistics_arrays(source_dir: str, *, progress: bool = False, fast_only
 
 def _enumerate_binary_files(source_dir: str) -> List[str]:
     # NUMERIC order: 4-digit names from older engines roll over to 5 digits at
-    # frame 10,000 and sort out of order alphabetically (BUGS.md PTM-664).
+    # frame 10,000 and sort out of order alphabetically.
     names = [n for n in os.listdir(source_dir) if re.match(r"temperature_\d+\.bin$", n)]
     names.sort(key=lambda n: int(n[len("temperature_"):-4]))
     return [os.path.join(source_dir, n) for n in names]

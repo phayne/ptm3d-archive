@@ -1,4 +1,4 @@
-// PTM-12 CORRECTED occlusion-aware MC VF referee (Fermi's corrections folded in).
+// CORRECTED occlusion-aware MC VF referee (view-factor row-sum overshoot study).
 //   - 0.1 mm ray offset (default; param), forced-outward normals
 //   - grazing guard: rise-march skips self-relief hits (out-of-plane rise < k*edge), re-casts
 //   - deterministic Halton QMC (bit-reproducible, no std::rand)

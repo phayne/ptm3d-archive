@@ -7,7 +7,7 @@ all about the scale of the mesh it is applied to. A mesh whose facets are
 already AT the roughness scale resolves the roughness geometrically, so a
 sub-facet model on top counts it twice, and no code anywhere refuses that. The
 GUI is therefore the only guard, and this file is what keeps it honest.
-``BUGS.md`` ENG-BEAM-SCALE-1 records that a CLI user still has none.
+A CLI user still has no such guard.
 
 Boundaries under test (``gui_core.facet_scale``): refuse below 0.05 m, warn
 between 0.05 m and 1 m, allow at or above 1 m, lunar bodies only.

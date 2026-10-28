@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Out-of-core twin of assemble_vf_haworth.py (Ada, 2026-10-15): same inputs, same CLI, and a
+"""Out-of-core twin of assemble_vf_haworth.py: same inputs, same CLI, and a
 BYTE-IDENTICAL output contract (<csr>, <csr>.rowsum.npy, <csr>.provenance.json keys), with peak
-RAM set by --ram-gib instead of by nnz. Built for the sky-side Moon3D 509k matrix (PTM-732:
-~5.5e9 directed entries, ~9.5e9 nnz, ~76 GB CSR), which the in-core assembler would need
+RAM set by --ram-gib instead of by nnz. Built for the sky-side Moon3D 509k matrix (~5.5e9 directed entries, ~9.5e9 nnz, ~76 GB CSR), which the in-core assembler would need
 ~570 GB of RAM to build (60 B/nnz measured).
 
 How byte-identity is kept (every floating-point operation is the in-core one, in the in-core
 order; only the data movement changes):
-  A  count pass: per-lo directed-entry counts and sweep coverage (the in-core gate, verbatim).
+  A count pass: per-lo directed-entry counts and sweep coverage (the in-core gate, verbatim).
      lo-range BUCKETS are cut so each fits the RAM budget.
-  B  spill pass: each chunk file is parsed exactly as in-core (keep = f >= FTHR, S = area[I]*V),
+  B spill pass: each chunk file is parsed exactly as in-core (keep = f >= FTHR, S = area[I]*V),
      lo/hi/S are appended to their bucket's spill files IN FILE-READ ORDER, so a stable sort
      inside a bucket equals the in-core global stable sort restricted to that key range.
-  C  symmetrize per bucket in key order. The in-core prefix sum csum is GLOBAL; it is carried
+  C symmetrize per bucket in key order. The in-core prefix sum csum is GLOBAL; it is carried
      across buckets exactly (carry added to the bucket's first element, then a sequential
      cumsum -- the same additions in the same order). Pairs (a, b, Ssym) go to pair spill files.
-  D  cap: the in-core row sums are np.add.at(rs, concat(a-halves, b-halves), F) -- every a-half
+  D cap: the in-core row sums are np.add.at(rs, concat(a-halves, b-halves), F) -- every a-half
      contribution in global pair order, THEN every b-half one. Reproduced with np.add.at over the
      a-halves of all buckets in order, then the b-halves (bincount would change the summation
      order and is NOT used). F = Ssym / area[...] exactly as in-core; scaled F is spilled only if
      the cap actually scales.
-  E  write in row blocks. In-core, a stable argsort of rows over concat(a-half, b-half) puts, in
+  E write in row blocks. In-core, a stable argsort of rows over concat(a-half, b-half) puts, in
      each row r, its a-half entries (cols > r ascending) before its b-half ones (cols < r
      ascending). Here the b-half is transposed into row-block spill files in global pair order
      and merged after the a-half with a stable sort per block: the same sequence. cols / float32
@@ -136,7 +135,7 @@ def main():
     if a.radiance_prune_eps > 0.0:
         raise SystemExit("FATAL: radiance pruning is not supported out of core; use assemble_vf_haworth.py")
     if a.min_hits > 1 and a.symmetrize_divisor == "tried":
-        raise SystemExit(f"FATAL: min_hits={a.min_hits} with --symmetrize-divisor tried (FC-08; see the in-core assembler)")
+        raise SystemExit(f"FATAL: min_hits={a.min_hits} with --symmetrize-divisor tried (the divisor defect; see the in-core assembler)")
     t0 = time.time()
     out = Path(a.out_csr)
     scratch = Path(a.scratch) if a.scratch else Path(str(out) + ".ooc_scratch")

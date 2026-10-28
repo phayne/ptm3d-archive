@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PTM-733 regression test: mc_ref_pp traces the ENGINE's surface side, never the raw winding alone.
+"""Shared surface-side rule regression test: mc_ref_pp traces the ENGINE's surface side, never the raw winding alone.
 
 Synthetic, no external data: a 1.2 m bowl (depth 0.25 m, ~2,400 faces) placed on the lunar
-surface at 85 deg S, written twice -- wound OUTWARD (sky side) and wound INWARD (the PTM-732
+surface at 85 deg S, written twice -- wound OUTWARD (sky side) and wound INWARD (the inward-wound Moon3D mesh
 Moon3D 509k situation). The current referee (ensure_mc_ref_pp.resolve_current) must:
   O1  outward mesh: 0 faces reversed under both rules, and partner records BYTE-IDENTICAL to
-      PTM_PP_ORIENT=raw (the pre-PTM-733 behavior) -> outward-wound meshes are unaffected.
+      PTM_PP_ORIENT=raw (the pre-fix behavior) -> outward-wound meshes are unaffected.
   O2  inward mesh, no acknowledgment: exit 5 before tracing, no partner .bin written.
   O3  inward mesh + PTM_ILLUM_TRUE_NORMALS=1 + PTM_PP_ORIENT_EXPECT_REVERSAL=1: every face
       reversed, and kept partners / SumF equal to the outward mesh to round-off (the two
@@ -76,7 +76,7 @@ def run(binary, work, ply, tag, env):
                        capture_output=True, text=True, env=e, timeout=600)
     toks = [ln.split() for ln in r.stdout.splitlines() if ln and not ln.startswith("#")]
     if any(len(t) < 6 for t in toks):
-        raise SystemExit("FAIL: this referee prints no nkept column (it predates f1d8995 and PTM-733)")
+        raise SystemExit("FAIL: this referee prints no nkept column (it predates f1d8995 and the shared surface-side rule)")
     rows = {int(t[0]): (float(t[1]), int(t[5])) for t in toks}
     orient = next((ln for ln in r.stderr.splitlines() if ln.startswith("# ORIENTATION")), None)
     stats = next((json.loads(ln[8:]) for ln in r.stderr.splitlines() if ln.startswith("# STATS ")), None)
@@ -126,7 +126,7 @@ def main():
               f"{'n/a' if k_in is None else f'{k_in.mean():.1f}'} | underside (raw) kept {k_u.mean():.1f}")
     if fails:
         print("FAIL:\n  " + "\n  ".join(fails)); return 1
-    print("PASS: mc_ref_pp orientation (PTM-733) O1-O5"); return 0
+    print("PASS: mc_ref_pp orientation O1-O5"); return 0
 
 
 if __name__ == "__main__":

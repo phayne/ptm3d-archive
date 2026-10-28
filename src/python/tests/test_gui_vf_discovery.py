@@ -257,7 +257,7 @@ def test_a_version_one_sparse_file_is_offered_and_warned_about():
             f"version 2 must rank above version 1; got {names}")
         old = result.matches[1]
         assert old.ok, "a v1 file is offered, not refused -- refusing it " \
-                       "forces the multi-gigabyte rebuild PTM-19 forbids"
+                       "forces the multi-gigabyte rebuild the never-rebuild rule forbids"
         joined = " ".join(old.notes)
         assert "-22%" in joined and "2026-08-23" in joined, (
             f"the v1 warning must say what changed and when: {joined}")
@@ -449,7 +449,7 @@ def test_a_truncated_csr_is_refused_rather_than_offered():
 
 
 def test_the_orphaned_matrices_are_refused_by_name():
-    """PTM-312: loadable, correctly dimensioned, and known to be wrong.
+    """Defective offline view-factor matrices: loadable, correctly dimensioned, and known to be wrong.
 
     Nothing in these files says so -- current layout, right face count -- and
     the sweeps that would let them be rebuilt were in ``/tmp`` and are gone.

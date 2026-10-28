@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stratified analysis of a flux-cube product, for the Fermi gate.
+"""Stratified analysis of a flux-cube product, for the physics review gate.
 
 TERMINOLOGY, and it matters
 ---------------------------
@@ -33,7 +33,7 @@ component is invisible there. The dark strata are where those become visible.
 
 Reported per stratum, per face: the window max and median of every component,
 the component's share of the total, and the dynamic range. Nothing is
-thresholded or hidden -- Fermi reads the numbers, not a verdict.
+thresholded or hidden -- the physics review reads the numbers, not a verdict.
 
 Usage:
   python3 scripts/flux_cube_strata.py <run>/flux_cubes/flux_cubes.fcb

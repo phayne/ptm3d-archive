@@ -23,7 +23,7 @@ because it was measured, not because the comparison needed it to pass:
 
 3. The plain ``thermophysical:`` values become ``*_override`` values. On a
    built-in body the engine reads only the override keys -- ``thermophysical.H``
-   and its nine siblings are read by nothing (``BUGS.md`` PTM-67) -- so the
+   and its nine siblings are read by nothing -- so the
    shipped files state ten properties the engine ignores, and the card states
    the four that have an override path. Every value is Europa's own, so the two
    are the same run. MEASURED, not argued: two ico3 Europa runs, one with the

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression test: radiation exchange that is ~zero must change ~nothing.
 
-BUGS.md PTM-665. The coupled CPU run solves the whole mesh on the SIMD-batch
+Convex-shape drift. The coupled CPU run solves the whole mesh on the SIMD-batch
 integrator and then re-integrates every face carrying ANY indirect flux (the
 default selection threshold is 0 K). Until 2026-09-24 that re-integration used
 the SCALAR integrator, whose flux sampling lags by half a substep, so a

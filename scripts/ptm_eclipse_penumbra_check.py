@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PTM-38 acceptance harness: does the engine's direct-solar track the TRUE
+"""Penumbral-eclipse acceptance harness: does the engine's direct-solar track the TRUE
 fraction of the solar disk left visible during a partial (penumbral) eclipse?
 
 The engine's eclipse model is a ray/sphere test of the primary's *geometric*

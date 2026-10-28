@@ -129,7 +129,7 @@ SUMMARY_V2 = (
     "Retained only so a copy already in circulation can be recognised and replaced by v3.")
 # american-english: allow-end
 
-# v1 is archived in the file rather than deleted. Fermi's reason for replacing it
+# v1 is archived in the file rather than deleted. The physics review's reason for replacing it
 # is the reason it is archived and not silently dropped: a sibling caveat
 # attribute does not travel with a copy-pasted sentence, so v1 -- which is now
 # false in three places, including telling the reader to carry margin in ONE
@@ -274,10 +274,10 @@ def ply_face_count(path):
 def read_face_stat_bin(path, expect_faces=None, expect_source=""):
     """Read one `statistics/*.bin`: a uint32 face count, then that many float32.
 
-    PTM-460. This function existed here as a bare
+    Flux-cube statistics header. This function existed here as a bare
     ``np.fromfile(path, dtype=float32)``, which reads the 4-byte face-count
     HEADER as if it were the first face's value and shifts every face by one
-    index -- PTM-06's bug class, recurring in a script written after PTM-06 was
+    index -- the statistics-header off-by-one bug class, recurring in a script written after that bug was
     fixed in `ptm_qa.py`. On the site A product it reported "2397891 faces" for a
     2,397,890-face mesh, and every temperature it then reduced belonged to the
     face before it. The consumer here takes a median over 2.4M faces, so the

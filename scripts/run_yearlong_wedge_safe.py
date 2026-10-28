@@ -90,7 +90,7 @@ same two run_chunked_simulation.py uses:
 Before this fix the engine refused the hand-off (the 1-cadence-stale gap plus
 the 0.57 ms UTC error exceeded its one-cadence warn band). Older engines took
 the stale state silently, so every earlier run of this driver carries a
-1-cadence seam at each chunk boundary (BUGS.md PTM-719).
+1-cadence seam at each chunk boundary.
 
 PICARD CAP (2026-08-15). Every radiation knob is inherited from the base config
 byte for byte, so a k_max chosen once by habit propagates silently to every
@@ -225,7 +225,7 @@ def gate_check_common(log_path: Path, expect_hole_seal_count: int | None = 30) -
     """Same illumination/VF banners the other addon drivers gate on.
     Returns a list of problems (empty = clean).
 
-    `expect_hole_seal_count`: PTM-18 interior-hole-seal count is MESH-SPECIFIC
+    `expect_hole_seal_count`: interior-hole-seal count is MESH-SPECIFIC
     (2026-07-21 finding: moon3d seals 30, haworth_radcore_r32c legitimately
     seals 140 -- verified via a dedicated hole-census probe before launch, not
     guessed). The original hardcoded "sealed 30" gate false-failed a healthy
@@ -250,9 +250,9 @@ def gate_check_common(log_path: Path, expect_hole_seal_count: int | None = 30) -
         problems.append("RISE_HABS h_eps=0 did not engage")
     if expect_hole_seal_count is not None:
         if not re.search(rf"(?:PTM-18 )?interior hole-seal ENABLED: sealed {expect_hole_seal_count} interior hole", text):
-            problems.append(f"PTM-18 seal count != {expect_hole_seal_count}")
+            problems.append(f"hole-seal count != {expect_hole_seal_count}")
     elif not re.search(r"(?:PTM-18 )?interior hole-seal ENABLED: sealed \d+ interior hole", text):
-        problems.append("PTM-18 hole-seal banner missing entirely")
+        problems.append("hole-seal banner missing entirely")
     return problems
 
 
@@ -432,7 +432,7 @@ def make_stage_yaml(base_cfg: dict, chunk_dir: Path, start_time: dt.datetime,
     out = cfg.setdefault("output", {})
     out["directory"] = str(chunk_dir)
     out["write_raw_stats"] = True
-    # 2026-07-21 (Luna): was hardcoded True unconditionally -- silently
+    # 2026-07-21: was hardcoded True unconditionally -- silently
     # discarded a base config's own `output.skip_time_series: false` with NO
     # warning, which would have defeated a rigorous (per-step-frame) Diviner
     # comparison run without any indication the frames were never written.
@@ -995,7 +995,7 @@ def main():
                    help="ABORT (not warn) on a launch-time consistency "
                         "contradiction vs the machine profile (Phase R, R3d)")
     p.add_argument("--expect-hole-seal-count", type=int, default=30,
-                   help="PTM-18 interior-hole-seal count the gate expects in the log banner "
+                   help="interior-hole-seal count the gate expects in the log banner "
                         "(mesh-specific -- moon3d seals 30; verify a new mesh's own count with "
                         "a dedicated probe run before trusting a different value here, "
                         "2026-07-21 finding). Pass -1 to skip this specific check entirely.")

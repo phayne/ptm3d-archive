@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-R2 self-chunking acceptance suite (Fermi's tests A-D) — TURNKEY for the GPU gap.
+R2 self-chunking acceptance suite — TURNKEY for the GPU gap.
 
-Runs ONLY when no ptm_thermal_sim is on the GPU (it refuses otherwise). Fermi's
+Runs ONLY when no ptm_thermal_sim is on the GPU (it refuses otherwise). The physics review's
 bar is BIT-IDENTICAL (0 differing bytes), not a tolerance. Tests:
 
   A) UNCHUNKED byte-regression vs a pre-R2 build. Runs the pre-R2 binary and the

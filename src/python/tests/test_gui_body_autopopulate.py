@@ -19,7 +19,7 @@ the number is wrong:
    spin pole has no plausibility check that would catch it.
 
 3. **An SPK that does not span the run is not an error the engine reports.**
-   It substitutes Keplerian elements per epoch and logs nothing (PTM-145: the
+   It substitutes Keplerian elements per epoch and logs nothing (the
    Justitia kernel covered 30 days of 2034 while the configurations targeted
    2035, and all fifteen "passed"). The negative control below is the arm that
    matters: a kernel that arrives and does NOT cover the run must leave the
@@ -378,7 +378,7 @@ class _SpkClient:
 
 
 def test_a_kernel_that_does_not_cover_the_run_is_refused():
-    """PTM-145's negative control, and the arm that matters most here.
+    """Generic-body metakernel negative control, and the arm that matters most here.
 
     The kernel arrives. It is a real file. It simply does not span the run --
     which is exactly the Justitia case, and exactly what the engine does not
@@ -436,7 +436,7 @@ def test_an_unreadable_kernel_is_unknown_and_not_fine():
 
 
 def test_the_fetched_window_carries_a_year_of_margin_at_each_end():
-    """PTM-300: the request must reach well past the run, at BOTH ends.
+    """Justitia SPK coverage: the request must reach well past the run, at BOTH ends.
 
     Both ends, because equilibration integrates BEFORE the start time. A margin
     that only extends forward -- which is what the HORIZONS page computes --
@@ -637,7 +637,7 @@ def test_a_damit_shape_is_cached_with_its_md5_and_brings_its_spin():
         assert shape.exists() and shape.suffix == ".obj"
         assert shape.name == "shape_damit_9110.obj", shape.name
 
-        # PTM-303: the .obj itself is swallowed by .gitignore, so its identity
+        # the .obj itself is swallowed by .gitignore, so its identity
         # lives in a sidecar that is NOT ignored.
         record = shape_provenance(shape)
         assert record["damit_id"] == 9110
@@ -851,7 +851,7 @@ def test_the_card_offers_the_three_fetches_and_none_runs_on_a_keystroke():
 
 
 def test_a_refused_kernel_writes_nothing_into_the_card():
-    """The card half of the PTM-145 negative control."""
+    """The card half of the generic-body metakernel resolution negative control."""
     import tempfile
 
     from gui_core.body_fetch import FetchResult

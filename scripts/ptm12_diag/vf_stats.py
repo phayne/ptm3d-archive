@@ -26,7 +26,7 @@ Definitions (all stated in the JSON so a reader never has to guess):
                   already detected many times (nnz is set by geometry and grows
                   with the visible set); near 1 = rows are capped by the ray
                   budget. A HINT, not a classification: the thresholds below are
-                  engineering choices pending Fermi.
+                  engineering choices pending the physics review.
   directed_saturation = partners_kept / terrain_hits from the sweep STATS lines
                   (per launch ray, how often a hit found a partner not seen
                   before), when sweep logs are given.
@@ -88,7 +88,7 @@ def parse_sweep_stats(pattern):
                 for k, v in d.items():
                     if k in ("n_faces_mesh", "nrays", "min_hits",
                              "orientation_rule", "orientation_reversed", "orientation_digest"):
-                        # per-chunk constants (PTM-733 orientation included): collected, not summed
+                        # per-chunk constants (surface-side orientation included): collected, not summed
                         tot.setdefault(k, set()).add(v)
                     elif k == "max_partners_kept":
                         max_kept = max(max_kept, v)

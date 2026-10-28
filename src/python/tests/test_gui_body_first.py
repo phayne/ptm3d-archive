@@ -1302,7 +1302,7 @@ def test_every_card_emits_a_configuration_the_engine_accepts():
 
 
 # --------------------------------------------------------------------------
-# 6. The generic-body round-trip floor (PTM-201)
+# 6. The generic-body round-trip floor
 # --------------------------------------------------------------------------
 
 def test_a_surface_value_too_small_to_survive_is_refused():
@@ -1348,7 +1348,7 @@ def test_showing_a_card_does_not_rewrite_the_configuration():
         manager, panel = _panel(scratch)
         # The precondition is SET here, not inherited from whichever check ran
         # before this one. In-suite the engine arm above happens to leave a
-        # generic-body card active, which is how the PTM-444 rewrite was found;
+        # generic-body card active, which is how the order-dependent GUI test rewrite was found;
         # run alone, this file used to land on whatever card the panel started
         # on and the bug could not reproduce, so the check passed on the broken
         # code. An asteroid card left open is a thing a user does, and it is the
@@ -1419,7 +1419,7 @@ def test_a_file_naming_two_bodies_keeps_its_generic_body_block():
     when the body name is built-in -- so a card that leaves such a file
     untouched emits a Moon run from a screen describing an asteroid.
 
-    This is the boundary of the PTM-444 guard, and it is here because the first
+    This is the boundary of the order-dependent GUI test guard, and it is here because the first
     draft of that guard crossed it: gating the repair on ``_seeding_defaults``
     alone fixed the Moon-file case and broke this one (measured 2026-08-30).
     """

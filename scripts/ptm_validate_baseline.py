@@ -642,7 +642,7 @@ def run_suite(suite: dict, repo: str, binary: str, run_root: str,
         refuse_if_banked(out, f"the output directory for arm {name}")
         shutil.rmtree(out, ignore_errors=True)
         log = os.path.join(run_root, "logs", name + ".log")
-        # engine_args: appended to EVERY arm (e.g. the PTM-727 legacy arm,
+        # engine_args: appended to EVERY arm (e.g. the indirect-aware spin-up seed legacy arm,
         # --engine-arg=--seed-indirect --engine-arg=off). Recorded in STATUS.txt.
         rc, secs = run_one(binary, repo, arm["config"], out,
                            resolve_args(arm.get("args", []), inputs_dir) + list(engine_args),
@@ -1239,7 +1239,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         expect_differ = False
         if args.expect_differ_if_log:
             # The arm's own engine log decides whether a CHANGE is expected (the
-            # PTM-727 default arm: an arm whose log shows the new seed acting must
+            # Indirect-aware spin-up seed default arm: an arm whose log shows the new seed acting must
             # differ from the legacy bank; every other arm must stay identical).
             log = os.path.join(os.path.dirname(os.path.abspath(run_dir)), "logs", name + ".log")
             if not os.path.exists(log):
@@ -1383,7 +1383,7 @@ def main(argv=None) -> int:
     v.add_argument("--expect-differ-if-log", default="", metavar="REGEX",
                    help="an arm whose engine log matches REGEX must DIFFER from the bank "
                         "(identical = FAIL); every other arm must stay byte-identical. "
-                        "PTM-727 default arm: 'seed_indirect: series armed'")
+                        "For the seed default arm: 'seed_indirect: series armed'")
     v.add_argument("--rerun", action="store_true",
                    help="run every banked arm fresh from the recipe in the "
                         "manifest and compare that. Needs --binary and --repo.")

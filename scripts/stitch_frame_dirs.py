@@ -45,7 +45,7 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=0,
                     help="zero-pad width of output index; 0 (default) = the engine's rule, "
                          "max(6, digits(total frames - 1)), so a lexicographic sort of the "
-                         "output is its numeric order (BUGS.md PTM-664)")
+                         "output is its numeric order")
     a = ap.parse_args()
 
     dst_dir = a.out_dir / a.field

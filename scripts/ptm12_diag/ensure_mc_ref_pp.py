@@ -44,12 +44,12 @@ recipe or the staleness check):
   ensure_mc_ref_pp.py --replace     also overwrite the legacy fixed path with
                                      the fresh binary (on-disk hygiene).
   ensure_mc_ref_pp.py --check-only  exit 0/1 only; no path on stdout.
-  ensure_mc_ref_pp.py --self-test   PTM-711 regression check (two uncached
+  ensure_mc_ref_pp.py --self-test   dyld-load regression check (two uncached
                                      builds, closed-form smoke run, equal
                                      LC_UUID-masked digests).
 
 Every binary this module returns has just been EXECUTED on a closed-form mesh
-(smoke_test); a binary that links but cannot load (PTM-711) is fatal.
+(smoke_test); a binary that links but cannot load is fatal.
 Embree: $PTM_EMBREE_ROOT (or $EMBREE_ROOT) pins an install prefix; the R1
 benchmark uses ~/opt/embree-4.3.3-avx512, matching the revision engine.
 """
@@ -63,7 +63,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MC_SRC = HERE / "mc_ref_pp.cpp"
-# Local headers mc_ref_pp.cpp #includes (PTM-733): part of the source, so part of the cache key.
+# Local headers mc_ref_pp.cpp #includes: part of the source, so part of the cache key.
 MC_HEADERS = [HERE.parent.parent / "src" / "cpp" / "mesh" / "face_orientation.h"]
 LEGACY_BIN = HERE / "mc_ref_pp"
 CACHE_ROOT = HERE / ".mc_ref_pp_cache"
@@ -112,7 +112,7 @@ def _build_command(out_path, cxx):
                               capture_output=True, text=True).stdout.strip()
         if sdk:
             cmd += ["-isysroot", sdk]
-        # PTM-711: NO `-Wl,-no_uuid`. That flag (added 2026-09-03 to make two
+        # NO `-Wl,-no_uuid`. That flag (added 2026-09-03 to make two
         # compiles md5-identical) produces a binary with no LC_UUID load
         # command, and the macOS 26 dyld refuses to load it ("dyld: missing
         # LC_UUID load command"): the referee built but could never run. The
@@ -167,7 +167,7 @@ def build_mc_ref_pp(out_path):
     return str(out_path)
 
 
-# ---- PTM-711 regression check: the binary must LOAD and RUN, not just link ----------------
+# ---- dyld-load regression check: the binary must LOAD and RUN, not just link ----------------
 # A successful link proves nothing about loadability: the -no_uuid binary linked cleanly for
 # five weeks and dyld refused it every time. So every binary this module hands out is first
 # executed on a tiny mesh with a closed-form answer.
@@ -212,8 +212,7 @@ def _write_smoke_inputs(work):
 
 
 def smoke_test(binary):
-    """Run `binary` on the closed-form mesh above. FATAL on: failure to load/exit 0
-    (PTM-711), a row sum off the closed form, an output record that does not
+    """Run `binary` on the closed-form mesh above. FATAL on: failure to load/exit 0, a row sum off the closed form, an output record that does not
     hold exactly the two receiver faces, or any back-face hit. Returns the
     measured SumF."""
     import struct
@@ -221,7 +220,7 @@ def smoke_test(binary):
     with tempfile.TemporaryDirectory(prefix="mc_ref_pp_smoke_") as work:
         ply, tmax, fl = _write_smoke_inputs(work)
         outb = Path(work) / "smoke_out.bin"
-        # PTM-733: the closed-form geometry is two facing plates in a LOCAL frame (receiver
+        # the closed-form geometry is two facing plates in a LOCAL frame (receiver
         # wound to face the source, not the outside of a body), so no radial orientation rule
         # applies to it. The smoke test checks the integrator and the dyld load, not the
         # orientation (test_mc_ref_pp_orientation.py does that), so it traces the raw winding.
@@ -259,7 +258,7 @@ def smoke_test(binary):
         if why is not None:
             sys.stderr.write(r.stdout[-2000:] + r.stderr[-2000:])
             raise SystemExit(f"FATAL: mc_ref_pp smoke test failed for {binary}: {why}. "
-                             "This binary must not be used (PTM-711 regression check).")
+                             "This binary must not be used (dyld-load regression check).")
     _log(f"  mc_ref_pp: smoke test PASS ({binary}): SumF {sumf:.5f} vs closed form "
          f"{want:.5f}, |err| {abs(sumf - want):.2e}")
     return sumf
@@ -280,7 +279,7 @@ def find_or_build_mc_ref_pp(explicit, work):
     for cand in (explicit, os.environ.get("PTM_MC_REF_PP"), LEGACY_BIN):
         if cand and Path(cand).is_file() and os.access(str(cand), os.X_OK):
             _log(f"  mc_ref_pp: using existing {cand}")
-            smoke_test(cand)   # PTM-711: an existing file can still be unloadable
+            smoke_test(cand)   # an existing file can still be unloadable
             return str(cand)
     return build_mc_ref_pp(Path(work) / "mc_ref_pp")
 
@@ -341,7 +340,7 @@ def content_digest(path):
     ld64 writes a 16-byte LC_UUID whose value depends on more than the code:
     measured 2026-10-12 (ld-1267), the same source and command linked to two
     different output paths differ in exactly those 16 bytes. Removing the
-    command (-no_uuid) is what broke loading (PTM-711), so the comparison masks
+    command (-no_uuid) is what broke loading, so the comparison masks
     it instead. On a signed Mach-O the signature blob covers the UUID, so it is
     excluded too. Anything that is not a thin 64-bit little-endian Mach-O (e.g.
     an ELF, whose build-id is already a content hash) is hashed as-is."""
@@ -402,7 +401,7 @@ def main():
     ap.add_argument("--check-only", action="store_true",
                      help="exit 0/1 only; do not print the resolved path")
     ap.add_argument("--self-test", action="store_true",
-                     help="PTM-711 regression check: build into two fresh directories, run "
+                     help="dyld-load regression check: build into two fresh directories, run "
                           "the closed-form smoke test on both, and require equal content "
                           "digests (LC_UUID masked). Uses no cache; exit 0 on PASS.")
     a = ap.parse_args()

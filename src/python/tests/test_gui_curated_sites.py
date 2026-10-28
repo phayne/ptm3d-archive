@@ -439,7 +439,7 @@ def _count_failing_receipts(sites):
 
 
 def test_the_orphaned_sites_are_not_curated_and_say_why():
-    """PTM-312. The meshes survive; the matrices beside them do not.
+    """Defective offline view-factor matrices. The meshes survive; the matrices beside them do not.
 
     They are not curated, they must not become curated by accident, and the
     reason has to travel with the fact -- otherwise the next person sees sites

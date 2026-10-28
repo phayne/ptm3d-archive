@@ -3,8 +3,7 @@
 ``src/cpp/thermal/planetary_properties.h`` is the only authority on that.
 Until 2026-08-26 nothing on the Python side asked it: the GUI offered seven
 built-in bodies, the engine implemented three, and the other four resolved to
-Europa's properties and ran to completion with zero absorbed flux and exit 0
-(``BUGS.md`` ENG-BODY-UNBACKED-RUN). The engine now refuses those names; this
+Europa's properties and ran to completion with zero absorbed flux and exit 0. The engine now refuses those names; this
 module is the other half, so the GUI, the tutorials and any script can ask what
 is runnable instead of carrying their own copy of the answer.
 
@@ -259,7 +258,7 @@ def albedo_map_status(body, data_root):
     property of the fetched dataset and of ``PTM_DATA_ROOT``, not of the engine.
     ``gui_core.datasets.albedo_status`` answers a body+resolution question from
     a hardcoded set instead, which is why it can promise a per-face map the
-    engine will reject (``BUGS.md`` GUI-ALBEDO-STATUS-IGNORES-MESH).
+    engine will reject.
     """
     directory = Path(data_root) / "albedo_maps"
     proper = str(body or "").strip().capitalize()
