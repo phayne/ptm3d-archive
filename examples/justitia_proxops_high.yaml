@@ -72,7 +72,7 @@ illumination:
   albedo_maps_directory: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal/269justitia/proxops/orbit_high
+  directory: output/justitia/proxops/orbit_high
   format: binary
   vtk_mode: none
   include_primary_ir: false

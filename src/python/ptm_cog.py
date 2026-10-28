@@ -20,7 +20,7 @@ Implementation is a 2-pass build:
      example file.
 
 Format reverse-engineered from
-``/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/artemis/a3gt/
+``<campaign-root>/
  ptm3d/Malapert_PTM3D-site07/cog/{ice_depth,temperature_max}.tif``.
 """
 

@@ -89,7 +89,7 @@ illumination:
   albedo_maps_directory: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal/269justitia/ice_10cm_step
+  directory: output/justitia/ice_10cm_step
   format: binary
   vtk_mode: none
   include_primary_ir: false

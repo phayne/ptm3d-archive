@@ -34,11 +34,12 @@ Deterministic + idempotent: per-frame RNG is seeded by (--seed, frame index) so 
 given (seed, frame) always yields the same realization; existing noisy outputs are
 skipped unless --overwrite.
 """
+from pathlib import Path
 import os, sys, glob, argparse, importlib.util
 import numpy as np
 from astropy.io import fits
 
-PTM = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm"
+PTM = str(Path(__file__).resolve().parents[1])
 
 # Reuse the driver's assembler/snapshot helpers + Planck constants, READ-ONLY.
 # ema_campaign_driver.py's top-level campaign block is now wrapped in an

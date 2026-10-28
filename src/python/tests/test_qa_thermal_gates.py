@@ -46,7 +46,7 @@ T_GEO = 24.0428
 
 #: Real runs, used where they exist. Each arm SKIPS rather than passing when
 #: its fixture is absent -- a gate that cannot look is not a gate that agrees.
-EMA = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science")
+EMA = Path(os.environ.get("PTM_EMA_ROOT", "/nonexistent/ema"))
 CHIMAERA_BROKEN = EMA / "thermal/623chimaera/flyby_preTerminatorFix_20260704_142231"
 CHIMAERA_GOOD = EMA / "thermal/623chimaera/flyby"
 #: A finished, radiation-coupled lunar polar run. Registered locally rather

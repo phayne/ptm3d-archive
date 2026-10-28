@@ -820,8 +820,8 @@ def _toplevel(path):
     Two measured facts about the answer, both of which decide how it is used:
 
     * git replies in the FILESYSTEM's own spelling. Asked about
-      `/Users/paha3326/projects/ptm-x` on this case-insensitive volume it says
-      `/Users/paha3326/Projects/ptm-x`, and it resolves symlinks (`/tmp` ->
+      `/Users/me/projects/ptm-x` on this case-insensitive volume it says
+      `/Users/me/Projects/ptm-x`, and it resolves symlinks (`/tmp` ->
       `/private/tmp`) on the way. `os.path.abspath` and `os.path.realpath` do
       NEITHER on macOS -- they hand back the case they were given -- so the raw
       `$PTM` string and this answer routinely differ while naming one directory.
@@ -1214,7 +1214,7 @@ def _registered_run(name):
 
 
 def cmd_selftest(args):
-    E = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science"
+    E = os.environ.get("PTM_EMA_ROOT", "output/ema")
     C = f"{E}/thermal/623chimaera"
     cases = [
         ("thermal: archived BROKEN field (5bfbdbe) must FAIL",

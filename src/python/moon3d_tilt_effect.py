@@ -28,6 +28,7 @@ leaves BOTH the numerator and the denominator of every fraction (Paul's ruling,
         --out docs/figures/final/fig_tilt_effect_85.png
 """
 from __future__ import annotations
+import os
 import argparse
 from pathlib import Path
 import sys
@@ -47,7 +48,7 @@ from moon3d_temp_3d import read_ply_vertices_double, tri_faces
 from ptm_pubstyle import apply_style, DOUBLE_W
 import ptm_population as pop
 
-HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
+HEAT3D = Path(os.environ.get("PTM_HEAT3D_ROOT", str(Path(__file__).resolve().parents[3])))   # holds output/<run>
 PSR_THRESH = 1.0     # W/m^2
 COLD_THRESH = 110.0  # K
 

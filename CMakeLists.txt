@@ -532,7 +532,7 @@ if(NOT DEFINED CSPICE_ROOT OR CSPICE_ROOT STREQUAL "")
         # cspice` is then found with no flags (/opt/homebrew on arm64,
         # /usr/local on Intel).
         foreach(_cand "/usr/local/cspice" "/opt/cspice" "$ENV{HOME}/cspice"
-                      "$ENV{HOME}/software/cspice" "/Users/paha3326/software/cspice"
+                      "$ENV{HOME}/software/cspice"
                       "/opt/homebrew/opt/cspice" "/usr/local/opt/cspice")
             if(EXISTS "${_cand}/lib" AND _PTM_CSPICE_DEFAULT STREQUAL "")
                 set(_PTM_CSPICE_DEFAULT "${_cand}")

@@ -16,7 +16,7 @@ BIN="$(python3 "$SCRIPT_DIR/ensure_mc_ref_pp.py")" || {
   exit 1
 }
 
-MESH=/Users/paha3326/dev/heat3d/moon3d_c_cartesian_NEW_500k_clean_native.ply
+MESH=${PTM_PP_MESH:?set PTM_PP_MESH to the binary PLY mesh to sweep}
 TMAX=/tmp/ptm12_rfd/temperature_max.bin
 for c in $(seq -w 0 47); do
   "$BIN" "$MESH" "$TMAX" sweep_chunks/chunk_${c}.txt 40000 1e-4 0.2 1e-5 /tmp/pp_sweep/pp_${c}.bin > /tmp/pp_sweep/log_${c}.txt 2>&1 &

@@ -172,7 +172,7 @@ DEM    = None
 # docs/dem-to-mesh-workflow.md.
 DTM_TOOL_REPO   = REPO / "build" / "bin" / "dtm_to_ply_delaunay"
 DTM_TOOL_LOCAL  = Path("/tmp/dtm_to_ply_delaunay")
-DTM_TOOL_REMOTE = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/dtm_to_ply_delaunay")
+DTM_TOOL_REMOTE = Path(os.environ.get("PTM_DTM_TOOL", "/nonexistent/dtm_to_ply_delaunay"))
 
 
 def _pick_dtm_tool():

@@ -18,6 +18,7 @@ NOTE: x = r sin(lon), y = r cos(lon) measures lon from the +y axis, so
 lon = atan2(x, y) (NOT atan2(y, x)).
 """
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,9 +91,7 @@ def load_diviner(path: str | Path) -> DivinerGrid:
 if __name__ == "__main__":
     import sys
     g = load_diviner(sys.argv[1] if len(sys.argv) > 1 else
-                     "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/"
-                     "Collaborators/LandisM/moon/"
-                     "Tbols_SP_new_full_run_hires_bad_orbit_removed_channel_all.mat")
+                     os.environ.get("PTM_DIVINER_MAT", ""))
     print(f"grid {g.t_max.shape}  res {g.res_deg:.5f} deg ({g.res_m:.1f} m)")
     print(f"x_deg {g.x_deg.min():.2f}..{g.x_deg.max():.2f}  -> lat at edge "
           f"{diviner_xy_to_latlon(30,0)[0]:.0f}")

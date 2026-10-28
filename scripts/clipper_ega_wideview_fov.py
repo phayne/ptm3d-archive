@@ -10,6 +10,7 @@ Samples the PTM3D time_steps.txt epochs and computes per-frame:
 Writes JSON with the full per-frame geometry AND prints summary stats used to
 pick `fov_x_deg` so both bodies fit in-frame for as many frames as possible.
 """
+import os
 import argparse
 import json
 import math
@@ -47,7 +48,7 @@ def ang_deg(v1, v2):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kernels-dir", default="/Users/paha3326/software/cspice/data")
+    ap.add_argument("--kernels-dir", default=os.environ.get("CSPICE_DATA", str(Path(__file__).resolve().parents[1] / "data" / "kernels")))
     ap.add_argument("--spk", default="data/spice/clipper_ega_moon.bsp")
     ap.add_argument("--clipper-id", default="-159")
     ap.add_argument("--time-steps", default="gui/output/moon_clipper-EGA_ico9_30m/time_steps.txt")

@@ -1,5 +1,5 @@
 {
-  "generator": "/Users/paha3326/Projects/ptm-martinez/scripts/plot_conductivity_models.py",
+  "generator": "scripts/plot_conductivity_models.py",
   "git_sha": "b9f3a4b",
   "model_martinez": {
     "reference": "Martinez & Siegler (2021) JGR Planets 126, e2021JE006829, Eqs. 9-10",

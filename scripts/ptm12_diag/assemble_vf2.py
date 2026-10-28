@@ -9,7 +9,7 @@ defect was the symmetrization divisor, fixed below (FC-08).
 Usage: assemble_vf2.py <MIN_HITS=5>   (hits = F*NRAYS, NRAYS=40000)
 CSR: int32 n, float64 geomhash, int64 indptr[n+1], int64 nnz, int32 cols[nnz], float32 data[nnz]."""
 import numpy as np, glob, time, sys, os
-DIAG="/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/scripts/ptm12_diag"
+DIAG=os.path.dirname(os.path.abspath(__file__))
 N=509337; NRAYS=int(sys.argv[2]) if len(sys.argv)>2 else 40000
 MIN_HITS=float(sys.argv[1]) if len(sys.argv)>1 else 5.0
 FTHR=MIN_HITS/NRAYS

@@ -17,6 +17,7 @@ Output: a per-site 4x3 figure (rows: summer-max, summer-avg, winter-max,
 winter-avg; cols: Diviner | PTM3D | diff) + a summary JSON of bias/RMSE.
 """
 from __future__ import annotations
+import os
 import argparse
 import json
 import re
@@ -35,8 +36,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from diviner_compare import read_ply, face_geometry, load_step
 from ptm_pubstyle import apply_style
 
-REPO = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm")
-OUTROOT = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output")
+REPO = Path(__file__).resolve().parents[2]
+OUTROOT = Path(os.environ.get("PTM_RESULTS_ROOT", str(REPO / "output")))
 SEASDIR = REPO / "data/diviner_seasonal"
 METAKERNEL = str(REPO / "data/kernels/moon.tm")
 EPS4 = 0.95 ** 0.25

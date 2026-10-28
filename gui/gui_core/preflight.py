@@ -328,8 +328,7 @@ _EXTERNAL_DATA_SOURCES = {
         "doi:10.6084/m9.figshare.16904632, CC BY 4.0. It is public, but PTM3D "
         "does not redistribute it -- see data/external/README.md",
         (
-            "~/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/"
-            "sutton_WorkMORE",
+            "data/external/sutton_WorkMORE",
         ),
     ),
 }

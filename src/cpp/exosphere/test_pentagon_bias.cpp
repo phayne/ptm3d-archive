@@ -9,6 +9,7 @@
  * This test analyzes the bias and implements a correction.
  */
 
+#include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -323,7 +324,8 @@ int main(int argc, char* argv[]) {
     std::cout << " Pentagon Vertex Bias Analysis" << std::endl;
     std::cout << "========================================" << std::endl;
 
-    std::string mesh_file = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/build/output/europa_high_res/mesh.ply";
+    const char* mesh_env = std::getenv("PTM_TEST_EUROPA_MESH");
+    std::string mesh_file = (argc > 1) ? argv[1] : (mesh_env ? mesh_env : "output/europa_high_res/mesh.ply");
     if (argc > 1) {
         mesh_file = argv[1];
     }

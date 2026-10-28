@@ -29,6 +29,7 @@ equal aspect, 1:1 line, thinned low-alpha gray points, single sequential
 blue hue) is byte-for-byte the same code path.
 """
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
 
@@ -44,7 +45,9 @@ import diviner_seasonal_compare as D
 from ptm_pubstyle import apply_style
 
 LA, LO = -88.181, 6.041
-OUTDIR = Path("/Users/paha3326/Projects/ptm/docs/figures/diviner_validation/seasonal/fig8_hybrid")
+# Run directories (not distributed): $PTM_RESULTS_ROOT/fig8_hybrid_production_ringfix/{coupled,radoff}
+_RUNS = Path(os.environ.get("PTM_RESULTS_ROOT", "output")) / "fig8_hybrid_production_ringfix"
+OUTDIR = Path(__file__).resolve().parents[1] / "docs/figures/diviner_validation/seasonal/fig8_hybrid"
 
 # Same (vlo, vhi) axis ranges as the color-mapped _ringfix figure, for the
 # "sunlit" site key -- SCALES_BY_SITE[key][(season, stat)] = (vlo, vhi, dlo, dhi)
@@ -208,11 +211,11 @@ def main():
     suffix = (("_logd" if args.log_density else "")
               + ("_pubclean" if args.pubclean else "")
               + ("_v2" if args.panel_labels else ""))
-    make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/coupled"),
+    make_figure(_RUNS / "coupled",
                 "coupled", f"fig8_hybrid_coupled_rigorous_ringfix_scatter{suffix}",
                 pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px,
                 log_density=args.log_density, panel_labels=args.panel_labels)
-    make_figure(Path("/Users/paha3326/projects/moon3d/outputs/fig8_hybrid_production_ringfix/radoff"),
+    make_figure(_RUNS / "radoff",
                 "radoff", f"fig8_hybrid_radoff_rigorous_ringfix_scatter{suffix}",
                 pubclean=args.pubclean, pubclean_canvas_px=args.pubclean_canvas_px,
                 log_density=args.log_density, panel_labels=args.panel_labels)

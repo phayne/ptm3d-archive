@@ -80,7 +80,7 @@ illumination:
   albedo_maps_directory: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal/269justitia/ice_depth_study/d0p5cm
+  directory: output/justitia/ice_depth_study/d0p5cm
   format: binary
   vtk_mode: none
   include_primary_ir: false

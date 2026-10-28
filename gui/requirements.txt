@@ -45,8 +45,7 @@ rasterio>=1.3.0
 #   gui/dem_panels/dem_preview_panel.py   GeoTIFF DEM preview + ROI picking
 #                                         (the panel degrades to a text notice
 #                                         without it, it does not crash)
-#   scripts/build_lola_ring.py, scripts/verify_corrected_ring.py,
-#   scripts/audit_ring_horizon.py, src/python/ptm_cog.py
+#   scripts/build_lola_ring.py, src/python/ptm_cog.py
 #
 # It is deliberately NOT listed as a pip requirement above: the `GDAL` wheel
 # only builds against a GDAL C library that is ALREADY installed and whose

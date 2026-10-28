@@ -40,6 +40,7 @@ the calibration gate (``--calibrate``).
 
 from __future__ import annotations
 
+import os
 import argparse
 import csv as _csv
 import json
@@ -49,7 +50,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-REPO = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm")
+REPO = Path(__file__).resolve().parents[1]
 
 # Defaults (production). DENSITY_EXP_RING is set by the calibration gate.
 R_CORE_KM_DEFAULT = 3.0
@@ -231,9 +232,7 @@ def main() -> int:
     p.add_argument("--calibrate", action="store_true",
                    help="Run the density_exp calibration sweep on --site.")
     p.add_argument("--vrt", type=Path, help="VRT for --calibrate.")
-    p.add_argument("--dtm-tool", type=Path, default=Path(
-        "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/"
-        "europa/heat3d/dtm/dtm_to_ply_delaunay"))
+    p.add_argument("--dtm-tool", type=Path, default=Path(__file__).resolve().parents[1] / "build" / "bin" / "dtm_to_ply_delaunay")
     p.add_argument("--exps", default="1.5,2,3,4")
     p.add_argument("--out-dir", type=Path, default=Path("/tmp/calib_ext"))
     p.add_argument("--max-points", type=int, default=MAX_POINTS_DEFAULT)

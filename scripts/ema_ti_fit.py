@@ -35,13 +35,14 @@ Subcommands:
   extract   -- extract T(local-time) from one real thermal output dir (smoke test).
   fit       -- run the real campaign fit once Rocky's 15-point sweep + cameras exist.
 """
+from pathlib import Path
 import os, sys, re, glob, json, argparse, importlib.util
 import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-PTM = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm"
-TROOT = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal"
+PTM = str(Path(__file__).resolve().parents[1])
+TROOT = os.environ.get("PTM_EMA_ROOT", PTM + "/output/ema") + "/thermal"
 
 def _load(mod, path):
     s = importlib.util.spec_from_file_location(mod, path); m = importlib.util.module_from_spec(s)
@@ -78,7 +79,7 @@ def _body_num_from_sweep_root(sweep_root):
     """Derive the body number ('623', '23871', ...) from a sweep-root path such as
     '.../thermal/623chimaera/sweep' -> '623', by matching the '<num><name>'
     directory component. Returns None if no such component is present. Mirrors the
-    dynamic pattern at ema_ousha_extra_offgrid.py:148 and fixes EMA-02: the `fit`
+    sweep-root naming pattern and fixes EMA-02: the `fit`
     path must NOT silently reuse Chimaera's albedo for every body."""
     for part in reversed(os.path.normpath(sweep_root).split(os.sep)):
         m = re.match(r"(\d+)[a-z]", part)

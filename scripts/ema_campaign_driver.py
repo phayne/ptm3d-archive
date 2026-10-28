@@ -17,6 +17,7 @@ Seeliger level nor the old fudge. Structural Hapke params (B0/h/g/theta_bar) are
 Fermi's provisional class-based defaults (see HAPKE_DEFAULTS), overridable per
 body via the body_config 'surface.hapke' block.
 """
+from pathlib import Path
 import os, sys, re, json, glob, time, math, subprocess
 import numpy as np, yaml
 import spiceypy as sp
@@ -24,19 +25,20 @@ import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import imageio.v2 as imageio
 
-PTM   = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm"
+PTM   = str(Path(__file__).resolve().parents[1])
+EMA_ROOT = os.environ.get("PTM_EMA_ROOT", PTM + "/output/ema")   # campaign output root
 TBIN  = PTM+"/build/bin/ptm_thermal_sim"
 CBIN  = PTM+"/build/bin/ptm_camera_sim"
-CSP   = "/Users/paha3326/software/cspice/data"
-SCSPK = "/Users/paha3326/Research/asteroid/EMA/trajectory/ema_khamis_reftraj_280318_v2.bsp"
+CSP   = os.environ.get("CSPICE_DATA", PTM + "/data/kernels")
+SCSPK = os.environ.get("PTM_EMA_SC_SPK", "")   # spacecraft trajectory SPK (not distributed)
 BODIES= PTM+"/data/horizons_cache/bodies"
-TROOT = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal"
-CROOT = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/camera"
+TROOT = EMA_ROOT + "/thermal"
+CROOT = EMA_ROOT + "/camera"
 CAMYAML = PTM+"/examples/cameras/ema_ecam_ir3s_rockox.yaml"
-MANIFEST = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/campaign_manifest.json"
-STATUSDIR = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/status"
-LOGDIR = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/logs"
-LOG = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/campaign.log"
+MANIFEST = EMA_ROOT + "/campaign_manifest.json"
+STATUSDIR = EMA_ROOT + "/status"
+LOGDIR = EMA_ROOT + "/logs"
+LOG = EMA_ROOT + "/campaign.log"
 LAM=10.5e-6; EPS=0.95; HP=6.62607015e-34; CC=2.99792458e8; KB=1.380649e-23
 # Rockox first (thermal already done -> validates render/MP4 fast), then chronological
 TARGETS=[("13294","Rockox"),("10253","Westerwald"),("623","Chimaera"),

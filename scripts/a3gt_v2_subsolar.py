@@ -15,9 +15,9 @@ production / crosscheck / full options sample this phase drift at
 different densities.
 
 SPICE kernels used (verified on disk 2026-05-06):
-  /Users/paha3326/software/cspice/data/lsk/naif0012.tls
-  /Users/paha3326/software/cspice/data/spk/de440.bsp
-  /Users/paha3326/software/cspice/data/pck/pck00011.tpc
+  $CSPICE_DATA/lsk/naif0012.tls
+  $CSPICE_DATA/spk/de440.bsp
+  $CSPICE_DATA/pck/pck00011.tpc
 
 Output JSON shape:
   {
@@ -37,6 +37,7 @@ Output JSON shape:
 
 from __future__ import annotations
 
+import os
 import argparse
 import json
 import math
@@ -47,10 +48,12 @@ from typing import Sequence
 import numpy as np
 
 
+_KDIR = Path(os.environ.get("CSPICE_DATA",
+                            str(Path(__file__).resolve().parents[1] / "data" / "kernels")))
 KERNEL_PATHS = [
-    Path("/Users/paha3326/software/cspice/data/lsk/naif0012.tls"),
-    Path("/Users/paha3326/software/cspice/data/spk/de440.bsp"),
-    Path("/Users/paha3326/software/cspice/data/pck/pck00011.tpc"),
+    _KDIR / "lsk/naif0012.tls",
+    _KDIR / "spk/de440.bsp",
+    _KDIR / "pck/pck00011.tpc",
 ]
 
 

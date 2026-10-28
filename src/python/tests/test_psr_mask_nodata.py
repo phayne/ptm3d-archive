@@ -49,7 +49,7 @@ coordinate appears in this file, under the 2026-09-03 standing ruling.
 
 Run directly::
 
-    /Users/paha3326/anaconda3/envs/europa_viz/bin/python \
+    python3 \
         src/python/tests/test_psr_mask_nodata.py
 """
 

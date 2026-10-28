@@ -35,6 +35,7 @@ With --check it compares psr_count_frac / psr_area_frac / median_tmax_all agains
 Luna's verified hand table and flags any deviation beyond --tol.
 """
 from __future__ import annotations
+import os
 import argparse
 import json
 from pathlib import Path
@@ -50,7 +51,7 @@ from ptm_population import (area_fraction, count_fraction, population_note,
 
 PSR_THRESH = 1.0    # W/m^2  direct-solar max below this = permanent shadow
 COLD_THRESH = 110.0  # K
-HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
+HEAT3D = Path(os.environ.get("PTM_HEAT3D_ROOT", str(Path(__file__).resolve().parents[3])))   # holds output/<run>
 
 # de-tilted sweep tags, latitude in degrees (clean integer placements)
 DT = [("dt85", -85.0), ("dt80", -80.0), ("dt75", -75.0),

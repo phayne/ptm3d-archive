@@ -29,13 +29,13 @@ produced by Fermi's calc10_geom.py from a run's own view-factor matrix and
 temperature field.  It is a multi-hundred-MB measurement, NOT in the repo; the
 default path is where the 2026-08-24 review left it.
 """
+import os
 import argparse
 from pathlib import Path
 import numpy as np
 from scipy.special import erfc
 
-DEFAULT_PAIRS = Path("/Users/paha3326/projects/fermi_beaming_review_2026-08-24/"
-                     "calc10_pairs.npy")
+DEFAULT_PAIRS = Path(os.environ.get("PTM_CHI_PAIRS", "calc10_pairs.npy"))
 PAIRS = DEFAULT_PAIRS
 W_DEG = 32.5
 NQ = 33

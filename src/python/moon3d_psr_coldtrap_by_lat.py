@@ -43,6 +43,7 @@ LAT COUPLED_DIR RADOFF_DIR (dirs holding mesh.ply + statistics/*.bin):
     --run -80    /path/lat80/coupled  /path/lat80/radoff  ...
 """
 from __future__ import annotations
+import os
 import argparse
 import json
 from pathlib import Path
@@ -62,7 +63,7 @@ PSR_THRESH = 1.0      # W m^-2  (direct-solar max below this = permanent shadow)
 COLD_THRESH = 110.0   # K       (cold-trap water-ice stability threshold)
 TRUE_LAT = -84.781    # Moon3D nominal latitude
 
-HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
+HEAT3D = Path(os.environ.get("PTM_HEAT3D_ROOT", str(Path(__file__).resolve().parents[3])))   # holds output/<run>
 # (latitude deg, coupled run dir, radoff run dir). UPDATE these to the forthcoming
 # six-latitude two-band outputs; all overridable on the command line with
 # --run LAT COUPLED_DIR RADOFF_DIR.

@@ -23,6 +23,7 @@ Run directly::
 
 from __future__ import annotations
 
+import os
 import struct
 import sys
 import tempfile
@@ -50,11 +51,10 @@ from gui_core.mesh_preview import (                               # noqa: E402
 #: The real meshes, for the arms that need a file nobody in this test wrote.
 #: Absolute because they live outside the repository; each arm skips with a
 #: named reason when its file is absent.
-REAL_LUNAR_DEM = Path(
-    "/Users/paha3326/projects/moon3d/meshes/fig8_hybrid/sunlit_radcore_r50.ply")
-REAL_EUROPA_DEM = Path(
-    "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/"
-    "sutton_WorkMORE/Cilix_DEM_350m_SOCET.ply")
+REAL_LUNAR_DEM = Path(os.environ.get(
+    "PTM_TEST_LUNAR_DEM", "/nonexistent/sunlit_radcore_r50.ply"))
+REAL_EUROPA_DEM = Path(os.environ.get(
+    "PTM_TEST_EUROPA_DEM", "/nonexistent/Cilix_DEM_350m_SOCET.ply"))
 SHIPPED_CRATER = REPO_ROOT / "data" / "meshes" / "lunar_crater_80N.ply"
 SHIPPED_SHAPE = (REPO_ROOT / "data" / "horizons_cache" / "bodies"
                  / "101955_Bennu_(1999_RQ36)" / "bennu_radar_shape.obj")
