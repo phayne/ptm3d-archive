@@ -19,7 +19,7 @@
 //                   value the engine itself never used) and vf_mc_flux
 //   5.67e-8         -- thermal_config.sigma for every mesh run, i.e. the value
 //                   the surface energy balance actually ran with
-//   5.6704e-8       -- the Ojakangas-Stevenson module
+//   5.6704e-8       -- a since-removed Python research module
 //
 // Two of those were live inconsistencies inside one routine:
 // Profile::update_T computed T_geo with a 5.670374419e-8 fallback while the

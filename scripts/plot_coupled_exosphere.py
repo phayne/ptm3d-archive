@@ -2,7 +2,7 @@
 """Publication-quality globe plots for coupled exosphere simulation.
 
 Reads binary exosphere output (PLY mesh + per-face binary fields) and produces
-3D globe views using plot_surface, matching the style of plot_ice_shell.py.
+3D globe views using plot_surface, in the project globe style.
 
 Usage:
     python scripts/plot_coupled_exosphere.py \
@@ -27,7 +27,7 @@ from scipy.interpolate import griddata
 
 
 # ---------------------------------------------------------------------------
-# Global style (matching plot_ice_shell.py)
+# Global style
 # ---------------------------------------------------------------------------
 plt.rcParams.update({
     'font.family': 'serif',
@@ -201,7 +201,7 @@ def regrid_to_latlon(lats, lons, values, n_lat=91, n_lon=181):
 
 
 # ---------------------------------------------------------------------------
-# 3D Globe rendering (matching plot_ice_shell.py style)
+# 3D globe rendering
 # ---------------------------------------------------------------------------
 
 def make_globe_xyz(lat_grid, lon_grid, data_grid=None):
