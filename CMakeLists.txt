@@ -838,6 +838,12 @@ add_custom_target(ptm_build_info ALL
 # ============================================================================
 # Subdirectories
 # ============================================================================
+# Declared here, before any subdirectory, because src/cpp/mesh reads it before
+# src/cpp/main used to declare it: on the FIRST configure of a fresh build dir
+# mesh_utils was then compiled without the VTK mesh reader (and .vtk meshes
+# failed to load) until the configure step ran a second time.
+option(PTM_USE_VTK_READER "Use VTK C++ reader for mesh import (replicates PyVista)" ON)
+
 # Add the subdirectories for the main project
 add_subdirectory(src/cpp/constants)
 add_subdirectory(src/cpp/maps)
