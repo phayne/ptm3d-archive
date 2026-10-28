@@ -76,7 +76,7 @@ std::string datasetForPath(const std::string& p) {
         {"data/albedo_maps/",     "albedo-maps"},
         {"data/dem/validation/",  "validation-meshes"},
         {"data/dem/copernicus/",  "copernicus-dem"},
-        {"data/meshes/moon3d",    "moon3d-mesh"},
+        {"data/meshes/moon3d_cartesian_double", "moon3d-mesh"},
     };
     for (const auto& m : kMap)
         if (p.rfind(m.prefix, 0) == 0) return m.dataset;

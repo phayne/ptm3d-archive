@@ -23,7 +23,8 @@ mesh:
 thermal:
   run_thermal_mesh: true
   threads: 0                    # 0 = auto-detect
-  equilibration_orbits: 1.0
+  equilibration_orbits: 80.0    # integrated diurnal cycles of spin-up; enough for the engine's spin-up check
+  equilibration_samples_per_diurnal_cycle: 48   # spin-up cadence; the output cadence is unchanged
   equilibration_steps_per_day: -1.0
   use_gpu: false
   compute_statistics: true      # write statistics/*.bin (Tmax/Tavg/Tmin, flux)
@@ -51,6 +52,5 @@ illumination:
 output:
   directory: output/quickstart_moon_diurnal
   format: binary
-  vtk_mode: thermal
 advanced:
   verbose: false

@@ -1,165 +1,74 @@
-# ---------------------------------------------------------------------------
-# PATHS IN THIS FILE ARE PORTABLE. Read examples/moon3d_native_yearlong/README.md
-# before running: three inputs are site-local and are NOT in the repository.
-#   mesh.import_file            -> place/symlink the 509k VTK under data/meshes/
-#                                  (or point PTM_DATA_ROOT at a data dir holding it)
-#   radiation.view_factor_file  -> symlink the EXISTING .vf into ./view_factors/
-#   PTM_HMATRIX_VF_REPLACE      -> the corrected CSR, supplied per machine by env
-# Until 2026-08-15 this file existed only in one working tree, with absolute
-# paths to one machine. That is how the moon3d_lat_final dataset was lost.
-# ---------------------------------------------------------------------------
-# Moon3D latitude-sweep re-run (two-band radiosity, default ON — radiation.band_separated
-# inherits compiled default true; not set explicitly, per config_parser.cpp:204 / radiation_config.h:63).
-# Latitude tag: native (crater placed at -84.79 deg, native IM-2 site, unrotated).
-# Derived from examples/moon3d_500k_clean.yaml (2026-07-12, Luna) -- ONLY mesh.import_file and
-# output.directory changed. start_time/duration_days/equilibration UNCHANGED (see runbook for basis).
+# Moon3D year-long simulation (one full year, 2030-09-01 to 2031-09-01) of the
+# 509,337-face Moon3D testbed crater mesh placed at the IM-2 landing site.
+# These are the settings of the Moon3D JGR revision's year-long runs; only
+# machine paths are replaced by repository-relative ones. Read
+# examples/moon3d_native_yearlong/README.md before running: the mesh and the
+# view-factor matrix are not distributed, and the run takes days.
+# Radiation-coupled arm.
+
+# The validated fine-mesh illumination settings. They are opt-in (default OFF)
+# and are always used together; never set PTM_ILLUM_RISE_EPS on its own.
+# See docs/ENVIRONMENT.md.
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_KEPS: '0.2'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
+
 simulation:
   start_time: '2030-09-01T00:00:00'
   duration_days: 365.25
-  timesteps: 1484
+  timesteps: 1484                 # ~6 h output cadence
   body: Moon
 mesh:
-  resolution: 9
-  # Site-local input, NOT distributed and NOT in data/data_manifest.json.
-  # Resolution (docs/ENVIRONMENT.md, PTM_DATA_ROOT contract): absolute wins ->
-  # $PTM_DATA_ROOT/meshes/... -> <repo>/data/meshes/...  A miss is fatal and
-  # names the key, but its "fetch it with --dataset moon3d-mesh" hint points at
-  # a DIFFERENT mesh (moon3d_cartesian_double.ply) and will not produce this one.
-  import_file: data/meshes/moon3d_c_cartesian_NEW_500k_clean.vtk
-  scale_factor: 1.0
-  export_basic: false
-  use_topographic: false
-  topo_directory: data/topo
+  # Not distributed (see the README). Resolved against $PTM_DATA_ROOT, then <repo>/data.
+  import_file: data/meshes/moon3d_c_cartesian_NEW_500k_clean_native.ply
 thermal:
   run_thermal_mesh: true
   threads: 0
-  equilibration_orbits: 13
-  thermal_m: 10   # layers per upper skin depth (unchanged compiled default)
-  thermal_n: 15   # layer growth factor (unchanged compiled default)
-  thermal_b: 32   # skin depths to bottom -- INCREASED from compiled default 15.
-                  # b is keyed to the DIURNAL skin depth (skinDepth(planet.day,kappa),
-                  # thermal_model.cpp:727/2956) regardless of run duration. Annual/diurnal
-                  # skin-depth ratio = sqrt(365.25/29.5306) = 3.516. Matching the code's own
-                  # diurnal e-fold target (b=15 -> ~9 e-folds, thermal_model.cpp comment,
-                  # bottom amp <0.05K) at the ANNUAL scale requires b >= 9*3.516 = 31.6 -> 32.
-                  # (Luna, design note SESSION-NOTES-2026-07-20-moon3d-yearlong-design.md.)
-  equilibration_steps_per_day: -1.0
-  equilibration_samples_per_diurnal_cycle: 120.0
-  use_gpu: true
-  gpu_devices: 2
+  equilibration_orbits: 8         # integrated diurnal cycles of spin-up
+  equilibration_samples_per_diurnal_cycle: 120
+  thermal_m: 10
+  thermal_b: 32                   # deeper than the default 15, for the annual wave
+  use_gpu: false                  # the revision runs used the CPU solver
   compute_statistics: true
-  thermal_inertia_map: ''
-  h_parameter_map: ''
-  use_default_property_map: false
-  property_maps_directory: data/property_maps
-  enable_shadow_flux: false
-  crater_dd_ratio: 8.0
-  integration_days: -1.0
-  integration_steps: -1
-  integration_offset_days: 0.0
-  integration_offset_steps: 0
+  # Basal heat flow 0.022 W/m^2, the value used by the revision's production runs.
+  # (The engine's lunar default is 0.018 W/m^2, Langseth et al. 1976.)
   geothermal_heat_flow: 0.022
 thermophysical:
-  use_default_albedo: false
-  albedo: 0.12
-  use_default_emissivity: false
-  emissivity: 0.95
   incidence_angle_albedo: true
-  use_default_ks: false
-  ks: 0.00074
-  use_default_kd: false
-  kd: 0.0034
-  use_default_H: false
-  H: 0.06
-  use_default_rhos: false
-  rhos: 1100.0
-  use_default_rhod: false
-  rhod: 1800.0
-  use_default_cp0: false
-  cp0: -3.6125
-  use_default_Qb: false
-  Qb: 0.02
-  use_default_chi: true
-  chi: 2.7
-  constant_thermal_inertia: -1.0
 radiation:
   enabled: true
-  min_shadow_fraction: 0.8
-  verbose: false
-  use_gpu: true
-  # RELATIVE view_factor_file resolves against THIS YAML's directory
-  # (config_parser.cpp resolveDataPath is not applied to this key), i.e.
-  # examples/moon3d_native_yearlong/view_factors/.
-  # SYMLINK the existing 3.4 GB matrix there. If the file is absent the engine
-  # BUILDS it -- do not let that happen: rebuilding a moon3d .vf is the
-  # documented GPU-wedge trigger (BUGS.md PTM-19), and the corrected matrix
-  # cannot be reproduced by a rebuild anyway.
-  view_factor_file: view_factors/moon3d_c_cartesian_NEW_500k_clean.vf
-  max_coupling_iterations: 5
+  use_gpu: false
+  max_coupling_iterations: 20
   coupling_temp_threshold: 2.0
   coupling_flux_threshold: 0.1
   coupling_face_fraction: 0.01
+  min_shadow_fraction: 0.8
   use_hmatrix: true
   use_aca: true
   aca_tolerance: 0.001
   aca_max_rank: 50
-  hmatrix_threads: 0
   adaptive_neighbors: true
   captured_energy_target: 0.95
   max_neighbors: 500
   min_neighbors: 20
-  # ---- Smith (1967) beamed thermal emission: OFF, and it must stay off ----
-  # ⛔ NOT because this is not a lunar polar crater -- it is -- but because of
-  # the MESH SCALE. Beaming is a SUB-facet model: chi stands in for roughness
-  # the mesh does not resolve, at the scale where surface elements become
-  # thermally isolated from one another (millimeters to centimeters on lunar
-  # regolith). This mesh's facets are ~2 mm (509,337 faces over 1.96 m^2 total
-  # area -- a simulated crater ~1.6 m across), i.e. AT that scale. It already
-  # resolves the anisothermality chi is a stand-in for.
-  #
-  #   Paul's ruling, 2026-08-25: "The Moon3D mesh resolution is comparable to
-  #   the roughness scale (millimeters to centimeters) that the beaming is
-  #   intended to capture, so the beaming should be OFF for small local meshes
-  #   like this."
-  #
-  # Turning it on here would count the same physics twice. Beaming belongs on
-  # SITE and REGIONAL meshes -- meters and up (sunlit_radcore_r50 at 237 m,
-  # haworth_radcore_r32c at 181 m, an A3GT 3 km core at 3.5 m).
-  # See docs/radiation-exchange.md section 8.4 for the criterion and the
-  # measured facet scales.
+  # Sub-facet roughness (beaming) stays OFF here: this mesh's ~3 mm facets
+  # already resolve the roughness scale the beaming model stands in for.
   beaming: false
+  # The revision runs replaced the H-matrix with a precomputed sky-side
+  # view-factor matrix via PTM_HMATRIX_VF_REPLACE (see the README). This file
+  # path is resolved against THIS directory.
+  view_factor_file: view_factors/moon3d_509k_empty_stub.vf
 illumination:
   include_primary_reflection: true
   use_batch_processing: true
-  albedo_map: ''
-  albedo_maps_directory: data/albedo_maps
-  positions_file: ''
   use_albedo_map: false
 output:
-  # Repo-relative and gitignored (.gitignore 'output/'). Overridden per chunk by
-  # scripts/run_yearlong_wedge_safe.py --output-dir; only used on a direct run.
   directory: output/moon3d_native_yearlong/coupled
   format: binary
-  vtk_mode: thermal
   include_primary_ir: true
-  thermal_vtk_file: ''
-  complete_vtk_file: ''
-  locations_file: ''
   depths_file: data/locations/depths.txt
-  series_output: ''
-  location_data: ''
-  no_maps: false
 advanced:
   verbose: true
-  default_visible_albedo: -1.0
-visualization:
-  create: false
-  width: 1024
-  height: 768
-  fps: 30
-  camera_distance: 5.0
-  camera_latitude: 30.0
-  camera_longitude: 0.0
-  emission_angle: -1.0
-  azimuth: -1.0
-  save_frames: false
