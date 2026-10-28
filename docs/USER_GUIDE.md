@@ -382,7 +382,7 @@ output/
 
 **Binary format**: each statistics file is a 4-byte little-endian int32 face
 count followed by one single-precision float per mesh face (see the tutorial
-`tutorials/06_interpreting_outputs.md` for a reader snippet).
+`tutorials/03_outputs.md` for a reader snippet).
 
 **Time index**: per-step frames are labeled by output index, and index `NNNN`
 means the same thing in every one of them. `temperature/temperature_NNNN.bin`
@@ -495,7 +495,7 @@ sweep.plot_curves(save="family.png")
 | Execution | Serial by default. `jobs=N` runs `N` engine processes at once and **refuses to start** if any point asks for the GPU — there is one GPU, and concurrent use of it wedges the device. |
 | Resume | Each point writes `sweep_point.json` before it starts and rewrites it when it finishes. A re-run skips a point only if that file says `complete`, the config still hashes the same, **and** the outputs are on disk; every skip and every re-run prints its reason. |
 | Provenance | The swept values, the generated overrides, the argv, the engine path and md5, and the config hash are recorded next to the outputs. `ptm.sweep.load_sweep(dir)` reopens a finished sweep without retyping the grid. |
-| Generated configs | Written to each point's own output directory, never into `examples/` or `configs/`. `radiation.view_factor_file` is made absolute, because it is the one key the engine resolves against the YAML's own directory (`config_parser.cpp:507-517`). |
+| Generated configs | Written to each point's own output directory, never into `examples/` or `configs/`. `radiation.view_factor_file` is made absolute, because it is the one key the engine resolves against the YAML's own directory (`config_parser.cpp`). |
 | Axis names | `albedo` and `constant_thermal_inertia` go through the engine CLI flags `--albedo` / `--constant-thermal-inertia` when the binary advertises them (detected from `--help`, never assumed) and otherwise through the config keys `thermophysical.albedo_override` / `thermophysical.constant_thermal_inertia`, which the engine interprets identically (measured: byte-identical output either way). `thermal_inertia` is **flag-only** — see below. Any name containing a dot is a config key. A bare name that is neither must be declared in `label_axes=`, so it cannot become a dead key in the YAML. |
 | No engine needed to read one | Constructing a sweep, `--list`, `--dry-run`, `table()`, `write_table()`, `grid_of()`, the plots and `load_sweep()` all work with no compiled binary present. The engine is resolved only when something launches. |
 

@@ -27,7 +27,7 @@ $$Q_{s,i} + k_0 \frac{T_1 - T_0}{\Delta z_0} = \varepsilon_i \sigma T_0^4$$
 
 where $T_0$ is the surface temperature, $T_1$ the first subsurface node temperature, $k_0$ the
 surface conductivity, $\Delta z_0$ the first layer thickness, $\varepsilon_i$ the broadband IR
-emissivity and $\sigma = 5.67051196 \times 10^{-8}$ W m<sup>-2</sup> K<sup>-4</sup>. The surface
+emissivity and $\sigma = 5.670374419 \times 10^{-8}$ W m<sup>-2</sup> K<sup>-4</sup>. The surface
 temperature is found by Newton-Raphson iteration on
 
 $$f(T_0) = Q_{s,i} + k_0 \frac{T_1 - T_0}{\Delta z_0} - \varepsilon_i \sigma T_0^4 = 0$$
@@ -213,10 +213,9 @@ Richardson $m = 8/16$ double-area reference on `lunar_crater_80N.ply` (60 faces,
 | fixed $m = 3$ (the sparse rule) | $+2.899$ percent | $+31.75$ percent | 81 |
 | $\max(3, \text{adaptive})$ — shipped | $+0.729$ percent | $+7.10$ percent | 191 |
 
-The near/far SWITCH is still not unified — sparse uses $N_s \le 5$, the H-matrix uses
-$r < 4(\sqrt{A_i} + \sqrt{A_j})$, a wider window. That difference, the caller-level grazing culls
-($10^{-6}$ against $0.01$ on the centroid cosines) and the neighbor-selection rule are the remaining
-declared differences between the two paths; arm `[H4]` of `test_vf_production` bounds what they cost.
+The two builders still differ in where they switch from the far-field to the near-field rule
+(sparse builder: $N_s \le 5$; H-matrix: $r < 4(\sqrt{A_i} + \sqrt{A_j})$), in their grazing-angle
+culls, and in neighbor selection; arm `[H4]` of `test_vf_production` bounds what these cost.
 
 **Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
 cosine-weighted hemispherical rays and count first hits, giving $F_{ij} \approx \text{hits}_j/N$.
@@ -290,12 +289,38 @@ sweeps every face as a ray source and writes the raw per-partner hit fractions; 
 applies a reciprocity-preserving $\Sigma F \le 1$ congruence, and writes the v2 header
 (face count, float64 geometry hash, `indptr`, `nnz`, columns, values).
 
+**Orientation.** The referee launches rays from the side of each face that the engine
+illuminates, using the same rule as the engine (`src/cpp/mesh/face_orientation.h`), and refuses a
+mesh it would have to reverse on more than 1% of faces unless told to expect it. Before the
+Moon3D revision it used the raw triangle winding; on a mesh wound into the body that silently
+produced the view factors of the surface's underside, while reciprocity, row sums and nonzero
+counts all looked normal. The engine refuses a loaded matrix whose recorded orientation differs
+from its own.
+
+**Near-field rise filter.** The referee's sixth argument, `keps` (default 0.2), drops hits whose
+rise above the source face is below `keps` times the face edge, to reject self-relief. It also
+drops some real near partners: the Moon3D revision's matrices were built with `keps = 0.01`. This
+is a referee setting, distinct from the engine's `PTM_ILLUM_RISE_KEPS`.
+
 **The symmetrization estimator.** Every undirected pair $\lbrace i,j\rbrace$ is measured twice, once from
-each end. Both are unbiased estimates of $S_{ij} = A_i F_{ij}$, so the assembler averages them:
+each end. Neither directed estimate is exact: rays leave the source face's centroid, and the rise
+filter removes some near partners, so a large face's estimate of a small neighbor is biased. The
+default (`--symmetrize-divisor tried`) averages the two with equal weight:
 
 $$S_{ij}^{\text{sym}} = \tfrac{1}{2}\left(\hat{S}_{i\to j} + \hat{S}_{j\to i}\right)$$
 
-The divisor is **2 — the number of ray directions tried** — and a direction that registered no
+With equal weight, a small face next to large ones has its row pulled toward their (low) reverse
+estimates: on the Moon3D mesh, cold-trap peak radiative-equilibrium temperature came out 2.2 K low
+(median). The **pooled** divisor (`--symmetrize-divisor pooled`) weights each direction by its rays
+per unit area,
+
+$$G_{ij} = \frac{h_{ij} + h_{ji}}{n_i/A_i + n_j/A_j},$$
+
+which is reciprocal by construction and has lower variance. The Moon3D revision's crater matrix
+used pooled; its Haworth matrix used tried, where the two agree (median ratio 1.0004, 95th
+percentile 1.011).
+
+For `tried` the divisor is **2, the number of ray directions tried**, and and a direction that registered no
 hit contributes the zero it measured. That matters because in the far field neither direction
 fires reliably. Dividing instead by the number of directions that *happened to hit* conditions on
 detection and inflates the estimate by
@@ -333,7 +358,7 @@ invariance check. Run it after any change to the assembler or the referee.
 
 For large meshes the full sparse matrix becomes expensive to store and to multiply. Following
 Potter et al. (2023), the module offers hierarchical-matrix compression with
-$O(N \log N)$ storage and product cost (`radiation.use_hmatrix: true`).
+storage and product cost that grow asymptotically as $O(N \log N)$ under the usual admissibility conditions (Potter et al. 2023); PTM3D has not benchmarked that scaling (`radiation.use_hmatrix: true`).
 
 ### 5.1 Spatial partitioning
 
@@ -412,7 +437,7 @@ $$\mathbf{B}^{(k+1)} = \mathbf{E} + \rho\mathbf{Q}_{\text{solar}} + \rho\left(w 
 
 initialized with $\mathbf{B}^{(0)} = \mathbf{E} + \rho\mathbf{Q}_{\text{solar}}$, where $w$ is the
 row-sum renormalization of §4.5. Each iteration costs one matrix-vector product:
-$O(N \log N)$ for the H-matrix, $O(\text{nnz})$ for the sparse matrix.
+asymptotically $O(N \log N)$ for the H-matrix (not benchmarked here) and $O(\text{nnz})$ for the sparse matrix.
 
 ### 6.2 Gauss-Seidel iteration
 
@@ -939,7 +964,7 @@ the usual production setup, and the one long campaigns use — the re-run covers
 only, the equilibration phase is never revisited, and the correction is large: 54 K to 126 K in the
 deep column, +10.2 K in the window-mean surface temperature of a permanently shadowed crater floor.
 
-### 7.8 The spin-up seed and indirect flux (`thermal.seed_indirect`, BUGS.md PTM-727)
+### 7.8 The spin-up seed and indirect flux (`thermal.seed_indirect`)
 
 §7.7 fixes the equilibration *forcing*. It does not fix the column the equilibration
 *starts from*. The spin-up seed (`src/cpp/thermal/eq_seed.h`) is built from each face's absorbed
@@ -947,17 +972,15 @@ direct forcing, and in a coupled run its surface anchor stands down (status
 `fallback-radiation-coupled`, because the forcing depends on neighbors it cannot see). A face
 whose only heat is indirect therefore starts on the geothermal floor (25.28 K on Moon3D). Two
 equilibration lunations are far shorter than the deep column's response time, so it ends
-~50 K too cold at depth. Fermi's replay of the Moon3D dt65 run (F2,
-`runs/stage3_f2/fermi/`) put the effect on the cold-trap mean temperature at +2.0 to +2.2 K once
-spun up. **Decisive control (PTM-727): `<FILL FROM runs/ptm727_control/verdict.json BEFORE
-MERGE>`.** The last line of §7.7, "correct at leading order", does not hold for this population.
+about 50 K too cold at depth. In the Moon3D revision's runs, seeding with the indirect flux raised the
+spun-up cold-trap mean temperature by 2.0 to 2.2 K (median). The last line of §7.7, "correct at leading order", does not hold for this population.
 
 `thermal.seed_indirect` acts in the eq-indirect re-solve, the first point at which an indirect
 estimate exists, and nowhere else:
 
 | value | seed forcing | surface anchor |
 |---|---|---|
-| `series` (**default**) | absorbed flux + the reduced sweep's **time-varying** indirect flux, over the output window | lumped (runs) |
+| `series` (**default**) | absorbed flux + the reduced sweep's **time-varying** indirect flux, over whole diurnal cycles of the output window; the spin-up forcing of that re-solve carries the same series, folded by phase onto the spin-up steps | lumped (runs) |
 | `mean` | absorbed flux + per-face $\langle q_{\text{ind}}\rangle$ on every sample | stands down: the warm bracket $T_{\text{rad}}(\langle F\rangle + \langle q\rangle)$, which Jensen puts above $\langle T\rangle$ (24.8 K median on Moon3D never-lit faces); for attribution only |
 | `off` | absorbed flux only (legacy) | stands down |
 
@@ -966,17 +989,21 @@ estimate exists, and nowhere else:
 acted are written to `provenance.txt` (`seed_indirect`, `seed_indirect_source`,
 `seed_indirect_effect`) and the value to `config_used.yaml`, so an old output tree is
 unambiguous and a re-run can pin it. A coupled run on the default prints one
-`[eq-seed] DEFAULT CHANGED (PTM-727)` line naming the legacy switch.
+`[eq-seed] DEFAULT CHANGED` line naming the legacy switch.
 
 Where the default cannot act it reverts to the legacy seed and says so in one line: radiation
 off, no internal eq-indirect pass (`eq_indirect_source: off`, an `eq_indirect_flux_file`, no
 equilibration span), the CPU scalar solver, a warm-started chunk (its column comes from the
-checkpoint), or a measured $\langle q_{\text{ind}}\rangle = 0$. An **explicit** `series`/`mean`
+checkpoint), a measured $\langle q_{\text{ind}}\rangle = 0$, or an output window shorter than one diurnal cycle. An **explicit** `series`/`mean`
 that cannot act is FATAL instead. Those runs are byte-identical to `off` by construction, and the
 validation suite checks it (`ptm-validate`, default arm with `--expect-differ-if-log`).
 
-Not changed by this option: the equilibration forcing itself still uses the constant
-$\langle q_{\text{ind}}\rangle$ of §7.7.
+With `off`, the equilibration forcing uses the constant $\langle q_{\text{ind}}\rangle$ of §7.7.
+
+On the CPU solver, each face-subset re-thermal pass of the coupling loop re-seeds its columns the
+same way (`PTM_CPU_RETHERMAL=seed-series`, the default; `reseed` restores the earlier warm-bracket
+re-seed). On the shipped 80°N crater with a 1-cycle spin-up, this brings never-lit mean
+temperatures from 1.75 K to 0.38 K of a 40-cycle reference.
 
 ## 8. Anisotropic beamed emission
 
