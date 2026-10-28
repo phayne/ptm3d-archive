@@ -14,6 +14,8 @@
 
 // std::sort, for the PTM-67 unread-key report (deterministic key order).
 #include <algorithm>
+#include <set>
+#include <tuple>
 // Added for the flux-cube code below: libstdc++ does not pull these in
 // transitively the way libc++ does, which cost a Linux-only CI failure.
 #include <cstddef>
@@ -26,7 +28,26 @@ namespace ptm {
 
 // Helper template for safe YAML node access with defaults
 template<typename T>
+T getWithDefault(const YAML::Node& node, const std::string& key, const T& defaultVal);
+
+namespace {
+// Every (map, key) the parser looks up, keyed by the map node's source position.
+// After parsing, any key present in the file but never looked up is unknown to
+// the engine: a typo, a key from another tool, or a key this version does not
+// read. Those are reported instead of being dropped in silence.
+std::set<std::tuple<int, int, std::string>> g_read_keys;
+int g_unknown_key_count = 0;
+
+void noteRead(const YAML::Node& map, const std::string& key) {
+    if (!map || !map.IsMap()) return;
+    const YAML::Mark m = map.Mark();
+    g_read_keys.emplace(m.line, m.column, key);
+}
+} // namespace
+
+template<typename T>
 T getWithDefault(const YAML::Node& node, const std::string& key, const T& defaultVal) {
+    noteRead(node, key);
     if (node && node[key]) return node[key].as<T>();
     return defaultVal;
 }
@@ -560,10 +581,74 @@ int ConfigParser::applyEngineEnv(const std::string& filename) {
     return applied;
 }
 
+
+namespace {
+// Keys the parser reads by direct subscript rather than through
+// getWithDefault (sequences, sub-maps, presence tests). Listed per section;
+// see the reads in loadFromYAML below.
+bool readDirectly(const std::string& section, const std::string& key) {
+    static const std::set<std::pair<std::string, std::string>> k = {
+        {"thermal", "eq_extrapolation"}, {"thermal", "gpu_device_ids"},
+        {"thermal", "gpu_batch_size"}, {"thermal", "state_restore_allow_mismatch"},
+        {"thermal", "seed_indirect"}, {"thermal", "ice_stability"},
+        {"illumination", "gpu_device_ids"},
+        {"output", "map_depths_m"}, {"output", "map_depth_stats"},
+        {"radiation", "beaming"}, {"radiation", "gpu_device_ids"},
+    };
+    return k.count({section, key}) > 0;
+}
+
+void collectUnread(const YAML::Node& map, const std::string& section,
+                   const std::string& path, std::vector<std::string>& out) {
+    if (!map || !map.IsMap()) return;
+    const YAML::Mark m = map.Mark();
+    for (const auto& kv : map) {
+        std::string key;
+        try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+        const std::string dotted = path + "." + key;
+        const bool read = g_read_keys.count({m.line, m.column, key}) > 0 ||
+                          (path == section && readDirectly(section, key));
+        if (!read) { out.push_back(dotted); continue; }
+        if (kv.second.IsMap()) collectUnread(kv.second, section, dotted, out);
+    }
+}
+
+// Report every key in the file the parser never read. The thermophysical,
+// generic_body, flux_cubes and shadow_depth sections have their own, more
+// specific warners; engine_env is a free-form map of environment variables.
+void warnUnknownConfigKeys(const YAML::Node& root) {
+    g_unknown_key_count = 0;
+    if (!root || !root.IsMap()) return;
+    static const std::set<std::string> kSections = {
+        "simulation", "mesh", "thermal", "illumination", "radiation", "output",
+        "gpu", "advanced"};
+    static const std::set<std::string> kOwnWarner = {
+        "thermophysical", "generic_body", "flux_cubes", "shadow_depth", "engine_env"};
+    std::vector<std::string> unknown;
+    for (const auto& kv : root) {
+        std::string sec;
+        try { sec = kv.first.as<std::string>(); } catch (...) { continue; }
+        if (kOwnWarner.count(sec)) continue;
+        if (!kSections.count(sec)) { unknown.push_back(sec + " (whole section)"); continue; }
+        collectUnread(kv.second, sec, sec, unknown);
+    }
+    g_unknown_key_count = static_cast<int>(unknown.size());
+    if (unknown.empty()) return;
+    std::sort(unknown.begin(), unknown.end());
+    std::cerr << "[config] WARNING: " << unknown.size()
+              << " key(s) in this file are not read by the engine and have NO effect"
+                 " (a misspelling, or a key this version does not use):" << std::endl;
+    for (const auto& u : unknown) std::cerr << "[config]   unknown key: " << u << std::endl;
+}
+} // namespace
+
+int lastUnknownConfigKeyCount() { return g_unknown_key_count; }
+
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     SimulationConfig config;
     try {
         YAML::Node root = YAML::LoadFile(filename);
+        g_read_keys.clear();
 
         // Parse Time section
         if (root["simulation"]) {
@@ -1280,6 +1365,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 "generic_body.spice_metakernel");
         }
 
+        warnUnknownConfigKeys(root);
         std::cout << "Successfully loaded configuration from: " << filename << std::endl;
 
     } catch (const YAML::Exception& e) {
@@ -1528,6 +1614,7 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
 #else
 
 // Fallback implementation without YAML support
+int lastUnknownConfigKeyCount() { return 0; }
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     last_error_ = "YAML support not available. Please install yaml-cpp library.";
     throw std::runtime_error(last_error_);

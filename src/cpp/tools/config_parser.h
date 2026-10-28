@@ -1135,6 +1135,10 @@ private:
     void parseAdvancedSection(SimulationConfig::AdvancedParams& params, const void* node);
 };
 
+/// Number of keys in the last YAML file loaded by ConfigParser::loadFromYAML that
+/// the engine does not read (each was printed as a WARNING). 0 when none.
+int lastUnknownConfigKeyCount();
+
 } // namespace ptm
 
 #endif // PTM_CONFIG_PARSER_H

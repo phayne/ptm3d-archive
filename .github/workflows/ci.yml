@@ -309,6 +309,9 @@ jobs:
       - name: Build core binary
         run: cmake --build build --target ptm_thermal_sim -j2
 
+      - name: Unknown config keys and CLI arguments are reported
+        run: python3 scripts/test_unknown_config_keys.py --binary build/bin/ptm_thermal_sim
+
       # --- Correctness battery (CPU) -----------------------------------------
       - name: Build + run bowl-crater radiation gate
         # The program's exit status is now a real gate: main() aggregates every

@@ -6371,7 +6371,9 @@ struct SeedIndirectHandoff {
     // modulo the cycle; the eq step takes their box average. Empty when inactive.
     std::vector<std::vector<int>> eq_fold;
 };
-static SeedIndirectHandoff g_seed_indirect;   // inactive unless mode != Off
+static SeedIndirectHandoff g_seed_indirect;
+// Count of command-line arguments the parser did not recognize (warned, ignored).
+static int g_unknown_cli_args = 0;   // inactive unless mode != Off
 
 /// The indirect flux an EQUILIBRATION step carries. Without the PTM-727 series
 /// hand-off this is exactly the per-face constant <q_ind> the eq-indirect pass
@@ -17551,6 +17553,17 @@ int main(int argc, char** argv) {
         } else if (arg == "--help") {
             showUsage(argv[0]);
             return 0;
+        } else {
+            // An argument no branch above recognizes. It used to be dropped in
+            // silence (rc 0, no message), so a mistyped flag ran the default
+            // model and looked successful. Warn, name the token, and keep going.
+            ++g_unknown_cli_args;
+            std::cerr << "[cli] WARNING: unrecognized command-line argument '" << arg
+                      << "' was IGNORED"
+                      << (arg.rfind("--", 0) == 0
+                              ? " (not a known flag, or a flag missing its value; see --help)"
+                              : " (a config file is passed as --config FILE)")
+                      << "." << std::endl;
         }
     }
 
@@ -17822,7 +17835,20 @@ int main(int argc, char** argv) {
     // how that mistake gets made.
     // ------------------------------------------------------------------
     if (validate_only) {
-        std::cout << "\n[validate-config] ACCEPTED: " << config_file << "\n"
+        // Unknown keys and arguments do not refuse the file (rc stays 0, as the
+        // GUI expects), but they are the most common mistake a check exists to
+        // catch, so they are summarized here as well as listed where found.
+        const int n_unknown_keys = ptm::lastUnknownConfigKeyCount();
+        if (n_unknown_keys > 0 || g_unknown_cli_args > 0) {
+            std::cout << "\n[validate-config] WARNING: " << n_unknown_keys
+                      << " unknown config key(s) and " << g_unknown_cli_args
+                      << " unrecognized command-line argument(s); each is listed above "
+                         "and has NO effect on the run. Check for misspellings."
+                      << std::endl;
+        }
+        std::cout << "\n[validate-config] ACCEPTED"
+                  << ((n_unknown_keys > 0 || g_unknown_cli_args > 0) ? " WITH WARNINGS" : "")
+                  << ": " << config_file << "\n"
                   << "[validate-config]   checked: YAML syntax and structure, the "
                      "PTM_DATA_ROOT path-resolution\n"
                   << "[validate-config]            contract, enum values "
