@@ -140,13 +140,11 @@ TimeAxis = namedtuple("TimeAxis", "et elapsed_s utc")
 def read_time_steps(path):
     """Read ``time_steps.txt`` into a :class:`TimeAxis`.
 
-    Column 1 is **seconds past the J2000 epoch** -- SPICE ET -- even though the
-    file's own header comment says "Time elapsed from start (seconds)". The
-    header is wrong and has been wrong for every run in the tree;
-    ``docs/tutorials/06_interpreting_outputs.md`` documents the trap. Eleven
-    separate parsers in the repo re-discover it, several of them by plotting a
-    time axis that starts at 8.3e8. ``elapsed_s`` is the rebased column, so a
-    caller that wants elapsed time never has to know.
+    Column 1 is **seconds past the J2000 epoch** (SPICE ET). Files written
+    before release/r1-engine carry a header comment calling it "Time elapsed
+    from start (seconds)"; that label was wrong, the numbers were always ET.
+    ``elapsed_s`` is the rebased column, so a caller that wants elapsed time
+    never has to know.
     """
     path = Path(path)
     et, utc = [], []

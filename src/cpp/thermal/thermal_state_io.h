@@ -903,11 +903,11 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
     if (status == TrailerStatus::Absent || t == nullptr) {
         v.unverified.push_back(
             "depth grid z[]      -- a restore onto a DIFFERENT grid with the "
-            "same layer count is accepted in silence (PTM-STATE-GRID-BLIND)");
+            "same layer count is accepted in silence");
         v.unverified.push_back(
             "epoch               -- the epoch this column belongs to is not in "
             "the file, so a cross-window or cross-season restore cannot be "
-            "detected (PTM-STATE-NO-EPOCH)");
+            "detected");
         v.unverified.push_back(
             "body + properties   -- the physics the column was integrated with");
         v.unverified.push_back(

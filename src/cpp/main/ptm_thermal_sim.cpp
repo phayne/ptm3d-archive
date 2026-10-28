@@ -14649,7 +14649,7 @@ bool writeTimeStepsFile(
     }
 
     file << "# Time steps metadata\n";
-    file << "# Column 1: Time elapsed from start (seconds)\n";
+    file << "# Column 1: Ephemeris time, seconds past J2000 (TDB)\n";
     file << "# Column 2: UTC time\n";
     
     for (size_t i = 0; i < times.size(); i++) {
