@@ -239,6 +239,7 @@ def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=Fals
     env = dict(os.environ)
     env.pop("PTM_PP_RING_PLY", None)          # no occluder mesh in either arm
     env.pop("PTM_PP_NO_BACKFACE_CULL", None)
+    env["PTM_PP_ORIENT"] = "raw"  # the closed-form test meshes are local-frame and wound raw by design
     if no_backface_cull:
         env["PTM_PP_NO_BACKFACE_CULL"] = "1"
     procs = []

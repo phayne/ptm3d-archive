@@ -134,6 +134,7 @@ sys.path.insert(0, str(HERE))
 
 # Reuse the referee driver wholesale. A second copy of "how to run mc_ref_pp"
 # is a second thing to keep in step with mc_ref_pp.
+# sweep() runs mc_ref_pp with PTM_PP_ORIENT=raw: these test meshes are local-frame, wound raw by design.
 from test_vf_assembler_gate import (           # noqa: E402
     assemble, read_csr, sweep, write_binary_ply, write_tmax,
 )
