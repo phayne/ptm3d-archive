@@ -2,7 +2,7 @@
 // Earthshine).  Header-only so the standalone gate `test_primary_disk` can
 // exercise exactly the arithmetic the engine runs.
 //
-// PTM-44: the primary is not a point.  Jupiter subtends 5.98 deg of angular
+// the primary is not a point.  Jupiter subtends 5.98 deg of angular
 // RADIUS from Europa and Earth 0.95 deg from the Moon, yet both primary-flux
 // paths decided visibility with a single ray to the disk CENTER and zeroed the
 // whole flux the instant `cos(theta) <= 0`.  Both are all-or-nothing
@@ -31,7 +31,7 @@ namespace disk {
 //
 // Moved here VERBATIM from the anonymous namespace of illumination_model.cpp so
 // the solar-disk sampler and the new primary-disk sampler share one definition
-// (PTM-45(ii) was the same class of drift: one concept spelled three ways).
+// (the primary/eclipse fallbacks were the same class of drift: one concept spelled three ways).
 // The engine's call sites are unchanged and the arithmetic is bit-identical.
 // ---------------------------------------------------------------------------
 
@@ -91,7 +91,7 @@ inline double horizonMeanG(double t) {
 // Branches, and why they join exactly:
 //   h = asin(cos_theta0) is the disk center's altitude above the horizon plane.
 //   h >= alpha : the whole disk is up -> the exact answer is cos_theta0, and
-//                the arithmetic downstream is BIT-IDENTICAL to the pre-PTM-44
+//                the arithmetic downstream is BIT-IDENTICAL to the pre-fix
 //                code.  This is the overwhelming majority of faces.
 //   h <= -alpha: the whole disk is down -> 0, also bit-identical (the old
 //                cos <= 0 cut).
@@ -134,7 +134,7 @@ inline double diskMeanCosAboveHorizon(double cos_theta0, double alpha) {
 //    512           0.0082                 0.0020
 //
 // A power-law fit over that range gives worst ~ 0.49 * N^(-0.65), i.e. roughly
-// the inverse square root of the sample count, NOT 1/N. (Fermi's independent
+// the inverse square root of the sample count, NOT 1/N. (The physics review's independent
 // fit on the same data: N^(-0.68).) Two other point sets were tried at N = 512
 // and are no better -- Fibonacci spiral 0.0092, equal-area polar grid 0.0174,
 // both printed by the same test -- so this is a property of counting rays, not
@@ -445,7 +445,7 @@ inline void probeOffset(uint32_t k, double& dx, double& dy) {
 }
 
 // ---------------------------------------------------------------------------
-// Lambert-sphere photometry (PTM-41)
+// Lambert-sphere photometry
 // ---------------------------------------------------------------------------
 
 // Phase function of a Lambert sphere, normalized to Phi(0) = 1:

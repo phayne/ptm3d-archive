@@ -439,7 +439,7 @@ inline double nearFieldPairIntegral(const std::array<double, 3>& a0,
     if (n_valid == 0) return 0.0;
 
     // Divide by the TOTAL sample-pair count, never by the survivors. Dividing by
-    // the survivors would condition the estimate on detection -- FC-08's error --
+    // the survivors would condition the estimate on detection -- the view-factor divisor defect's error --
     // and inflates the near field by +1.42 percent mass-weighted / +25 percent on
     // the worst pair, while the cut itself discards 0.00000 percent of the
     // coupling mass (measured 2026-08-23). This divisor is correct; do not "fix"

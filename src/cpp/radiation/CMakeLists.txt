@@ -62,7 +62,7 @@ set_target_properties(test_bowl_crater PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Two-band radiosity PTM-08 severity test: Gauss-Seidel vs Jacobi on a synthetic
+# Two-band radiosity row-norm severity test: Gauss-Seidel vs Jacobi on a synthetic
 # concave enclosure with Σ_j F_ij > 1 (vf_row_norm_ active), visible Bond albedo A.
 # Regression fixture: exits nonzero while GS omits the row-norm, 0 once A1 lands.
 add_executable(test_two_band_rownorm test_two_band_rownorm.cpp)
@@ -103,7 +103,7 @@ set_target_properties(test_flux_cube_identity PROPERTIES
 
 # Closed-form gate on the PRODUCTION in-engine view-factor path. test_bowl_crater
 # builds its view factors from its own inline centroid kernel and never calls
-# ViewFactorCalculator, which is why FC-08 (a 2x far-field inflation) lived for
+# ViewFactorCalculator, which is why the view-factor divisor defect (a 2x far-field inflation) lived for
 # months under a green run of it. This target drives the real Embree-occluded
 # ViewFactorCalculator against the Ingersoll spherical cap and a coaxial
 # parallel-disk pair, and carries its own fault-injection negative controls.
@@ -163,7 +163,7 @@ set_target_properties(vf_rowsum_dump PROPERTIES
 # Emit a correctly-dimensioned, current-format (HMAT/v2) EMPTY base .vf (nnz=0)
 # via the production serializer, so a rolling-VF site can satisfy the VF-load
 # gate without the multi-GB build (overridden by PTM_HMATRIX_VF_REPLACE). See
-# BUGS PTM-24 (stale MFFV/v1 base -> silent recompute wedge).
+# the stale-format fallback (stale MFFV/v1 base -> silent recompute wedge).
 add_executable(make_empty_vf make_empty_vf.cpp)
 target_link_libraries(make_empty_vf PRIVATE radiation mesh_utils)
 if(OpenMP_CXX_FOUND)

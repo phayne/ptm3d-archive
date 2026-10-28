@@ -44,7 +44,7 @@ float evalPolynomial(float T, const float* coeffs, int n_coeffs, float base) {
 /**
  * @brief Compute k(T) = kc * (1 + R350 * T^3)   [Hayne et al. (2017)]
  *
- * PTM-62: this returned `kc + R350*T^3` -- ADDITIVE, not multiplicative -- and
+ * this returned `kc + R350*T^3` -- ADDITIVE, not multiplicative -- and
  * its own doc comment stated that wrong formula, so the two agreed with each
  * other and with nothing else. Every other path in PTM3D uses the
  * multiplicative Hayne form: `thermal_model.cpp` (CPU profile/grid/batch),
@@ -93,7 +93,7 @@ void materialUpdateKernel(
 
     float Ti = T[idx];
 
-    // k(T) = kc * (1 + R350 * T^3)   [PTM-62: was stated additively]
+    // k(T) = kc * (1 + R350 * T^3)   [was stated additively in the HIP/CUDA path]
     float ki = computeK(Ti, kc[idx], R350);
     k[idx] = ki;
 
@@ -466,7 +466,7 @@ void combinedThermalKernel(
         float rho_i = rho[idx];
         rho_local[i] = rho_i;
 
-        // k(T) = kc * (1 + R350 * T^3)   [PTM-62: was stated additively]
+        // k(T) = kc * (1 + R350 * T^3)   [was stated additively in the HIP/CUDA path]
         float ki = computeK(Ti, kc_i, R350);
         k_local[i] = ki;
 

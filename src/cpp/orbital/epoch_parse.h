@@ -1,8 +1,8 @@
 #ifndef ORBITAL_EPOCH_PARSE_H
 #define ORBITAL_EPOCH_PARSE_H
 
-// Epoch strings for `generic_body.orbit.epoch` and `generic_body.spin.epoch`
-// (BUGS.md PTM-663). Both keys were parsed and then dropped, so every generic
+// Epoch strings for `generic_body.orbit.epoch` and `generic_body.spin.epoch`.
+// Both keys were parsed and then dropped, so every generic
 // body ran with its Kepler mean anomaly and its prime meridian both referred
 // to J2000 whatever the config said.
 //

@@ -1,5 +1,5 @@
 #include "illumination_model.h"
-#include "../mesh/face_orientation.h"   // PTM-733 shared surface-side rule
+#include "../mesh/face_orientation.h"   // shared surface-side rule
 #include "primary_disk.h"
 #include "embree_isa_report.h"
 #include "../constants/physics_constants.h"
@@ -71,7 +71,7 @@ inline std::array<double,3> kmToMeters(const std::array<double,3>& vkm) {
 inline std::array<double,3> metersToKm(const std::array<double,3>& vm) {
     return { vm[0]/1000.0, vm[1]/1000.0, vm[2]/1000.0 };
 }
-// PTM-36: km -> MESH-NATIVE scale factor for the primary-body (eclipse) shadow sphere.
+// km -> MESH-NATIVE scale factor for the primary-body (eclipse) shadow sphere.
 //
 // PTM3D mesh units are NOT uniform: global icosphere meshes are built in KM
 // (mesh_utils.cpp createIcosphereMesh scales vertices to body_radius_km_) while
@@ -89,7 +89,7 @@ inline double kmToNativeScale(const std::array<double,3>& face_center) {
     return (mag > 10000.0) ? 1000.0 : 1.0;   // meters : kilometers
 }
 
-// PTM-45(ii): ONE definition of the penumbral "heavy" solar-disk sample count.
+// ONE definition of the penumbral "heavy" solar-disk sample count.
 //
 // It used to be spelled three different ways -- single face max(64, baseN*4)
 // (:3082), CPU batch max(64, baseN) (:3836), GPU batch max(64, N) (:5017) --
@@ -103,7 +103,7 @@ inline uint32_t heavySolarSamples(int num_samples) {
     return std::max<uint32_t>(64u, baseN * 4u);
 }
 
-// PTM-45(i) / rule 7: an unrecognized primary body is a silent substitution in
+// Rule 7: an unrecognized primary body is a silent substitution in
 // four different places. Say it ONCE per (body, context) instead of never.
 inline void warnUnknownPrimaryOnce(const std::string& body,
                                    const char* context,
@@ -121,7 +121,7 @@ inline void warnUnknownPrimaryOnce(const std::string& body,
               << " (warned once; see docs/KNOWN_LIMITATIONS.md)." << std::endl;
 }
 
-// PTM-44 / Fermi F1: the horizon-oriented 5-point probe found nothing above the
+// The horizon-oriented 5-point probe found nothing above the
 // face's horizon while the analytic clip still says the disk is (barely) lit.
 // Rule 7: the fallback keeps the analytic value, and it announces itself.
 inline void warnPrimaryProbeUnderflowOnce() {
@@ -136,7 +136,7 @@ inline void warnPrimaryProbeUnderflowOnce() {
     });
 }
 
-// PTM-38: does the primary body overlap ANY part of the finite solar disk seen
+// does the primary body overlap ANY part of the finite solar disk seen
 // from this ray origin?  True in the penumbra AND in the umbra; false when the
 // Sun is completely clear of the primary.
 //
@@ -219,7 +219,7 @@ inline uint32_t hashFaceSeed(const std::array<double,3>& c, const std::array<dou
     return h;
 }
 // The QMC disk sampler now lives in primary_disk.h so the solar-disk path and
-// the PTM-44 primary-disk path share ONE definition (and so the standalone
+// the primary-disk path share ONE definition (and so the standalone
 // test_primary_disk gate can exercise the same arithmetic). Definitions moved
 // verbatim; every call site below is unchanged.
 using ptm::disk::vanDerCorput;
@@ -260,7 +260,7 @@ IlluminationModel::IlluminationModel(bool debug_output)
     // NOTE: kernels_path_ is deliberately left EMPTY here. Pinning it to the
     // compiled-in SPICE_KERNELS_DIR at construction made initialize_spice()'s
     // resolution ladder dead code, so $PTM_SPICE_KERNELS never took effect even
-    // though docs/ENVIRONMENT.md advertises it as an override (BUGS.md PTM-145).
+    // though docs/ENVIRONMENT.md advertises it as an override.
     // The directory is resolved lazily in initialize_spice(): an explicit
     // setKernelsPath() call, then $PTM_SPICE_KERNELS, then SPICE_KERNELS_DIR.
 
@@ -269,7 +269,7 @@ IlluminationModel::IlluminationModel(bool debug_output)
     // furnsh'ing it (a) loads the wrong metakernel for every non-Europa body, and
     // (b) — because a partial/failed load latches a SPICE error and the one-shot
     // `spice_initialized` guard — permanently blocks the correct per-body metakernel
-    // from ever loading, silently producing a garbage epoch (BUGS.md PTM-27).
+    // from ever loading, silently producing a garbage epoch.
     // SPICE is initialized lazily/explicitly AFTER setPlanetaryBody()/setGenericBody()
     // has set the correct metakernel (see initialize_spice() callers).
 }
@@ -366,7 +366,7 @@ bool IlluminationModel::initializeScene(
         // thermally solved / radiosity-coupled / output. When there are no
         // occluders, Vv/Ff alias the inputs verbatim → byte-identical to
         // the pre-occluder behavior. See docs/extended-occluder-architecture.md
-        // PTM-18: interior-hole seal gate (env; also settable via setSealInteriorHoles). Compute the
+        // interior-hole seal gate (env; also settable via setSealInteriorHoles). Compute the
         // fill BEFORE the merge so the fills (CORE-vertex indices) append after core [+ occluder ring]
         // in primID space. Default OFF -> no fill -> byte-identical (below preserves the input alias).
         if (const char* sh = std::getenv("PTM_ILLUM_SEAL_HOLES"))
@@ -514,7 +514,7 @@ bool IlluminationModel::initializeScene(
                       << " (native units).\n";
         }
 
-        // PTM-13: build the local-horizon (skyline) field for the grazing DIRECT-sun shadow
+        // build the local-horizon (skyline) field for the grazing DIRECT-sun shadow
         // cull IF requested. Default OFF -> byte-identical (no build, no cull). Env knobs:
         // PTM_ILLUM_HORIZON_CULL=1 enable; PTM_ILLUM_HORIZON_SLACK_DEG / _CELL_SCALE tune it.
         // The cull is azimuth-specific and resolution-independent (see horizon_field.h); it is
@@ -573,12 +573,12 @@ bool IlluminationModel::initializeScene(
             }
         }
 
-        // PTM-13 P1: build the topological self-skip adjacency (source + N-ring edge neighbors) for
+        // Shadow-ray rise-epsilon P1: build the topological self-skip adjacency (source + N-ring edge neighbors) for
         // the grazing DIRECT-sun shadow ray IF requested. Default OFF -> byte-identical (no build, no
         // re-trace). Env knobs: PTM_ILLUM_TOPO_SELFSKIP=1 enable; PTM_ILLUM_SELFSKIP_RINGS=<n> depth.
         // When ON, the CPU direct-solar occlusion starts the ray AT the face (eps_n=eps_d=0, tnear=0)
         // and skips the source + its <= N edge rings by primID, so the ~mm-scale local rim occluder
-        // (present in the mesh) is detected instead of hopped by the 1 cm offset. See BUGS.md PTM-13.
+        // (present in the mesh) is detected instead of hopped by the 1 cm offset.
         {
             if (const char* se = std::getenv("PTM_ILLUM_TOPO_SELFSKIP"))
                 if (se[0]=='1'||se[0]=='t'||se[0]=='T'||se[0]=='y'||se[0]=='Y') use_topo_selfskip_ = true;
@@ -607,7 +607,7 @@ bool IlluminationModel::initializeScene(
                              "(see docs/KNOWN_LIMITATIONS.md).\n";
         }
 
-        // PTM-13 rise-epsilon: build the per-core-face facet scale for the out-of-plane-rise
+        // Shadow-ray rise-epsilon: build the per-core-face facet scale for the out-of-plane-rise
         // self-relief discriminator IF requested. Default OFF -> byte-identical (no build, no
         // re-trace). Env knobs: PTM_ILLUM_RISE_EPS=1 enable; PTM_ILLUM_RISE_KEPS=<k> the facet
         // fraction (h_eps = k * local edge; default 0.2 -> ~0.5 mm at a 2.5 mm facet). Independent
@@ -619,14 +619,14 @@ bool IlluminationModel::initializeScene(
             if (const char* ke = std::getenv("PTM_ILLUM_RISE_KEPS")) {
                 double kk = std::atof(ke); if (kk > 0.0) rise_keps_ = kk;
             }
-            // PTM-13 OPTION 3 multi-hit refinement (sub-mode). RISE_EPS2 implies RISE_EPS so the base
+            // Shadow-ray rise-epsilon OPTION 3 multi-hit refinement (sub-mode). RISE_EPS2 implies RISE_EPS so the base
             // build + CPU routing engage; the OR layer lives inside traceOccludedRiseEps.
             if (const char* r2 = std::getenv("PTM_ILLUM_RISE_EPS2"))
                 if (r2[0]=='1'||r2[0]=='t'||r2[0]=='T'||r2[0]=='y'||r2[0]=='Y') { use_rise_eps2_ = true; use_rise_eps_ = true; }
             if (const char* be = std::getenv("PTM_ILLUM_RISE_BARY_EPS")) {
                 double bb = std::atof(be); if (bb >= 0.0) rise_bary_eps_ = bb;
             }
-            // PTM-13 Class-2 fix: absolute self-relief floor override (meters). >=0 replaces the
+            // Shadow-ray rise-epsilon Class-2 fix: absolute self-relief floor override (meters). >=0 replaces the
             // edge-proportional h_eps with a fixed floor (0 => exact source-triangle-only exclusion).
             // Default unset -> rise_habs_ stays -1.0 -> byte-identical (edge-proportional floor).
             if (const char* ha = std::getenv("PTM_ILLUM_RISE_HABS")) {
@@ -1232,7 +1232,7 @@ std::vector<uint8_t> IlluminationModel::traceOccluded(
     return blocked;
 }
 
-// PTM-13 P1: build the per-core-face self-skip CSR. For each CORE face c in [0, n_core), collect
+// Shadow-ray rise-epsilon P1: build the per-core-face self-skip CSR. For each CORE face c in [0, n_core), collect
 // c plus every face reachable within selfskip_rings_ edge-neighbor hops over the merged mesh
 // (primID space), sorted, into face_skip_nbr_[face_skip_off_[c] .. face_skip_off_[c+1]). This lets
 // the direct-solar occlusion re-trace skip self/near-neighbor hits by primID so it can start the
@@ -1305,7 +1305,7 @@ void IlluminationModel::buildSelfSkipAdjacency(
     face_skip_off_[n_core] = static_cast<uint32_t>(face_skip_nbr_.size());
 }
 
-// PTM-13 P1: occlusion test with topological self-skip. Per ray, march via rtcIntersect1, skipping
+// Shadow-ray rise-epsilon P1: occlusion test with topological self-skip. Per ray, march via rtcIntersect1, skipping
 // any hit whose primID is the source face or one of its <= selfskip_rings_ edge-neighbors, until the
 // first NON-neighbor hit (=> blocked) or no hit (=> clear). The callers pass origins AT the face and
 // zero geometric offset, so the ~mm local occluder present in the mesh is detected rather than hopped
@@ -1384,14 +1384,14 @@ std::vector<uint8_t> IlluminationModel::traceOccludedSelfSkip(
     return blocked;
 }
 
-// PTM-13 rise-epsilon occlusion test. Per ray, march via rtcIntersect1 from the TRUE face centroid
+// Shadow-ray rise-epsilon occlusion test. Per ray, march via rtcIntersect1 from the TRUE face centroid
 // (callers pass origins AT the face, eps_n=eps_d=0) and reject a hit as self-relief iff its
 // out-of-plane rise above the source face's own tangent plane, dz = (P_hit - c_src)*n_src, is below
 // the facet-scaled floor h_eps = rise_keps_ * face_edge_local_[src]; the FIRST hit with dz >= h_eps
 // is a real occluder (=> blocked), no hit => clear. The origin IS the centroid so c_src = org_local
 // and dz = t_hit * (dir_hat . n_src). The origin primID is skipped (dz~0 there) for float robustness.
 // This separates the ~0.12 mm coplanar self-relief from the ~2.47 mm real rim occluder that the 1 cm
-// offset hops (BUGS.md PTM-13); it is resolution-independent (h_eps scales with the facet). CPU
+// offset hops; it is resolution-independent (h_eps scales with the facet). CPU
 // Embree only; used when use_rise_eps_ is set.
 // OPTION 3 (use_rise_eps2_): the single hit-POINT dz misses a near-coplanar occluder CROSSED near its
 // shared edge (dz<h_eps) whose TRIANGLE rises >= h_eps farther along. When set, a would-be-skip hit
@@ -1527,7 +1527,7 @@ std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
     return blocked;
 }
 
-// PTM-18: fan-triangulate the SMALL INTERIOR boundary-edge loops of the core mesh (missing-triangle
+// fan-triangulate the SMALL INTERIOR boundary-edge loops of the core mesh (missing-triangle
 // holes / T-junction cracks) that let a low grazing sun thread through to shadowed floor faces via the
 // finite-disk penumbra path (the "crater-center flash"). The outer patch perimeter (the boundary
 // component whose spatial extent spans the mesh) is NOT a hole and is excluded. Only clean closed loops
@@ -1644,9 +1644,9 @@ std::vector<int> IlluminationModel::intersectsFirstAVX512(
     size_t num_rays = origins.size();
     std::vector<int> face_ids(num_rays, -1);  // Initialize all to -1 (no hit)
 
-// PTM-290: parenthesized. `&&` binds tighter than `||`, so the old guard was
+// parenthesized. `&&` binds tighter than `||`, so the old guard was
 // `defined(__x86_64__) || (...)` and took this 16-wide branch on EVERY x86-64
-// build. Unreachable in production either way (PTM-716: addRayToBatch has no caller).
+// build. Unreachable in production either way (addRayToBatch has no caller).
 #if (defined(__x86_64__) || defined(_M_X64)) && defined(__AVX512F__) && defined(__AVX512DQ__)
     // Process rays in SIMD packets of 16
     size_t processed = 0;
@@ -1949,7 +1949,7 @@ bool IlluminationModel::calculateIllumination(
                 sun_pos,
                 primary_pos,
                 constants::N_SOLAR_SAMPLES,  // Number of solar samples (sqrt(N) should be integer)
-                static_cast<int>(f)          // PTM-13 P1: source core-face id for topological self-skip
+                static_cast<int>(f)          // rise-epsilon P1: source core-face id for topological self-skip
             );
             
             // Store illumination value
@@ -2554,7 +2554,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
     //
     // Rungs 1 and 2 are EXPLICIT instructions and are taken exactly as given,
     // usable or not: silently demoting one would hide a typo and would undo the
-    // env override PTM-145 restored. Rungs 3 and 4 are implicit, so a rung that
+    // env override restored by the generic-body metakernel fix. Rungs 3 and 4 are implicit, so a rung that
     // carries no leapseconds kernel is passed over -- otherwise a build whose
     // compiled-in directory is empty (any fresh worktree or clone: the *.tm
     // files are tracked, lsk/ pck/ spk/ are not) ends the search on a directory
@@ -2692,7 +2692,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             // "<kernel dir>//Users/.../metakernel.tm", which cannot exist -- so every
             // config carrying an absolute generic_body.spice_metakernel (i.e. every
             // EMA asteroid config) missed, and then fell through to the substitution
-            // below. BUGS.md PTM-145.
+            // below.
             //
             // A RELATIVE value is tried in a fixed order, and every candidate is
             // named if none of them exists:
@@ -2759,7 +2759,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
                 // any non-Europa body meant proceeding with EUROPA's ephemeris and
                 // then silently dropping to the Keplerian fallback -- a completed
                 // rc=0 run with the wrong physics, off by up to 52 K per face on a
-                // measured Chimaera case (BUGS.md PTM-145). A metakernel that was
+                // measured Chimaera case. A metakernel that was
                 // explicitly configured and cannot be found is fatal.
                 return false;
             }
@@ -2772,7 +2772,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
             // it latches a SPICE error and leaves subsequent str2et_c/spkpos_c as
             // silent no-ops, producing a garbage epoch. Do not cache a failed init
             // (leave spice_initialized false) and return false so the caller aborts
-            // instead of running with an uninitialized epoch (BUGS.md PTM-27).
+            // instead of running with an uninitialized epoch.
             if (failed_c()) {
                 SpiceChar short_msg[81] = {0};
                 SpiceChar long_msg[1841] = {0};
@@ -2790,7 +2790,7 @@ bool IlluminationModel::initialize_spice(bool verbose) {
 
             // Always state which file was furnsh'd, resolved, not as configured:
             // "europa.tm" and a per-body absolute path look identical in a config
-            // dump, and only the resolved path distinguishes them (BUGS.md PTM-145).
+            // dump, and only the resolved path distinguishes them.
             std::cout << "Loaded SPICE meta-kernel: " << meta_kernel << std::endl;
 
             // Only print detailed messages if verbose mode is enabled
@@ -2822,7 +2822,7 @@ double IlluminationModel::convertTimeToET(const std::string& time_str) {
 }
 
 namespace {
-// Seconds from the SPIN epoch, for the body-fixed rotation (BUGS.md PTM-663).
+// Seconds from the SPIN epoch, for the body-fixed rotation.
 //
 // The Keplerian branches used to rotate the body by the seconds from the
 // ORBIT epoch. That was invisible only because both epochs were pinned to
@@ -2865,7 +2865,7 @@ std::array<double, 3> IlluminationModel::getSunPosition(double et) {
     // Fall back to Keplerian propagation for out-of-range times.
     if (failed_c()) {
         reset_c();
-        // BUGS.md PTM-301: reset_c() clears the SPICE error and emits nothing,
+        // reset_c() clears the SPICE error and emits nothing,
         // so before this counter existed a substituted epoch left no trace
         // anywhere. Count it and remember the span; reportEphemerisFallback()
         // prints the one summary line at end of run. Deliberately NOT a
@@ -2905,7 +2905,7 @@ std::array<double, 3> IlluminationModel::getSunPosition(double et) {
 }
 
 // ---------------------------------------------------------------------------
-// Ephemeris provenance (BUGS.md PTM-301)
+// Ephemeris provenance
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -2968,7 +2968,7 @@ bool IlluminationModel::checkSpkCoverage(double et_start, double et_end, bool st
         // config without it keeps a human-readable name that SPICE cannot
         // resolve -- then spkpos_c fails at every epoch and the whole run is
         // Keplerian. Returning true here would have made strict mode degrade
-        // to permissive on precisely the PTM-300 scenario.
+        // to permissive on precisely the Justitia SPK coverage scenario.
         std::cerr << "\n[ephemeris] WARNING: cannot resolve '" << target_body_name_
                   << "' to a NAIF body code, so the SPK coverage of this run's window"
                      " could not be checked.\n"
@@ -3249,7 +3249,7 @@ std::string IlluminationModel::ephemerisProvenanceBlock() const {
         os << "ephemeris_spk_coverage=none (no loaded SPK covers this body)\n";
     } else {
         // "Not measured" and "measured as absent" are different facts, and a
-        // provenance file that conflates them is the PTM-301 failure mode in a
+        // provenance file that conflates them is the per-epoch Keplerian fallback failure mode in a
         // new place. `window_within_coverage` is omitted below for the same
         // reason: false would read as a measurement.
         os << "ephemeris_spk_coverage=not measured (see the [ephemeris] warning"
@@ -3538,17 +3538,17 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     const std::array<double, 3>& sun_position,        // SPICE in km
     const std::array<double, 3>& primary_position,    // SPICE in km
     int num_samples,
-    int src_face)                                     // PTM-13 P1: source core-face id (-1 = no self-skip)
+    int src_face)                                     // rise-epsilon P1: source core-face id (-1 = no self-skip)
 {
-    // PTM-13 P1: topological self-skip is active only with a valid mesh source face id (the lat/lon
-    // point path passes -1). Default OFF -> byte-identical. PTM-13 rise-epsilon is the independent
+    // Shadow-ray rise-epsilon P1: topological self-skip is active only with a valid mesh source face id (the lat/lon
+    // point path passes -1). Default OFF -> byte-identical. Rise-epsilon is the independent
     // rise-based discriminator (takes precedence when both are set). Either starts the ray AT the face.
     const bool selfskip = use_topo_selfskip_ && src_face >= 0;
     const bool riseeps  = use_rise_eps_ && src_face >= 0;
     const bool at_face  = selfskip || riseeps;
     // Convert SPICE positions to meters for geometric tests
     const std::array<double,3> sun_pos_m     = kmToMeters(sun_position);
-    // PTM-36: the eclipse sphere must live in MESH-NATIVE units (km for global
+    // the eclipse sphere must live in MESH-NATIVE units (km for global
     // icosphere meshes, m for DEM/site meshes) -- center AND radius together.
     const double km_to_native = kmToNativeScale(face_center);
     const std::array<double,3> primary_pos_n = {
@@ -3569,7 +3569,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
     }
     std::array<double, 3> sun_dir = { sun_rel_m[0]/sun_dist_m, sun_rel_m[1]/sun_dist_m, sun_rel_m[2]/sun_dist_m };
-    // PTM-36: ray parameters t from raySphereIntersect are in MESH-NATIVE units
+    // ray parameters t from raySphereIntersect are in MESH-NATIVE units
     // (sun_dir is a unit vector), so the "nearer than the Sun" bound must be too.
     const double sun_dist_n = sun_dist_m * (km_to_native / 1000.0);
 
@@ -3628,7 +3628,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         }
     }
 
-    // PTM-13: local-horizon (skyline) cull of the grazing DIRECT sun. Azimuth-specific;
+    // local-horizon (skyline) cull of the grazing DIRECT sun. Azimuth-specific;
     // catches the over-tessellation/grazing leak where the single Embree ray hops the mm
     // rim. Gated (default OFF -> byte-identical). CPU path; built in initializeScene().
     if (use_horizon_cull_ && horizon_direct_.built()) {
@@ -3647,7 +3647,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     if (r_up > constants::EPSILON) { up[0]/=r_up; up[1]/=r_up; up[2]/=r_up; }
     const double sin_elev = dotProduct(sun_dir, up);
 
-    // Robust origin offsets (meters). PTM-13 P1/rise-epsilon: under self-skip or rise-epsilon the ray
+    // Robust origin offsets (meters). Self-skip (P1) / rise-epsilon: under self-skip or rise-epsilon the ray
     // starts AT the face (eps_n=eps_d=0) and self/self-relief hits are rejected by primID / out-of-plane
     // rise. Default OFF -> unchanged (2x/1x).
     const double eps_base = calculateSafeRayOffset(face_center, face_normal);
@@ -3660,14 +3660,14 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         face_center[2] + face_normal[2] * eps_n + sun_dir[2] * eps_d
     };
 
-    // PTM-38: is the primary anywhere on the solar disk (penumbra OR umbra)?
+    // is the primary anywhere on the solar disk (penumbra OR umbra)?
     // See primaryDiskOverlap(). False outside an eclipse -> byte-identical.
     const bool eclipse_partial = (!primary_is_sun_) &&
         primaryDiskOverlap(ray_origin_base, sun_dir, primary_pos_n, primary_radius_n,
                            sun_dist_n, disk_ang);
 
     // Center-ray fast path; use meters for eclipse/horizon
-    // PTM-38: !eclipse_partial vetoes the fast path for the WHOLE eclipse. The
+    // !eclipse_partial vetoes the fast path for the WHOLE eclipse. The
     // old center-ray test broke the penumbra at both ends: before the primary
     // covered the disk center it returned FULL sun, and the moment it did it
     // returned ZERO -- while the limb of the Sun was still visible. Falling
@@ -3678,7 +3678,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
         if (use_geometric_horizon_ && checkLunarHorizon(ray_origin_base, sun_dir, vectorLength(face_center))) {
             return enable_shadow_flux_ ? calculateShadowFlux(face_center, face_normal, sun_pos_m) : 0.0;
         }
-        // Terrain occlusion via Embree. PTM-13: rise-epsilon / self-skip re-trace when active (default OFF).
+        // Terrain occlusion via Embree. Rise-epsilon / self-skip re-trace when active (default OFF).
         {
             std::vector<std::array<double,3>> o(1, ray_origin_base);
             std::vector<std::array<double,3>> d(1, sun_dir);
@@ -3712,8 +3712,8 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
 
     const uint32_t baseN   = static_cast<uint32_t>(std::max(1, num_samples));
-    uint32_t heavyN        = heavySolarSamples(num_samples);   // PTM-45(ii)
-    // PTM-38: in the penumbra, 8 samples quantize the eclipsed fraction at
+    uint32_t heavyN        = heavySolarSamples(num_samples);   // one shared definition
+    // in the penumbra, 8 samples quantize the eclipsed fraction at
     // ~12.5 % (~21 K near half-obscuration). Start heavy when the primary
     // overlaps the disk. Outside an eclipse this is the old initialN exactly.
     uint32_t initialN      = eclipse_partial ? heavyN : std::max<uint32_t>(8, baseN);
@@ -3769,7 +3769,7 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
                                 ray_origin_base[2] + sd[2]*eps_d });
         }
 
-        // Terrain occlusion for survivors. PTM-13: rise-epsilon / self-skip re-trace (default OFF).
+        // Terrain occlusion for survivors. Rise-epsilon / self-skip re-trace (default OFF).
         std::vector<uint8_t> occ;
         if (riseeps)
             occ = traceOccludedRiseEps(origins, dirs, std::vector<int>(dirs.size(), src_face),
@@ -3882,7 +3882,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
     if (const char* tn = std::getenv("PTM_ILLUM_TRUE_NORMALS"))
         if (tn[0]=='1'||tn[0]=='t'||tn[0]=='T'||tn[0]=='y'||tn[0]=='Y') use_true_normals = true;
 
-    // PTM-221: DECLINE on a mesh whose normals were ANALYTICALLY substituted.
+    // DECLINE on a mesh whose normals were ANALYTICALLY substituted.
     // MeshUtils::setupMesh() deliberately replaces the winding normal with the
     // radial normal on a smooth icosphere to remove a ~0.5 K pentagon-vertex bias
     // (test_pentagon_bias). Recomputing the winding normal here would silently undo
@@ -3968,7 +3968,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
             // count every face whose illumination normal ends up different from the
             // default radial-flip normal, and the largest angular change. An earlier
             // banner reported only the overhang count, which read "0 overhang faces
-            // (0.00 %)" on a run that in fact replaced all 1,280 normals (PTM-221).
+            // (0.00 %)" on a run that in fact replaced all 1,280 normals.
             int overhang = 0;
             size_t differ = 0;    // differ from the default normal at all (incl. round-off)
             size_t reversed = 0;  // differ by more than 90 deg, i.e. orientation reversed
@@ -4055,7 +4055,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
         }
     }
     
-    // PTM-733 self-check: the surface side these illumination normals face must be EXACTLY the
+    // Shared surface-side rule self-check: the surface side these illumination normals face must be EXACTLY the
     // one the shared rule (src/cpp/mesh/face_orientation.h) gives, because that rule is what
     // mc_ref_pp traces and what the VF_REPLACE gate compares a CSR against. Read-only (cannot
     // change any output); runs only when a VF_REPLACE CSR is in use. Any disagreement is FATAL:
@@ -4387,7 +4387,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
     // (SPICE returns km; the Sun is far enough that the mesh-unit mismatch on
     // global km meshes is a ~1e-9 direction error, and sun_dist_km below is exact)
     const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
-    // PTM-36: the eclipse sphere must live in MESH-NATIVE units (km for global
+    // the eclipse sphere must live in MESH-NATIVE units (km for global
     // icosphere meshes, m for DEM/site meshes) -- center AND radius together.
     const double km_to_native = kmToNativeScale(face_centers[0]);
     const std::array<double,3> primary_pos_n = {
@@ -4430,7 +4430,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         double sun_dist_m = vectorLength(sun_rel);
         if (sun_dist_m <= constants::EPSILON) { direct_solar_values[i] = 0.0; continue; }
         std::array<double, 3> sun_dir = { sun_rel[0]/sun_dist_m, sun_rel[1]/sun_dist_m, sun_rel[2]/sun_dist_m };
-        // PTM-36: ray parameters t are in MESH-NATIVE units (sun_dir is unit).
+        // ray parameters t are in MESH-NATIVE units (sun_dir is unit).
         const double sun_dist_n = sun_dist_m * (km_to_native / 1000.0);
 
         // Incidence cosine
@@ -4490,7 +4490,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             }
         }
 
-        // PTM-13: local-horizon (skyline) cull of the grazing DIRECT sun (mirror of the
+        // local-horizon (skyline) cull of the grazing DIRECT sun (mirror of the
         // single-face path). Gated (default OFF -> byte-identical). CPU batch path.
         if (use_horizon_cull_ && horizon_direct_.built()) {
             const std::array<double,3> p_local = {
@@ -4504,7 +4504,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             }
         }
 
-        // Robust origin. PTM-13 P1/rise-epsilon: with topological self-skip OR rise-epsilon the ray
+        // Robust origin. Self-skip (P1) / rise-epsilon: with topological self-skip OR rise-epsilon the ray
         // starts AT the face (eps_n=eps_d=0) and self/self-relief hits are rejected by primID / out-of-
         // plane rise, so a real mm-scale local occluder is detected instead of hopped by the 1 cm
         // offset. Default OFF -> unchanged (2x/1x).
@@ -4519,7 +4519,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             fc[2] + fn[2] * eps_n + sun_dir[2] * eps_d
         };
 
-        // PTM-38: is the primary anywhere on the solar disk (penumbra OR umbra)?
+        // is the primary anywhere on the solar disk (penumbra OR umbra)?
         // Computed once per face and used twice: to veto the center-ray fast path
         // (which would otherwise report full sun for any face less than ~50 %
         // obscured) and to escalate the disk sampling below. False whenever no
@@ -4530,7 +4530,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         // Center-ray fast path only if center is above horizon
         if (cos_inc0 > 0.0) {
-            // PTM-38: any overlap of the primary with the solar disk sends this
+            // any overlap of the primary with the solar disk sends this
             // face to the finite-disk sampler. The old center-ray-only test is a
             // strict subset of eclipse_partial, so this is never less
             // conservative than before.
@@ -4568,13 +4568,13 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         double uoff = u01(seed ^ 0x85EBCA6Bu);
         double voff = u01(seed ^ 0xC2B2AE35u);
 
-        // PTM-38: the default 9 samples (constants::N_SOLAR_SAMPLES) quantize the
+        // the default 9 samples (constants::N_SOLAR_SAMPLES) quantize the
         // eclipsed fraction at ~11 %, ~21 K near half-obscuration. Escalate to the same heavy count
         // the single-face path uses (illumination_model.cpp heavyN) whenever the
         // primary overlaps the disk. Untouched -> byte-identical -- outside an
         // eclipse.
         const uint32_t baseN = static_cast<uint32_t>(std::max(8, num_samples));
-        // PTM-45(ii): ONE heavyN definition, shared with the single-face and
+        // ONE heavyN definition, shared with the single-face and
         // GPU batch paths. Identical at the default 9 samples (all 64).
         const uint32_t N = eclipse_partial ? heavySolarSamples(num_samples) : baseN;
         std::vector<std::array<double, 3>> dirs; dirs.reserve(N);
@@ -4624,7 +4624,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
                                 ray_o[2] + sd[2]*eps_d });
         }
 
-        // Terrain occlusion for survivors. PTM-13: rise-epsilon / self-skip re-trace (default OFF -> traceOccluded).
+        // Terrain occlusion for survivors. Rise-epsilon / self-skip re-trace (default OFF -> traceOccluded).
         std::vector<uint8_t> occ;
         if (use_rise_eps_)
             occ = traceOccludedRiseEps(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)),
@@ -4657,7 +4657,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
         double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
-        // PTM-38: normalize by the ATTEMPTED disk samples, not the survivors.
+        // normalize by the ATTEMPTED disk samples, not the survivors.
         // total_out counts only the samples that were NOT eclipse-skipped, so a
         // face with 95 % of the solar disk behind the primary renormalized its
         // 5 % of surviving samples back up to FULL SUN -- the eclipse was a step
@@ -4792,7 +4792,7 @@ void IlluminationModel::createCoordinateSystem(
 }
 
 // ===========================================================================
-// PTM-44: fractional visibility of the PRIMARY's finite disk.
+// fractional visibility of the PRIMARY's finite disk.
 //
 // Both primary-flux paths used to decide visibility with ONE ray to the disk
 // center and to zero the flux the instant cos(theta) <= 0. The primary is not a
@@ -4942,7 +4942,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     }
 
     // Same |face_center| > 10000 unit discriminator the rest of this file uses
-    // (PTM-37 makes it visible and refuses the ambiguous cases at startup).
+    // (the mesh length-unit guard makes it visible and refuses the ambiguous cases at startup).
     const bool centers_in_meters = (vectorLength(face_centers[0]) > 10000.0);
     const double km_to_native = centers_in_meters ? 1000.0 : 1.0;
 
@@ -4960,7 +4960,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // ---- per-face ray budget (primary_disk.h) ------------------------------
     // OFF only by explicit opt-out or by the ALWAYS_SAMPLE upper-bound arm,
     // which has to keep meaning "always sample" or it stops being an upper
-    // bound on the fast path's error (Fermi F1).
+    // bound on the fast path's error.
     static const bool budget_opt_out = [](){
         const char* e = std::getenv("PTM_PRIMARY_DISK_BUDGET");
         const bool off = e && std::atoi(e) == 0;
@@ -4987,7 +4987,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // ray count the census cannot be checked against a stopwatch.
     std::array<size_t, ptm::disk::PRIMARY_DISK_NUM_TIERS> n_tier{};
     size_t n_capped = 0, n_rays = 0;
-    // Fermi F1 accounting: faces whose analytic clip A is POSITIVE but which end
+    // Horizon-clip accounting: faces whose analytic clip A is POSITIVE but which end
     // at zero anyway, and why. On a closed convex mesh the limb legitimately
     // blocks grazing rays, so this is not expected to be zero -- but it must be
     // attributable to rays, never to a probe that simply missed the crescent.
@@ -5058,7 +5058,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // two photometric models the two batch functions apply downstream,
         // evaluated at mean_cos = A, so the budget prices the exact quantity a
         // visibility error moves. Calling them rather than restating them is
-        // deliberate -- a second copy of the Lambert sphere is how PTM-45(ii)
+        // deliberate -- a second copy of the Lambert sphere is how the primary/eclipse fallbacks
         // happened. The reflected half is counted only when the run actually
         // delivers it.
         uint32_t n_samp_face = N_SAMP;
@@ -5151,7 +5151,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // center ray did. Mesh-native units.
         const float tfar_dist = static_cast<float>((ray_dist - primary_radius_) * km_to_native);
 
-        // Fermi F1: the probe basis is oriented to the HORIZON, not arbitrarily.
+        // the probe basis is oriented to the HORIZON, not arbitrarily.
         // u points along the horizon gradient, so probe (+1, 0) is the disk's
         // HIGHEST point. With an arbitrary basis (createCoordinateSystem) all
         // five probes can miss a thin above-horizon crescent, probes_up comes
@@ -5245,7 +5245,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // Everything below is a SHORT-CIRCUIT of the sampler, so all of it is
         // gated on !always_sample: PTM_PRIMARY_DISK_ALWAYS_SAMPLE has to mean
         // "always sample", or the ALWAYS_SAMPLE arm is not an upper bound on
-        // the fast path's error (Fermi F1).
+        // the fast path's error.
         if (!always_sample && probes_up == 0) {
             // With the horizon-oriented basis this is confined to a sliver of
             // width ~sin^3(alpha)/2 in cos(theta_0) at the very bottom of the
@@ -5478,14 +5478,14 @@ void IlluminationModel::calculatePrimaryIRBatch(
     } else if (primary_body_name_ == "MARS") {
         primary_ir_flux = constants::MARS_IR_FLUX;
     } else {
-        // PTM-45(i): unknown primary body -> no IR flux. Behavior unchanged;
+        // unknown primary body -> no IR flux. Behavior unchanged;
         // the single-face path now agrees, and both say so.
         warnUnknownPrimaryOnce(primary_body_name_, "primary IR heating (batch)",
                                "contributing 0 W/m^2 for every face");
         return;
     }
     
-    // PTM-44: one evaluation of the finite disk's visibility, shared with
+    // one evaluation of the finite disk's visibility, shared with
     // calculatePrimaryReflectedBatch. Replaces the per-face center ray AND the
     // hard cos_angle <= 0 cut that used to live in this loop.
     updatePrimaryDiskVisibility(face_centers, face_normals, primary_position, sun_position);
@@ -5528,14 +5528,14 @@ void IlluminationModel::calculatePrimaryReflectedBatch(
     } else if (primary_body_name_ == "MARS") {
         primary_albedo = constants::MARS_BOND_ALBEDO;
     } else {
-        // PTM-45(i), same class: a substituted Bond albedo. Value UNCHANGED
+        // Same class as the primary/eclipse fallbacks: a substituted Bond albedo. Value UNCHANGED
         // (both reflected paths already agree on 0.3); it just no longer
         // happens silently.
         warnUnknownPrimaryOnce(primary_body_name_, "primary reflected light (batch)",
                                "substituting a Bond albedo of 0.3");
     }
 
-    // PTM-44: shared finite-disk visibility (memoized -- the IR batch that runs
+    // shared finite-disk visibility (memoized -- the IR batch that runs
     // beside this one gets the same evaluation, not a second set of rays).
     updatePrimaryDiskVisibility(face_centers, face_normals, primary_position, sun_position);
 
@@ -5586,7 +5586,7 @@ bool IlluminationModel::traceRaySingle(const Ray& ray) {
     return !result.empty() && result[0] >= 0;
 }
 
-// `mean_cos` is <cos theta> over the primary's disk (PTM-44): the horizon clip
+// `mean_cos` is <cos theta> over the primary's disk: the horizon clip
 // and the terrain-visible fraction are already folded in by
 // updatePrimaryDiskVisibility, and it equals the old dot(normal, primary_dir)
 // exactly whenever the whole disk is above the horizon and unoccluded.
@@ -5604,7 +5604,7 @@ double IlluminationModel::calculatePrimaryHeating(
     double primary_angular_radius = std::asin(primary_radius_ / primary_distance);
     double solid_angle = 2 * M_PI * (1.0 - std::cos(primary_angular_radius));
 
-    // PTM-40: view factor from a differential area to a sphere.
+    // view factor from a differential area to a sphere.
     //
     // The correct factor is F_dA->sphere = sin^2(alpha) * cos(theta), which for
     // a sphere of uniform radiosity J gives E = J * F (by reciprocity,
@@ -5622,7 +5622,7 @@ double IlluminationModel::calculatePrimaryHeating(
     // what J has to be: JUPITER_IR_FLUX 13.8 = sigma*(124.5 K)^4 and
     // EARTH_IR_FLUX 240 = sigma*(255 K)^4, both matching the body's effective
     // temperature, not any at-target irradiance. (SATURN_IR_FLUX and
-    // MARS_IR_FLUX do NOT match their own stated temperatures -- see BUGS PTM-43;
+    // MARS_IR_FLUX do NOT match their own stated temperatures -- see the primary-body constant-pair check;
     // Titan/Enceladus/Phobos-class runs are affected by that, not by this fix.)
     double view_factor = solid_angle / M_PI * mean_cos;
     
@@ -5647,7 +5647,7 @@ double IlluminationModel::calculatePrimaryHeating(
         primary_ir_flux = constants::MARS_IR_FLUX;
     }
     else {
-        // PTM-45(i): unknown primary body.
+        // unknown primary body.
         //
         // This used to fall through to primary_temp = 250 K and emit
         // sigma*250^4 = 221 W/m^2 with no warning, while the batch path
@@ -5669,7 +5669,7 @@ double IlluminationModel::calculatePrimaryHeating(
     return primary_ir_flux * view_factor;
 }
 
-// PTM-41: disk-integrated reflected irradiance from a LAMBERT SPHERE primary.
+// disk-integrated reflected irradiance from a LAMBERT SPHERE primary.
 //
 //     E = p * F * sin^2(alpha) * Phi_L(a) * <cos theta>
 //     p       = (2/3) * A_bond          (Lambert sphere: phase integral q = 3/2)
@@ -5696,7 +5696,7 @@ double IlluminationModel::calculatePrimaryHeating(
 // mis-shaped in phase, it broke energy conservation by a factor 2, and at full
 // phase it was 8/3 = 2.667x low (ratio truth/old = (8/3) Phi_L/Phi_old, which
 // falls to 1.70 at quadrature and crosses 1 near a = 125 deg -- near NEW phase
-// the old code over-estimated). The declined blanket x4 of PTM-40 would have
+// the old code over-estimated). The declined blanket x4 of the primary IR view-factor fix would have
 // given 2x the correct total power; the radiosity and the phase function had to
 // be repaired together, which is what this does. With p = (2/3) A_bond and
 // Phi_L, q = 3/2 and the energy budget closes exactly.
@@ -5714,7 +5714,7 @@ double IlluminationModel::calculatePrimaryReflectedLight(
     double primary_distance) {
 
     // If Primary is below the horizon or fully hidden, no reflection.
-    // mean_cos is <cos theta> over the disk (PTM-44); it equals the old
+    // mean_cos is <cos theta> over the disk; it equals the old
     // dot(normal, primary_dir) for a fully visible disk.
     if (mean_cos <= 0.0) {
         return 0.0;
@@ -5762,7 +5762,7 @@ double IlluminationModel::calculatePrimaryReflectedLight(
         primary_albedo = constants::MARS_BOND_ALBEDO;
     }
     else {
-        // PTM-45(i), same class as the batch path above: substituted value,
+        // Same class as the batch path above: substituted value,
         // UNCHANGED at 0.3, now announced.
         warnUnknownPrimaryOnce(primary_body_name_, "primary reflected light",
                                "substituting a Bond albedo of 0.3");
@@ -6262,7 +6262,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
 
     // Convert SPICE positions from km to meters for direction computation
     const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
-    // PTM-36: the eclipse sphere must live in MESH-NATIVE units (km for global
+    // the eclipse sphere must live in MESH-NATIVE units (km for global
     // icosphere meshes, m for DEM/site meshes) -- center AND radius together.
     // Kept identical to the CPU batch path so CPU/GPU stay equivalent.
     const double km_to_native = kmToNativeScale(face_centers[0]);
@@ -6281,10 +6281,10 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     auto u01 = [&](uint32_t s) -> double { return (hash32(s) & 0xFFFFFFU) / double(0x1000000U); };
 
     const uint32_t N = std::max(8, num_samples);
-    // PTM-38: penumbral faces are sampled heavily (mirrors the CPU paths exactly
+    // penumbral faces are sampled heavily (mirrors the CPU paths exactly
     // so CPU and GPU stay equivalent). Only faces the primary actually overlaps
     // pay for it, so a run without an eclipse is byte-identical.
-    const uint32_t heavyN = heavySolarSamples(num_samples);   // PTM-45(ii)
+    const uint32_t heavyN = heavySolarSamples(num_samples);   // one shared definition
 
     // ==== PHASE 1: Generate all rays (parallel, CPU) ====
     // We'll collect all rays from all faces, then batch them to GPU.
@@ -6297,11 +6297,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         std::array<double, 3> ray_origin;
         double sun_dist_m;   // meters — for the ray geometry
         double sun_dist_km;  // km — for angular size and irradiance
-        double sun_dist_n;   // mesh-native units — far bound for eclipse checks (PTM-36)
+        double sun_dist_n;   // mesh-native units — far bound for eclipse checks
         double cos_inc0;
         double disk_scale;
         bool below_horizon;     // Entire disk below horizon
-        bool eclipse_overlap;   // PTM-38: primary overlaps ANY part of the solar
+        bool eclipse_overlap;   // primary overlaps ANY part of the solar
                                 // disk (penumbra or umbra), not just the center ray
         bool needs_sampling;    // Needs finite-disk sampling
         bool precheck_occluded; // Analytic body-occlusion pre-check culled it
@@ -6323,7 +6323,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         };
         fi.sun_dist_m = vectorLength(sun_rel);
         fi.sun_dist_km = fi.sun_dist_m / 1000.0;
-        fi.sun_dist_n = fi.sun_dist_m * (km_to_native / 1000.0);  // PTM-36
+        fi.sun_dist_n = fi.sun_dist_m * (km_to_native / 1000.0);  // eclipse km/m units
 
         if (fi.sun_dist_m <= constants::EPSILON) {
             fi.below_horizon = true;
@@ -6388,7 +6388,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             fc[2] + fn[2] * eps_n + fi.sun_dir[2] * eps_d
         };
 
-        // PTM-38: eclipse test on the WHOLE solar disk, not just the center ray
+        // eclipse test on the WHOLE solar disk, not just the center ray
         // (mesh-native units). The center-ray-only test reported full sun for
         // every face less than ~50 % obscured. Strict superset of the old test.
         fi.eclipse_overlap = false;
@@ -6422,7 +6422,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             ray_counts[i] = 1;
         } else {
             // Disk sampling - estimate N rays (actual may be less due to eclipse filtering).
-            // PTM-38: penumbral faces are sampled with heavyN; this expression must
+            // penumbral faces are sampled with heavyN; this expression must
             // stay identical to the per-face Nf used in PHASE 1b or the ray offsets
             // computed from it will not line up.
             ray_counts[i] = fi.eclipse_overlap ? heavyN : N;
@@ -6512,7 +6512,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             double uoff = u01(seed ^ 0x85EBCA6Bu);
             double voff = u01(seed ^ 0xC2B2AE35u);
 
-            // PTM-38: heavy sampling for penumbral faces (must match ray_counts[i])
+            // heavy sampling for penumbral faces (must match ray_counts[i])
             const uint32_t Nf = fi.eclipse_overlap ? heavyN : N;
             fri.eclipse_skip.reserve(Nf);
             fri.ray_dirs.reserve(Nf);
@@ -6715,7 +6715,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
             if (total_valid == 0) {
                 direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             } else {
-                // PTM-38: normalize by the ATTEMPTED disk samples, not the
+                // normalize by the ATTEMPTED disk samples, not the
                 // survivors. total_valid counts only the non-eclipse-skipped
                 // samples, so a 95 %-obscured face renormalized its surviving
                 // 5 % back up to full sun. Terrain-blocked samples were always

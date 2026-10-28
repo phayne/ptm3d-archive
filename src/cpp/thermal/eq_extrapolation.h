@@ -34,7 +34,7 @@
 // solution instead of amplifying noise through a regularized inverse. This
 // mirrors, line for line, the reference implementation the GO decision was
 // measured on (`eq_compare_2026-08-08/code/modeext.py:_rre`, rcond 1e-12) — the
-// numbers in Fermi's ADDENDUM A1 table are that function's output, so any
+// numbers in the physics review's A1 table are that function's output, so any
 // deviation here would invalidate the acceptance thresholds.
 //
 // For the default p = 4 the per-face solve is a 50x3 least-squares problem
@@ -135,7 +135,7 @@ struct Options {
 // discriminator (an active column measured cond 3.2e5 and was fine) --
 // ||gamma||_1 is the right diagnostic.
 //
-// Rejected by Fermi, do not reintroduce: per-layer gamma (the scalar-Aitken
+// Rejected by the physics review, do not reintroduce: per-layer gamma (the scalar-Aitken
 // family, measured diverging to 1e14 K), per-depth-block gamma (more
 // parameters, arbitrary boundaries, deep block still fitted to noise), and
 // "extrapolate only above the last active layer" (assumes activity is monotone
@@ -187,7 +187,7 @@ inline bool level2Hold(double s_layer, double hold_K) {
 //
 //     |gamma_0| * max_z |S_0(z) - S_last(z)|  >  tol_K
 //
-// This is Fermi's bound (N8.0) evaluated at extrapolation time from quantities
+// This is the physics review's bound (N8.0) evaluated at extrapolation time from quantities
 // already in hand. It identifies the population that produced the 73 faces in
 // the 2026-08-09 validation: columns whose upper layers are still active (so
 // the fit assigns a non-zero seed weight) while deeper layers have converged to

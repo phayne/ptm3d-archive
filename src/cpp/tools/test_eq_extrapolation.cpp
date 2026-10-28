@@ -2,7 +2,7 @@
 //
 // WHY THIS TEST EXISTS
 // --------------------
-// The acceptance thresholds in Fermi's ADDENDUM (A1: 0.267 K certified at 5
+// The acceptance thresholds in the physics review addendum (A1: 0.267 K certified at 5
 // passes; A3a: 0 missed detections over 72 cases) were measured with ONE
 // specific reference implementation, `eq_compare_2026-08-08/code/modeext.py`
 // `_rre`. If the C++ disagrees with that function, every published number

@@ -41,7 +41,7 @@
 //     end of the integrated series -- equilibration_steps + n_steps >
 //     total_time_steps -- MUST still be refused. This is the case the check was
 //     written for: accepting it reads past the end of every series and cube
-//     rows silently stop lining up with time_steps.txt (the PTM-250/251 defect
+//     rows silently stop lining up with time_steps.txt (the output-epoch drift defect
 //     class). Relaxing == to <= must not cost this refusal.
 //
 //  F. CACHE-KEY REFUSAL (negative control). A cache built for a different mesh

@@ -100,10 +100,10 @@ extern const std::string SUN_SPICE_ID;         // SPICE ID for Sun
 extern const double EPSILON;              // Small value for floating-point comparisons
 
 /**
- * @brief PTM-43: verify every primary-body (TEMPERATURE, IR_FLUX) pair against
+ * @brief verify every primary-body (TEMPERATURE, IR_FLUX) pair against
  *        IR_FLUX == sigma * TEMPERATURE^4.
  *
- * The IR flux constants are consumed as EMITTER-SURFACE fluxes (PTM-40), so a
+ * The IR flux constants are consumed as EMITTER-SURFACE fluxes, so a
  * pair that disagrees means one of its two halves is wrong -- and you cannot
  * tell which by looking at either alone. Runs automatically at library load
  * and WARNS to stderr on any mismatch; exposed here so a test can call it.

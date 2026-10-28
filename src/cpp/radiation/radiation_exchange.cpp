@@ -2,7 +2,7 @@
 #include "smith_beaming.h"              // Smith (1967) anisotropic emission chi table
 #include "mc_view_factor.h"             // Monte Carlo view factor builder
 #include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
-#include "../mesh/face_orientation.h"     // PTM-733 shared surface-side rule (engine == mc_ref_pp)
+#include "../mesh/face_orientation.h"     // shared surface-side rule (engine == mc_ref_pp)
 #include "../thermal/thermal_model.h"  // For ProgressBar
 #include "../gpu/gpu_guardrails.h"     // VRAM-margin + placement policy (no OpenCL dep)
 #include "../gpu/machine_profile.h"    // per-host VRAM record (no OpenCL dep)
@@ -279,7 +279,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
     radiosity_new_.resize(n, 0.0);
     temp_vec_.resize(n, 0.0);
 
-    // PTM-12 per-partner corrected VF (full replacement). If PTM_HMATRIX_VF_REPLACE points
+    // View-factor row-sum overshoot per-partner corrected VF (full replacement). If PTM_HMATRIX_VF_REPLACE points
     // at a symmetric CSR built from the occlusion-exact referee (assemble_vf2.py), REPLACE the
     // stored H-matrix operator with it: fixes the near-field over-count AND the floor
     // under-coupling in one reciprocal, ΣF<=1 matrix. Format: int32 n, float64 geomhash,
@@ -465,7 +465,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
         }
     }
 
-    // PTM-12 row-sum correction (occlusion-aware referee). Install a symmetric
+    // View-factor row-sum overshoot row-sum correction (occlusion-aware referee). Install a symmetric
     // diagonal-congruence wrapper D F D over F_op_ so the effective row sums match a
     // reference (true occluded) row sum supplied via PTM_HMATRIX_ROWFIX (a raw file of
     // n float64 = referee Sum_j F_ij per face, e.g. from scripts/ptm12_diag/mc_ref_raw).
@@ -514,7 +514,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                 }
             }
             // Symmetric Sinkhorn: rowsum(D F D)_i = d_i (F d)_i -> target_i. Stabilizations (FULL):
-            // (a) PTM-14 negative/zero guard (skip update where (F d)_i<=0), (b) under-relaxation,
+            // (a) negative-ACA-entry negative/zero guard (skip update where (F d)_i<=0), (b) under-relaxation,
             // (c) clamp d in [DMIN, DMAX] to bound amplification (DMIN small so the over-count rows
             // that need d~0.15 still reduce). The fail-loud gate below is the arbiter.
             std::vector<double> d(n, 1.0), Fd(n, 0.0);
@@ -525,7 +525,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
                 for (size_t i = 0; i < n; ++i) {
                     if (stored[i] <= 1e-12 || target[i] <= 0.0) { d[i] = 1.0; continue; }
                     double g = Fd[i];
-                    if (g <= 1e-30) continue;             // negative/zero row-sum guard (ACA PTM-14)
+                    if (g <= 1e-30) continue;             // negative/zero row-sum guard (negative ACA entries)
                     double rs = d[i] * g;
                     if (rs > 1e-30) d[i] *= std::pow(target[i] / rs, RELAX);
                     if (d[i] > DMAX) d[i] = DMAX; else if (d[i] < DMIN) d[i] = DMIN;
@@ -540,7 +540,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
             }
             // Fail-loud convergence GATE. The FULL-mode congruence can DIVERGE when it
             // amplifies near-zero-stored rows (d_i>1 compounding via d_i d_j) or hits ACA
-            // far-field negative entries (PTM-14) -> row sums blow up to ~1e19, mean<0. A
+            // far-field negative entries -> row sums blow up to ~1e19, mean<0. A
             // diverged D would make the coupled solve produce garbage (observed 2026-07-19:
             // FULL ran ~14h to T=4.8e9 K). NEVER install a diverged correction: abort so the
             // caller must switch to DAMP or fix the inputs. Tolerance explicit + logged.
@@ -627,7 +627,7 @@ void RadiositySolver::setSolarAlbedo(const std::vector<double>& solar_albedo) {
     // are recomputed on the next solve().
 }
 
-// --- PTM-106: direct-beam (source) albedo, distinct from the diffuse operator ---
+// --- direct-beam (source) albedo, distinct from the diffuse operator ---
 
 void RadiositySolver::setSolarSourceAlbedo(const std::vector<double>& source_albedo) {
     if (source_albedo.size() != emissivity_.size()) {
@@ -669,7 +669,7 @@ void RadiositySolver::clearSolarSourceAlbedo() {
 // reflectivity = the OPERATOR albedo A_op. A source albedo A_src != A_op is therefore
 // expressed by pre-scaling the uploaded flux by A_src/A_op, which is undefined where
 // A_op -> 0. Rather than silently dropping those faces' reflected sunlight (the exact
-// archetype PTM-106 is an instance of), refuse the GPU two-band path and let the CPU
+// archetype of the two-band source-albedo defect), refuse the GPU two-band path and let the CPU
 // two-band solve -- which multiplies A_src in directly and needs no ratio -- run.
 void RadiositySolver::checkSourceAlbedoGPURepresentable() {
     src_albedo_gpu_ok_ = true;
@@ -847,7 +847,7 @@ void RadiositySolver::initGPU() {
                             || !config_.gpu_device_ids.empty();
 
     // Device footprint. The single-GPU solver and every pool device each hold a
-    // FULL replica of the CSR. The 32-bit addressing wall (PTM-25) is handled by
+    // FULL replica of the CSR. The 32-bit addressing wall is handled by
     // the solver's chunked sub-buffers, so there is NO per-buffer nnz ceiling
     // here (the old 100M-nnz "soft limit" is retired) -- the only question is
     // whether the replica + working buffers fit a device's VRAM.
@@ -886,7 +886,7 @@ void RadiositySolver::initGPU() {
     // dies that hold the CSR replica, while the replica stays resident for the
     // whole window. Nothing in either path knows about the other. A3GT lunar polar site B
     // passed this check with 0.63 GiB of nominal margin -- less than the thermal
-    // solver's own ask -- and that promotion happened by accident: the FC-08
+    // solver's own ask -- and that promotion happened by accident: the view-factor
     // divisor fix shrank the matrix 8.4% and carried it across the threshold
     // from "refused, run radiosity on the CPU" to "accepted, 26.55 GiB on four
     // dies". The floor makes that crossing a decision, not a side effect.
@@ -933,7 +933,7 @@ void RadiositySolver::initGPU() {
         // rung nobody chose; a quiet ENFORCEMENT on a platform where the failure
         // was never observed is the same sin in the other direction; and a
         // quiet WAIVER would be the worst of the three. Formatted on a LOCAL
-        // stream: see the gb() note below (PTM-05 -- std::cout arrives here
+        // stream: see the gb() note below (std::cout arrives here
         // carrying scientific/setprecision(1) from a progress banner).
         std::ostringstream msg;
         msg << std::fixed << std::setprecision(2)
@@ -995,7 +995,7 @@ void RadiositySolver::initGPU() {
     // GB, formatted on a LOCAL stream. std::cout arrives here carrying
     // std::scientific << setprecision(1) from an earlier progress banner, which
     // rendered the whole ACTIVE RUNG line as "2e+01 GB CSR+working on a 3e+01 GB
-    // device" -- the PTM-05 archetype (same fix as thermal_opencl.cpp's
+    // device" -- the unwatched side-channel archetype (same fix as thermal_opencl.cpp's
     // surface-BC certificate), on the one line whose job is to say exactly how
     // much memory the run just committed. Never format these through the ambient
     // std::cout state.
@@ -1126,7 +1126,7 @@ void RadiositySolver::initGPU() {
 
     // Single-GPU rung of the degrade ladder. Returns true if it engaged the GPU.
     // Every failure is loud (never a silent drop to CPU); the CSR upload is
-    // wrapped because uploadViewFactors can throw (chunk/VRAM fail-loud, PTM-25).
+    // wrapped because uploadViewFactors can throw (chunk/VRAM fail-loud).
     auto try_single_gpu = [&]() -> bool {
         gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
         if (!gpu_solver_->initialize()) {
@@ -1582,7 +1582,7 @@ std::vector<double> RadiositySolver::solveGPUTwoBand(
         emiss_f.resize(n); refl_f.resize(n); visE_f.resize(n); visR_f.resize(n);
         zeros_f.assign(n, 0.0f);
     }
-    // PTM-106: the kernel forms solar_source = visR * flux, so a direct-beam source
+    // the kernel forms solar_source = visR * flux, so a direct-beam source
     // albedo A_src != the operator A is applied by uploading the EFFECTIVE flux
     // Q_i * A_src_i / A_i. Reduces to Q_i exactly when no source albedo is installed
     // (visSourceAlbedo returns solar_reflectivity_ -> ratio == 1 bitwise).
@@ -1658,7 +1658,7 @@ std::vector<double> RadiositySolver::solveGPU(
     const std::vector<double>& solar_flux)
 {
     // Band-separated GPU solve when enabled (B1); otherwise the gray GPU path below.
-    // src_albedo_gpu_ok_ (PTM-106) can veto it when A_src/A_op is not representable.
+    // src_albedo_gpu_ok_ can veto it when A_src/A_op is not representable.
     if (two_band_gpu_ok_ && src_albedo_gpu_ok_) {
         return solveGPUTwoBand(temperatures, solar_flux);
     }
@@ -1703,7 +1703,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     const size_t n_steps = temperatures_per_timestep.size();
     std::vector<std::vector<double>> indirect_per_timestep(n_steps);
 
-    // PTM-106: a per-timestep source albedo must be paired with the RIGHT timestep.
+    // a per-timestep source albedo must be paired with the RIGHT timestep.
     // If the batch override is present but mis-sized, refuse the pool (the serial
     // fallback below re-installs the correct per-step vector on each solve()).
     const bool src_batch_ok =
@@ -1720,7 +1720,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     // Single-device or CPU fallback: serial loop over solve(). Semantically
     // identical to the caller running its own per-timestep loop.
 #ifdef PTM_GPU_OPENCL
-    // A PTM-106 veto sends a POOL run down the serial path; that run still expects
+    // A two-band source-albedo veto sends a POOL run down the serial path; that run still expects
     // per-band batch output, so populate it here (legacy no-pool callers keep the
     // exact old behavior -- band batches untouched).
     const bool ptm106_serial_veto =
@@ -1827,7 +1827,7 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
                     for (size_t k : device_steps) {
                         const auto& temps_d = temperatures_per_timestep[k];
                         const auto& solar_d = solar_flux_per_timestep[k];
-                        // PTM-106: per-timestep direct-beam source albedo, applied by
+                        // per-timestep direct-beam source albedo, applied by
                         // pre-scaling the uploaded flux (the kernel forms
                         // source = A_op * flux). No override -> ratio 1, bitwise legacy.
                         const std::vector<double>* src_alb =
@@ -2064,7 +2064,7 @@ std::vector<double> RadiositySolver::solveTwoBand(
     //   Visible: (I - A F) B_vis = A Q_solar  (A = solar_reflectivity_, no emission)
     // vis_source (A_i Q_solar) is needed by both the solve and the identity below.
     auto emission = computeThermalEmission(temperatures);
-    // PTM-106: the FIRST bounce scatters the collimated direct beam, so it uses the
+    // the FIRST bounce scatters the collimated direct beam, so it uses the
     // direct-beam albedo A_src (== the BC's A(theta) when the caller installs it);
     // the operator/absorptivity below keep the diffuse Bond value. Falls back to
     // solar_reflectivity_ when no source albedo was installed -> legacy path,
@@ -2093,7 +2093,7 @@ std::vector<double> RadiositySolver::solveTwoBand(
     } else {
         solveTwoBandJacobiFused(emission, vis_source, B_ir, B_vis);
     }
-    // Per-band sweep counts (Fermi's decisive measurement). Logged once/process to
+    // Per-band sweep counts. Logged once/process to
     // avoid per-timestep spam; representative of the fused solve's band balance.
     static bool s_logged_band_sweeps = false;
     if (!s_logged_band_sweeps) {
@@ -2284,7 +2284,7 @@ void RadiositySolver::solveTwoBandJacobiFused(
     }
     bool conv_ir = false, conv_vis = false;
     int it_ir = 0, it_vis = 0;
-    // BUGS.md PTM-102: this path never wrote converged_ / last_residual_, so
+    // this path never wrote converged_ / last_residual_, so
     // didConverge() and getLastResidual() reported whatever the previous solve (or
     // the constructor) left behind. test_two_band_rownorm printed "JACOBI FAILED
     // (unexpected)" on all 4 configs while the numbers were in fact correct to
@@ -2343,7 +2343,7 @@ void RadiositySolver::solveTwoBandJacobiFused(
     // One shared width-2 traversal per outer iteration; the outer loop ran until the
     // slower band converged, so that is max(it_ir, it_vis), not their sum.
     last_csr_traversals_ = std::max(it_ir, it_vis);
-    // PTM-102: a TWO-band solve has converged only when BOTH bands have, and its
+    // a TWO-band solve has converged only when BOTH bands have, and its
     // residual is the worse of the two. This is deliberately STRICTER than the
     // "two separate solveJacobi calls" aggregate it otherwise mirrors -- that one
     // would report only the visible band (the last call), hiding an unconverged IR
@@ -2392,7 +2392,7 @@ std::vector<double> RadiositySolver::solveGaussSeidel(const std::vector<double>&
                 sum += vals[k] * radiosity_[cols[k]];
             }
 
-            // Renormalize Σ_j F_ij ≤ 1 (BUGS.md PTM-08). The M1 estimator can
+            // Renormalize Σ_j F_ij ≤ 1. The M1 estimator can
             // overshoot to Σ_j F_ij > 1 on fine/concave meshes; without this the
             // radiosity gain scatter_refl·Σ can exceed 1 and Gauss-Seidel diverges
             // (severe in the two-band visible channel, A up to ~0.5 Europa/~0.9
@@ -2551,13 +2551,13 @@ FaceClassification FaceSelector::classify(
         }
     }
 
-    // PTM-98 — which faces keep the indirect flux the radiosity solve computes.
+    // which faces keep the indirect flux the radiosity solve computes.
     //
     // View factors and the radiosity solve itself cover ALL faces regardless of
     // this classification; the set below is applied afterwards as a copy mask
     // (computeIndirectFlux / computeIndirectFluxBatch). Filtering for thermal
     // re-runs is a SEPARATE, downstream decision made on the computed indirect
-    // flux (PTM-89 coupling_mode).
+    // flux (the chunk-independent coupling_mode).
     //
     // The legacy Shadow gate is window-dependent: shadow_fractions comes from
     // this run's own illumination series, whose length is
@@ -2672,7 +2672,7 @@ void vfReplaceOrientationGate(const ptm::Mesh& mesh, bool illum_batch_path) {
     std::string csrDigest = provString(txt, "orientation_digest");
     std::string basis;
     if (csrDigest.empty()) {
-        // Legacy CSR (no sidecar, or a pre-PTM-733 sweep): every referee before PTM-733 traced
+        // Legacy CSR (no sidecar, or a pre-fix sweep): every referee before the shared surface-side rule traced
         // the RAW winding, so its orientation is "keep every face".
         std::vector<int8_t> ones(eng.n_faces, 1);
         csrDigest = ptm::orient::hex16(ptm::orient::signDigest(ones));
@@ -2992,7 +2992,7 @@ bool RadiationExchangeManager::computeViewFactorsOnly() {
             // "0.0" in the VF-build log. The value handed to the H-matrix builder
             // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
             // honored — proven: the compression ratio is identical whether the log
-            // shows "0.0" or "0.001". This is display-only; see BUGS.md PTM-09.
+            // shows "0.0" or "0.001". This is display-only (banner precision).
             // Save/restore so downstream formatting is left unchanged.
             const std::ios::fmtflags saved_fmt = std::cout.flags();
             const std::streamsize saved_prec = std::cout.precision();
@@ -3108,7 +3108,7 @@ bool RadiationExchangeManager::prepare(
                      "this config set the knob and not the switch." << std::endl;
     }
 
-    // PTM-101: the beamed-emission receiver/emitter sets are still shadow-fraction
+    // the beamed-emission receiver/emitter sets are still shadow-fraction
     // based and therefore window-dependent, even though the exchange set no longer
     // is. Beaming is off by default; say so when it is on.
     if (beamingRequested()) {
@@ -3240,7 +3240,7 @@ bool RadiationExchangeManager::prepare(
             // "0.0" in the VF-build log. The value handed to the H-matrix builder
             // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
             // honored — proven: the compression ratio is identical whether the log
-            // shows "0.0" or "0.001". This is display-only; see BUGS.md PTM-09.
+            // shows "0.0" or "0.001". This is display-only (banner precision).
             // Save/restore so downstream formatting is left unchanged.
             const std::ios::fmtflags saved_fmt = std::cout.flags();
             const std::streamsize saved_prec = std::cout.precision();
@@ -3393,7 +3393,7 @@ void RadiationExchangeManager::setSolarAlbedo(const std::vector<double>& solar_a
     }
 }
 
-// PTM-106 forwarders. Unlike setSolarAlbedo these are NOT cached across prepare():
+// Two-band source-albedo forwarders. Unlike setSolarAlbedo these are NOT cached across prepare():
 // the source albedo is a per-timestep quantity that only means anything once the
 // solver exists and the caller is inside the coupling loop. Silently dropping it
 // would reinstate the bug, so a missing solver WARNS.
@@ -3485,7 +3485,7 @@ RadiationExchangeManager::computeIndirectFluxBatch(
     for (size_t k = 0; k < n_steps; ++k) {
         const auto& flux = raw_per_step[k];
         if (flux.empty()) continue;
-        // PTM-98: full write-back (see computeIndirectFlux).
+        // full write-back (see computeIndirectFlux).
         writeBackFlux(flux, indirect_per_timestep[k]);
         if (have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty()) {
             writeBackFlux(ir_raw[k],  indirect_ir_batch_[k]);
@@ -3550,7 +3550,7 @@ std::vector<double> RadiationExchangeManager::computeIndirectFlux(
     // Solve radiosity equation (isotropic/Lambertian thermal emission)
     auto flux = solver_->solve(temperatures, solar_flux);
 
-    // PTM-98: write the solve's result back in FULL. `flux` is already indexed by
+    // write the solve's result back in FULL. `flux` is already indexed by
     // global face id and covers every face; the legacy path copied only the
     // classified subset and left the rest at 0, discarding computed flux.
     // `flux` is ours, so the total path steals its buffer rather than copying.
@@ -3687,7 +3687,7 @@ void RadiationExchangeManager::buildBeamPairs() {
     beam_row_off_.clear();
     if (classification_.exchange_face_indices.empty()) return;
 
-    // Receivers = the shadowed-floor faces. PTM-98: this is deliberately NOT
+    // Receivers = the shadowed-floor faces. This is deliberately NOT
     // classification_.exchange_face_indices any more. That set is now every face
     // by default, and the Smith beamed-emission correction is specifically a
     // sunlit-wall -> shadowed-floor redistribution: widening the receiver set
@@ -3695,11 +3695,11 @@ void RadiationExchangeManager::buildBeamPairs() {
     // factors for the whole mesh. Identical to the old list when
     // exchange_selection == Shadow.
     //
-    // KNOWN RESIDUAL (PTM-101): this receiver set, and the shadow[j] >= 0.99
+    // KNOWN RESIDUAL: this receiver set, and the shadow[j] >= 0.99
     // emitter test below, are still measured over THIS window, so a beaming run
     // (rms_slope_deg > 0) remains chunk-decomposition dependent. Beaming is off
     // by default; the warning is emitted in prepare().
-    // No reserve hint: since PTM-98 the exchange list is the whole mesh, so it is
+    // No reserve hint: since the window-independent exchange selection the exchange list is the whole mesh, so it is
     // no longer an estimate of the receiver count. Built once per run.
     beam_receivers_.clear();
     for (size_t i = 0; i < classification_.shadow_fractions.size(); ++i) {
@@ -3714,7 +3714,7 @@ void RadiationExchangeManager::buildBeamPairs() {
     // external referee CSR, the radiosity solves THAT matrix -- so the beamed
     // delta must be weighted by THAT matrix's F_ij too. Building our own
     // in-engine subset here (what this function did through 2026-08-24) mixes two
-    // different view-factor matrices into one flux, which is the FC-08 /
+    // different view-factor matrices into one flux, which is the view-factor divisor defect /
     // VF-unification-stage-2 error class: every self-consistency check still
     // passes because each half is internally consistent. Source the rows from the
     // replacement, or refuse to run -- never quietly substitute.
@@ -4232,11 +4232,11 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
                                              std::vector<double>* band_vis) const {
     // This is the ISOTHERMAL Smith-chi radiosity beaming. The anisothermal
     // sub-facet hook (radiation/anisothermal_beaming.h aniso::enhancementBol) is
-    // DESIGNED but NOT wired here. HARD PREREQUISITE before wiring it (Fermi,
+    // DESIGNED but NOT wired here. HARD PREREQUISITE before wiring it (the physics review,
     // 2026-07-05): first divide E_bol by a per-cos_sun closure table
     // C(cos_sun) = int chi*E_bol cos dOmega / pi to close the ~+9%-at-grazing
     // energy leak -- REQUIRED for energy balance. Do NOT re-fold E with chi's
-    // (m.s)(m.d) weight (Fermi: worse, +85% at grazing). See enhancementBol.
+    // (m.s)(m.d) weight. See enhancementBol.
     if (beam_pairs_.empty()) return;
     using clk = std::chrono::steady_clock;
     const auto t_enter = clk::now();
@@ -4349,7 +4349,7 @@ void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperat
         if (split_solar) dvis[i] = acc_vis;
     }
 
-    // Keep absorbed indirect flux non-negative on the receiver set. PTM-98: the
+    // Keep absorbed indirect flux non-negative on the receiver set. The
     // beam receiver list, not the (now all-faces) exchange list — only receivers
     // can be driven negative by the beamed correction, and clamping the rest
     // would silently touch faces this pass never wrote.

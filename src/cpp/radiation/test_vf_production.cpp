@@ -7,8 +7,8 @@
  * `test_bowl_crater` is described project-wide as "the Ingersoll gate", but it
  * builds its view factors from its own inline analytic centroid kernel and never
  * calls `radiation::ViewFactorCalculator`. Its reciprocity arm is a tautology
- * (the harness fills F from a symmetric formula), and FC-08 -- a factor-of-two
- * far-field inflation in the OFFLINE assembler -- lived for months underneath a
+ * (the harness fills F from a symmetric formula), and a factor-of-two
+ * far-field inflation in the OFFLINE assembler lived for months underneath a
  * green run of it. This file closes the in-engine half of that hole: it drives
  * the real Embree-occluded `ViewFactorCalculator` over geometry whose view
  * factors are known in closed form, and turns a scale error or a closure
@@ -59,10 +59,10 @@
  *       from the M1/M2 kernel and never symmetrizes. A_i F_ij == A_j F_ji only
  *       if the kernel, the areas and the occlusion agree in both directions.
  *
- *   [S] CLOSURE, sum_j F_ij <= 1. Necessary, never sufficient -- FC-08 passed
+ *   [S] CLOSURE, sum_j F_ij <= 1. Necessary, never sufficient -- the view-factor divisor defect passed
  *       it with entries 2x too large. Kept because it is free and because a
- *       row sum above 1 is an energy-fabricating defect in its own right
- *       (PTM-12).
+ *       row sum above 1 is an energy-fabricating defect in its own right.
+ *
  *
  * CONFIGURATIONS
  * --------------
@@ -90,7 +90,7 @@
  * never be quoted as a pass.
  *
  *   PTM_VFGATE_INJECT_SCALE=<x>     multiply every entry with Ns > the adaptive
- *                                   threshold (the FAR FIELD, FC-08's home) by x.
+ *                                   threshold (the FAR FIELD, the view-factor divisor defect's home) by x.
  *   PTM_VFGATE_INJECT_RECIP=<x>     multiply ONE entry by x, breaking A_iF_ij =
  *                                   A_jF_ji for that pair only.
  *   --tol-ingersoll / --tol-disk    tighten a tolerance below the measured
@@ -416,7 +416,7 @@ Injection readInjection() {
 }
 
 // A dense working copy of one CSR row set. The meshes here are small by design
-// (PTM-19: never rebuild a production .vf), so the extra memory is trivial and
+// (never rebuild a production .vf), so the extra memory is trivial and
 // it makes the reciprocity and injection passes trivial to read.
 struct DenseVF {
     size_t n = 0;
@@ -440,7 +440,7 @@ DenseVF densify(const radiation::ViewFactorMatrix& F) {
 
 // Far field == the regime the ADAPTIVE method sends to the M1 centroid kernel,
 // i.e. OUTSIDE radiation::isNearFieldPair at nearfield_window_factor. That is
-// exactly where FC-08's factor of two lived, so the control perturbs the same
+// exactly where the view-factor divisor defect's factor of two lived, so the control perturbs the same
 // population.
 size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double window_factor, double scale) {
     size_t touched = 0;
@@ -461,7 +461,7 @@ size_t injectFarFieldScale(DenseVF& d, const BuiltMesh& b, double window_factor,
 }
 
 // Perturb exactly ONE entry, chosen deterministically: the two-sided pair
-// carrying the most A_i F_ij mass. FAR FIELD is preferred -- that is FC-08's
+// carrying the most A_i F_ij mass. FAR FIELD is preferred -- that is the view-factor divisor defect's
 // regime -- but a geometry with no far-field pair at all (arm T: every pair is
 // near field) falls back to the near field rather than injecting nothing.
 // That fallback is the only control the NEAR-field reciprocity arms have, and
@@ -579,7 +579,7 @@ double areaWeightedCoupling(const DenseVF& d, const BuiltMesh& b, int want) {
 // midpoint rule in a DIFFERENT variable of the same symmetric double integral.
 // (An earlier revision of this comment had the two faces the wrong way round --
 // the code integrated over the RECEIVER and treated the EMITTER as a point.
-// Corrected 2026-08-23 by Fermi's review.) Its worst near-field pair read 0.4618
+// Corrected 2026-08-23 by the physics review.) Its worst near-field pair read 0.4618
 // on the cap. M2 is now a symmetric double-area sub-centroid quadrature
 // accumulated in canonical min(i,j) order, so BOTH regimes are reciprocal as
 // algebraic identities and both are gated at machine precision.
@@ -733,7 +733,7 @@ DenseVF runProductionVF(const BuiltMesh& b, const radiation::RadiationConfig& cf
 // HMatrixViewFactor exposes no row accessor, only matvec, so the dense matrix
 // is recovered one COLUMN at a time: y = F e_j gives y_i = F_ij. That is n
 // matvecs, which is only affordable because these meshes are deliberately small
-// (PTM-19: never rebuild a production .vf). It is also the honest thing to
+// (never rebuild a production .vf). It is also the honest thing to
 // score -- matvec is exactly how the radiosity solver consumes this matrix, so
 // the arm sees the same numbers the solver would.
 // `stress_blocks` shrinks the octree leaf and the ACA floor so that ACA runs on

@@ -1,8 +1,8 @@
 #pragma once
-// PTM-733 (2026-10-15): ONE definition of "which side of each face is the surface", shared by
+// ONE definition of "which side of each face is the surface", shared by
 // the engine and the mc_ref_pp view-factor referee, so the two can never disagree again.
 //
-// Background (PTM-732): the Moon3D 509k crater mesh is consistently wound INTO the Moon. The
+// Background: the Moon3D 509k crater mesh is consistently wound INTO the Moon. The
 // engine orients faces outward for illumination, but mc_ref_pp traced along the raw winding, so
 // the paper's v4 view-factor matrix described the crater's UNDERSIDE. Nothing caught it: the
 // CSR's mesh-identity hash is built from face areas, which do not depend on the winding.

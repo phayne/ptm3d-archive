@@ -5,13 +5,13 @@
 // ------------------------------------------
 // The Sun is not a point. Its angular radius is ~0.2666 deg at 1 AU, so a
 // shadow edge is smeared by dist*tan(theta_sun): 0.045 m at a 10 m occluder,
-// 0.45 m at 100 m. PTM-38 removed a center-ray test from the engine's own
+// 0.45 m at 100 m. The penumbral-eclipse fix removed a center-ray test from the engine's own
 // direct-solar path for exactly this reason -- it "broke the penumbra at both
 // ends" -- and the flux-cube pass then grew a ladder of its own to say the same
 // thing for a cube. The shadow-depth pass needs the identical question asked at
 // a point above the surface.
 //
-// Three spellings of one concept is the PTM-45(ii) / PTM-106c defect class:
+// Three spellings of one concept is the defect class of the primary/eclipse fallbacks:
 // they agree today and drift later. So the ladder lives here, once, and both
 // passes call it. It is header-only for the same reason primary_disk.h is: the
 // standalone tests exercise exactly the arithmetic the engine runs.

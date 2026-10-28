@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
         std::cout << "    -> PASS\n";
     }
 
-    // The flag consumers read (PTM-221). On an ellipsoid the surface normal is
+    // The flag consumers read. On an ellipsoid the surface normal is
     // NOT radial, so the analytic-radial-substitution record must be false and
     // the PTM_ILLUM_TRUE_NORMALS override must be allowed to engage.
     std::cout << "\n[flag] analytic_radial_normals = "

@@ -484,7 +484,7 @@ int main(int argc, char** argv) {
                 // wraparound at the 0°/360° boundary for cylindrical maps.
                 // Sample at the face's physical +latitude (north positive) to match every
                 // runtime sampling path (thermal ptm_thermal_sim.cpp, thermal_model.cpp,
-                // albedo_manager.cpp all use getValue(lon, +lat)). PTM-35: the previous
+                // albedo_manager.cpp all use getValue(lon, +lat)). The previous
                 // getValue(lon, -lat) flipped the hemisphere in the baked per-face bins.
                 double map_albedo = albedo_map.getValue(lon, lat);
                 
@@ -530,7 +530,7 @@ int main(int argc, char** argv) {
                     while (lon < 0) lon += 360.0;
                     while (lon >= 360.0) lon -= 360.0;
 
-                    // Get interpolated albedo value at the physical +latitude (PTM-35 fix)
+                    // Get interpolated albedo value at the physical +latitude (the albedo generator latitude flip fix)
                     double map_albedo = albedo_map.getValue(lon, lat);
                     
                     // Use map value if physically valid (0-1 range)

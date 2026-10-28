@@ -91,7 +91,7 @@ public:
         #pragma omp parallel for reduction(+:rescaled,singular)
         for (size_t f = 0; f < n; ++f) {
             if (current[f] == baseline_[f]) continue;
-            // PTM-657 face-local refresh: faces at or below rescale_min keep their baseline.
+            // face-local refresh: faces at or below rescale_min keep their baseline.
             if (rescale_min > 0.0 && !(std::abs(current[f] - baseline_[f]) > rescale_min)) continue;
             if (1.0 - baseline_[f] < 1e-10) { ++singular; continue; }
             const double s = scaleFactor(baseline_[f], current[f]);

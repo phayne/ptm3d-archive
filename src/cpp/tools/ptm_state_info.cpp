@@ -9,7 +9,7 @@
 // WHY C++ AND NOT PYTHON. The format is trivially readable from Python, and
 // that is exactly the problem: a Python reader would be a SECOND
 // implementation of a format whose own header comment records that being
-// duplicated three times was the original defect (BUGS.md PTM-76). This tool
+// duplicated three times was the original defect. This tool
 // calls state_io::probe() and state_io::read() -- the engine's own code -- so
 // it cannot drift from what a restore will actually accept. The optional
 // --body grid reconstruction has the same argument in a stronger form: it
@@ -18,8 +18,8 @@
 //
 // WHAT IT CANNOT TELL YOU, and says so out loud. The v1 format records the
 // SHAPE and nothing else: no depth grid, no epoch, no body, no thermophysics,
-// no mesh identity, no coupling state. Those are BUGS.md PTM-STATE-GRID-BLIND
-// and PTM-STATE-NO-EPOCH. A PTMT v2 file closes them by carrying an identity
+// no mesh identity, no coupling state. Those are the unchecked checkpoint grid
+// and the unrecorded checkpoint epoch. A PTMT v2 file closes them by carrying an identity
 // trailer, which this tool prints in full and whose CRC32 it verifies over the
 // whole file. For a v1 file the questions are still unanswered, and this tool
 // prints them as unanswered rather than omitting them, because a report that is
@@ -207,7 +207,7 @@ Options parseArgs(int argc, char** argv) {
 // distinguish a real integrated column from a cold-start artifact:
 //   n_nonfinite  -- a NaN in a checkpoint poisons every face it restores into
 //   n_below_cmb  -- below 2.7 K is unphysical (thermal_model.h ABSOLUTE_ZERO_K)
-//   n_exact_zero -- the PTM-78 signature: an all-zero column banked because the
+//   n_exact_zero -- the post-equilibration hand-off signature: an all-zero column banked because the
 //                   single-phase branch never filled the post-eq hand-off
 // ---------------------------------------------------------------------------
 struct Stats {
@@ -703,7 +703,7 @@ int main(int argc, char** argv) {
 
             // The one cross-check this tool can make that nothing else does:
             // the grid the file RECORDS against the grid the given --body/--m/
-            // --n/--b would BUILD. A disagreement here is PTM-STATE-GRID-BLIND
+            // --n/--b would BUILD. A disagreement here is the unchecked checkpoint grid
             // caught in the act. Computed above the output branch so --json
             // gets it too; only the rendering lives here.
             if (tr_grid_checked && tr_grid_disagree) {
@@ -726,12 +726,12 @@ int main(int argc, char** argv) {
 
         // ---- what this file CANNOT answer ---------------------------------
         if (!have_tr) {
-            std::printf("\nNOT RECORDED BY THE v1 FORMAT (each one is an open ledger row):\n"
+            std::printf("\nNOT RECORDED BY THE v1 FORMAT (each one is a known gap of v1):\n"
                         "  depth grid z[]      no  -- a restore onto a different grid with the\n"
                         "                             same layer count is accepted in silence\n"
-                        "                             (PTM-STATE-GRID-BLIND)\n"
+                        "                             (unchecked depth grid)\n"
                         "  epoch / time        no  -- a wrong-epoch restore is undetectable\n"
-                        "                             (PTM-STATE-NO-EPOCH)\n"
+                        "                             (unrecorded epoch)\n"
                         "  body, properties    no      mesh identity      no\n"
                         "  post-coupling flag  no  -- whether this state is pre- or\n"
                         "                             post-radiation-coupling\n"

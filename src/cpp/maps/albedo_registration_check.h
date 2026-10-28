@@ -35,7 +35,7 @@ struct AlbedoRegistrationReport {
 /**
  * @brief Detect (and disclose) a longitude/latitude-misregistered albedo map.
  *
- * A per-face albedo map that has been rolled in longitude — the PTM-34 defect,
+ * A per-face albedo map that has been rolled in longitude — the albedo-map longitude-roll defect,
  * where the lunar Bond-albedo FITS was mislabeled by 180 degrees — still has the
  * correct VALUE DISTRIBUTION, so the mean albedo, the albedo range and the
  * effective absorbed albedo all look completely normal. Only the SPATIAL

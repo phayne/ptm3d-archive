@@ -89,7 +89,7 @@ namespace gpu {
 /// PTM_MAX_TIMESTEPS_PER_DISPATCH (honored ahead of everything here), or
 /// `--calibrate-gpu --safe-ceiling-s <s>` for the hand-run profile path.
 ///
-/// TODO(PTM-276): source this per-host from the machine profile / a probed
+/// TODO: source this per-host from the machine profile / a probed
 /// watchdog measurement rather than a compile-time constant.
 constexpr double kSafeDispatchCeilingSeconds = 2.0;
 

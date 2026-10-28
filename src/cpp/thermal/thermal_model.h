@@ -184,7 +184,7 @@ const double ABSOLUTE_ZERO_K = 2.7;      // Cosmic microwave background temperat
 // That is why a Mercury probe measured T_max = 577.05 K -- 77 K ABOVE the
 // clamp -- while the engine printed a warning saying the clamp would truncate
 // it: the run took the SIMD batch path, which never had the ceiling.
-// Diagnosed as BUGS.md ENG-CLAMP-PATH-INCONSISTENT; removing the ceiling is
+// Diagnosed as a one-path temperature clamp; removing the ceiling is
 // what makes the three paths agree, in the direction of no clamp at all.
 //
 // The T_geo FLOOR is a different object and STAYS. It is physics
@@ -375,7 +375,7 @@ bool solverEqFixEnabled();
 
 // Emit a warning if the surface-Newton step limiter's growth branch or the
 // iteration cap ever fired. Both are supposed to be unreachable; silence about
-// them is exactly the failure mode PTM-115/116 were.
+// them is exactly the failure mode of the GPU radiation-off frame collapse and the surface-Newton under-convergence.
 void reportSurfaceNewtonStats();
 
 // Record nodes the removed T_geo floor would have raised (PTM_SOLVER_EQFIX).
@@ -522,7 +522,7 @@ public:
     // built once in main and PASSED to every solver entry point, whereas every
     // solver entry point REBUILDS its own `thermal::Planet(body_name)` and so
     // discards anything the config put on the main-scope Planet. That is the
-    // exact mechanism of BUGS.md PTM-53, which made `ks_override`/`kd_override`
+    // exact mechanism of the built-in-body property override, which made `ks_override`/`kd_override`
     // silent no-ops on the Moon/Europa mesh+GPU path while still printing an
     // override banner. Putting the selector on Config sidesteps it by
     // construction; engagement is still proven by byte-difference, not assumed.
@@ -987,7 +987,7 @@ public:
     void surfFlux();
     void fastEquilibrate(int days, double target_time);
 
-    // Warm start (BUGS.md PTM-76). Replace this face's whole T(z) column with a
+    // Warm start. Replace this face's whole T(z) column with a
     // restored checkpoint column (thermal/thermal_state_io.h; float32 on disk,
     // widened exactly to the float64 the CPU solvers carry), then recompute k,
     // cp and kappa so the profile is left in the same self-consistent state the
@@ -1052,7 +1052,7 @@ constexpr int THERMAL_BATCH_SIZE = 8;     // 8 doubles = 512 bits (AVX-512)
 // thermal_kernels.cl -- but independent and NOT required to match it; the two
 // solvers are allowed different ceilings).
 //
-// Raised 128 -> 512 (BUGS.md PTM-SIGSEGV-450LAYER, 2026-08-15): a discrete
+// Raised 128 -> 512 (2026-08-15): a discrete
 // buried-ice-layer config (generic_body.surface.ice_depth + thermal_m: 150,
 // to resolve the regolith/ice interface) builds a 450-layer reference grid.
 // ThermalBatchSoA::copyGridFromProfile() copied the grid using the profile's

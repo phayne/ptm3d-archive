@@ -143,7 +143,7 @@ void write_cycle_csv(const std::string& path, const CycleRecorder& rec)
 // and are NOT gated: they exist to show the dt scaling, and 24 steps/day is
 // knowingly far outside the target.
 //
-// RE-BLESS, 2026-08-06 (PTM-116 scalar surface-Newton seed fix). The gate value
+// RE-BLESS, 2026-08-06 (scalar surface-Newton seed fix). The gate value
 // MOVED relative to the pre-fix binary -- 0.677 K at latitude 0 -> 0.987 K at
 // latitude 85 -- but it moved BACK ONTO the recorded documentation, which was
 // never updated: docs/thermal-model.md L204, docs/equilibration-paper.md L193
@@ -152,14 +152,14 @@ void write_cycle_csv(const std::string& path, const CycleRecorder& rec)
 // at N=768. Post-fix this program prints 0.987 / 2.168 / 11.931 / 0.207 at
 // latitude 85 -- all four match. Pre-fix it printed 0.442 / 1.111 / 13.097 /
 // 0.125 and put the worst latitude at 0 deg, matching none of them. So no
-// expected value here or in docs/ needed updating: PTM-116 was a regression
+// expected value here or in docs/ needed updating: the scalar surface-Newton under-convergence was a regression
 // away from the documented behavior, and the fix restores it.
 //
-// Root cause of the movement, measured (probe in
-// ~/projects/ptm116_2026-08-06/probe_eqdt_arms.cpp): exactly ONE step per
+// Root cause of the movement, measured (with a standalone probe of the
+// solver arms): exactly ONE step per
 // simulated day. At every candidate cadence N (all divisible by 4) the step at
 // day_fraction 0.75 has hour_angle = 2.5*pi, where cos() returns ~3e-16 instead
-// of 0, i.e. a "sunlit" step with Qs ~ 1e-13 W/m^2 -- squarely inside PTM-116's
+// of 0, i.e. a "sunlit" step with Qs ~ 1e-13 W/m^2 -- squarely inside the scalar surface-Newton
 // collapse band. Pre-fix that single step returned a surface T up to 140 K
 // below the true root, cold-biasing the coarse-dt arms and partly canceling
 // their large-dt warm bias. The Fourier reference arm (4979 steps/day, NOT
@@ -167,14 +167,14 @@ void write_cycle_csv(const std::string& path, const CycleRecorder& rec)
 // Zeroing fluxes below 1e-6 W/m^2 makes pre-fix and post-fix agree to <=1e-4 K
 // at every cadence -- the whole delta is that one step. Do NOT "fix" the
 // forcing: tiny-but-positive surface fluxes are real (Jupiter-shine on Europa,
-// PTM-44 fractional-disk visibility), and this step is the canary.
+// fractional-disk visibility), and this step is the canary.
 //
 // ATTENTION, not resolved here: the docs quoted above also claim the error
 // scales as dt^2 (second-order Crank-Nicolson). The recorded numbers themselves
 // contradict that -- 0.21 K at N=768 to 0.99 K at N=192 is a factor 4.7 for a
 // factor 4 in dt, i.e. order ~1.1, and the post-fix series measured here
 // (0.207 / 0.456 / 0.987 / 2.168 / 4.961 / 11.931 at latitude 85) is a clean
-// first-order power law. That discrepancy pre-dates PTM-116 and is a claim in
+// first-order power law. That discrepancy pre-dates the scalar surface-Newton under-convergence and is a claim in
 // two manuscripts; it is flagged, not edited.
 //
 // The 1 K tolerance below is deliberately NOT widened. At latitude 85 the

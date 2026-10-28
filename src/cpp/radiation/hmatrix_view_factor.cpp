@@ -839,7 +839,7 @@ void HMatrixViewFactor::build(const std::shared_ptr<ptm::Mesh>& mesh,
         // Show the tolerance in default float notation so an inherited
         // std::fixed / low-precision stream state (from an upstream caller) cannot
         // truncate it to a misleading "0.0". Display-only; the value is honored
-        // regardless (BUGS.md PTM-09). Save/restore leaves cout unchanged.
+        // regardless. Save/restore leaves cout unchanged.
         const std::ios::fmtflags saved_fmt = std::cout.flags();
         const std::streamsize saved_prec = std::cout.precision();
         std::cout.unsetf(std::ios::floatfield);

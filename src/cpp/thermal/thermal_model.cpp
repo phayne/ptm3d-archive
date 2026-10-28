@@ -892,8 +892,8 @@ void Profile::init_T(const Planet& planet, double /*lat -- see above*/,
     // INITIAL CONDITION is not a solution bound -- a correct solver forgets it
     // within a spin-up. Removing it would silently change what "legacy" means.
     // What was not acceptable was leaving it SILENT, so it now says when it
-    // binds. Zero shipped configs select the legacy seed. BUGS.md
-    // ENG-LEGACY-SEED-CAPS.
+    // binds. Zero shipped configs select the
+    // legacy seed.
     double delta_T_geo = std::min(gradient * depth, 50.0);  // Max 50K geothermal increase
     if (gradient * depth > 50.0) {
         static std::atomic<bool> announced{false};
@@ -1671,7 +1671,7 @@ void reportSurfaceNewtonStats() {
     // Printed through a LOCAL stream. std::cout arrives here carrying
     // `std::fixed << std::setprecision(1)` from an earlier banner, which
     // renders a 3e-13 K residual as "0.0" -- a run reporting a number that is
-    // not the number it measured, i.e. the PTM-05/PTM-55 archetype.
+    // not the number it measured, i.e. the unwatched side-channel archetype.
     if (ns > 0) {
         std::ostringstream o;
         o << "[Thermal] surface-BC certificate: max achieved "
@@ -1805,7 +1805,7 @@ double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double
     // above as well, since the 500 K ceiling was removed 2026-08-26
     // (thermal_model.h). Until then the two helpers deliberately mirrored
     // DIFFERENT bounds because the paths they report for had different bounds;
-    // that divergence is what ENG-CLAMP-PATH-INCONSISTENT recorded, and it is
+    // that divergence is what the clamp-path audit recorded, and it is
     // gone. This path refuses to run under PTM_SOLVER_EQFIX, so there is no
     // floor-release branch here.
     const double qb = batch.Qb[f];
@@ -2530,7 +2530,7 @@ std::vector<double> generateAdaptiveGrid(const Planet& planet, const Config& con
     return z;
 }
 
-// Warm start (BUGS.md PTM-76). See the declaration in thermal_model.h.
+// Warm start. See the declaration in thermal_model.h.
 bool Model::restoreState(const float* T_column, int n) {
     if (!T_column || n <= 0 || n != N_z ||
         static_cast<int>(profile.T().size()) != n) {
@@ -2721,7 +2721,7 @@ void Model::run() {
         // equilibration step that is never exported, and the exported index 0
         // is a row below -- which does get the corrected surface.
         //
-        // A WARM START IS THE EXCEPTION (BUGS.md PTM-662). A restored
+        // A WARM START IS THE EXCEPTION. A restored
         // checkpoint is the column the previous chunk integrated to exactly
         // this epoch, and that chunk -- like a single-shot run passing through
         // the same epoch -- reported this frame with the surface re-solved at
@@ -2742,7 +2742,7 @@ void Model::run() {
         // initial condition by 0.4*dt of integration at Qs(t_0), which the
         // solver then forgets.
         //
-        // Skipped on a warm start (BUGS.md PTM-662). There the perturbation is
+        // Skipped on a warm start. There the perturbation is
         // not forgotten on the timescale of a chunk: a continuous run passes
         // through the seam epoch without it, so applying it to a restored
         // column made every frame of the next chunk differ from the unchunked
@@ -3115,7 +3115,7 @@ double Model::interpolateFlux(double time) {
 // =============================================================================
 
 void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, const Config& config) {
-    // BUGS.md PTM-SIGSEGV-450LAYER: this used to silently clamp to
+    // this used to silently clamp to
     // MAX_THERMAL_LAYERS, which looked protective but did nothing --
     // copyGridFromProfile() (always called right after, see
     // runThermalModelsForAllFacesBatchSoA) overwrote n_layers again with the
@@ -3180,7 +3180,7 @@ void ThermalBatchSoA::initialize(int layers, int faces, const Planet& planet, co
 
 void ThermalBatchSoA::copyGridFromProfile(const Profile& ref_profile,
                                           const double* H_per_face) {
-    // BUGS.md PTM-SIGSEGV-450LAYER: the actual overflow site. This used to
+    // the actual overflow site. This used to
     // assign ref_profile.nlayers straight into n_layers with NO bound check,
     // then loop z/dz/g1/g2 and (below) the per-face kc/rho/T arrays out to
     // that unclamped count -- a discrete buried-ice-layer grid (thermal_m:
@@ -3315,7 +3315,7 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     // So the refusal stays, for one reason and stated as that one reason: a
     // run that sets PTM_SOLVER_EQFIX and gets the floor anyway would be a
     // silent substitution, which is the failure mode the gate exists to
-    // prevent. Refuse rather than accept-and-ignore. BUGS.md PTM-216.
+    // prevent. Refuse rather than accept-and-ignore.
     static const bool refuse = solverEqFixEnabled();
     if (refuse) {
         std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX asks for the T_geo floor "
@@ -3349,7 +3349,7 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     //
     // NOT touched by PTM_SOLVER_EQFIX: this path REFUSES to run under the gate
     // (see advanceTimestep) rather than accept the flag and keep the floor
-    // anyway. BUGS.md PTM-216.
+    // anyway.
     for (int f = 0; f < n_faces; ++f) {
         const double qb = Qb[f];
         if (qb <= 0.0) continue;
@@ -3365,7 +3365,7 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
 // Initialize batch grid from z-grid vector
 void initializeBatchGrid(ThermalBatchSoA& batch, const std::vector<double>& z_grid,
                          const Planet& planet) {
-    // BUGS.md PTM-SIGSEGV-450LAYER: this free function has no caller in the
+    // this free function has no caller in the
     // current tree (found while auditing every MAX_THERMAL_LAYERS silent
     // std::min alongside ThermalBatchSoA::initialize()'s, which DID have live
     // callers and DID contribute to the overflow there), but a silent

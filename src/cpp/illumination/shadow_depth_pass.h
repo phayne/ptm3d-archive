@@ -14,7 +14,7 @@
 //     one. The quantity is the greatest h at which the visible solar fraction
 //     is exactly zero; one height step above it a sliver of limb is showing.
 //     The Sun is a finite disk of angular radius ~0.2666 deg at 1 AU, so this
-//     is NOT a single ray to the disk center -- PTM-38 removed exactly that
+//     is NOT a single ray to the disk center -- the penumbral eclipse removed exactly that
 //     test from the engine's direct-solar path because it "broke the penumbra
 //     at both ends". The disk test here is the engine's own ladder, called
 //     through illumination/solar_disk_visibility.h, which the flux-cube pass
@@ -106,7 +106,7 @@ struct PassInputs {
 
     // --- time axis --------------------------------------------------------
     // MUST be the same (times, time_strings) pair handed to writeTimeStepsFile.
-    // Re-deriving the grid from start_time + i*dt is the PTM-250/251 defect.
+    // Re-deriving the grid from start_time + i*dt is the output-epoch drift defect.
     const std::vector<double>* times = nullptr;
     const std::vector<std::string>* time_strings = nullptr;
     int equilibration_steps = 0;
@@ -166,7 +166,7 @@ struct PassInputs {
 
     // --- output ------------------------------------------------------------
     std::string output_dir;         // run directory
-    bool write_frames = true;       // shadow_depth/shadow_depth_<index>.bin (>= 6 digits, PTM-664)
+    bool write_frames = true;       // shadow_depth/shadow_depth_<index>.bin (>= 6 digits)
     bool write_raw_stats = false;   // statistics/_raw side files for chunk merge
     std::string provenance_json;    // engine sha / md5 / config, echoed verbatim
     // Monotonicity audit: how many faces and epochs to re-scan above the first

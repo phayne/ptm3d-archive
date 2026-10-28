@@ -2843,7 +2843,7 @@ void BallisticTransport::computeTransportProduct(
     // The persistent index keeps the query radius of its FIRST build. A later
     // call with hotter sources would have its kernel silently truncated at that
     // radius. Opt-in callers get a call-local index instead; everyone else is
-    // warned (PTM-643; the sublimation path's behavior is unchanged here).
+    // warned (the sublimation path's behavior is unchanged here).
     const SphericalSpatialIndex* index = &spatial_index_;
     SphericalSpatialIndex local_index;
     if (theta_max_global > spatial_index_query_radius_ * (1.0 + 1e-12)) {
@@ -3072,7 +3072,7 @@ void BallisticTransport::computeTransportProduct(
             totals->jeans_escaped = jeans_escaped_total;
             totals->unscattered = unscattered_total;
         }
-        return;  // raw sums only (PTM-657); no log line (called many times)
+        return;  // raw sums only; no log line (called many times)
     }
 
     // Pre-correction mass conservation
@@ -3200,7 +3200,7 @@ double BallisticTransport::finalizeTransport(const std::vector<double>& face_are
                                              const std::vector<double>& raw,
                                              const std::vector<double>& calibration,
                                              std::vector<double>& deposition) {
-    // Must match the correction in computeTransportProduct exactly (PTM-657).
+    // Must match the correction in computeTransportProduct exactly.
     if (spatialSmoothingRadiusRad() > 0.0) {
         throw std::invalid_argument("finalizeTransport: the face-local refresh does not support "
                                     "EXO_DEP_SMOOTH_DEG spatial smoothing");
@@ -3246,7 +3246,7 @@ void ExosphereModel::computeTransportProduct(
 }
 
 // ---------------------------------------------------------------------------
-// PTM-671: fixed-temperature transport operator (see exosphere_physics.h).
+// fixed-temperature transport operator (see exosphere_physics.h).
 // The kernel, self-cap and escape formulas below are copies of the ones in
 // BallisticTransport::computeTransportProduct, kept separate on purpose: that
 // function is the legacy (--no-sputter-operator-cache) path and must keep its

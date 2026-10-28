@@ -17,13 +17,13 @@
 //  (f) updateWith(): same trigger, face selection and baseline bookkeeping as
 //      update(); a face whose apply() refuses keeps its baseline and counts as
 //      singular.
-//  (g) PTM-675 trust region at large r: at r = 0.4 (brightening), 2 and 3 the law
+//  (g) diurnal-law trust region at large r: at r = 0.4 (brightening), 2 and 3 the law
 //      re-anchored by solveDiurnalAnchor at the WORST point of the trust region
 //      (|ln(r / r_a)| = 0.35) matches the independent reference, where the law
 //      anchored at r = 1 does not.
 //  (h) solveDiurnalAnchor at r = 1 returns the thermal run's own curve.
 //  (i) IceLayerModel::boxCompositionOf == updateBoxComposition.
-//  (j) PTM-676 garden subcycling: a frost-free face whose box ice turns over within
+//  (j) garden-step subcycling: a frost-free face whose box ice turns over within
 //      an epoch (the HIGH ph2 faces 66352 / 47295 at 850 kyr) reaches the SAME state
 //      with 1-, 3- and 9-epoch steps when subcycled, and a step-dependent one without.
 
@@ -321,7 +321,7 @@ int main() {
             std::snprintf(nm, sizeof nm, "r=%.1f: anchor solve converged (%d Newton iterations)", r, ai.iterations);
             check(okA && ai.iterations <= 6, nm, ai.iterations, 6);
             // 0.1 K: half the production gate (peak-T p95 <= 0.2 K). Set after measuring
-            // (the a-priori 0.05 K was not met at r = 0.4: 0.07 K); disclosed in PTM-675.
+            // (the a-priori 0.05 K was not met at r = 0.4: 0.07 K); disclosed with the trust region.
             std::snprintf(nm, sizeof nm, "r=%.1f: trust-region law (worst point) max|T - T_resolve|", r);
             check(e_tr < 0.1, nm, e_tr, 0.1);
             std::snprintf(nm, sizeof nm, "r=%.1f: the r_a = 1 law fails the same limit (discriminates)", r);

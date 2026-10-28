@@ -20,7 +20,7 @@
 // formulas all give the right answer. So:
 //
 //   * Every face gets a DISTINCT emissivity, a DISTINCT Bond albedo and a
-//     DISTINCT PTM-106 source albedo, with A_src != A_bond everywhere. Swapping
+//     DISTINCT two-band source albedo, with A_src != A_bond everywhere. Swapping
 //     the two albedos, or dropping the (1-eps)/eps weighting, then moves the
 //     answer far outside 1e-12.
 //   * Arm B runs an enclosure with Sigma_j F_ij = 1.5 > 1, so vf_row_norm_ is
@@ -126,7 +126,7 @@ ArmResult runArm(const char* label, int N, double s, bool shadow_face0) {
     solver.setConfig(cfg);
     solver.setSolarAlbedo(bond);              // OPERATOR (diffuse) reflectance
     solver.enableTwoBand();                   // band separation, config route
-    solver.setSolarSourceAlbedo(a_src);       // PTM-106 SOURCE albedo
+    solver.setSolarSourceAlbedo(a_src);       // two-band SOURCE albedo
     solver.setRetainRadiosityB(true);         // stage-0 hook, default off
 
     solver.solve(T, solar);

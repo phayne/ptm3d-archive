@@ -8,7 +8,7 @@
  * (view_factor.cpp), the in-engine H-matrix builder, and an OFFLINE Monte-Carlo
  * referee pipeline (scripts/ptm12_diag/mc_ref_pp.cpp + assemble_vf_haworth.py)
  * -- and until now nothing compared their answers. Each was gated against
- * closed forms in isolation, which is necessary and not sufficient: FC-08 was a
+ * closed forms in isolation, which is necessary and not sufficient: the view-factor divisor defect was a
  * factor-of-two inflation in the offline assembler that every in-isolation
  * invariant passed, and the 2026-08-23 near-field bias was a -21.7 percent
  * error on touching pairs in the in-engine builder that the offline pipeline

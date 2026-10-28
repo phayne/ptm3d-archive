@@ -28,12 +28,12 @@
 //   * It will not read the dead `thermophysical:` scalars out of a config.
 //     On a built-in body `ks`, `kd`, `H`, `rhos`, `rhod`, `cp0`, `Qb`, `chi`,
 //     `albedo` and `emissivity` under that block are read by NOTHING
-//     (BUGS.md PTM-67) -- the run used the compiled body defaults regardless
+//     -- the run used the compiled body defaults regardless
 //     of what the file says. Honoring them here would reconstruct a column the
 //     engine never integrated. --config lists them and ignores them, out loud.
 //   * It will not take Qb from the config either. `geothermal_heat_flow` was
-//     inert on every solver entry point for the whole moon3d campaign
-//     (PTM-161), so Qb is read out of the STATE's own bottom boundary
+//     inert on every solver entry point for the whole moon3d campaign,
+// so Qb is read out of the STATE's own bottom boundary
 //     condition and the configured value is printed beside it for comparison.
 //
 // USAGE

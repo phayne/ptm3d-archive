@@ -129,7 +129,7 @@ std::vector<float> PTMOutputReader::readBinaryFile(const std::string& filepath) 
 }
 
 std::string PTMOutputReader::buildFilename(const std::string& field, int step_index) const {
-    // Either naming generation (BUGS.md PTM-664): >= 6-digit indices from
+    // Either naming generation: >= 6-digit indices from
     // current engines, 4-digit from runs written before. When neither exists
     // the current-rule name is returned so the caller's "cannot open" message
     // names a real candidate.

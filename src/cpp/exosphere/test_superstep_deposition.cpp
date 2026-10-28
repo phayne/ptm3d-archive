@@ -1,4 +1,4 @@
-// Unit tests for the multiscale super-step deposition (PTM-644). Self-contained;
+// Unit tests for the multiscale super-step deposition. Self-contained;
 // exit code 0 = all checks pass.
 //
 // A super-step holds deposition fixed while each face's emission follows its ice
@@ -492,7 +492,7 @@ static void test_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// (9) PTM-640: with albedo coupling, a super-step ends when a face's albedo would
+// (9) with albedo coupling, a super-step ends when a face's albedo would
 // pass the refresh threshold, so the refresh is never late by more than one epoch's
 // drift, and the answer no longer depends on the super-step size.
 static double kLimiterDT = -22.0;  // cooler body: one epoch moves the albedo by << threshold
@@ -548,7 +548,7 @@ static LimRun runLimiter(bool limit, int cap, int epochs, int local_mode = 0, do
 }
 
 static void test_albedo_step_limiter() {
-    std::printf("\n(9) albedo step limiter (PTM-640): refresh never late, step-size independent\n");
+    std::printf("\n(9) albedo step limiter: refresh never late, step-size independent\n");
     const int E = 3000;
     const double thr = exo::CompositionAlbedoConfig().albedo_update_threshold;
     LimRun on0 = runLimiter(true, 0, E), on1 = runLimiter(true, 100, E), on2 = runLimiter(true, 25, E);
@@ -569,11 +569,11 @@ static void test_albedo_step_limiter() {
           std::abs(on0.sub / on2.sub - 1.0), 0.01);
 }
 
-// (10) PTM-657: the transport is linear per source up to the row-bias correction
+// (10) the transport is linear per source up to the row-bias correction
 // and mass fix, so masked raw updates reproduce a full call; and the face-local
 // refresh reproduces the global refresh (exactly at tolerance 0).
 static void test_local_refresh() {
-    std::printf("\n(10) face-local refresh (PTM-657)\n");
+    std::printf("\n(10) face-local refresh\n");
     const double R = exo::constants::EUROPA_RADIUS;
     const ptm::Mesh m = make_icosphere(3, R);
     const size_t n = m.faces.size();

@@ -50,7 +50,7 @@ __kernel void spmv_kernel(
 }
 
 /**
- * Chunked SpMV (PTM-25 workaround for the 2^31-byte single-buffer wall).
+ * Chunked SpMV (workaround for the 2^31-byte single-buffer wall).
  *
  * Identical math to spmv_kernel, but operates on ONE row-chunk whose values /
  * col_indices buffers each stay below 2^31 bytes, so the int j byte offset
@@ -83,7 +83,7 @@ __kernel void spmv_chunk_kernel(
 }
 
 /**
- * Chunked CSR-Vector SpMV: PTM-25 chunking + wavefront-per-row coalescing.
+ * Chunked CSR-Vector SpMV: 2^31-wall chunking + wavefront-per-row coalescing.
  * ~5x the scalar chunked kernel's bandwidth. Bit-identical per row to
  * spmv_vector_kernel (same stride + tree reduction).
  */

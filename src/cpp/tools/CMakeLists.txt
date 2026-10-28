@@ -267,8 +267,8 @@ set_target_properties(test_conductivity_model
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Primary-body finite-disk geometry gate (PTM-41 Lambert-sphere photometry,
-# PTM-44 fractional visibility). Header-only under test -- same reasoning as
+# Primary-body finite-disk geometry gate (Lambert-sphere photometry,
+# fractional visibility). Header-only under test -- same reasoning as
 # test_conductivity_model above: no library to go stale underneath it.
 add_executable(test_primary_disk test_primary_disk.cpp)
 set_target_properties(test_primary_disk
@@ -313,7 +313,7 @@ set_target_properties(test_equilibration_dt
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Scalar surface-Newton convergence gate (PTM-116). Links `thermal` so it
+# Scalar surface-Newton convergence gate. Links `thermal` so it
 # measures the SHIPPING surfTemp against a float64 bisection root -- a stale
 # libthermal would be caught by the emulation-fidelity self-check inside.
 add_executable(test_surface_newton test_surface_newton.cpp)
@@ -355,7 +355,7 @@ set_target_properties(test_eq_anchor
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Thermal-state checkpoint gate (BUGS.md PTM-76). Pins the 'PTMT' format, the
+# Thermal-state checkpoint gate. Pins the 'PTMT' format, the
 # bit-identical round trip, the single float32 rounding at the write, and the
 # refusal on every malformed or mismatched input. No GPU required.
 add_executable(test_state_io test_state_io.cpp)
@@ -369,7 +369,7 @@ set_target_properties(test_state_io
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Per-step frame file names (BUGS.md PTM-664): the >= 6-digit width rule, sort
+# Per-step frame file names: the >= 6-digit width rule, sort
 # order within a run, and reader resolution of both naming generations.
 # Header-only; links nothing.
 add_executable(test_frame_naming test_frame_naming.cpp)
@@ -380,7 +380,7 @@ set_target_properties(test_frame_naming
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Epoch strings for generic_body.orbit.epoch / spin.epoch (BUGS.md PTM-663):
+# Epoch strings for generic_body.orbit.epoch / spin.epoch:
 # TDB reading, the exact-J2000 spelling, and refusal of every other scale or
 # malformed date. Header-only; links nothing.
 add_executable(test_epoch_parse test_epoch_parse.cpp)

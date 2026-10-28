@@ -104,13 +104,13 @@ private:
     const HMatrixViewFactor& H_;
 };
 
-// PTM-12 row-sum correction wrapper. Wraps any base VF operator and applies the
+// View-factor row-sum overshoot row-sum correction wrapper. Wraps any base VF operator and applies the
 // symmetric diagonal congruence y = D * (F * (D * x)), D = diag(d_i), where d_i is
 // chosen (Sinkhorn, at construction) so the corrected row sums Sum_j (d_i F_ij d_j)
 // match an occlusion-aware referee's true row sums. The symmetric congruence PRESERVES
 // reciprocity (A_i F_ij d_i d_j == A_j F_ji d_j d_i because the stored F is reciprocal)
 // and restores F_sky = 1 - Sum_j F_ij > 0, curing BOTH the near-field M1 over-weight
-// (PTM-12) and the Sum F > 1 renorm runaway. Installed ONLY when env PTM_HMATRIX_ROWFIX
+// and the Sum F > 1 renorm runaway. Installed ONLY when env PTM_HMATRIX_ROWFIX
 // is set; default OFF => this wrapper never exists => byte-identical legacy behavior.
 class CorrectedRowFixOperator : public IViewFactorOperator {
 public:
@@ -137,7 +137,7 @@ private:
     mutable std::vector<double> xs_;
 };
 
-// PTM-12 per-partner corrected VF (full replacement). A SYMMETRIC sparse (CSR) view-factor
+// View-factor row-sum overshoot per-partner corrected VF (full replacement). A SYMMETRIC sparse (CSR) view-factor
 // matrix built from the occlusion-exact referee (raw-winding hemisphere MC, per-partner F),
 // symmetrized for EXACT reciprocity (A_i F_ij = A_j F_ji by construction) and capped to
 // ΣF <= 1. REPLACES the stored H-matrix operator, fixing BOTH the near-field over-count
@@ -334,7 +334,7 @@ public:
     // TICKET-two-band-radiosity-production.md and docs/two-band-radiosity-derivation.tex.
     void setSolarAlbedo(const std::vector<double>& solar_albedo);
 
-    // PTM-106: per-face DIRECT-BEAM source albedo A_src,i for the visible band.
+    // per-face DIRECT-BEAM source albedo A_src,i for the visible band.
     //
     // The visible band has TWO distinct reflectances and they are not the same
     // physical quantity:
@@ -350,7 +350,7 @@ public:
     //                      value (solar_reflectivity_, set by setSolarAlbedo) is the
     //                      correct reflectance here and is left UNCHANGED.
     //
-    // Before PTM-106 the source used (2) -- the static base albedo -- so at grazing
+    // Before the two-band source-albedo fix the source used (2) -- the static base albedo -- so at grazing
     // incidence a Hayne body scattered with 0.12 while its BC absorbed with ~0.60:
     // (A(theta) - A0) Q of reflected sunlight vanished from the budget instead of
     // reaching the shadowed floors. Call this per timestep with the SAME albedo the
@@ -407,7 +407,7 @@ public:
 
     // Get convergence information from last solve
     int getLastIterations() const { return last_iterations_; }
-    // Per-band sweep counts from the last two-band solve (Fermi's measurement).
+    // Per-band sweep counts from the last two-band solve.
     int getLastIterationsIR() const { return last_iterations_ir_; }
     int getLastIterationsVis() const { return last_iterations_vis_; }
     // CSR traversals (matvecs) the last solve actually dispatched. This is the
@@ -463,7 +463,7 @@ public:
     // used to call ViewFactorCalculator::computeSubset() unconditionally, so on a
     // VF_REPLACE run the base radiosity solved the referee matrix while the Smith
     // beamed-emission delta was computed from a DIFFERENT, in-engine matrix. Two
-    // matrices in one physical answer is the FC-08 / VF-unification-stage-2 error
+    // matrices in one physical answer is the view-factor divisor defect / VF-unification-stage-2 error
     // class; the beam pass now reads these instead.
     bool vfReplaceActive() const { return vf_replace_cpu_route_; }
     const std::string& vfReplacePath() const { return vf_replace_path_; }
@@ -577,11 +577,11 @@ private:
     // In two-band mode this same per-face value is the visible Bond albedo A for the
     // whole visible channel (scatter A, absorb 1-A), not just the first-bounce source.
     std::vector<double> solar_reflectivity_;
-    // PTM-106: per-face DIRECT-BEAM source albedo A_src (see setSolarSourceAlbedo).
+    // per-face DIRECT-BEAM source albedo A_src (see setSolarSourceAlbedo).
     // Empty => the source falls back to solar_reflectivity_ (legacy, byte-identical).
     std::vector<double> solar_albedo_source_;
     std::vector<std::vector<double>> solar_albedo_source_batch_;
-    // PTM-106 GPU representability guard. The GPU kernel hard-wires
+    // Two-band source-albedo GPU representability guard. The GPU kernel hard-wires
     //   solar_source[i] = reflectivity[i] * solar_flux[i],
     // so a source albedo different from the operator albedo is expressed by
     // pre-scaling the uploaded flux by A_src/A_op. That factor is undefined where
@@ -776,7 +776,7 @@ struct BeamEmitStep {
 
 // Main radiation exchange manager
 // Coordinates view factor computation, radiosity solving, and thermal integration
-// PTM-733: refuse a PTM_HMATRIX_VF_REPLACE CSR traced on a different side of the surface than
+// refuse a PTM_HMATRIX_VF_REPLACE CSR traced on a different side of the surface than
 // the one this run illuminates. No-op (returns immediately) when PTM_HMATRIX_VF_REPLACE is unset.
 // illum_batch_path: true = calculateIlluminationFromMesh (radial_per_face, or winding_majority
 // under PTM_ILLUM_TRUE_NORMALS=1); false = the legacy --no-batch calculateIllumination, which
@@ -860,7 +860,7 @@ public:
     // mesh face count.
     void setSolarAlbedo(const std::vector<double>& solar_albedo);
 
-    // PTM-106: per-face DIRECT-BEAM source albedo for the visible band, forwarded to
+    // per-face DIRECT-BEAM source albedo for the visible band, forwarded to
     // the solver. Call per timestep with the SAME effective albedo A(theta) the
     // surface BC absorbed with; the enclosure then receives exactly the A(theta) Q
     // the BC did not absorb. Not stored across prepare() -- the solver must exist.
@@ -978,7 +978,7 @@ private:
     FaceClassification classification_;
     bool is_active_ = false;
 
-    // PTM-98: true when every face keeps the flux the radiosity solve computed
+    // true when every face keeps the flux the radiosity solve computed
     // for it, i.e. the post-solve copy mask is the identity. Then the write-back
     // is a whole-vector move instead of a scatter, and no face can be left
     // holding a stale or zero value that the solver actually filled in.
@@ -986,10 +986,10 @@ private:
         return classification_.exchange_faces == classification_.total_faces;
     }
 
-    // PTM-98: copy one solver result (indexed by GLOBAL face id, length >= dst)
+    // copy one solver result (indexed by GLOBAL face id, length >= dst)
     // into a destination already sized and zero-filled. Total when every face
     // participates; otherwise only the classified subset survives, which is the
-    // pre-PTM-98 behavior kept for reproduction. Single definition so the total
+    // pre-fix behavior kept for reproduction. Single definition so the total
     // and per-band write-backs cannot drift apart.
     void writeBackFlux(const std::vector<double>& src,
                        std::vector<double>& dst) const {
@@ -1016,7 +1016,7 @@ private:
 
     // Receivers for the Smith (1967) beamed-emission pass: the shadowed-floor
     // faces. Kept separate from classification_.exchange_face_indices, which is
-    // all faces by default since PTM-98. Built in buildBeamPairs().
+    // all faces by default since the window-independent exchange-selection fix. Built in buildBeamPairs().
     std::vector<int> beam_receivers_;
 
     // Face properties

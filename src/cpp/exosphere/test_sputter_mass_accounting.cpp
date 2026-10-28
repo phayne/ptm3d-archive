@@ -1,5 +1,5 @@
-// Unit tests for the sputter mass accounting (PTM-642) and the transport-kernel
-// options it relies on (PTM-643). Self-contained; exit code 0 = all checks pass.
+// Unit tests for the sputter mass accounting and the transport-kernel
+// options it relies on. Self-contained; exit code 0 = all checks pass.
 //
 //  (1) Stoichiometry: radiolytic O2 : H2 mass ratio = m_O2 / (2 m_H2) (7.94, 8:1
 //      nominal); product fractions and fate shares each sum to 1. The legacy split
@@ -131,7 +131,7 @@ static void test_stoichiometry() {
           "surface loss share = 1 - f_H2O (1 - e_H2O) (current set, at T_ref: 0.3119)",
           c.escapeShare() + c.reservoirShare(), 0.3119);
     {
-        exo::SputteringConfig lp;  // PTM-649 legacy parameter set (the pre-2026-09-23 defaults)
+        exo::SputteringConfig lp;  // legacy sputtering parameter set (the pre-2026-09-23 defaults)
         lp.legacy_params = true;
         lp.applyLegacyParams();
         check(std::abs(lp.escapeShare() + lp.reservoirShare() - (1.0 - 0.85 * 0.9)) < 1e-15,
@@ -144,7 +144,7 @@ static void test_stoichiometry() {
 
     exo::SputteringConfig L;
     L.legacy_escape_only = true;
-    L.applyLegacyParams();  // what the CLI does for --sputter-legacy-escape-only (PTM-649)
+    L.applyLegacyParams();  // what the CLI does for --sputter-legacy-escape-only
     check(L.o2Fraction() == 0.10 && L.h2Fraction() == 0.05, "legacy split is the old 0.10 / 0.05 (ratio 2)",
           L.o2Fraction() / L.h2Fraction(), 2.0);
     check(std::abs(L.escapeShare() - 0.2225) < 1e-15, "legacy escaping share = 22.25% of gross", L.escapeShare(), 0.2225);
@@ -275,7 +275,7 @@ static void test_kernel_bound_population() {
 // Two populations: sublimation on faces [0, n/2), sputtering on [n/2, n).
 // Deposition at cache time is a mass-conserving spread of each source.
 static void test_deposition_rescale() {
-    std::printf("\n(4) deposition rescale follows its own source (PTM-642 c)\n");
+    std::printf("\n(4) deposition rescale follows its own source (mass accounting, part c)\n");
     const size_t n = 200;
     std::vector<double> A(n, 1.0), avail0(n, 1.0), avail1(n, 1.0);
     std::vector<double> sub(n, 0.0), sput(n, 0.0);

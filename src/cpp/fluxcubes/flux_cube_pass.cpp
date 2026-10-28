@@ -145,7 +145,7 @@ void sampleDisk(const V3& origin_km, const V3& primary_pos_km, double radius_km,
 // The ladder used to live here. It now lives in
 // illumination/solar_disk_visibility.h, because the shadow-depth pass asks the
 // identical question from a point above the surface and two copies of it would
-// be the PTM-45(ii) drift class. This is a thin V3 adapter over that one
+// be the drift class of the primary/eclipse fallbacks. This is a thin V3 adapter over that one
 // spelling; `{0,0,0}` selects the historical disk basis, so the arithmetic is
 // unchanged.
 double solarDiskVisibility(const V3& o, const V3& s_hat, double alpha,
@@ -187,7 +187,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
     // ------------------------------------------------------------- cache key
     // Refuse on mismatch and print the exact regeneration command. NEVER
     // rebuild inline: a 7,542-row hemisphere sweep starting unannounced inside
-    // a production window is the kind of surprise that ends campaigns (PTM-19).
+    // a production window is the kind of surprise that ends campaigns.
     const double gh_tol = 1e-3 * std::fabs(in.geomhash_core) + 1e-9;
     if (c.h.n_faces_core != in.n_faces_core ||
         std::fabs(c.h.geomhash_core - in.geomhash_core) > gh_tol) {
@@ -468,7 +468,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                 std::array<V3, 5> pts = {xc, xc, xc, xc, xc};
                 int n_pt = 1;
                 if (in.shadow_probe_rays >= 5) {
-                    // Fermi's falsifying test (PTM_FLUXCUBE_PROBE_AXIS=U): the
+                    // the physics review's falsifying test (PTM_FLUXCUBE_PROBE_AXIS=U): the
                     // horizontal probe does NOT sample the cube's VERTICAL
                     // extent, and at grazing sun -- winter is entirely
                     // -4.3..+7.3 deg -- the unsampled +-edge/2 of HEIGHT maps to

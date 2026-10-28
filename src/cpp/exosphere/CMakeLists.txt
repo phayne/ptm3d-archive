@@ -527,7 +527,7 @@ if(OpenMP_CXX_FOUND)
     message(STATUS "  OpenMP lib: ${OpenMP_omp_LIBRARY}")
 endif()
 message(STATUS "")
-# Multiscale snapshot timing (PTM-636): snapshot L is the state after exactly L
+# Multiscale snapshot timing: snapshot L is the state after exactly L
 # epochs and time_steps.txt lists every snapshot (exit code 0 = pass).
 add_executable(test_multiscale_snapshot_time
     test_multiscale_snapshot_time.cpp
@@ -567,7 +567,7 @@ set_target_properties(test_multiscale_snapshot_time
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Sputter mass accounting (PTM-642) and transport-kernel options (PTM-643):
+# Sputter mass accounting and transport-kernel options:
 # stoichiometry, fate closure, deposition rescale, end-to-end audit (exit code 0 = pass).
 add_executable(test_sputter_mass_accounting
     test_sputter_mass_accounting.cpp
@@ -607,7 +607,7 @@ set_target_properties(test_sputter_mass_accounting
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# PTM-649 sputtering parameter set (derivations, tau(T), normalization, ion maps)
+# Sputtering parameter set (derivations, tau(T), normalization, ion maps)
 add_executable(test_sputter_parameters
     test_sputter_parameters.cpp
 )
@@ -646,7 +646,7 @@ set_target_properties(test_sputter_parameters
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# PTM-644 super-step deposition consistency (unit + ico3 end to end)
+# super-step deposition consistency (unit + ico3 end to end)
 add_executable(test_superstep_deposition
     test_superstep_deposition.cpp
 )
@@ -724,7 +724,7 @@ set_target_properties(test_lag_barrier
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Gardened lag + sputter split (PTM-669; Costello cross-check, Spencer, d*, mass)
+# Gardened lag + sputter split (Costello cross-check, Spencer, d*, mass)
 add_executable(test_lag_gardening
     test_lag_gardening.cpp
 )
@@ -763,7 +763,7 @@ set_target_properties(test_lag_gardening
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# Fixed-temperature sputter transport operator vs the direct kernel (PTM-671)
+# Fixed-temperature sputter transport operator vs the direct kernel
 add_executable(test_sputter_operator
     test_sputter_operator.cpp
 )

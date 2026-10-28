@@ -1,4 +1,4 @@
-// Unit tests for the gardened lag with the sputter split (PTM-669). Self-contained;
+// Unit tests for the gardened lag with the sputter split. Self-contained;
 // exit code 0 = all checks pass.
 //
 //  (1) Box depth vs scripts/jwst/gardening.py: Lambda_99(t)^2 = K99 t (Costello et al.
@@ -58,7 +58,7 @@ static void test_box_depth_vs_python() {
     }
     check(worst < 1e-12, "sqrt(K99 t) == gardening_depth(t, lam=4.605), Cases A and B, 1e2..1e6 yr", worst, 1e-12);
     check(std::abs(gc::K(gc::U_CASE_B) * YR / 3.84e-9 - 1.0) < 2e-3 && std::abs(gc::K(gc::U_CASE_A) * YR / 1.10e-9 - 1.0) < 3e-3,
-          "K99 = 3.84e-9 (B), 1.10e-9 (A) m^2/yr (Fermi's values, rounded)", gc::K(gc::U_CASE_B) * YR, 3.84e-9);
+          "K99 = 3.84e-9 (B), 1.10e-9 (A) m^2/yr (physics review values, rounded)", gc::K(gc::U_CASE_B) * YR, 3.84e-9);
     exo::LagBarrierConfig lc;
     lc.gardening = true;
     const double h = lc.gardenBoxDepth(1e5 * YR);
@@ -92,7 +92,7 @@ static void test_spencer() {
     const double em = dry.sub_int + dry.sputw_int + dry.sputr_int;
     check(std::abs((9.0 - dry.M_end + B * 1e12) / (em + 0.0) - 1.0) < 1e-9,
           "box runs dry mid-step: emitted = box ice + deposition (mass)", std::abs((9.0 - dry.M_end + B * 1e12) / em - 1.0), 1e-9);
-    // Gardening off: the same sub-critical face grows a lag (the PTM-659 behavior).
+    // Gardening off: the same sub-critical face grows a lag (the lag-barrier behavior).
     const auto nog = exo::solveGardenFaceStep(0.5 * Js_c, Jw, Jr, B, 0.0, 0.0, M, f, beta, ell, 0.0, 0.0, 1e12);
     check(nog.d_end > 0.0, "v_m = 0: every net source grows a lag", nog.d_end, 0.0);
 }
@@ -169,7 +169,7 @@ static void test_veneer() {
 }
 
 static void test_regression_vs_lag() {
-    std::printf("\n(5) v_m = 0, no shield: garden step == PTM-659 lag step\n");
+    std::printf("\n(5) v_m = 0, no shield: garden step == lag-barrier step\n");
     double worst = 0.0;
     const double ell = 5e-6;
     struct Case { double Js, Jp, B, d0, mf0, M, f, c, T; };
@@ -275,7 +275,7 @@ static void test_global_mass() {
             ++iters;
         }
     } catch (const std::exception& x) { err = x.what(); }
-    check(err.empty(), "30 kyr in " + std::to_string(iters) + " steps; every step passes the PTM-644 audit" +
+    check(err.empty(), "30 kyr in " + std::to_string(iters) + " steps; every step passes the super-step deposition audit" +
                        (err.empty() ? "" : ": " + err));
     const auto& st = s.mte->getStatistics();
     const double net = st.total_sublimated_mass + st.total_sputtered_mass - st.total_deposited_mass;

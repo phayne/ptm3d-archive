@@ -1,4 +1,4 @@
-// PTM-671: the fixed-temperature transport operator (built once, reused) against
+// the fixed-temperature transport operator (built once, reused) against
 // the direct per-call kernel of BallisticTransport::computeTransportProduct.
 //
 //   (1) the kernel table's interpolation error is small;

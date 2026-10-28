@@ -1,4 +1,4 @@
-// test_epoch_parse -- generic_body epoch strings (BUGS.md PTM-663).
+// test_epoch_parse -- generic_body epoch strings.
 //
 // Pins the rule orbital/epoch_parse.h documents: every accepted form is read on
 // the TDB scale, the J2000 spelling every shipped config carries resolves to

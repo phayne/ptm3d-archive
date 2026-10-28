@@ -91,7 +91,7 @@
 #endif
 
 // Before writing a per-step product, drop frames of the OTHER index width that
-// a previous run left in the same directory (BUGS.md PTM-664; see
+// a previous run left in the same directory (see
 // ptm::removeOtherWidthFrames). Said out loud when it removes anything.
 static void clearOtherWidthFrames(const std::string& output_dir,
                                   std::initializer_list<const char*> fields,
@@ -451,7 +451,7 @@ namespace {
 }
 
 // ---------------------------------------------------------------------------
-// PTM-09 class: format a small dimensionless number (an albedo, a Hayne
+// Banner-precision class: format a small dimensionless number (an albedo, a Hayne
 // coefficient) through a LOCAL stream.
 //
 // std::cout arrives at the albedo banners already carrying
@@ -461,7 +461,7 @@ namespace {
 // coefficients a = 0.06 and b = 0.25 print as "0.1" and "0.2" -- three distinct
 // numbers rendered as two, and a run reporting values it did not use. That cost
 // a runner a bug chase on 2026-08-17 (it reads exactly like a hard-coded 0.1
-// albedo). Same archetype as PTM-05/PTM-55 and the conductivity-model banner at
+// albedo). Same archetype as the unwatched side channels and the conductivity-model banner at
 // the `std::ostringstream cmb` site further down: a local stream starts in the
 // default format and cannot inherit std::cout's state.
 static inline std::string fmtSig(double v, int sig = 6) {
@@ -837,7 +837,7 @@ static inline double refGridHOverride(const thermal::Config& config) {
 // ONE definition, filled by main() once the ET grid and the resolved Planet
 // both exist, and read by every checkpoint writer and reader in this file. The
 // alternative -- each write site deriving the epoch and the hashes for itself
-// -- is how the format got three inline copies of its own header (PTM-76).
+// -- is how the format got three inline copies of its own header.
 //
 // The depth grid is deliberately NOT here: it is per-solver (the GPU has
 // z_grid, CpuStateCheckpoint builds a reference Profile), and the two are
@@ -1296,7 +1296,7 @@ static std::vector<double> referenceDepthGrid(const thermal::Config& config) {
 // `planet`) with the config's thermophysical overrides applied. Four sites in
 // this file need only its periods or its name and were each open-coding the
 // same two lines; the pairing matters, because a Planet WITHOUT
-// applyConfiguredThermo carries body defaults and is the PTM-53 trap.
+// applyConfiguredThermo carries body defaults and is the built-in-body property-override trap.
 static thermal::Planet referenceBody(const thermal::Config& config) {
     thermal::Planet p(config.getProperty("planet", "Moon"));
     applyConfiguredThermo(p, config);
@@ -1319,7 +1319,7 @@ static void printDepthGridPreflight(const thermal::Config& config,
 
     // A LOCAL stream: std::cout arrives here carrying whatever fixed/precision
     // state an earlier banner left on it, which is how a log comes to report
-    // numbers that are not the numbers the run used (PTM-05 / PTM-55).
+    // numbers that are not the numbers the run used.
     std::ostringstream o;
     o << std::defaultfloat << std::setprecision(6);
 
@@ -1594,7 +1594,7 @@ static bool depthCsvValidateDepths(const thermal::Config& config,
 // PHASE 2H -- locations/*_depths.csv backed by the MESH SOLVER's own column.
 //
 // Before this, the CSV at a site and statistics/temperature_*.bin at the same
-// face came from two different integrations (PTM-DEPTHCSV-SEPARATE-INTEGRATION):
+// face came from two different integrations:
 // runThermalModelDepthSeries re-solved a standalone 1-D column with its own
 // seed repair window (seed_config.seed_forcing_steps), its own anchor census
 // and its own absorbed-flux composition -- its own comment says it is "NOT
@@ -2029,19 +2029,19 @@ static inline int depthMapSamplesInCall(int lo, int hi, int n_steps_in_call) {
     return (b > a) ? (b - a) : 0;
 }
 
-// PTM-53 rule-7 tripwire. applyConfiguredThermo() bumps this every time it
+// Built-in-body property override rule-7 tripwire. applyConfiguredThermo() bumps this every time it
 // applies a user-configured scalar override to a solver-local Planet; main()
 // FAILS the run if an override was configured and this stayed at zero, so an
 // override can never again be announced in the log and then silently ignored.
 static std::atomic<int> g_thermo_override_applied{0};
 
-// PTM-53: the SINGLE definition of "the user asked for a thermophysical
+// the SINGLE definition of "the user asked for a thermophysical
 // override". The forwarding block and the tripwire both call this, so a knob
 // added to one can never be missing from the other -- which is the failure mode
-// that would quietly re-open PTM-53 for the next property someone adds.
+// that would quietly re-open the built-in-body property override for the next property someone adds.
 // `geothermal_heat_flow` lives on SimulationConfig::thermal, not on
 // ThermophysicalParams, but it reaches the solvers through the SAME ovr_*
-// channel and must therefore arm the SAME tripwire (PTM-161). It is passed
+// channel and must therefore arm the SAME tripwire. It is passed
 // explicitly rather than read from a global so the one definition still owns
 // the whole predicate.
 static bool thermoOverrideRequested(const ptm::SimulationConfig::ThermophysicalParams& tp,
@@ -2111,7 +2111,7 @@ static std::vector<double> parseCsvDoubles(const std::string& csv) {
 
 // Format a double for a Config property WITHOUT the 6-decimal truncation that
 // Config::setProperty(key, double) inflicts via std::to_string -- harmless for
-// 7.4e-4, silently zero for 1e-8 (BUGS.md PTM-60).
+// 7.4e-4, silently zero for 1e-8.
 static std::string fullPrecision(double v) {
     std::ostringstream os;
     os.precision(17);
@@ -2129,7 +2129,7 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
     // absorbed flux only (absolute steps [0, equilibration_steps)). Empty =
     // legacy. Same contract as the GPU and SIMD-batch solvers.
     const std::vector<double>& eq_indirect_flux = {},
-    // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
+    // thermal.initial_state_file / thermal.final_state_file.
     // Empty = neither, and this driver is byte-identical to what it was.
     const std::string& initial_state_file = "",
     const std::string& final_state_file   = "");
@@ -2139,8 +2139,8 @@ bool runThermalModelsForAllFaces(const std::string&, const std::shared_ptr<Mesh>
 // because the SIMD batch solver below takes an optional triple of these.
 using FluxFn = std::function<double(size_t,int)>;
 
-// Re-entry of the CPU SIMD-batch driver for the radiation-coupling re-thermal
-// (BUGS.md PTM-665). The coupled CPU run solved the whole mesh on this
+// Re-entry of the CPU SIMD-batch driver for the radiation-coupling re-thermal.
+// The coupled CPU run solved the whole mesh on this
 // integrator and then re-integrated every face carrying indirect flux on the
 // SCALAR one (Model::run), whose flux sampling lags by half a substep; the
 // selected faces moved by the two solvers' difference even at zero exchange
@@ -2154,12 +2154,12 @@ using FluxFn = std::function<double(size_t,int)>;
 // unit) but are NOT products of this pass: the caller copies back only the
 // selected faces, and the location-column recorder skips the mates.
 // Report-only products -- spin-up / certificate / anchor censuses, the seed
-// recorder, the PTM-51 dump -- are NOT emitted by a subset pass: they would
+// recorder, the dark-face warm-seed dump -- are NOT emitted by a subset pass: they would
 // print whole-mesh-looking banners over a selection. Streamed mode is refused.
 struct SimdFaceSubset {
     const std::vector<int>* faces = nullptr;
     const std::vector<std::vector<double>>* extra_flux = nullptr;
-    // PTM-57 (CPU path): when set, the end-of-window T(z) of every SELECTED face is written
+    // when set, the end-of-window T(z) of every SELECTED face is written
     // here (layer-major, layer * n_faces + face; sized by the driver on first use) and the
     // face is marked in end_touched -- the CPU twin of the GPU re-thermal's hand-back, so a
     // coupled run's checkpoint carries the coupled column instead of iteration 0's.
@@ -2190,7 +2190,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // no indirect term. Same contract as the GPU persistent solver's
     // eq_indirect_flux argument.
     const std::vector<double>& eq_indirect_flux = {},
-    // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
+    // thermal.initial_state_file / thermal.final_state_file.
     const std::string& initial_state_file = "",
     const std::string& final_state_file   = "",
     // STREAMED MODE. Supply all three and leave direct_solar_values /
@@ -2203,7 +2203,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     FluxFn get_direct    = FluxFn(),
     FluxFn get_reflected = FluxFn(),
     FluxFn get_ir        = FluxFn(),
-    // Radiation-coupling re-thermal of a face subset (BUGS.md PTM-665).
+    // Radiation-coupling re-thermal of a face subset.
     const SimdFaceSubset* subset = nullptr);
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
@@ -2228,13 +2228,13 @@ bool runThermalModelsForAllFacesBatchSoA(
 // call a Planet method inside the hot OpenMP loop cheaply. Guaranteed in
 // [0,1] for w in [0,1], mu0 in [0,1].
 //
-// PTM-29 fix (2026-07-30): the Hapke branch is now CONTINUOUS at cos_theta>=1,
+// Noon-notch residual fix (2026-07-30): the Hapke branch is now CONTINUOUS at cos_theta>=1,
 // matching the CPU reference Planet::getAlbedoWithIncidence (thermal_model.cpp:
 // 579-589), which clamps mu0 to [0,1] and ALWAYS evaluates A_h in the Hapke
 // branch. The old `cos_theta>=1 -> return A0` short-circuit returned the
 // PER-FACE A0, but A_h(mu0->1) is anchored to the BODY-average A0 by the
 // config-gate w — so for any face whose local albedo != the body A0 it was a
-// step discontinuity. PTM-28 Fix A pushed cos_theta to 1.00002 at the diurnal
+// step discontinuity. The GPU Hapke sawtooth Fix A pushed cos_theta to 1.00002 at the diurnal
 // insolation peak, firing that branch for exactly one output step per cycle and
 // spiking the absorbed flux (measured +70 W/m^2 on a dark face) into the
 // multi-K noon notch the GPU flux path showed but the CPU never did. Evaluating
@@ -2289,7 +2289,7 @@ static inline double applyIncidenceAlbedo(double A0,
     double cos_theta = direct_flux / solar_constant;
     if (use_hapke && hapke_w >= 0.0) {
         // Analytic directional-hemispheric albedo A_h(mu0) = 1 - gamma*H(mu0,w).
-        // PTM-29: clamp mu0 to [0,1] and evaluate A_h here for ALL cos_theta
+        // clamp mu0 to [0,1] and evaluate A_h here for ALL cos_theta
         // (continuous with the CPU reference). The legacy escape hatch restores
         // the old per-face-A0 short-circuit at cos_theta>=1.
         if (legacyAlbedoNormalA0() && cos_theta >= 1.0) return A0;
@@ -2315,7 +2315,7 @@ static inline double applyIncidenceAlbedo(double A0,
     return A;
 }
 
-// ---- Fix A (BUGS.md PTM-28): instantaneous heliocentric solar constant --------
+// ---- Fix A: instantaneous heliocentric solar constant --------
 // applyIncidenceAlbedo() and the CPU incidence block recover the solar incidence
 // as cos(theta) = direct_flux / S. direct_solar was formed by the illumination
 // model as S_inst * <cos>, with S_inst = SOLAR_CONSTANT / dist_au^2
@@ -2324,7 +2324,7 @@ static inline double applyIncidenceAlbedo(double A0,
 // planet.S (perihelion + near-normal incidence), pinning the albedo to A0 across
 // a super-solar-constant plateau; under the Hapke branch that plateau edge is a
 // C1 (derivative) kink in absorbed flux which the GPU coarse time-integrator
-// amplifies into a non-physical diurnal sawtooth (PTM-28). Feeding the per-
+// amplifies into a non-physical diurnal sawtooth. Feeding the per-
 // timestep S_inst makes cos_theta <= 1 by construction so the plateau/kink never
 // forms. g_solar_irr_per_step is filled ONCE in main() from the sun positions;
 // left EMPTY (or env PTM_LEGACY_FIXED_SOLARCONST=1) every site falls back to the
@@ -2348,11 +2348,11 @@ static inline double solarConstForStep(int t, double fixed) {
     return fixed;
 }
 
-// ---- BUGS.md PTM-107(a): observable effective surface albedo -----------------
+// ---- observable effective surface albedo -----------------
 // The BC's operative visible albedo A(theta) was computed per face per timestep and
 // then thrown away, so no external energy-closure audit could reconstruct it -- an
-// auditor had to treat it as a free parameter (that is what made the PTM-105
-// investigation and Fermi's 11.4% closure residual un-decidable). Accumulate the
+// auditor had to treat it as a free parameter (that is what made the Moon incidence-albedo default
+// investigation and the physics review's 11.4% closure residual un-decidable). Accumulate the
 // flux-weighted mean per face here, at the ONE place the BC actually decides it,
 // and write it beside the other statistics.
 //   A_eff,f = sum_t A_f(t) Q_f(t) / sum_t Q_f(t)     (Q = direct solar, W/m^2)
@@ -2362,7 +2362,7 @@ static std::vector<double> g_eff_albedo_num;   // sum_t A*Q per face
 static std::vector<double> g_eff_albedo_den;   // sum_t Q   per face
 static bool g_eff_albedo_valid = false;
 
-// ---- Accumulation WINDOW (Fermi condition C2) --------------------------------
+// ---- Accumulation WINDOW --------------------------------
 // Every other statistics/*.bin is reduced over the INTEGRATION window
 // [stats_start_step, stats_start_step + stats_steps). The albedo accumulators
 // originally swept the whole flux table -- equilibration steps included -- so
@@ -2375,7 +2375,7 @@ static bool g_eff_albedo_valid = false;
 // window aligned, A_eff is identical at 1 and 4 orbits (max per-face difference
 // 1.1e-6, below the run's own ET-round-trip floor of 5e-5 in the direct beam).
 // Both the BC-side accumulator (below)
-// and the radiosity source-side accumulator (the PTM-106 self-check, in the
+// and the radiosity source-side accumulator (the two-band source-albedo self-check, in the
 // coupling loop) now reduce over exactly this window, so the file is window-
 // consistent AND the self-check still compares like with like.
 // Set once in main() from the SAME helper the statistics export uses; never a
@@ -2386,7 +2386,7 @@ static bool g_aeff_win_set   = false;
 
 // The integration (statistics) window, in ABSOLUTE step indices. Extracted from
 // the statistics-export site so the albedo accumulators can be told the window
-// BEFORE the thermal solve without a second copy of the recipe (the PTM-106c
+// BEFORE the thermal solve without a second copy of the recipe (the per-step source-albedo update
 // class: two spellings of one formula, agreeing today, drifting later). The
 // export site now calls this same function; its printed banner is unchanged.
 struct IntegrationWindow { int start = 0; int steps = 0; };
@@ -2400,7 +2400,7 @@ static IntegrationWindow computeIntegrationWindow(int equilibration_steps,
                                                   int integration_steps_cli,
                                                   int integration_offset_steps_cli,
                                                   double integration_offset_days) {
-    // PTM-15 fix: the integration (statistics) window lives entirely in the
+    // Direct-solar-maximum fix: the integration (statistics) window lives entirely in the
     // post-equilibration OUTPUT segment, which is sampled at the OUTPUT cadence.
     // The blended full-run cadence total_time_steps/total_simulation_days mixes
     // the (possibly coarse) equilibration cadence with the fine output cadence,
@@ -2472,11 +2472,11 @@ static inline bool aeffStepInWindow(int t) {
                           && t <  g_aeff_win_start + g_aeff_win_steps;
 }
 
-// ---- Fermi condition C1: the same accumulation on the GPU thermal path --------
+// ---- the same accumulation on the GPU thermal path --------
 // The CPU accumulates A_eff inside calculateAbsorbedFlux, which the GPU solver
 // never calls -- it builds its absorbed flux in prepare_flux() instead (two copies:
 // the multi-GPU batch worker and the single-GPU serial loop). Every production
-// lunar/Europa run is GPU, so both effective_albedo.bin and the PTM-106 self-check
+// lunar/Europa run is GPU, so both effective_albedo.bin and the two-band source-albedo self-check
 // were absent exactly where they matter.
 //
 // This is deliberately a SEPARATE read-only pass rather than a hook inside
@@ -2542,7 +2542,7 @@ static void accumulateEffectiveAlbedoGPU(size_t n_faces,
     g_eff_albedo_valid = true;
 }
 
-// PTM-106 self-check. The whole claim of the fix is one identity:
+// Two-band source-albedo self-check. The whole claim of the fix is one identity:
 //   the albedo the radiosity SCATTERS the direct beam with
 //     == the albedo the surface BC did NOT absorb with.
 // Both sides are now computed, so verify rather than assert by eye: the coupling
@@ -2554,7 +2554,7 @@ static void accumulateEffectiveAlbedoGPU(size_t n_faces,
 static std::vector<double> g_src_albedo_num;   // sum_t A_src*Q per face
 static std::vector<double> g_src_albedo_den;
 static bool g_src_albedo_valid = false;
-// Set by the coupling loop when the PTM-106 source override is actually ACTIVE
+// Set by the coupling loop when the two-band source-albedo source override is actually ACTIVE
 // (two-band + incidence-dependent BC + no legacy hatch). Without it the report
 // below cannot tell "this run has no identity to verify" (radiation off, gray
 // radiosity, constant albedo, legacy hatch -- each of which prints its own
@@ -2565,11 +2565,11 @@ static bool g_ptm106_expected = false;
 static void reportSourceAlbedoConsistency() {
     // Rule 7: a self-check that cannot run must SAY SO. This used to return in
     // silence, which is how the whole check went missing on the GPU thermal path
-    // for every production run (Fermi, 2026-08-05): g_eff_albedo_valid was set
+    // for every production run: g_eff_albedo_valid was set
     // only inside the CPU calculateAbsorbedFlux, so a GPU run printed nothing at
     // all and looked exactly like a run where the check had passed.
     if (!g_src_albedo_valid || !g_eff_albedo_valid) {
-        // Nothing to verify when the PTM-106 override was never active (radiation
+        // Nothing to verify when the two-band source-albedo override was never active (radiation
         // off, gray radiosity, no incidence-dependent albedo, legacy hatch): the
         // source IS the operator by construction, and each of those paths already
         // announces which albedo feeds the radiosity.
@@ -2667,7 +2667,7 @@ static bool writeEffectiveAlbedo(const std::string& output_dir) {
         // SAME on-disk convention as every other statistics/*.bin: uint32 face
         // count, then float32[n]. Writing float64 here would silently mis-parse in
         // every existing reader (scripts/ptm_analyze, the GUI) at exactly half the
-        // face count -- the PTM-67 class.
+        // face count -- the unread-config-key class.
         const uint32_t n32 = static_cast<uint32_t>(n);
         out.write(reinterpret_cast<const char*>(&n32), sizeof(n32));
         std::vector<float> a_eff_f(n);
@@ -2700,7 +2700,7 @@ static bool writeEffectiveAlbedo(const std::string& output_dir) {
     }
 }
 
-// ---- BUGS.md PTM-106: radiosity visible-band SOURCE albedo -------------------
+// ---- radiosity visible-band SOURCE albedo -------------------
 // The surface BC absorbs (1 - A(theta)) Q with the incidence-dependent Hayne/Hapke
 // albedo, so the enclosure must receive A(theta) Q. Before this fix the two-band
 // radiosity built its visible source from the STATIC base albedo A0 instead (0.12
@@ -2726,7 +2726,7 @@ static inline bool legacyRadiosityStaticAlbedo() {
 // ---- Tri-state env gate --------------------------------------------------
 // Named for the radiation gates it was written for, but nothing about it is
 // radiation-specific, so it is the shared spelling rule for every boolean
-// environment override in this file (BUGS.md PTM-301's
+// environment override in this file (the SPICE coverage check's
 // PTM_SPICE_COVERAGE_STRICT is the second user).
 //
 // A gate that ships default ON keeps its environment variable as a KILL
@@ -2825,7 +2825,7 @@ static inline bool radSelectOutputWindowEnabled() {
 // there. This predicate had three identical spellings (the whole-mesh
 // persistent solver, the selected-faces re-thermal, and now the skip gate that
 // DEPENDS on the other two); two copies agreeing today and drifting later is
-// the PTM-106c class of defect, so there is one.
+// the per-step source-albedo update class of defect, so there is one.
 static bool rethermalTwoPhase(const std::vector<double>& times,
                               int equilibration_steps, int total_time_steps,
                               float* eq_dt_out = nullptr,
@@ -2894,7 +2894,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // which includes EVERY warm-start chunk) there is no separate eq phase,
     // so the buffer is filled immediately BEFORE the output cycle — the state
     // that cycle actually starts from. (It previously was not filled at all on
-    // that path, despite this comment claiming otherwise: BUGS.md PTM-78.)
+    // that path, despite this comment claiming otherwise.)
     std::vector<float>* post_eq_T_out = nullptr,
     // Multi-GPU controls (see config_parser.h thermal.gpu_*).
     //   gpu_devices == 1 (default) AND gpu_device_ids empty → legacy
@@ -2957,7 +2957,7 @@ bool runThermalForSelectedFaces_GPU(
     const std::vector<int>& gpu_device_ids = {},
     int gpu_inter_batch_pause_ms = 0,
     void* shared_thermal_pool = nullptr,
-    // Optional POST-COUPLING state hand-back (BUGS.md PTM-57). When non-null,
+    // Optional POST-COUPLING state hand-back. When non-null,
     // the T(z) column AT THE END of this call's output cycle is written into
     // final_T_inout (layer-major, GLOBAL face indexing, size n_layers ×
     // n_faces) for every face this call re-thermal'd, and the corresponding
@@ -3041,7 +3041,7 @@ bool runThermalModelsForAllFacesStreamed(
     const thermal::Planet* planet,
     int equilibration_steps,
     const std::vector<double>& eq_indirect_flux,
-    // thermal.initial_state_file / thermal.final_state_file (BUGS.md PTM-76).
+    // thermal.initial_state_file / thermal.final_state_file.
     const std::string& initial_state_file = "",
     const std::string& final_state_file   = "");
 
@@ -3351,7 +3351,7 @@ public:
         double visible_albedo = base_albedo;
 
         // Compute incidence-dependent albedo if enabled and face is illuminated.
-        // PTM-28 Fix A: recover cos(theta) against the per-timestep
+        // GPU Hapke sawtooth Fix A: recover cos(theta) against the per-timestep
         // instantaneous solar constant (falls back to the fixed value when
         // the table is legacy).
         if (use_incidence_albedo_ && direct_flux > 0.0) {
@@ -3392,7 +3392,7 @@ public:
                     double reflected_flux, double ir_flux) {
         const double visible_albedo = visibleAlbedo(f, t, direct_flux);
 
-        // PTM-107(a): record the OPERATIVE albedo the BC just decided on, flux-
+        // record the OPERATIVE albedo the BC just decided on, flux-
         // weighted by the direct beam. Per-face accumulators under a loop that
         // is parallel over FACES, so face f is touched by one thread only.
         // C2: only over the INTEGRATION window (t is the ABSOLUTE step index --
@@ -3414,7 +3414,7 @@ public:
         return absorbed_direct + absorbed_reflected + absorbed_ir;
     }
 
-    // PTM-107(a): publish the operative effective albedo for the statistics
+    // publish the operative effective albedo for the statistics
     // writer. Call once, after every face has been composed.
     void publishEffectiveAlbedo() {
         g_eff_albedo_num = std::move(eff_alb_num_);
@@ -3819,7 +3819,7 @@ bool AbsorbedFluxComposer::build(
         std::cout << "Warning: Fixed " << invalid_count << " invalid albedo values" << std::endl;
     }
 
-    // PTM-34 tripwire (CPU absorbed-flux path). A longitude-rolled albedo map keeps
+    // Albedo-map longitude-roll tripwire (CPU absorbed-flux path). A longitude-rolled albedo map keeps
     // its value distribution intact, so every scalar summary above (range, mean,
     // effective albedo) looks correct while the albedo sits on the wrong terrain.
     // The only observable is spatial, so check it spatially. Detect-and-disclose:
@@ -3851,7 +3851,7 @@ bool AbsorbedFluxComposer::build(
                         /*announce=*/true);
     albedo_successfully_loaded_ = albedo_successfully_loaded;
 
-    // PTM-107(a): per-face flux-weighted effective albedo accumulators. Sized
+    // per-face flux-weighted effective albedo accumulators. Sized
     // here (never inside a parallel region) and published to the file-scope
     // globals by publishEffectiveAlbedo(), so a run that composes flux more
     // than once reports the LAST (operative) composition, not a silent mixture.
@@ -3870,13 +3870,13 @@ void AbsorbedFluxComposer::resolveAngularModel(const thermal::Planet* planet,
                                        (planet->albedoCoef.size() >= 2 || use_hapke_albedo));
 
     if (use_incidence_albedo && announce) {
-        // PTM-55: report the OPERATIVE base albedo (the value face_albedos was
+        // report the OPERATIVE base albedo (the value face_albedos was
         // initialized to), not the Planet's, and say so when they differ. On
         // the CPU path the two agree today -- `planet` here IS the main-scope
         // Planet -- but the GPU path rebuilds its Planet, and a banner that can
-        // silently mean two things is exactly what PTM-55 is.
+        // silently mean two things is exactly what the albedo-banner is.
         if (std::abs(planet->albedo - default_visible_albedo) > 1e-9) {
-            // PTM-09 class: std::cerr/std::cout inherit whatever precision the
+            // Banner-precision class: std::cerr/std::cout inherit whatever precision the
             // caller left set (measured: 0.07 and 0.120 both printed as "0.1"),
             // so a diagnostic that exists to show a DISAGREEMENT would print
             // two identical numbers. Format explicitly through fmtSig().
@@ -4045,7 +4045,7 @@ struct SeedAnchorCensus {
         }
     }
     // `warm_started` = the run restored thermal.initial_state_file, so no face
-    // was seeded and there is no anchor to report (BUGS.md PTM-76). Say that,
+    // was seeded and there is no anchor to report. Say that,
     // rather than printing nothing: a census line that is simply absent is
     // indistinguishable from a census that was forgotten, and the whole point
     // of this line is that the seed cannot be silent.
@@ -4107,8 +4107,8 @@ struct SeedAnchorCensus {
 }  // namespace
 
 
-// Per-face warm-start / checkpoint plumbing for the CPU SCALAR solver
-// (BUGS.md PTM-76). One struct rather than four loose arguments, because this
+// Per-face warm-start / checkpoint plumbing for the CPU SCALAR solver.
+// One struct rather than four loose arguments, because this
 // function already carries ten and every caller would have to spell all of them.
 //
 // `n_layers` is the depth-grid size the CHECKPOINT was written with. The CPU
@@ -4123,7 +4123,7 @@ struct FaceStateIO {
 };
 
 // ---------------------------------------------------------------------------
-// Whole-mesh thermal-state checkpoint, CPU side (BUGS.md PTM-76).
+// Whole-mesh thermal-state checkpoint, CPU side.
 //
 // The GPU persistent solver has read and written thermal.initial_state_file /
 // thermal.final_state_file since the chunked workflow was built. No CPU path
@@ -4304,7 +4304,7 @@ struct CpuStateCheckpoint {
 // how many equilibration cycles a run needs against how many it configured was
 // printed by the CPU SIMD-batch solver and by nothing else. Every GPU run, and
 // every `--no-simd-batch` run, integrated its spin-up and said nothing about
-// whether that spin-up was long enough. (BUGS.md PTM-EQ-SPINUP-ESTIMATOR-CPU-ONLY.)
+// whether that spin-up was long enough. (The spin-up estimator used to be CPU-only.)
 //
 // This is the shared scorer the other drivers call. It READS z/T/kc/rho and
 // writes only the census, so a run with the census on must be byte-identical to
@@ -4432,7 +4432,7 @@ static void reportSpinupCensusAtSeed(thermal::EqSpinupCensus* census,
     // A LOCAL stream. EqSpinupCensus::line() sets std::fixed and
     // setprecision() on whatever stream it is handed and does not restore it,
     // so reporting straight to std::cout leaves every later line in main()
-    // formatted fixed-point at one decimal -- the PTM-05/PTM-55 archetype,
+    // formatted fixed-point at one decimal -- the unwatched side-channel archetype,
     // where a run prints numbers that are not the numbers it used. Buffering
     // confines that to this string.
     std::ostringstream o;
@@ -4440,7 +4440,7 @@ static void reportSpinupCensusAtSeed(thermal::EqSpinupCensus* census,
     if (scored) {
         // ⛔ NO MEASURED NUMBERS IN THIS BANNER, deliberately. The mechanism is
         // permanent; a figure is not, and a stale figure printed by the engine
-        // is the PTM-EQDT-DOC-STALE defect (docs quoting 0.99/2.2/11.9 K for a
+        // is the stale substep documentation defect (docs quoting 0.99/2.2/11.9 K for a
         // solver that now measures 0.549/1.238/5.325). For the record, measured
         // 2026-09-17 on the shipped 12,800-face lunar 80N crater
         // (examples/tutorial04_crater80N_radoff.yaml, 1 equilibration cycle):
@@ -4576,7 +4576,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     std::atomic<size_t>* seed_floor_faces = nullptr,
     SeedAnchorCensus*    anchor_census    = nullptr,
     // Warm start / final-state capture. Null = neither, and this function is
-    // then bit-identical to what it was before PTM-76.
+    // then bit-identical to what it was before CPU checkpoint support.
     FaceStateIO* state = nullptr,
     // Plan phase 2D. True ONLY from the two whole-mesh CPU scalar drivers, so
     // the radiation-coupling re-thermal -- which calls this for a SELECTED
@@ -4652,7 +4652,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
     try {
         const std::string planet_name = config.getProperty("planet", "Moon");  // Falls back to Moon if not set
         thermal::Planet planet(planet_name);
-        applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
+        applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides
 
         // Override basal heat flow if specified (per-face or global)
         if (Qb_override >= 0.0) {
@@ -4674,7 +4674,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
                             config,
                             false);
 
-        // ---- Warm start (BUGS.md PTM-76) -------------------------------
+        // ---- Warm start -------------------------------
         // Replace the seed the constructor just applied with the checkpointed
         // column.
         //
@@ -4735,7 +4735,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
         // checkpoint overwrote the seed a few lines above, so this column was
         // never integrated from. Scoring it would put a complete, plausible,
         // entirely fictional spin-up requirement in the banner for a chunk that
-        // did no spin-up at all (the same defect PTM-76 removed from the anchor
+        // did no spin-up at all (the same defect the CPU checkpoint support removed from the anchor
         // census). The driver discloses the suppression by count.
         if (spinup_census && !warm_started_face) {
             const auto& prof = model.profile;
@@ -4859,7 +4859,7 @@ std::vector<double> runThermalModelWithMatchedTimes(
         std::cerr << "Exception in thermal model: " << e.what() << std::endl;
         // A face that threw produced no T(z) column. If a checkpoint was
         // requested, the assembled buffer would carry zeros here and the next
-        // chunk would resume a dead column (BUGS.md PTM-78's failure mode).
+        // chunk would resume a dead column (the post-equilibration hand-off's failure mode).
         // Count it so the driver refuses to write the file at all.
         if (state && (state->in_column || state->out_column) && state->refusals)
             ++(*state->refusals);
@@ -5442,7 +5442,7 @@ std::vector<double> runThermalModelForFace(
 // set it) are byte-identical untouched. Call right after the local Planet is
 // built and BEFORE reference_profile, so the depth grid / cp / kc all pick it up.
 //
-// PTM-53: the SECOND block below fixes the defect this gate created. The
+// the SECOND block below fixes the defect this gate created. The
 // gb_thermo gate is correct for what it does -- it repairs a generic body whose
 // name-resolved Planet is a placeholder -- but it also meant that the explicit
 // scalar overrides (thermophysical.{ks,kd,emissivity,albedo}_override and the
@@ -5553,7 +5553,7 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
         planet.cpCoeff = parseCsvDoubles(config.getProperty("gb_cpCoeff", ""));
     }
 
-    // ---- PTM-53: explicit user overrides, on EVERY body -------------------
+    // ---- explicit user overrides, on EVERY body -------------------
     // "ovr_thermo" is the one-lookup fast path (mirroring the gb_thermo gate
     // above): this function runs PER FACE on the scalar CPU path, so the
     // overwhelmingly common no-override case must not pay for seven map probes
@@ -5577,7 +5577,7 @@ static void applyConfiguredThermo(thermal::Planet& planet, const thermal::Config
         {"ovr_cp0",        &thermal::Planet::cp0,        "cp0",        " J/kg/K"},
         {"ovr_emissivity", &thermal::Planet::emissivity, "emissivity", ""},
         {"ovr_albedo",     &thermal::Planet::albedo,     "albedo A0",  ""},
-        // PTM-161: `thermal.geothermal_heat_flow` / `--geothermal-heat-flow`
+        // `thermal.geothermal_heat_flow` / `--geothermal-heat-flow`
         // was parsed, applied to the main-scope Planet and announced, and then
         // discarded by every one of the four solver entry points, which each
         // rebuild a local Planet from the body NAME. On a built-in body the
@@ -5753,7 +5753,7 @@ bool runThermalModelsForAllFacesStreamed(
                      "the CPU SCALAR solver]" << std::endl;
     }
 
-    // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
+    // Warm start / final-state checkpoint. Same format and
     // same reader/writer as the GPU persistent solver.
     CpuStateCheckpoint ckpt;
     if (!ckpt.begin(initial_state_file, final_state_file, config, n_faces,
@@ -5824,7 +5824,7 @@ bool runThermalModelsForAllFacesStreamed(
             double face_H = (face_H_overrides && f < face_H_overrides->size())
                           ? (*face_H_overrides)[f]
                           : -1.0;
-            // Warm start / final-state capture for this face (PTM-76).
+            // Warm start / final-state capture for this face.
             std::vector<float> st_in, st_out;
             FaceStateIO st;
             FaceStateIO* st_ptr = nullptr;
@@ -5867,7 +5867,7 @@ bool runThermalModelsForAllFacesStreamed(
     progress_thread.join();
     progressBar.finish();
 
-    // PTM-107(a): hand the per-face effective albedo to the statistics writer.
+    // hand the per-face effective albedo to the statistics writer.
     // Without this a streamed run silently shipped no effective_albedo.bin.
     composer.publishEffectiveAlbedo();
 
@@ -5991,7 +5991,7 @@ bool runThermalModelsForAllFaces(
     // Print initial message
     std::cerr << "\nRunning thermal models for " << n_faces << " mesh faces..." << std::endl;
 
-    // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
+    // Warm start / final-state checkpoint. Same format and
     // same reader/writer as the GPU persistent solver.
     CpuStateCheckpoint ckpt;
     if (!ckpt.begin(initial_state_file, final_state_file, config, n_faces,
@@ -6137,7 +6137,7 @@ bool runThermalModelsForAllFaces(
                 double face_H = (planet && f < planet->face_H_overrides.size())
                               ? planet->face_H_overrides[f]
                               : -1.0;
-                // Warm start / final-state capture for this face (PTM-76).
+                // Warm start / final-state capture for this face.
                 std::vector<float> st_in, st_out;
                 FaceStateIO st;
                 FaceStateIO* st_ptr = nullptr;
@@ -6295,7 +6295,7 @@ bool runThermalModelsForAllFaces(
     return success;
 }
 
-// Phase R / Fermi PORT-EQ-01: per-face mean-flux equilibration seed.
+// Phase R / per-face mean-flux equilibration seed.
 // The legacy Moon/Europa/A3GT seed derives T(z,0) from the INSTANTANEOUS
 // absorbed flux over the first 10 equilibration steps with a hard 100 K
 // nightside floor — so a PSR floor (which never sees the sun) is stamped at
@@ -6345,10 +6345,10 @@ static bool eqPerfaceFluxMode() {
 //     construction, so it does not reintroduce the seam -- verified by
 //     measuring the seed's longitude spread at fixed latitude.
 // ---------------------------------------------------------------------------
-// ---- PTM-727: indirect-aware spin-up seed (thermal.seed_indirect) -----------
+// ---- indirect-aware spin-up seed (thermal.seed_indirect) -----------
 // The seed is built from the absorbed DIRECT forcing only, so a never-lit column
 // (indirect flux is its only heat) starts on the geothermal floor and two
-// equilibration lunations leave it ~50 K too cold at depth (Fermi, F2 replay,
+// equilibration lunations leave it ~50 K too cold at depth (physics review replay,
 // runs/stage3_f2/fermi/analyze_f093.txt). The first point at which an indirect
 // estimate exists is the eq-indirect re-solve; this hand-off is ACTIVE ONLY for
 // the duration of that whole-mesh solve (runEqIndirectPass sets it, a scope
@@ -6361,9 +6361,9 @@ struct SeedIndirectHandoff {
     const std::vector<std::vector<double>>* series = nullptr;  // [face][abs step], absorbed
     const std::vector<double>* mean = nullptr;                  // per-face <q_ind>, absorbed
     int t_lo = 0;   // first absolute step of the solved (output) window
-    int t_hi = 0;   // one past the last: t_lo + WHOLE cycles only (Fermi R2)
+    int t_hi = 0;   // one past the last: t_lo + WHOLE cycles only
     std::string source;
-    // Fermi R1 (2026-10-14): in series mode the EQUILIBRATION forcing also carries
+    // in series mode the EQUILIBRATION forcing also carries
     // the time-varying indirect, folded by phase. eq_fold[t] lists the absolute
     // output steps whose time falls in eq step t's interval [t_t, t_t + dt_eq)
     // modulo the cycle; the eq step takes their box average. Empty when inactive.
@@ -6373,7 +6373,7 @@ static SeedIndirectHandoff g_seed_indirect;
 // Count of command-line arguments the parser did not recognize (warned, ignored).
 static int g_unknown_cli_args = 0;   // inactive unless mode != Off
 
-/// The indirect flux an EQUILIBRATION step carries. Without the PTM-727 series
+/// The indirect flux an EQUILIBRATION step carries. Without the indirect-aware spin-up seed series
 /// hand-off this is exactly the per-face constant <q_ind> the eq-indirect pass
 /// has always added (eqi[gf]) -- same expression, same value, byte-identical.
 /// With it: the box average of the reduced sweep's indirect series over the
@@ -6391,7 +6391,7 @@ static inline double eqIndirectAt(const std::vector<double>& eqi, size_t gf, int
     return eqi[gf];
 }
 
-// What the run's seed actually was, for provenance.txt (PTM-727 default change):
+// What the run's seed actually was, for provenance.txt (the indirect-aware spin-up seed default change):
 // the configured value, where it came from, and whether it ACTED -- a default that
 // could not act on this run is recorded as inert with the reason, so an output tree
 // says exactly which initial condition produced it.
@@ -6443,21 +6443,21 @@ struct GpuSharedSeedContext {
     double cp0                = 0.0;
     const std::vector<double>* cp_coeff = nullptr;
     SeedAnchorCensus* census  = nullptr;
-    /// Forcing window (PTM-727 series mode). Defaults reproduce the historical
+    /// Forcing window (the indirect-aware spin-up seed series mode). Defaults reproduce the historical
     /// window exactly: steps [0, seedForcingSteps(total_time_steps)).
     int t_offset  = 0;
     int n_forcing = 0;   ///< 0 = seedForcingSteps(total_time_steps)
 };
 
-/// Re-point a GPU seed context at the indirect-aware forcing when the PTM-727
+/// Re-point a GPU seed context at the indirect-aware forcing when the indirect-aware spin-up seed
 /// hand-off is active. `holder` owns the composed callable and must outlive the
 /// gpuFillSharedSeed call. Returns false (no change) when the hand-off is off.
-// PTM_DUMP_SEED_ALL=1 (diagnostic, PTM-728): record and dump every seeding pass,
+// PTM_DUMP_SEED_ALL=1 (diagnostic): record and dump every seeding pass,
 // including the CPU re-thermal subset passes. Read once; default off.
-// PTM_DIAG_CPU_FLUX_LEFT_CONST=1 (diagnostic, PTM-728): the CPU SIMD main loop holds the
+// PTM_DIAG_CPU_FLUX_LEFT_CONST=1 (diagnostic): the CPU SIMD main loop holds the
 // left-endpoint flux over every substep of an interval, as the GPU thermal kernel does
 // (thermal_kernels.cl Q_surf = flux_all[tg]), instead of interpolating linearly. Default off.
-// PTM-728 phase 2: how a CPU re-thermal (face-subset) pass starts its columns.
+// CPU re-thermal start mode phase 2: how a CPU re-thermal (face-subset) pass starts its columns.
 //   reseed       (the default before release/r1-engine): re-seed every pass from scratch on
 //                the warm-bracket fallback, then re-equilibrate over the full span.
 //   resume       restore the column state the last WHOLE-mesh pass reached at the end of
@@ -6491,7 +6491,7 @@ static bool cpuRethermalExplicit() {
 static std::vector<double> g_cpu_post_eq_T, g_cpu_post_eq_surf;
 static int g_cpu_post_eq_steps = -1;
 static int g_cpu_post_eq_layers = 0;
-// The PTM-727 whole-cycle series window [lo, hi), recorded when the eq-indirect pass arms it.
+// The indirect-aware spin-up seed whole-cycle series window [lo, hi), recorded when the eq-indirect pass arms it.
 // The hand-off itself (g_seed_indirect) is reset when that pass ends, so a later re-thermal
 // pass under PTM_CPU_RETHERMAL=seed-series reads the window from here.
 static int g_rt_series_lo = -1, g_rt_series_hi = -1;
@@ -6667,7 +6667,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     const size_t n_batches = (n_faces + BS - 1) / BS;
 
-    // ---- face subset (BUGS.md PTM-665) ------------------------------------
+    // ---- face subset ------------------------------------
     const bool is_subset = (subset != nullptr);
     const CpuRethermalMode rt_mode = cpuRethermalMode();
     const bool rt_capture = (rt_mode == CpuRethermalMode::Resume) && !is_subset &&
@@ -6765,7 +6765,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // albedo and drifted from the standard path by up to ~115 K at
     // albedo-sensitive faces (spatial map + high-incidence terminator).
     thermal::Planet planet(config.getProperty("planet", "Moon"));
-    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
+    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides
     // Per-face albedo scaling (defect #1): propagate the Hapke directional-albedo
     // gate from config to THIS mesh-flux planet. Without this the CPU SIMD-batch
     // path left use_hapke_albedo default-OFF and always ran Hayne, even when the
@@ -6943,7 +6943,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     std::cerr << "Using " << n_layers << " depth layers per profile" << std::endl;
 
-    // PTM-728 phase 2: re-thermal start mode (PTM_CPU_RETHERMAL). Said once per pass,
+    // CPU re-thermal start mode phase 2: re-thermal start mode (PTM_CPU_RETHERMAL). Said once per pass,
     // never silent; a resume without a valid capture is FATAL.
     if (is_subset && subset->end_T && subset->end_touched) {
         if (subset->end_T->size() != static_cast<size_t>(n_layers) * n_faces)
@@ -7008,7 +7008,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     locationColumnsVerifyGrid(ref_profile.z().data(),
                               static_cast<size_t>(n_layers), "cpu_simd_batch");
 
-    // BUGS.md PTM-SIGSEGV-450LAYER: the CPU SIMD batch path's ThermalBatchSoA
+    // the CPU SIMD batch path's ThermalBatchSoA
     // stack-allocates every per-layer array at a fixed size
     // (thermal::MAX_THERMAL_LAYERS). A discrete buried-ice-layer grid
     // (generic_body.surface.ice_depth + a fine thermal_m to resolve the
@@ -7047,7 +7047,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         return false;
     }
 
-    // Warm start / final-state checkpoint (BUGS.md PTM-76). Same format and
+    // Warm start / final-state checkpoint. Same format and
     // same reader/writer as the GPU persistent solver. This batch path shares
     // ONE grid across every face (the ref_profile above), so unlike the CPU
     // scalar path it cannot hit a per-face layer-count mismatch.
@@ -7169,16 +7169,16 @@ bool runThermalModelsForAllFacesBatchSoA(
     thermal::ProgressBar progressBar(static_cast<int>(n_faces), "SIMD Batch thermal", 50, true);
 
     // ------------------------------------------------------------------
-    // PTM-51 diagnostic (env PTM_DUMP_EQ_SEED=<path.csv>, default OFF).
+    // Dark-face warm-seed diagnostic (env PTM_DUMP_EQ_SEED=<path.csv>, default OFF).
     //
-    // PTM-51 documents a real, measured residual: Moon topographic faces with
+    // The dark-face warm-seed issue documents a real, measured residual: Moon topographic faces with
     // EXACTLY zero absorbed flux equilibrate to ~63.6 K against T_geo = 24.04 K.
     // Its stated MECHANISM -- an active 50 K cap on the seed's deep column --
-    // was disputed (Fermi, 2026-08-04) as ~20x too small to supply that heat,
+    // was disputed as ~20x too small to supply that heat,
     // with the analytic clear-sky EQUILIBRATION FORCING proposed instead. The
     // two hypotheses make opposite, checkable predictions for a zero-flux face:
-    //   PTM-51 as written : T_deep - T_surf_est = 50 K   and eq forcing = 0
-    //   Fermi             : T_deep - T_surf_est ~ 2.5 K  and eq forcing > 0
+    //   dark-face warm-seed claim: T_deep - T_surf_est = 50 K   and eq forcing = 0
+    //   physics review:            T_deep - T_surf_est ~ 2.5 K  and eq forcing > 0
     // This dump writes both quantities per face so the question is settled by
     // measurement rather than by arithmetic on either side. Zero cost and
     // byte-identical when the variable is unset.
@@ -7209,7 +7209,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // touching this: it is a FORCING with no topography, no shadowing, no IR
     // and no indirect flux, it is NOT counted by equilibration_orbits, the GPU
     // has no analog, and it destroys the per-face initial condition computed
-    // above (Fermi measured a permanently shadowed lunar column go 24.043 K ->
+    // above (the physics review measured a permanently shadowed lunar column go 24.043 K ->
     // 64.375 K surface / +60 K at 1 m under 24 lunations of it). Under
     // spinup_seed: physical it is OFF unless a config asks for it by name.
     double equil_duration_s_shared;
@@ -7252,7 +7252,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // A restored checkpoint is a continuation, so the pre-conditioner would
     // discard exactly the state the previous chunk produced. Overridden here
-    // rather than left to the config, and said out loud (BUGS.md PTM-76).
+    // rather than left to the config, and said out loud.
     if (ckpt.want_in && equil_duration_s_shared > 0.0) {
         std::cerr << "[warm-start] thermal.initial_state_file is set, so the "
                   << (equil_duration_s_shared / std::max(1.0, planet.day))
@@ -7381,9 +7381,9 @@ bool runThermalModelsForAllFacesBatchSoA(
     // ⛔ THE PER-BATCH DIAGNOSTICS THAT LIVE **BELOW** THE SKIP POINT.
     // Three accumulators are fed from inside the time integration, which a
     // restored batch does not run: the spin-up census, the equilibration
-    // certificate census, and the PTM-51 equilibration-flux dump. A resumed run
+    // certificate census, and the dark-face warm-seed equilibration-flux dump. A resumed run
     // would print a whole-mesh-looking census scored on the fraction of the
-    // mesh this process happened to integrate, and a PTM-51 CSV with zeros for
+    // mesh this process happened to integrate, and a dark-face warm-seed CSV with zeros for
     // the rest -- neither of which the crash gate can see, because one goes to
     // stdout and the other to an env-supplied path outside the output tree.
     //
@@ -7398,7 +7398,7 @@ bool runThermalModelsForAllFacesBatchSoA(
     // refusing on it would make this feature unusable rather than safe. It is
     // therefore DISCLOSED beside its own report instead. The other two change
     // something real: the certificate census can END THE SPIN-UP EARLY, and the
-    // PTM-51 dump writes a CSV product with a column per face. Those refuse.
+    // The dark-face warm-seed dump writes a CSV product with a column per face. Those refuse.
     if (bc_on && (g_eq_cert_census || dump_eq_seed)) {
         std::cerr << "\n[SIMD Batch] FATAL: thermal.batch_checkpoint is on "
                      "together with a per-batch quantity that is accumulated "
@@ -7584,7 +7584,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
-            // ---- Warm start (BUGS.md PTM-76) ---------------------------
+            // ---- Warm start ---------------------------
             // A restored column REPLACES the seed below. It is applied after
             // copyGridFromProfile (which fills T with T_eq_init) and before the
             // first advanceTimestep, which is exactly where the seed would go,
@@ -7645,7 +7645,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 avg_flux /= std::max(1, flux_avg_window);
                 sum_inst_T /= std::max(1, flux_avg_window);
 
-                // PTM-46: seed the column at the steady state this face can
+                // seed the column at the steady state this face can
                 // actually hold, eps*sigma*T^4 = <F_abs> + Qb. Including the
                 // interior heat flux makes the expression CONTINUOUS as
                 // avg_flux -> 0 and lands a never-lit face exactly on the
@@ -7662,7 +7662,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // that a whole orbit of equilibration still left an 85-face
                 // 119 K patch embedded in a 47-105 K polar night. The 50 K floor
                 // was the same defect one step down: it pinned the rest of the
-                // polar night at 50 K against a physical 27.7 K (PTM-48).
+                // polar night at 50 K against a physical 27.7 K.
                 //
                 // Qb is taken per face (batch.Qb[f], already overridden above
                 // from face_Qb) so the seed matches the per-face floor the
@@ -7704,7 +7704,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     sfc_.stride     = flux_stride;
                     sfc_.n_samples  = flux_avg_window;
                     sfc_.span_s     = seed_dt_s * flux_avg_window;
-                    // PTM-727 (thermal.seed_indirect): same composition as the
+                    // same composition as the
                     // GPU helper applySeedIndirect. flux_base already carries
                     // <q_ind> on the equilibration steps (eq_indirect_flux above),
                     // and nothing on the output steps.
@@ -7789,7 +7789,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     if (!is_subset) {
                         simd_anchor_census.add(sres);
                         thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
-                    } else if (g_dump_seed_all) {   // PTM-728 diagnostic: re-thermal seeds too
+                    } else if (g_dump_seed_all) {   // the CPU re-thermal start mode diagnostic: re-thermal seeds too
                         thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
                     }
 
@@ -7797,7 +7797,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     for (int layer = 0; layer < n_layers; ++layer)
                         batch.T[layer * BS + f] = T_col[layer];
 
-                    if (dump_eq_seed) {                   // PTM-51 diagnostic
+                    if (dump_eq_seed) {                   // the dark-face warm-seed diagnostic
                         dbg_avg_flux[global_f]   = avg_flux;
                         dbg_T_surf_est[global_f] = sres.T_surface;
                         dbg_dT_geo[global_f]     = sres.T_deep - sres.T_surface;
@@ -7823,7 +7823,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // the solver already clamps at ABSOLUTE_ZERO_K
                 // (thermal_model.cpp:849, 2641, 2678, 2704); the seed did not.
                 // No validated arm reaches the bound (minimum seed in the
-                // PTM-46 validation set is 24.04 K = Moon T_geo), so this is a
+                // Zero-flux face seed validation set is 24.04 K = Moon T_geo), so this is a
                 // guard, not a behavior change -- verified byte-identical.
                 //
                 // ⚠️ The 400 K UPPER bound is a LEGACY-SEED artifact, kept for
@@ -7836,7 +7836,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // (thermal_model.h). It binds on Mercury (subsolar cycle mean
                 // ~468 K), which is precisely where the seed is worst, so it
                 // now says so instead of substituting quietly. Zero shipped
-                // configs select the legacy seed. BUGS.md ENG-LEGACY-SEED-CAPS.
+                // configs select the legacy seed.
                 const double T_rad_eq = std::sqrt(std::sqrt(ratio));
                 if (T_rad_eq > 400.0) {
                     static std::atomic<bool> announced{false};
@@ -7877,7 +7877,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const double skin_d = thermal::skinDepth(planet.day, kappa0);
                 const double inv_skin = (skin_d > 0.0) ? (1.0 / skin_d) : 0.0;
 
-                if (dump_eq_seed) {                       // PTM-51 diagnostic
+                if (dump_eq_seed) {                       // the dark-face warm-seed diagnostic
                     dbg_avg_flux[global_f]   = avg_flux;
                     dbg_T_surf_est[global_f] = T_surf_est;
                     dbg_dT_geo[global_f]     = delta_T_geo;   // == T_deep - T_surf_est
@@ -7914,7 +7914,7 @@ bool runThermalModelsForAllFacesBatchSoA(
             // ⛔ WHAT IS **BELOW** THIS LINE AND IS THEREFORE NOT PAID. Three
             // accumulators are fed from inside the time integration: the
             // spin-up census, the equilibration-certificate census and the
-            // PTM-51 equilibration-flux dump. A restored batch contributes to
+            // Dark-face warm-seed equilibration-flux dump. A restored batch contributes to
             // none of them, which would silently turn a whole-mesh census into
             // a this-process-only one. All three are opt-in, so the driver
             // REFUSES the combination up front rather than relabeling a partial
@@ -8169,7 +8169,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                         const double flux_factor = (cos_zen > 0.0) ? cos_zen : 0.0;
                         flux_vec[f] = planetary_absorption * flux_factor;
                     }
-                    if (dump_eq_seed) {                   // PTM-51 diagnostic
+                    if (dump_eq_seed) {                   // the dark-face warm-seed diagnostic
                         for (int f = 0; f < faces_in_batch; ++f) {
                             const size_t gf = start_face + f;
                             dbg_eqflux_sum[gf] += flux_vec[f];
@@ -8312,7 +8312,7 @@ bool runThermalModelsForAllFacesBatchSoA(
             // convention is not settled here. Row 0 is only EXPORTED as output
             // index 0 when there is no equilibration prefix.
             //
-            // ROW 0 ON A WARM START IS RE-SOLVED (BUGS.md PTM-662). A restored
+            // ROW 0 ON A WARM START IS RE-SOLVED. A restored
             // checkpoint is the column the previous chunk integrated to exactly
             // this epoch, and that chunk -- like a single-shot run passing
             // through the same epoch -- filed its frame here with the surface
@@ -8427,7 +8427,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 for (int s = 0; s < n_sub; ++s) {
                     const double alpha = (s + 0.5) / static_cast<double>(n_sub);
                     const double one_m = 1.0 - alpha;
-                    if (g_diag_flux_left_const) {   // PTM-728 diagnostic: the GPU kernel's forcing
+                    if (g_diag_flux_left_const) {   // the CPU re-thermal start mode diagnostic: the GPU kernel's forcing
                         for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_a[f];
                     } else {
                         for (int f = 0; f < faces_in_batch; ++f) {
@@ -8506,7 +8506,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 }
             }
 
-            // End-of-window T(z) for the checkpoint (BUGS.md PTM-76). Taken from
+            // End-of-window T(z) for the checkpoint. Taken from
             // the live batch state after the last advance -- the same instant the
             // GPU persistent solver samples for its own final_state_file.
             if (ckpt.want_out) {
@@ -8631,7 +8631,7 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     progressBar.finish();
 
-    // PTM-107(a): hand the per-face effective albedo to the statistics writer.
+    // hand the per-face effective albedo to the statistics writer.
     // In array mode calculateAbsorbedFlux already published its own composer's;
     // the streamed composer is ours, so we publish it, at the same point in the
     // run and from the same accumulators. Without this a streamed SIMD-batch
@@ -8694,7 +8694,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         g_eq_cert_census->report(std::cout, mean_cycles);
     }
 
-    // PTM-51 diagnostic: write the per-face seed terms and the analytic
+    // Dark-face warm-seed diagnostic: write the per-face seed terms and the analytic
     // equilibration forcing that actually drove the column.
     if (dump_eq_seed && !is_subset) {
         std::ofstream fh(eq_seed_dump_path);
@@ -8779,7 +8779,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
         thermal::EqSeedRecorder::instance().write("cpu-simd-batch");
     } else if (const char* all = std::getenv("PTM_DUMP_SEED_ALL"); all && all[0] == '1') {
-        // Diagnostic only (PTM-728): a re-thermal subset pass re-seeds its faces too.
+        // Diagnostic only: a re-thermal subset pass re-seeds its faces too.
         thermal::EqSeedRecorder::instance().write("cpu-simd-subset");
     }
 
@@ -8924,7 +8924,7 @@ bool addThermalDataToVTK(
 // route past the RAM wall — a 25-cycle eq array is ~6.1 GB on the 509k-face
 // lunar mesh, so 100+ cycles in ONE array is hard-blocked.
 //
-// ---- SEMANTICS (changed 2026-08-11; BUGS.md PTM-146) ----------------------
+// ---- SEMANTICS (changed 2026-08-11) ----------------------
 // `thermal.equilibration_orbits` is the INTEGRATED number of diurnal cycles of
 // real, ephemeris-driven spin-up. `thermal.equilibration_cycles` (passes) is a
 // pure MEMORY/COST dial that says how many replays are used to reach it, so
@@ -8960,7 +8960,7 @@ bool addThermalDataToVTK(
 // GPU and is "configured == integrated real-forcing spin-up, plus a fixed
 // analytic seed" on the CPU. The banner below prints the seed length rather
 // than letting it stay invisible. Removing or exposing it is a separate change
-// (it would move every CPU baseline) — BUGS.md row proposed.
+// (it would move every CPU baseline) and is still open.
 //
 // Granularity: we cycle the EQUILIBRATION forcing array as assembled
 // (`prepare_flux(0, equilibration_steps)`). On the shipped lunar year-long
@@ -9051,7 +9051,7 @@ static int resolveEquilibrationPasses(const thermal::Config& config,
 //
 // Returns false only on a request we refuse to run. A request we cannot honor
 // (too few passes) is NOT a refusal: it warns and falls back to plain cycling,
-// which is what Fermi's ADDENDUM A3(b) specifies.
+// which is what the physics review specifies.
 //
 // `eq_passes` <= 0 means "the pass budget is not known at this call site" and
 // skips ONLY the budget check, so main() can validate the knob itself long
@@ -9881,7 +9881,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
-    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
+    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides
     // Kirchhoff (G1): this path rebuilds its own Planet, so record the infrared
     // absorptivity it will actually use instead of assuming it matches the
     // main-scope one. reportKirchhoffConsistency() compares the whole set.
@@ -9899,7 +9899,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // path production actually runs. It shipped wired into
     // runThermalModelsForAllFacesBatchSoA ONLY, so every GPU window -- every
     // A3GT window -- integrated its spin-up and said nothing about whether that
-    // spin-up was long enough (BUGS.md PTM-EQ-SPINUP-ESTIMATOR-CPU-ONLY).
+    // spin-up was long enough.
     //
     // Report-only: it reads the seed column, kc/rho and Qb, and writes only
     // itself. A run with it on must be byte-identical to the same run with
@@ -9937,7 +9937,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // gate-ON run is verifiable from stdout — proves the branch FIRES.
         std::cout << "[GPU Thermal] Using directional-hemispheric (Hapke) albedo "
                      "A_h(i) = 1 - gamma*H(mu0,w)" << std::endl;
-        // PTM-55: this banner used to print `planet.albedo` -- the albedo of the
+        // this banner used to print `planet.albedo` -- the albedo of the
         // Planet REBUILT two lines above from the body name, which inherits the
         // body default and never re-reads the configured value. That is not the
         // number the physics uses: face_albedos is initialized from
@@ -9946,14 +9946,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // carried two different values for one quantity ("A0 = 0.12" from the
         // main scope, "A0 = 0.1" here) with no way for a reader to tell which
         // the solver saw. Report the operative value, and say where it came
-        // from -- per PTM-05.
+        // from -- per the unwatched side-channel rule.
         std::cout << "[GPU Thermal]   Base albedo A0 = " << fmtSig(default_visible_albedo)
                   << " (operative: face_albedos is initialized to this; a loaded "
                      "albedo map supersedes it per face), single-scattering w = "
                   << fmtSig(hapke_w) << std::endl;
         if (std::abs(planet.albedo - default_visible_albedo) > 1e-9) {
             // Explicit precision -- see the CPU sibling: the inherited stream
-            // state can print two different values identically (PTM-09 class).
+            // state can print two different values identically (the banner-precision class).
             std::ios_base::fmtflags f(std::cerr.flags());
             std::streamsize pr = std::cerr.precision();
             std::cerr << std::defaultfloat << std::setprecision(6)
@@ -9972,9 +9972,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // ---- Optional initial / final thermal-state checkpoint -------------
     // The format ('PTMT', layer-major float32) lives in ONE place --
     // thermal/thermal_state_io.h -- which is what makes a checkpoint written by
-    // this solver readable by the CPU drivers and vice versa (BUGS.md PTM-76).
+    // this solver readable by the CPU drivers and vice versa.
     // This block used to be the only copy; the CPU paths had none, and the
-    // PTM-57 rewrite below had a third.
+    // coupled-checkpoint hand-off rewrite below had a third.
     std::vector<float> loaded_initial_T;
     if (!initial_state_file.empty()) {
         std::string st_err;
@@ -10007,7 +10007,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                   t_err, verdict)) {
             return false;
         }
-        // BUGS.md PTM-662, GPU half, NOT fixed here. The CPU drivers now
+        // Warm-start seam frame, GPU half, NOT fixed here. The CPU drivers now
         // re-solve a warm-started window's first frame at its own epoch, so a
         // chunked CPU run equals the unchunked run at every frame. The GPU
         // persistent kernel still files the restored column's raw surface
@@ -10325,7 +10325,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         albedo_maps_dir += '/';
     }
 
-    // Records which file the per-face albedos actually came from, so the PTM-34
+    // Records which file the per-face albedos actually came from, so the albedo-map longitude-roll
     // registration tripwire below can name it.
     std::string albedo_source_label = "(no albedo map loaded)";
 
@@ -10464,7 +10464,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                   << fmtSig(default_visible_albedo) << std::endl;
     }
 
-    // PTM-34 tripwire (GPU thermal path). See the CPU-path copy for the rationale:
+    // Albedo-map longitude-roll tripwire (GPU thermal path). See the CPU-path copy for the rationale:
     // a longitude-rolled map is invisible to every scalar summary, so the check is
     // spatial. Detect-and-disclose; the map is named, never silently corrected.
     if (albedo_loaded) {
@@ -10480,7 +10480,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     std::vector<double> face_w(n_faces);
     for (size_t f = 0; f < n_faces; ++f) face_w[f] = hapkeWFromA0(face_albedos[f]);
 
-    // PTM-107(a) on the GPU path (Fermi condition C1). OUTPUT-ONLY: reads the flux
+    // Effective-albedo on the GPU path. OUTPUT-ONLY: reads the flux
     // table and face_albedos/face_w, writes only the two file-scope accumulators.
     // The incidence gate is reproduced here from the SAME planet fields the batch
     // workers use for their own `use_incidence` (see prepare_flux below) so the
@@ -10711,14 +10711,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
-            std::function<double(size_t, int)> seed_indirect_holder;   // PTM-727
+            std::function<double(size_t, int)> seed_indirect_holder;   // the indirect-aware spin-up seed
             applySeedIndirect(sc, absorbed_at, seed_indirect_holder, times);
             // A warm-started chunk overwrites T_initial with the checkpoint a
             // few lines below (uploadAllTemps), so the seed computed here never
             // reaches the answer. Feeding the census and the guards from it
             // would print a complete, plausible, entirely fictional anchor line
-            // -- with quadrature -- for a run that was seeded by nothing
-            // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
+            // -- with quadrature -- for a run that was seeded by nothing.
+            // The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
             size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
@@ -10751,7 +10751,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 avg_flux /= n_samples;
 
                 if (perface) {
-                    // Fermi PORT-EQ-01: seed each column from ITS OWN time-mean
+                    // seed each column from ITS OWN time-mean
                     // absorbed flux + Qb. PSR floors (mean ~0) cold-start at the
                     // geothermal steady state ~24.7 K; sunlit ~unchanged after eq.
                     // Isothermal at the diurnal-mean equilibrium (no warm floor).
@@ -11000,8 +11000,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
             // ---- Single-phase (legacy dt, and EVERY warm-start chunk) ----
-            // Two defects used to live on exactly this branch (BUGS.md PTM-78,
-            // and the mechanism behind PTM-54/PTM-57):
+            // Two defects used to live on exactly this branch (the post-eq hand-off,
+            // and the mechanism behind the uncoupled first frames of chunks):
             //
             //  1. equil_cycles == 1 made solvePersistentMultipleCycles run
             //     total_cycles = n_equil_cycles + 1 = 2 passes over the chunk's
@@ -11500,14 +11500,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             sc.cp0 = planet.cp0;
             sc.cp_coeff = &planet.cpCoeff;
-            std::function<double(size_t, int)> seed_indirect_holder;   // PTM-727
+            std::function<double(size_t, int)> seed_indirect_holder;   // the indirect-aware spin-up seed
             applySeedIndirect(sc, absorbed_at, seed_indirect_holder, times);
             // A warm-started chunk overwrites T_initial with the checkpoint a
             // few lines below (uploadAllTemps), so the seed computed here never
             // reaches the answer. Feeding the census and the guards from it
             // would print a complete, plausible, entirely fictional anchor line
-            // -- with quadrature -- for a run that was seeded by nothing
-            // (BUGS.md PTM-76). The fill itself is left alone so T_initial is
+            // -- with quadrature -- for a run that was seeded by nothing.
+            // The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
             size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
@@ -11544,7 +11544,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                 avg_flux /= n_samples;
 
                 if (perface) {
-                    // Fermi PORT-EQ-01: seed each column from ITS OWN time-mean
+                    // seed each column from ITS OWN time-mean
                     // absorbed flux + Qb (PSR floors cold-start at the geothermal
                     // steady state ~24.7 K; sunlit ~unchanged after equilibration).
                     double T_eq = std::sqrt(std::sqrt(
@@ -12108,7 +12108,7 @@ post_batch_loop:
         // one configuration where every column was zero was also the one
         // configuration the tripwire declined to inspect. That is how a
         // warm-start chunk shipped a coupled run whose re-thermal started from
-        // 0 K (BUGS.md PTM-78).
+        // 0 K.
         size_t n_zero = 0;
         for (size_t fc = 0; fc < n_faces; ++fc) {
             bool all_zero = true;
@@ -12186,7 +12186,7 @@ bool runThermalForSelectedFaces_GPU(
 
     // Get thermal model parameters
     thermal::Planet planet(config.getProperty("planet", "Moon"));
-    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides (PTM-53)
+    applyConfiguredThermo(planet, config);   // generic-body props + user scalar overrides
     // Kirchhoff (G1): this path rebuilds its own Planet, so record the infrared
     // absorptivity it will actually use instead of assuming it matches the
     // main-scope one. reportKirchhoffConsistency() compares the whole set.
@@ -12536,7 +12536,7 @@ bool runThermalForSelectedFaces_GPU(
         // TODO(ice-stability): rad-coupling re-thermal does not update
         // ice_acc->sum_E for selected faces; ice_depth.bin reflects
         // only iter-0's flux BC on the re-thermal'd faces. (Owed ledger row
-        // PTM-ICEACC-RETHERMAL-STALE. The depth product below does NOT have
+        // Stale ice accumulator after re-thermal. The depth product below does NOT have
         // this hole -- it is recomputed and REPLACED for every selected face.)
         std::vector<float> output_temps;
         std::vector<float> rt_dsum, rt_dmax, rt_dmin;
@@ -12571,7 +12571,7 @@ bool runThermalForSelectedFaces_GPU(
 
         // Hand the POST-COUPLING end-of-window column back to the caller so a
         // chunk checkpoint archives the coupled state, not iter-0's un-coupled
-        // one (BUGS.md PTM-57). downloadAllTemps strides by activeFaceCount(),
+        // one. downloadAllTemps strides by activeFaceCount(),
         // which EXCEEDS batch_n whenever the shared re-thermal pool was
         // allocated wider than this batch — using batch_n as the stride there
         // reads the wrong faces, and gating on `size == batch_n*n_layers`
@@ -12610,7 +12610,7 @@ bool runThermalForSelectedFaces_GPU(
         // slots. In two-phase mode, eq-window slots stay at 0 (matches
         // iter-0). In single-phase, the full range is written.
         //
-        // RE-THERMAL WARMUP SKIP (PTM-54). This used to be a hard-coded 2:
+        // RE-THERMAL WARMUP SKIP. This used to be a hard-coded 2:
         // the first 2 recorded steps of every re-thermal were LEFT at iter-0's
         // UN-COUPLED values, which is exactly the "first two frames of every
         // chunk are un-coupled" artifact. Its stated justification was a
@@ -12619,7 +12619,7 @@ bool runThermalForSelectedFaces_GPU(
         // surface Newton solve from a physics guess (equilibrium T, or T1 at
         // night), so it carries NO state across uploadAllTemps that could need
         // 2 steps to settle. The transient it was masking was the ZERO T(z)
-        // seed (post-eq snapshot never captured; see PTM-78) being clamped to
+        // seed (post-eq snapshot never captured) being clamped to
         // the old [3,500] K floor — a seed bug, symptomatically patched here.
         // With a correct seed there is nothing to skip. Default 0; set
         // PTM_RETHERMAL_WARMUP_SKIP=2 to restore the legacy mask.
@@ -13334,7 +13334,7 @@ std::string calculateAdjustedStartTime(const std::string& iso_time, double days_
     // kernel (or the whole metakernel) never loaded, str2et_c is a silent no-op
     // under erract=RETURN and `et` is left uninitialized; printing/using it would
     // produce a garbled start time and an epoch driven by stack garbage instead
-    // of the requested start_time (see BUGS.md PTM-27).
+    // of the requested start_time.
     if (failed_c()) {
         SpiceChar short_msg[81] = {0};
         getmsg_c("SHORT", 81, short_msg);
@@ -13990,7 +13990,7 @@ bool validateMesh(const std::shared_ptr<ptm::Mesh>& mesh) {
 }
 
 // ============================================================================
-// PTM-37: state the mesh length unit, and REFUSE to run when it is a guess.
+// state the mesh length unit, and REFUSE to run when it is a guess.
 //
 // PTM3D mesh units are not uniform and nothing on Mesh records which it has:
 // global icosphere meshes are built in KILOMETERS (mesh_utils.cpp scales
@@ -13999,7 +13999,7 @@ bool validateMesh(const std::shared_ptr<ptm::Mesh>& mesh) {
 // ad-hoc test, `|face_center| > 10000` -> meters (kmToNativeScale :74,
 // calculatePrimaryIRBatch :4070, calculatePrimaryReflectedBatch :4218). That
 // heuristic is a 1000x error waiting to happen: getting it backwards is what
-// PTM-36 was (Jupiter's shadow shrank 1000x and every Europa eclipse vanished).
+// the eclipse km/m unit defect was (Jupiter's shadow shrank 1000x and every Europa eclipse vanished).
 //
 // This does not fix the substrate -- Mesh still carries no unit -- but it
 // makes the guess VISIBLE and refuses the cases where it is unsafe:
@@ -14031,7 +14031,7 @@ struct MeshUnitReport {
 };
 
 // ---------------------------------------------------------------------------
-// FACET SCALE, and the beaming rule that depends on it (BUGS.md ENG-BEAM-SCALE-1).
+// FACET SCALE, and the beaming rule that depends on it.
 //
 // `radiation.beaming` turns on the Smith (1967) sub-facet roughness treatment.
 // Until now the engine enforced exactly one thing about it -- beaming: true
@@ -14156,7 +14156,7 @@ MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
 
     // Median |vertex|, as an independent witness of the same geometry. These
     // two must agree: face centers ARE vertex averages. They disagree when
-    // something rescaled one array and not the other -- see PTM-65, where
+    // something rescaled one array and not the other -- see the mesh scale_factor defect, where
     // mesh.scale_factor scales the vertices and leaves face_centers /
     // face_areas / face_normals at the loader's values, then prints "Applied
     // scale factor". Checking it here turns a silent 1000x geometry error
@@ -15503,11 +15503,11 @@ static double reportIndirectBandClosure(
 }
 
 // ---------------------------------------------------------------------------
-// Band-separated INDIRECT flux outputs (Paul's product, 2026-07-17 — Ada).
+// Band-separated INDIRECT flux outputs (2026-07-17).
 //
 // Writes the two indirect radiosity bands as per-timestep frames + statistics,
 // mirroring the direct_solar / primary_ir components exactly (uint32 face-count
-// header + float32 payload; PTM-15-corrected statistics window):
+// header + float32 payload; corrected statistics window):
 //   indirect_solar/ : absorbed multiply-scattered SOLAR indirect  (1-A)·Σ_j F_ij B^vis_j
 //   indirect_ir/    : absorbed thermal-IR indirect                   ε·Σ_j F_ij B^ir_j
 //
@@ -15598,7 +15598,7 @@ bool writeIndirectBandOutputs(
                 buf_ir[f]  = (at >= 0 && at < static_cast<int>(ri.size()))
                     ? static_cast<float>(ri[at]) : 0.0f;
             }
-            // BUGS.md PTM-664: width from the run's frame count, minimum 6.
+            // width from the run's frame count, minimum 6.
             const std::string ts = ptm::frameIndexString(t, out_steps);
             if (!write_frame(output_dir + "/indirect_solar/indirect_solar_" + ts + ".bin", buf_vis)) ++fail;
             if (!write_frame(output_dir + "/indirect_ir/indirect_ir_" + ts + ".bin", buf_ir)) ++fail;
@@ -15612,7 +15612,7 @@ bool writeIndirectBandOutputs(
         }
     }
 
-    // --- Statistics over the (PTM-15-corrected) integration window ----------
+    // --- Statistics over the (corrected) integration window -----------------
     if (write_stats && stats_steps > 0) {
         auto window_stats = [&](const std::vector<std::vector<double>>& series) {
             Statistics s;
@@ -16265,7 +16265,7 @@ bool exportDataAsBinary(
             }
         }
 
-        // BUGS.md PTM-664: width from the run's frame count, minimum 6.
+        // width from the run's frame count, minimum 6.
         std::string ts = ptm::frameIndexString(t, time_steps);
         bool ok=true;
         auto writeComp=[&](const char* name, const std::vector<float>& buf){
@@ -16370,7 +16370,7 @@ void printBanner() {
 // ============================================================================
 #ifdef PTM_GPU_OPENCL
 static int runGpuCalibration(int argc, char** argv) {
-    // Fermi F3: the probe MUST be production-representative or the ceiling is
+    // the probe MUST be production-representative or the ceiling is
     // unsafe. The kernel's von-Neumann substep count (Fo<0.49) is set by the
     // MINIMUM near-surface dz and kappa at the OUTPUT dt: a uniform 1 cm grid
     // @250 K yields ~2 substeps/step, but production cold-PSR fine grids hit
@@ -16591,7 +16591,7 @@ int main(int argc, char** argv) {
     // ========================================================================
     ptm::SimulationConfig sim_config;  // Starts with default values
 
-    // PTM-42: apply the config's `engine_env:` block BEFORE anything reads the
+    // apply the config's `engine_env:` block BEFORE anything reads the
     // environment. This must precede loadFromYAML (which reads PTM_DATA_ROOT)
     // and every solver/illumination construction (which latch their gates on
     // first call). The process environment wins on a conflict, and every
@@ -16608,7 +16608,7 @@ int main(int argc, char** argv) {
             sim_config = parser.loadFromYAML(config_file);
             std::cout << "✓ Configuration loaded from: " << config_file << std::endl;
         } catch (const std::exception& e) {
-            // PTM-66: this used to warn and CONTINUE. `sim_config` is still at
+            // this used to warn and CONTINUE. `sim_config` is still at
             // its constructor defaults here, so continuing ran the whole
             // simulation on built-in defaults -- default body, mesh, timesteps,
             // thermophysical properties and output directory -- and exited 0.
@@ -16634,7 +16634,7 @@ int main(int argc, char** argv) {
     //
     // Historically this could not be done by throwing from the parser: the catch
     // above downgraded any parse exception to a warning and then ran the whole
-    // simulation on built-in defaults with exit code 0 (BUGS.md PTM-66). PTM-66
+    // simulation on built-in defaults with exit code 0. That malformed-config defect
     // is fixed in this same release, so a throw would now be fatal -- but this
     // check stays, because it names the offending value and the valid set
     // instead of emitting a generic "failed to load config file".
@@ -16651,7 +16651,7 @@ int main(int argc, char** argv) {
 
     // simulation.body must name a body this engine implements, unless the
     // config also carries a `generic_body:` block that supplies the properties
-    // itself. BUGS.md ENG-BODY-UNBACKED-RUN.
+    // itself (the unknown-body fallback).
     //
     // WHAT THIS REPLACES. `PlanetaryData::getPropertiesByName` resolves any
     // unrecognized name to EUROPA. So `body: Mars` used to run to COMPLETION
@@ -16884,12 +16884,12 @@ int main(int argc, char** argv) {
     double rad_coupling_face_frac = 0.01;   // Face fraction still changing to stop
     std::string rad_coupling_select_mode = "physics";  // "physics" (default) or "legacy"
     double rad_coupling_select_safety = 0.5;            // Safety factor on predicted-ΔT threshold
-    // PTM-89: "bounded" (default) | "fixed" | "legacy". See config_parser.h.
+    // "bounded" (default) | "fixed" | "legacy". See config_parser.h.
     std::string rad_coupling_mode = "bounded";
     double rad_coupling_select_dt = 0.0;    // Absolute predicted-ΔT selection threshold [K]
-    // PTM-98: "all" (default) | "shadow". Radiation-exchange face set. See config_parser.h.
+    // "all" (default) | "shadow". Radiation-exchange face set. See config_parser.h.
     std::string rad_exchange_selection = "all";
-    double rad_min_shadow_fraction = 0.3;   // "shadow" mode only (PTM-99: now plumbed)
+    double rad_min_shadow_fraction = 0.3;   // "shadow" mode only (now plumbed)
 
     // ACA (Adaptive Cross Approximation) configuration for H-matrix
     bool rad_use_aca = true;                // Use ACA by default (much faster than SVD)
@@ -17160,7 +17160,7 @@ int main(int argc, char** argv) {
             config.setProperty("use_simd_batch", false);
             std::cout << "SIMD batch solver disabled; using legacy Model::run scalar path" << std::endl;
         } else if (arg == "--seed-indirect" && i + 1 < argc) {
-            // PTM-727. `--seed-indirect off` reproduces every run made before the
+            // Indirect-aware spin-up seed. `--seed-indirect off` reproduces every run made before the
             // default changed, byte-for-byte (the validation legacy arm uses it).
             const std::string v = argv[++i];
             if (v != "off" && v != "series" && v != "mean") {
@@ -17301,7 +17301,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // Same key the YAML `thermophysical.albedo_override` sets, so the
-            // flag inherits the PTM-53 solver forwarding, the albedo-map
+            // flag inherits the built-in-body property override solver forwarding, the albedo-map
             // out-ranking warning and the rule-7 tripwire unchanged. CLI beats
             // config, per the documented precedence -- say so when it does.
             double prior = sim_config.thermophysical.albedo_override;
@@ -17565,11 +17565,11 @@ int main(int argc, char** argv) {
     }
 
     // ----------------------------------------------------------------------
-    // PTM-89 coupling-mode resolution, AT CONFIG TIME.
+    // Chunk-independent coupling-mode resolution, AT CONFIG TIME.
     //
     // Resolved and validated here — before the illumination pass — so a typo in
     // the mode costs nothing instead of surfacing after minutes to hours of ray
-    // tracing (the failure shape of the *other* PTM-80). The env override lets a
+    // tracing (the failure shape of the *other* early GPU refusal). The env override lets a
     // published run be reproduced without editing its config.
     // ----------------------------------------------------------------------
     {
@@ -17609,7 +17609,7 @@ int main(int argc, char** argv) {
     }
 
     // ----------------------------------------------------------------------
-    // PTM-98 exchange-selection resolution, AT CONFIG TIME (same rationale as
+    // Window-independent exchange-selection resolution, AT CONFIG TIME (same rationale as
     // the coupling-mode block above: a typo must cost nothing).
     // ----------------------------------------------------------------------
     {
@@ -17926,7 +17926,7 @@ int main(int argc, char** argv) {
                 if (dst.spin_period_hours < 0) dst.spin_period_hours = loaded.spin_period_hours;
                 if (dst.pole_ra_deg < 0) dst.pole_ra_deg = loaded.pole_ra_deg;
                 if (dst.pole_dec_deg < 0) dst.pole_dec_deg = loaded.pole_dec_deg;
-                // BUGS.md PTM-663: these two were never merged either.
+                // these two were never merged either.
                 if (!dst.prime_meridian_set && loaded.prime_meridian_set) {
                     dst.prime_meridian_deg = loaded.prime_meridian_deg;
                     dst.prime_meridian_set = true;
@@ -17984,7 +17984,7 @@ int main(int argc, char** argv) {
         // --- Shape ---
         // Every branch below used to fall through to SPHERICAL in silence:
         // an unknown type, `ellipsoidal` without three axes, `custom_mesh`
-        // without a mesh_file (BUGS.md PTM-663 audit). An unknown type is a
+        // without a mesh_file (the generic-body epochs audit). An unknown type is a
         // typo and is refused; the two incomplete ones are said out loud.
         if (!cfg.shape_type.empty() && cfg.shape_type != "spherical" &&
             cfg.shape_type != "ellipsoidal" && cfg.shape_type != "custom_mesh") {
@@ -18038,7 +18038,7 @@ int main(int argc, char** argv) {
                 generic_body.shape.radius_km = cfg.radius_km;
         }
 
-        // --- Epochs (BUGS.md PTM-663) ---
+        // --- Epochs ---
         // orbit.epoch and spin.epoch were parsed and dropped until 2026-09-24:
         // M0 was applied at J2000 and the prime meridian was referred to J2000
         // whatever the file said. Both are TDB (orbital/epoch_parse.h); an
@@ -18087,7 +18087,7 @@ int main(int argc, char** argv) {
             if (cfg.pole_dec_deg >= -90.0 && cfg.pole_dec_deg != -1.0)
                 generic_body.spin.pole_dec_deg = cfg.pole_dec_deg;
         }
-        // Prime meridian W0 at spin.epoch (BUGS.md PTM-663). Applied whether or
+        // Prime meridian W0 at spin.epoch. Applied whether or
         // not a period was given: the frame is built from it either way.
         if (!std::isfinite(cfg.prime_meridian_deg)) {
             std::cerr << "FATAL: generic_body.spin.prime_meridian_deg = "
@@ -18121,7 +18121,7 @@ int main(int argc, char** argv) {
         // Anything but "spice" has always resolved to Keplerian, so a typo
         // ("SPICE", "horizons") ran a two-body orbit without a word. Refused
         // now; and "auto" -- the default -- is Keplerian too, which a config
-        // that also names a metakernel will not expect (BUGS.md PTM-663 audit).
+        // that also names a metakernel will not expect (the generic-body epochs audit).
         if (cfg.ephemeris_source != "spice" && cfg.ephemeris_source != "keplerian" &&
             cfg.ephemeris_source != "auto") {
             std::cerr << "FATAL: generic_body.ephemeris_source = '" << cfg.ephemeris_source
@@ -18195,7 +18195,7 @@ int main(int argc, char** argv) {
     // flags existed and none of them set TI. Rather than define a new
     // inversion, this resolves the flag onto the SAME two knobs every existing
     // thermal-inertia sweep in the tree already turns -- ks_override and
-    // kd_override -- so the request inherits, unchanged, the PTM-53 forwarding
+    // kd_override -- so the request inherits, unchanged, the built-in-body property override forwarding
     // to every solver, the martinez2021 composition guard, and the rule-7
     // tripwire that fails a run whose override no solver applied.
     //
@@ -18344,7 +18344,7 @@ int main(int argc, char** argv) {
     // face_albedos / radiosity reflectance and ks/kd feed the constant-TI cp.
     // Sentinel <0 leaves the body default untouched -> baseline runs unchanged.
     //
-    // PTM-53: these banners describe the REQUEST, not the outcome. What the
+    // these banners describe the REQUEST, not the outcome. What the
     // solver ends up using is echoed separately by applyConfiguredThermo()
     // ("[Thermo override] applied at solver: ..."), and a run that requests an
     // override no solver ever applies is FAILED at the tripwire below. Do not
@@ -18376,7 +18376,7 @@ int main(int argc, char** argv) {
             // fmtSig, NOT bare `<<`. std::cout arrives here already carrying
             // `std::fixed << std::setprecision(1)` from an earlier progress
             // banner, under which H = 0.06 m renders as "0.1" -- a run
-            // reporting a number it did not use (the same PTM-05/PTM-55
+            // reporting a number it did not use (the same the unwatched side-channel
             // archetype fmtSig exists for; the albedo-map rule-7 warning
             // further down still prints 0.06 as "0.1" today -- observed in this
             // branch's own ico6 log, reported to the ledger 2026-08-17, and NOT
@@ -18610,7 +18610,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // PTM-17: a REQUESTED mesh import that fails is FATAL. Never silently substitute
+        // a REQUESTED mesh import that fails is FATAL. Never silently substitute
         // a default icosphere for a specified import_file -- that runs the simulation on
         // the wrong geometry without warning. (The legitimate procedural-icosphere path is
         // the `else` branch below, taken only when no import_file is given.)
@@ -18698,7 +18698,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // PTM-37: state the inferred mesh length unit (and the body radius that
+    // state the inferred mesh length unit (and the body radius that
     // does or does not corroborate it), and refuse to run when the inference
     // is a coin flip. See inspectMeshLengthUnit for the three fatal cases.
     std::string mesh_length_unit = "unknown";
@@ -18713,7 +18713,7 @@ int main(int argc, char** argv) {
         if (units.fatal) {
             // Do NOT recommend mesh.scale_factor here. It scales the vertices
             // and leaves face_centers/face_areas/face_normals at the loader's
-            // values (PTM-65), which is precisely the internal inconsistency
+            // values, which is precisely the internal inconsistency
             // case 0 above refuses -- so the advice would send the operator
             // straight back into this same FATAL, one case earlier.
             std::cerr << "FATAL [mesh-units]: " << units.message << "\n"
@@ -19073,7 +19073,7 @@ int main(int argc, char** argv) {
                 early_rad_config.adaptive_neighbors = false;  // Use fixed if override specified
             }
 
-            // PTM-733: a VF_REPLACE CSR must be traced on the side this run illuminates (once).
+            // a VF_REPLACE CSR must be traced on the side this run illuminates (once).
             radiation::vfReplaceOrientationGate(*mesh, use_batch_processing);
             // Create temporary radiation exchange manager for view factor computation
             radiation::RadiationExchangeManager early_rad_manager(mesh, early_rad_config);
@@ -19174,7 +19174,7 @@ int main(int argc, char** argv) {
     // setPlanetaryBody()/setGenericBody() above so the correct per-body metakernel
     // (e.g. moon.tm, not the europa.tm default) is furnsh'd. A failure here (missing
     // or unresolved kernels) is fatal: without an ephemeris the absolute epoch and
-    // Sun/primary positions cannot be computed. Do not proceed with rc=0 (BUGS.md PTM-27).
+    // Sun/primary positions cannot be computed. Do not proceed with rc=0.
     if (!illumination_model->initialize_spice(verbose)) {
         std::cerr << "\nFATAL: SPICE initialization failed for body '" << planet.name << "'.\n"
                   << "  Cannot resolve the absolute epoch/ephemeris without SPICE kernels.\n"
@@ -19187,7 +19187,7 @@ int main(int argc, char** argv) {
     // initialize_spice() above already resolved it (explicit setKernelsPath, then
     // $PTM_SPICE_KERNELS, then SPICE_KERNELS_DIR); overwriting it afterwards
     // discarded any $PTM_SPICE_KERNELS override for every later use of the
-    // directory. BUGS.md PTM-145.
+    // directory (the generic-body metakernel fix).
     if (!using_generic_body) {
         illumination_model->setIncludePrimaryReflection(include_primary_reflection);
     }
@@ -19441,7 +19441,7 @@ int main(int argc, char** argv) {
     // Equilibration length, stated so the configured number, the integrated
     // number and the forcing block can be read off one banner on EVERY solver
     // path. Before 2026-08-11 this printed only equilibration_orbits, which on
-    // the GPU was half of what the run actually integrated (BUGS.md PTM-146).
+    // the GPU was half of what the run actually integrated.
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "Equilibration (configured): " << eq_orbits_configured
               << " day/night cycles  (thermal.equilibration_orbits)" << std::endl;
@@ -19684,7 +19684,7 @@ int main(int argc, char** argv) {
     // Publish the integration (statistics) window NOW, before any flux table is
     // built, so the effective-albedo accumulators on both the CPU and the GPU
     // thermal paths reduce over exactly the window every other statistics/*.bin
-    // uses (Fermi condition C2). Same helper the statistics export calls below;
+    // uses. Same helper the statistics export calls below;
     // the export cross-checks the two and warns if they ever disagree.
     {
         // The reducible window ends where the EXPORT window ends: the
@@ -19919,7 +19919,7 @@ int main(int argc, char** argv) {
     illumination_model->setExternalTimeGrid(external_ets);
 
     // ----------------------------------------------------------------------
-    // SPK coverage pre-check (BUGS.md PTM-301, second half)
+    // SPK coverage pre-check (second half)
     // ----------------------------------------------------------------------
     // Run HERE, not in --validate-config: the check needs furnsh'd kernels and
     // the resolved epoch grid, neither of which exists at the config-only exit.
@@ -19929,7 +19929,7 @@ int main(int argc, char** argv) {
     //
     // external_ets is the whole grid INCLUDING the equilibration prefix, which
     // is the span that matters: spin-up integrates before start_time, and a
-    // forward-only kernel fetch is exactly how PTM-437 put every spin-up epoch
+    // forward-only kernel fetch is exactly how the HORIZONS window extension put every spin-up epoch
     // outside coverage.
     if (!external_ets.empty()) {
         // Spelling rule shared with the radiation gates (envTristateFlag):
@@ -20051,7 +20051,7 @@ int main(int argc, char** argv) {
     const auto& sun_positions = illumination_model->getSunPositions();
     const auto& primary_positions = illumination_model->getPrimaryPositions();
 
-    // Fix A (BUGS.md PTM-28): build the per-timestep instantaneous solar constant
+    // Fix A: build the per-timestep instantaneous solar constant
     // table used by the incidence-angle albedo (Hayne + Hapke). direct_solar was
     // formed as (SOLAR_CONSTANT/dist_au^2)*<cos>, so recovering cos with the same
     // instantaneous S keeps cos<=1 and removes the super-solar-constant albedo
@@ -20142,7 +20142,7 @@ int main(int argc, char** argv) {
     // one ran.
     const bool stream_decision_at_extraction = use_streamed_thermal;
 
-    // BUGS.md PTM-76 (CLOSED for the whole-mesh solvers). The T(z) checkpoint
+    // CPU checkpoint support (CLOSED for the whole-mesh solvers). The T(z) checkpoint
     // used to be read and written ONLY by the GPU persistent solver; on a CPU
     // path both keys were dropped with no file and no error, so a chunked run
     // silently degraded into independent COLD-STARTED runs that still exit 0.
@@ -20153,7 +20153,7 @@ int main(int argc, char** argv) {
     // What is NOT covered, and therefore still refuses: the coupled CPU
     // re-thermal keeps no T(z) column, so a CPU run that both couples radiation
     // AND asks for a checkpoint can only archive the UN-COUPLED iter-0 column.
-    // That is disclosed at the re-thermal (BUGS.md PTM-57), not refused, since
+    // That is disclosed at the re-thermal, not refused, since
     // the checkpoint it writes is real and usable -- just pre-coupling on the
     // re-thermal'd faces.
     if (!sim_config.thermal.initial_state_file.empty() ||
@@ -20453,9 +20453,9 @@ int main(int argc, char** argv) {
     // sites below, next to the `&rad_post_eq_T` argument itself, so the flag
     // cannot drift from the mechanism it records.
     //
-    // The PTM-78 seed tripwire is gated on THIS, not on `radiation.enabled`
+    // The post-equilibration hand-off seed tripwire is gated on THIS, not on `radiation.enabled`
     // (a user-set flag) and not on `want_post_coupling_state` (a GPU coupled
-    // run without a checkpoint still needs the guard). BUGS.md PTM-94.
+    // run without a checkpoint still needs the guard): the CPU coupling tripwire.
     bool rad_post_eq_T_expected = false;
 
 
@@ -20509,7 +20509,7 @@ int main(int argc, char** argv) {
         // solver entry point. It is deliberately NOT placed on `planet`: every
         // mesh/GPU solver entry point rebuilds its own thermal::Planet(body) and
         // discards main-scope Planet edits, which is exactly how ks_override/
-        // kd_override became silent no-ops on the Moon path (BUGS.md PTM-53).
+        // kd_override became silent no-ops on the Moon path.
         {
             thermal::ConductivityModel cm = thermal::ConductivityModel::Hayne2017;
             if (!thermal::parseConductivityModel(
@@ -20525,7 +20525,7 @@ int main(int argc, char** argv) {
             // `std::fixed << std::setprecision(1)` from an earlier banner
             // (:10725 and friends), which rendered ks = 7.4e-4 as "0.0" and
             // H = 0.06 as "0.1" -- a run reporting numbers that are not the
-            // numbers it used, i.e. exactly the PTM-05/PTM-55 archetype. A
+            // numbers it used, i.e. exactly the unwatched side-channel archetype. A
             // local ostringstream starts in the default format and cannot be
             // affected by whatever std::cout's state happens to be.
             std::ostringstream cmb;
@@ -20607,11 +20607,11 @@ int main(int argc, char** argv) {
                 }
 
                 // ---- composition guard 2: ks/kd overrides (WARNING) ----
-                // ks_override/kd_override DO reach the solver (that is the PTM-53
+                // ks_override/kd_override DO reach the solver (that is the built-in-body property override
                 // fix) and DO print "Property override: ks ... -> ...", but Eq. 10
                 // never reads ks or kd. Left unsaid, a conductivity sweep driven by
                 // ks_override under martinez2021 would run N identical simulations
-                // and report them as a sweep -- the PTM-53 archetype re-entering by
+                // and report them as a sweep -- the built-in-body property override archetype re-entering by
                 // the other door.
                 {
                     const auto& tpo = sim_config.thermophysical;
@@ -20694,7 +20694,7 @@ int main(int argc, char** argv) {
             // Applied by applyConfiguredThermo() at each solver entry point;
             // gated on "gb_thermo" so built-in Moon/Europa runs stay byte-identical.
             // (User-requested scalar overrides are forwarded separately, below,
-            //  on EVERY body -- see PTM-53.)
+            //  on EVERY body -- see the built-in-body property overrides.)
             thermal_config.setProperty("gb_thermo", "1");
             thermal_config.setProperty("gb_ks",         planet.ks);
             thermal_config.setProperty("gb_kd",         planet.kd);
@@ -20725,7 +20725,7 @@ int main(int argc, char** argv) {
         }
 
         // ====================================================================
-        // PTM-53: forward the user's EXPLICIT scalar overrides to the solvers,
+        // forward the user's EXPLICIT scalar overrides to the solvers,
         // on named bodies (Moon/Europa/Mercury) as well as generic ones.
         // ====================================================================
         // Every mesh solver entry point rebuilds a local Planet from the body
@@ -20742,7 +20742,7 @@ int main(int argc, char** argv) {
         // not the raw request, so the solver sees exactly what main() computed.
         //
         // Values go through fullPrecision() rather than the Config double setter,
-        // which truncates at 6 decimals (BUGS.md PTM-60).
+        // which truncates at 6 decimals.
         {
             const auto& tp = sim_config.thermophysical;
             auto fwd = [&thermal_config](const char* key, double value) {
@@ -20751,7 +20751,7 @@ int main(int argc, char** argv) {
             if (thermoOverrideRequested(tp, geothermal_heat_flow)) {
                 thermal_config.setProperty("ovr_thermo", "1");  // solver-side fast-path gate
             }
-            // PTM-161. `geothermal_heat_flow` is a `thermal.*` knob, not a
+            // Geothermal heat flow: `geothermal_heat_flow` is a `thermal.*` knob, not a
             // `thermophysical.*` one, but it suffers the identical defect and
             // rides the identical channel. `planet.Qb` here is post-resolution
             // (main applies the CLI/YAML value at :11647/:11833), so the solver
@@ -21016,7 +21016,7 @@ int main(int argc, char** argv) {
             // The physics hash, over the resolved main-scope Planet -- which
             // already carries the Hapke gate (resolved at the "Hapke albedo
             // gate" block above) and every scalar override. That is the same
-            // object the PTM-53 forwarding sends to the solvers, so the hash
+            // object the built-in-body property override forwarding sends to the solvers, so the hash
             // covers what they will actually run.
             id.identity_text = thermal::state_id::text(planet, thermal_config,
                                                        id.refgrid_H);
@@ -21366,14 +21366,14 @@ int main(int argc, char** argv) {
                     sim_config.thermal.gpu_inter_batch_pause_ms,
                     eqi);
                 // This solver — and only this solver — fills the post-eq T(z)
-                // hand-off (argument above). Record it for the PTM-78 tripwire.
+                // hand-off (argument above). Record it for the post-equilibration hand-off tripwire.
                 rad_post_eq_T_expected = enable_radiation_exchange;
                 return ok;
             }
             if (solver_path == ptm::ThermalSolverPath::CpuSimdBatch) {
                 const std::vector<double>* face_H_ptr_l =
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
-                // The CPU solvers now carry the T(z) checkpoint too (PTM-76),
+                // The CPU solvers now carry the T(z) checkpoint too,
                 // in the same format the GPU writes.
                 return runThermalModelsForAllFacesBatchSoA(
                     output_dir, mesh, ds, pr, pi, times, total_time_steps,
@@ -21646,7 +21646,7 @@ int main(int argc, char** argv) {
                 &planet,
                 equilibration_steps,
                 eq_indirect_vec,
-                // The T(z) checkpoint (PTM-76). The streamed path exists for
+                // The T(z) checkpoint. The streamed path exists for
                 // exactly the large meshes the chunked workflow is used on, so
                 // it is the one that most needed it.
                 sim_config.thermal.initial_state_file,
@@ -21758,10 +21758,10 @@ int main(int argc, char** argv) {
         thermal::reportSurfaceNewtonStats();
 
         // ====================================================================
-        // PTM-53 rule-7 tripwire: an override that was requested but never
+        // Built-in-body property override rule-7 tripwire: an override that was requested but never
         // applied must FAIL, not sail through with a reassuring banner.
         // ====================================================================
-        // This is what PTM-53 was: the log said "Property override: ks 0.00074
+        // This is what the built-in-body property-override defect was: the log said "Property override: ks 0.00074
         // -> 0.00148 W/m/K" and the temperature field came out byte-identical to
         // the un-overridden run. It fires before any statistics are exported, so
         // a run that cannot honor the request produces no misleading output.
@@ -21853,8 +21853,8 @@ int main(int argc, char** argv) {
             rad_config.rms_slope_deg = rad_rms_slope_deg;
             rad_config.beam_vf_threshold = rad_beam_vf_threshold;
             rad_config.radiance_prune_eps = rad_radiance_prune_eps;
-            // PTM-98 / PTM-99: radiation-exchange face set. min_shadow_fraction
-            // parsed but was never bridged here before PTM-99, so the hard-coded
+            // radiation-exchange face set. min_shadow_fraction
+            // parsed but was never bridged here before the min_shadow_fraction plumbing, so the hard-coded
             // 0.3 always won; it is now forwarded and only consulted in "shadow".
             rad_config.exchange_selection =
                 (rad_exchange_selection == "shadow")
@@ -21865,8 +21865,8 @@ int main(int argc, char** argv) {
             // (D2, 2026-07-12); gray recovered exactly with band_separated:false.
             // When ON, the per-face Bond albedo is sourced
             // into the manager BEFORE prepare() (below), so prepare()'s initGPU can
-            // engage the single-GPU two-band gate for sparse Sum_j F_ij <= 1 meshes
-            // (PTM-11); H-matrix / Sum_j F_ij > 1 use the CPU two-band path.
+            // engage the single-GPU two-band gate for sparse Sum_j F_ij <= 1 meshes;
+            // H-matrix / Sum_j F_ij > 1 use the CPU two-band path.
             rad_config.band_separated = sim_config.radiation.band_separated;
             // Multi-GPU radiosity dispatch — pool is materialized inside
             // RadiositySolver::initGPU() when gpu_devices > 1 and use_gpu = true.
@@ -21879,7 +21879,7 @@ int main(int argc, char** argv) {
                 rad_config.adaptive_neighbors = false;  // Use fixed if override specified
             }
 
-            // PTM-733: a VF_REPLACE CSR must be traced on the side this run illuminates (once).
+            // a VF_REPLACE CSR must be traced on the side this run illuminates (once).
             radiation::vfReplaceOrientationGate(*mesh, use_batch_processing);
             // Create radiation exchange manager
             ptm::timing::begin("radiation_setup");   // VF load / build + prepare()
@@ -21919,7 +21919,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Load per-face albedos for radiation coupling BEFORE prepare() (PTM-11).
+            // Load per-face albedos for radiation coupling BEFORE prepare().
             // Must match the albedos used in the initial thermal solve. The per-face
             // Bond albedo is a pure function of the config, the on-disk albedo map, and
             // the mesh face count — it does NOT depend on prepare()'s Embree scene,
@@ -21960,7 +21960,7 @@ int main(int argc, char** argv) {
                     "data/albedo_maps/" + albedo_filename
                 };
 
-                // BUGS.md PTM-454. Until this gate existed, NO config key stopped
+                // Coupling albedo load. Until this gate existed, NO config key stopped
                 // this load: the search below ran unconditionally and accepted any
                 // <Body>_Albedo_res<N>.bin whose length matched the face count, so
                 // `illumination.use_albedo_map: false` produced a run whose thermal
@@ -21976,7 +21976,7 @@ int main(int argc, char** argv) {
                 // is the SAME field the surface BC is using -- one physics, and the
                 // mixed state is unreachable rather than merely announced.
                 //
-                // Folded in: BUGS.md PTM-369. The three bare "File does not exist:"
+                // Folded in: the coupling albedo re-probe. The three bare "File does not exist:"
                 // lines this probe printed on a disabled run came from the search
                 // loop; not searching is what silences them.
                 const bool rad_albedo_map_disabled =
@@ -22085,7 +22085,7 @@ int main(int argc, char** argv) {
                               << fmt_albedo(planet.albedo) << " instead." << std::endl;
                 }
 
-                // BUGS.md PTM-454, the state this fix removes. Until the gate above,
+                // Coupling albedo load, the state this fix removes. Until the gate above,
                 // `use_albedo_map: false` gave a run whose surface BC used a uniform
                 // albedo while the radiosity source albedo came off the map, and the
                 // engine only ANNOUNCED it. The gate makes that unreachable; this is
@@ -22102,7 +22102,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
 
-                // PTM-34 tripwire (radiation-coupling path). See the CPU absorbed-flux
+                // Albedo-map longitude-roll tripwire (radiation-coupling path). See the CPU absorbed-flux
                 // copy for the rationale. This load is a SEPARATE read of the same map
                 // that feeds the two-band radiosity source albedo, and a run can reach
                 // it on a config the absorbed-flux tripwire never sees, so it needs its
@@ -22117,7 +22117,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // D1/PTM-11: band-separated (two-band) radiosity. Source the SAME per-face
+            // D1/band-separated (two-band) radiosity. Source the SAME per-face
             // Bond albedo the surface BC uses (face_albedos_rad) into the manager BEFORE
             // prepare(). prepare() sequences setSolarAlbedo -> enableTwoBand -> initGPU
             // (radiation_exchange.cpp:1471-1476 / 1613-1620), so with the albedo present
@@ -22133,7 +22133,7 @@ int main(int argc, char** argv) {
                 std::cout << "  [radiation.band_separated] two-band radiosity ON: visible band "
                              "uses per-face Bond albedo (scatter A_i / absorb 1-A_i), IR band 1-eps/eps."
                           << std::endl;
-                // BUGS.md PTM-106. The albedo above is the STATIC base Bond albedo A0. It
+                // Two-band source-albedo. The albedo above is the STATIC base Bond albedo A0. It
                 // remains the correct reflectance for the DIFFUSE inter-face exchange
                 // (the operator and the absorptivity), but NOT for the first bounce of
                 // the collimated direct beam, which the surface BC reflects with the
@@ -22164,7 +22164,7 @@ int main(int argc, char** argv) {
                                  "operator == A0 by construction)." << std::endl;
                 }
             } else {
-                // Fermi condition C3. The PTM-106 fix lives entirely inside the
+                // The two-band source-albedo fix lives entirely inside the
                 // two-band solve; on the GRAY path the visible source is not even
                 // formed from a Bond albedo. setSolarAlbedo() is called only in the
                 // branch above, so solar_reflectivity_ stays EMPTY here and
@@ -22195,7 +22195,7 @@ int main(int argc, char** argv) {
 
             // Prepare (classify faces, compute view factors if needed). two_band_ is now
             // activated BEFORE initGPU (via config_.band_separated inside prepare()), so
-            // initGPU can set two_band_gpu_ok_ for sparse Sum_j F_ij <= 1 meshes (PTM-11).
+            // initGPU can set two_band_gpu_ok_ for sparse Sum_j F_ij <= 1 meshes.
             const bool rad_prepared = rad_manager.prepare(illumination_series);
             ptm::timing::end("radiation_setup");
             if (!rad_prepared) {
@@ -22266,12 +22266,12 @@ int main(int argc, char** argv) {
                 std::cout << "  Max iterations: " << rad_max_coupling_iter << std::endl;
                 std::cout << "  Temperature tolerance: " << rad_coupling_temp_tol << " K" << std::endl;
 
-                // ---- PTM-89: decomposition (chunking) independence ----------
+                // ---- decomposition (chunking) independence ----------
                 // Mode was resolved and validated at config time (above).
                 const bool rad_coupling_legacy_mode = (rad_coupling_mode == "legacy");
                 const bool rad_coupling_fixed_iters = (rad_coupling_mode == "fixed");
                 // std::cout arrives here carrying a `fixed`/`setprecision(1)`
-                // left over from an earlier progress line (BUGS.md PTM-69), which
+                // left over from an earlier progress line, which
                 // would print a 0.05 threshold as "0.1". A diagnostic that lies
                 // about the number it is warning you about is worse than none, so
                 // pin the format for this block and restore it afterwards.
@@ -22336,15 +22336,15 @@ int main(int argc, char** argv) {
                 std::cout.flags(rad_banner_flags);
                 std::cout.precision(rad_banner_prec);
 
-                // ---- Re-thermal SEED tripwire (BUGS.md PTM-78) --------------
+                // ---- Re-thermal SEED tripwire --------------
                 // Every GPU coupling iteration re-integrates the selected faces
                 // from rad_post_eq_T. If that hand-off is empty or all-zero the
                 // whole coupled field is garbage, and it used to happen in
                 // SILENCE on every warm-start chunk. Refuse to produce results
                 // rather than write a plausible-looking wrong answer.
                 //
-                // GATED ON THE MECHANISM, not on radiation.enabled (BUGS.md
-                // PTM-94). The hand-off exists on exactly one path: it is
+                // GATED ON THE MECHANISM, not on radiation.enabled (the CPU
+                // coupling tripwire). The hand-off exists on exactly one path: it is
                 // written by runThermalModelsForAllFaces_GPU_Persistent and
                 // read by runThermalForSelectedFaces_GPU. The CPU whole-mesh
                 // solvers (runThermalModelsForAllFacesBatchSoA,
@@ -22354,7 +22354,7 @@ int main(int argc, char** argv) {
                 // scratch. Ungated, this guard therefore aborted EVERY CPU
                 // radiation-coupled run while protecting nothing on that path.
                 // It keeps its full force on the GPU path, which is where
-                // PTM-78 actually corrupted results.
+                // the post-equilibration hand-off actually corrupted results.
                 if (rad_post_eq_T_expected) {
                     if (rad_post_eq_T.empty()) {
                         std::cerr << "\nFATAL: radiation coupling is enabled but the thermal solver"
@@ -22383,7 +22383,7 @@ int main(int argc, char** argv) {
                 } else {
                     // Not an error — a different, self-contained integration.
                     // Say it out loud so nobody compares a CPU coupled field to
-                    // a GPU one and calls the difference physics (BUGS.md PTM-94).
+                    // a GPU one and calls the difference physics.
                     std::cerr << "  [Re-thermal] WARNING: CPU thermal solver — each coupling"
                                  " iteration re-equilibrates the selected faces from scratch"
                                  " instead of resuming the GPU path's saved post-equilibration"
@@ -22458,7 +22458,7 @@ int main(int argc, char** argv) {
                 // alone would let the block fire again on a later iteration.
                 bool eq_indirect_internal_finished = false;
 
-                // ---- PTM-727: thermal.seed_indirect -------------------------
+                // ---- thermal.seed_indirect -------------------------
                 // Acts only inside the eq-indirect re-solve, so it is refused
                 // wherever that pass can never run -- except a warm-started
                 // chunk, whose column comes from the checkpoint (which carries
@@ -22500,7 +22500,7 @@ int main(int argc, char** argv) {
                             seed_indirect_mode = SeedIndirectMode::Off;
                         } else {
                             if (!explicit_si) {
-                                // The ONE loud line a user cannot miss (PTM-727 default change).
+                                // The ONE loud line a user cannot miss (the indirect-aware spin-up seed default change).
                                 std::cerr << "[eq-seed] DEFAULT CHANGED: this coupled run"
                                              " seeds the spin-up WITH indirect flux (thermal.seed_indirect:"
                                           << si << "); results differ from runs before the change."
@@ -22796,7 +22796,7 @@ int main(int argc, char** argv) {
                 // ratios: 509k flagship rho = 0.7766 -> r = 0.768 against a
                 // measured 0.745; 12.8k 80 N crater rho = 0.1341 -> r = 0.128
                 // against a measured 0.077-0.128. (The crater's rho was carried
-                // in Fermi's note as "~0.081" from the engine's own row-sum line
+                // in the physics review's note as "~0.081" from the engine's own row-sum line
                 // rounded to "max=0.1"; the actual maximum row sum is 0.13988,
                 // this power iteration returns 0.134091, and Perron-Frobenius
                 // bounds rho by the max row sum -- 0.081 was the estimate, not
@@ -22826,7 +22826,7 @@ int main(int argc, char** argv) {
                     // "Max indirect flux", "Max temperature change" -- would
                     // then print one significant digit (26.2 K as 3e+01). The
                     // banner block above saves flags()/precision() for exactly
-                    // this reason; PTM-69 is the ledger entry for the class.
+                    // this reason; this is the stream-precision leak class.
                     const std::ios_base::fmtflags rho_saved_flags = std::cout.flags();
                     const std::streamsize rho_saved_prec = std::cout.precision();
                     const radiation::SpectralRadiusEstimate sr =
@@ -22952,7 +22952,7 @@ int main(int argc, char** argv) {
                 }
 
                 // (Per-face albedos + two-band activation were sourced BEFORE prepare()
-                // above — PTM-11 — so the single-GPU two-band gate can engage for sparse
+                // above — so the single-GPU two-band gate can engage for sparse
                 // Sum_j F_ij <= 1 meshes. The face_albedos_rad declared there is reused
                 // below by the physics-mode DeltaT/DeltaF selector.)
 
@@ -23279,7 +23279,7 @@ int main(int argc, char** argv) {
                     std::cout.precision(eqi_prec);
 
                     eq_indirect_vec = q_ind_mean;
-                    // PTM-727: arm the indirect-aware seed for THIS solve only.
+                    // arm the indirect-aware seed for THIS solve only.
                     struct SeedIndirectScope {
                         ~SeedIndirectScope() { g_seed_indirect = SeedIndirectHandoff{}; }
                     } seed_indirect_scope;
@@ -23291,7 +23291,7 @@ int main(int argc, char** argv) {
                         g_seed_indirect.t_hi   = std::min(out_hi, seedForcingSteps(total_time_steps));
                         g_seed_indirect.source = source_desc;
                         if (seed_indirect_mode == SeedIndirectMode::Series) {
-                            // ---- Fermi R2: WHOLE cycles only ----------------------
+                            // ---- WHOLE cycles only ----------------------
                             // A sub-cycle window samples the indirect at one phase
                             // (2-11 % of its mean at the L1 start on Moon3D cold
                             // traps), which is the old cold seed again.
@@ -23334,7 +23334,7 @@ int main(int argc, char** argv) {
                             const long spc = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
                             const long n_cyc = (spc > 0) ? (g_seed_indirect.t_hi - lo) / spc : 0;
                             g_seed_indirect.t_hi = lo + static_cast<int>(n_cyc * spc);
-                            // ---- Fermi R1: fold the series onto the eq steps -------
+                            // ---- fold the series onto the eq steps -------
                             const int eqn = equilibration_steps;
                             g_seed_indirect.eq_fold.assign(static_cast<size_t>(eqn), {});
                             int n_nearest = 0;
@@ -23418,7 +23418,7 @@ int main(int argc, char** argv) {
                         std::fill(row.begin(), row.end(), 0.0);
                     for (auto& row : indirect_ir_series)
                         std::fill(row.begin(), row.end(), 0.0);
-                    // PTM-57's post-coupling checkpoint accumulates end-of-window
+                    // The post-coupling checkpoint accumulates end-of-window
                     // columns across coupling iterations. On a "converged" restart
                     // it is NON-empty and holds the discarded pass's columns; left
                     // alone, faces the new loop never re-thermals would keep them.
@@ -23512,7 +23512,7 @@ int main(int argc, char** argv) {
                     std::vector<double> temps_t(num_faces);
                     std::vector<double> solar_t(num_faces);
 
-                    // --- PTM-106: per-timestep visible-band SOURCE albedo ------------
+                    // --- per-timestep visible-band SOURCE albedo ------------
                     // A(theta) is the albedo the surface BC reflects the DIRECT beam
                     // with, so it is exactly what the enclosure must receive. Recipe is
                     // character-for-character the one the coupled CPU re-thermal uses to
@@ -23613,7 +23613,7 @@ int main(int argc, char** argv) {
                                 double sl = std::sqrt(sp[0]*sp[0] + sp[1]*sp[1] + sp[2]*sp[2]);
                                 if (sl > 0.0) s_hat = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
                             }
-                            // PTM-106: install A(theta) for THIS timestep before solving.
+                            // install A(theta) for THIS timestep before solving.
                             if (ptm106_active) {
                                 ptm106_fill(srcalb_t, t, solar_t, iter == 0);
                                 rad_manager.setSolarSourceAlbedo(srcalb_t);
@@ -23678,7 +23678,7 @@ int main(int argc, char** argv) {
                                     if (sl > 0.0) sun_dirs_batch[j] = {sp[0]/sl, sp[1]/sl, sp[2]/sl};
                                 }
                             }
-                            // PTM-106: per-timestep A(theta) for the batched (pool) path.
+                            // per-timestep A(theta) for the batched (pool) path.
                             // Built here so timestep j pairs with solar_batch[j]; the
                             // solver refuses the pool rather than mis-pair on a mismatch.
                             if (ptm106_active) {
@@ -23921,7 +23921,7 @@ int main(int argc, char** argv) {
                         const double epsilon = planet.emissivity;
                         const double sigma = ptm::kStefanBoltzmann;
                         const double T_floor = 40.0;
-                        // PTM-89: in legacy mode the threshold is a fraction of
+                        // in legacy mode the threshold is a fraction of
                         // the convergence tolerance -- ~1 K -- and both of the
                         // quantities compared against it are maxima OVER THE
                         // WINDOW, so a half-length window scores every face
@@ -24065,7 +24065,7 @@ int main(int argc, char** argv) {
                     //     warm-starts from the post-equilibration T(z)
                     //     hand-off and returns a column; the CPU path
                     //     re-integrates from the combined flux and returns
-                    //     none (PTM-57). A size threshold is not a physics
+                    //     none. A size threshold is not a physics
                     //     criterion.
                     //
                     // Cost. The extra DISPATCH is negligible and does not
@@ -24107,7 +24107,7 @@ int main(int argc, char** argv) {
                         // Unreachable today (the same use_gpu_thermal property
                         // picks both solvers), but it is what keeps the gate
                         // above honest if a future CPU->GPU re-thermal
-                        // escalation is added (BUGS.md PTM-78, PTM-94).
+                        // escalation is added.
                         if (!rad_post_eq_T_expected || rad_post_eq_T.empty()) {
                             std::cerr << "\nFATAL: the GPU re-thermal was selected but no solver"
                                          " produced the post-equilibration T(z) hand-off it seeds"
@@ -24190,7 +24190,7 @@ int main(int argc, char** argv) {
                         // whose depth grid is per-face (thermal_model.cpp:3184)
                         // -- not the shared reference grid the depth plan's
                         // (j, w) were resolved against. Reusing those weights
-                        // there is exactly PTM-76's failure, and computing
+                        // there is exactly the CPU checkpoint support's failure, and computing
                         // per-face weights is a separate piece of work.
                         //
                         // Reachable two ways: a CPU-solver run with radiation
@@ -24213,7 +24213,7 @@ int main(int argc, char** argv) {
                                      " carry it), or drop output.map_depths_m.\n";
                         return 1;
                     }
-                    // ---- CPU re-thermal on the SIMD-batch integrator (BUGS.md PTM-665)
+                    // ---- CPU re-thermal on the SIMD-batch integrator
                     // The whole mesh was solved by runThermalModelsForAllFacesBatchSoA
                     // (the default CPU path), so the selected faces are re-integrated
                     // by that SAME driver, from the SAME inputs (illumination arrays,
@@ -24243,7 +24243,7 @@ int main(int argc, char** argv) {
                                   "SIMD-batch integrator re-integrates the selection"
                                 : "the whole mesh was solved by the CPU SIMD-batch "
                                   "integrator; the selection is re-integrated by it");
-                        // PTM-57: the coupled end-of-window columns are handed back below
+                        // the coupled end-of-window columns are handed back below
                         // (sub.end_T), so the checkpoint is re-archived with them.
                         std::vector<double> eqi_subset = eq_indirect_vec;
                         for (int f : faces_to_rerun)
@@ -24332,7 +24332,7 @@ int main(int argc, char** argv) {
                         // runThermalModelWithMatchedTimes keeps no T(z) column —
                         // so a chunk checkpoint written after a CPU re-thermal
                         // still carries iter-0's UN-COUPLED column on these faces.
-                        // Say so; do not let it pass in silence (BUGS.md PTM-57).
+                        // Say so; do not let it pass in silence.
                         if (want_post_coupling_state) {
                             std::cerr << "  [Re-thermal] WARNING: CPU re-thermal path — no T(z)"
                                          " column is available, so the chunk checkpoint keeps"
@@ -24350,7 +24350,7 @@ int main(int argc, char** argv) {
                         ptm::discloseRethermalPath(
                             ptm::RethermalPath::CpuScalarFaces,
                             "no GPU thermal, or the GPU re-thermal failed and fell back");
-                        // BUGS.md PTM-665: reached only under --no-simd-batch now,
+                        // reached only under --no-simd-batch now,
                         // where this scalar integrator IS the whole-mesh solver.
                         // CPU path: OpenMP parallel loop
                         thermal::ProgressBar rerun_progress(faces_to_rerun.size(), "Thermal re-run", 50, true);
@@ -24458,7 +24458,7 @@ int main(int argc, char** argv) {
                     // snapshot taken just before it) -- the same quantity the old
                     // pre-radiosity check measured one iteration later, so the
                     // converge decision is identical but we stop BEFORE the next
-                    // iteration's redundant indirect pass. Fermi verified that skipped
+                    // iteration's redundant indirect pass. The physics review verified that skipped
                     // pass changes 0 temperatures; the band-separated indirect OUTPUT
                     // arrays (indirect_solar/ir) are thus one Picard step stale, within
                     // rad_coupling_temp_tol. Iteration cap (max_coupling_iterations)
@@ -24491,7 +24491,7 @@ int main(int argc, char** argv) {
                                        : "  Samples still changing: ")
                                   << std::scientific << std::setprecision(2)
                                   << (face_frac * 100) << "%" << std::fixed << std::endl;
-                        // PTM-89: the max-temperature exit bounds the residual on
+                        // the max-temperature exit bounds the residual on
                         // EVERY face by rad_coupling_temp_tol. "fixed" mode drops
                         // it as well, because any data-driven stopping rule is a
                         // function of the window and so can stop a short window
@@ -24503,7 +24503,7 @@ int main(int argc, char** argv) {
                                       << " K)" << std::endl;
                             coupling_loop_done = true;
                         }
-                        // PTM-89: the face-fraction exit has NO error bound -- it
+                        // the face-fraction exit has NO error bound -- it
                         // stops while up to coupling_face_fraction of the mesh is
                         // still moving by an arbitrary amount, and the count is a
                         // max over the window, so a short window reaches it first.
@@ -24557,7 +24557,7 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // ---- PTM-57: re-archive the checkpoint POST-coupling --------
+                // ---- re-archive the checkpoint POST-coupling --------
                 // thermal.final_state_file was already written by the iter-0
                 // solver, which returns BEFORE this block runs — so on disk it
                 // holds the UN-COUPLED column, and the next chunk cold-starts
@@ -24608,7 +24608,7 @@ int main(int argc, char** argv) {
                                      "grid.\n";
                     }
                     // Record what the re-archive actually did, so a restore is
-                    // never left to infer it (BUGS.md PTM-57).
+                    // never left to infer it.
                     auto stamp_coupling_flags = [&](bool all_patched) {
                         keep_tr.flags |=
                             thermal::state_io::flag::kPostCouplingComplete;
@@ -25018,7 +25018,7 @@ int main(int argc, char** argv) {
     ptm::timing::mark("thermal_coupling_done");
     ptm::timing::begin("export");   // provenance, per-step frames, statistics, extras
     ptm::appendThermalSolverProvenance(output_dir);
-    {   // PTM-727: which spin-up seed produced this tree (always recorded).
+    {   // which spin-up seed produced this tree (always recorded).
         std::ofstream pv(output_dir + "/provenance.txt", std::ios::app);
         if (pv) {
             pv << "seed_indirect=" << g_seed_indirect_record.mode << "\n"
@@ -25035,9 +25035,9 @@ int main(int argc, char** argv) {
     }
 
     // ========================================================================
-    // Which ephemeris actually served this run (BUGS.md PTM-301)
+    // Which ephemeris actually served this run
     // ========================================================================
-    // The counter half of PTM-301. `ephemeris_source: spice` in a config is a
+    // The counter half of the per-epoch Keplerian fallback. `ephemeris_source: spice` in a config is a
     // REQUEST; this is the answer. Printed to the log AND written into the run
     // directory, because the whole failure mode was a run that looked like
     // SPICE from every artifact it left behind.
@@ -25075,7 +25075,7 @@ int main(int argc, char** argv) {
     int stats_steps = 0;
     FilteredData stats_fd;
     {
-        // The window math lives in computeIntegrationWindow() (see its PTM-15 note),
+        // The window math lives in computeIntegrationWindow() (see its direct-solar-maximum note),
         // shared with the early publication that drives the effective-albedo
         // accumulators. Same inputs, same call, so the two can never diverge.
         const IntegrationWindow iw = computeIntegrationWindow(
@@ -25105,7 +25105,7 @@ int main(int argc, char** argv) {
                 << "  Start (abs step): " << stats_start_step << "\n"
                 << "  Duration (steps): " << stats_steps << "\n";
 
-        // Make silence impossible (PTM-15 archetype): the per-timestep output frames
+        // Make silence impossible (the direct-solar-maximum archetype): the per-timestep output frames
         // cover abs steps [equilibration_steps, equilibration_steps+time_steps); if the
         // statistics window does NOT cover all of them, the _max/_min/_avg files are
         // reduced over a STRICT SUBSET of the written frames — a consumer reading
@@ -25864,7 +25864,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        // PTM-107(a): the operative per-face effective albedo, so an external energy-
+        // the operative per-face effective albedo, so an external energy-
         // closure audit no longer has to treat the BC albedo as a free parameter.
         // Only meaningful for a run that actually integrated a thermal model --
         // an illumination-only run has no surface BC and therefore no operative
@@ -25996,7 +25996,7 @@ int main(int argc, char** argv) {
                 output_dir, mesh,
                 indirect_solar_series, indirect_ir_series,
                 equilibration_steps, time_steps,   // frame window (output)
-                stats_start_step, stats_steps,     // stats window (PTM-15)
+                stats_start_step, stats_steps,     // stats window
                 write_frames, compute_statistics);
             if (!ib_ok) {
                 std::cerr << "[indirect-bands] WARNING: one or more indirect-band "
@@ -26259,7 +26259,7 @@ int main(int argc, char** argv) {
         // identity at all; a product that cannot be traced to the code that made
         // it is not a deliverable.
         {
-            // PTM-461: the mesh-identity hash needs ROUND-TRIP precision.
+            // the mesh-identity hash needs ROUND-TRIP precision.
             // A bare `ostream << double` uses 6 significant digits, so a
             // geomhash of the form 31904726.165896364 was recorded as
             // 3.19047e+07 and read back as 31904700.0, and the packager
@@ -26652,7 +26652,7 @@ int main(int argc, char** argv) {
                 //       FITS map, and
                 //   (b) sanitized to [0, 1] instead of build()'s
                 //       [MIN_VALID_ALBEDO, MAX_VALID_ALBEDO] = [0.01, 0.99],
-                //       and skipped ptm::checkAlbedoMapRegistration() (PTM-34).
+                //       and skipped ptm::checkAlbedoMapRegistration().
                 // Two resolvers for one quantity is the defect; deleting one is
                 // the fix. AbsorbedFluxComposer::bindResolvedAlbedos(), which
                 // existed only because thermal_config used to be out of scope
@@ -26760,7 +26760,7 @@ int main(int argc, char** argv) {
                     // wrong in the OTHER direction. The mesh-wide field gets
                     // the per-step indirect term only on faces the coupling
                     // loop SELECTED for re-thermal; unselected faces keep their
-                    // iteration-0 temperature. Under the shipped PTM-89 bounded
+                    // iteration-0 temperature. Under the shipped chunk-independent bounded
                     // mode the selection threshold is 0 K -- every face carrying
                     // indirect flux is selected -- so the two agree. Raise
                     // radiation.coupling_temp_threshold and a face can carry

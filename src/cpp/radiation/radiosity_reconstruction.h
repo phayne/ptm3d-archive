@@ -27,7 +27,7 @@
 //
 // which is what this header spells, ONCE. Both the flux-cube post-solve pass
 // and test_flux_cube_identity call these functions; neither writes the algebra
-// out again. That is deliberate -- PTM-106c is the defect class where one
+// out again. That is deliberate -- the per-step source-albedo update is the defect class where one
 // formula acquires two spellings that agree today and drift later.
 //
 // GUARDS
@@ -71,13 +71,13 @@ inline double reconstructBIR(double eps, double T, double q_ind_ir) {
 }
 
 // Visible (solar) outgoing radiosity of one face.
-//   a_src      PTM-106 incidence-dependent SOURCE albedo actually used this step
+//   a_src      incidence-dependent two-band SOURCE albedo actually used this step
 //   q_dir      direct-beam solar flux on the face [W/m^2]
 //   a_bond     hemispheric/Bond albedo = the diffuse OPERATOR reflectance
 //   q_ind_vis  absorbed indirect visible flux [W/m^2] (lastIndirectVisible()[i])
 // NOTE the two albedos are different physical quantities and are NOT
 // interchangeable (radiation_exchange.h:320-340). Passing a_bond for a_src is
-// the PTM-106 defect, not a simplification.
+// the two-band source-albedo defect, not a simplification.
 inline double reconstructBVis(double a_src, double q_dir,
                               double a_bond, double q_ind_vis) {
     return a_src * q_dir + a_bond * (q_ind_vis / (1.0 - a_bond));

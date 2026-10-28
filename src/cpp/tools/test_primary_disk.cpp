@@ -1,4 +1,4 @@
-// test_primary_disk -- standalone gate for the PTM-41 / PTM-44 primary-body
+// test_primary_disk -- standalone gate for the primary-body
 // flux geometry in src/cpp/illumination/primary_disk.h.
 //
 // Everything here runs on the CPU in well under a second and needs no SPICE,
@@ -193,7 +193,7 @@ static void testHorizonMeanCos() {
     }
 
     // Continuity at BOTH seams and monotonicity of the whole ramp: the defect
-    // PTM-44 names is a STEP, so the fix has to be shown not to reintroduce one.
+    // at issue is a STEP, so the fix has to be shown not to reintroduce one.
     for (double alpha : alphas) {
         double maxstep = 0.0;
         bool ramp_mono = true;
@@ -284,7 +284,7 @@ static double segmentFraction(double e) {
 }
 
 static void testHalfPlaneOccluder() {
-    std::printf("\n4. Terrain sampling: half-plane occluder (PTM-44 core claim)\n");
+    std::printf("\n4. Terrain sampling: half-plane occluder (finite-disk core claim)\n");
     const double alpha = 5.978 * M_PI / 180.0;
 
     // (a) an occluder that hides exactly half the disk must give ~50 %.
@@ -689,12 +689,12 @@ static void reportJupiterTable() {
         std::printf("     %6.1f deg %-14.6f %-14.6f %s\n", dg, old_v, new_v,
                     old_v > 0 ? std::to_string(new_v / old_v).substr(0, 6).c_str() : "n/a");
     }
-    std::printf("     primary IR (unchanged, PTM-40): %.6f W/m^2\n", 13.8 * omega_over_pi);
+    std::printf("     primary IR (unchanged): %.6f W/m^2\n", 13.8 * omega_over_pi);
     std::printf("     hard upper bound, p = 1:        %.6f W/m^2\n", F * (R / d) * (R / d));
 }
 
 int main() {
-    std::printf("test_primary_disk -- PTM-41 / PTM-44 geometry gate\n");
+    std::printf("test_primary_disk -- primary-body geometry gate\n");
     testPhaseFunction();
     testEnergyClosure();
     testHorizonMeanCos();

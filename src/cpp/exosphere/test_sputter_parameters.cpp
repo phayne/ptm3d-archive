@@ -1,4 +1,4 @@
-// Unit tests for the sputtering parameter set (PTM-649). Self-contained; exit
+// Unit tests for the sputtering parameter set. Self-contained; exit
 // code 0 = all checks pass.
 //
 //  (1) e_H2O and T_launch both derive from the binding energy U (Sigmund-Thompson
@@ -396,7 +396,7 @@ static void test_fates() {
 }
 
 static void test_o2_map_and_polar() {
-    std::printf("\n(6b) O2 map (PTM-650) and the BASE pattern (no polar term)\n");
+    std::printf("\n(6b) O2 map and the BASE pattern (no polar term)\n");
     const ptm::Mesh m = make_icosphere(3, 1560.8e3);
     const Geo g = geometry(m);
     const size_t n = g.areas.size();

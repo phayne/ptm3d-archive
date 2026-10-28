@@ -3,7 +3,7 @@
 //
 // WHY EVERY REFUSAL GETS ITS OWN ARM. A partial that loads when it should not
 // restores un-solved or wrong-run faces into a finished product, and nothing
-// downstream can tell. That is the PTM-78 zero-column runaway's failure mode,
+// downstream can tell. That is the post-equilibration hand-off zero-column runaway's failure mode,
 // and the only defense is that each refusal has actually been FIRED here.
 //
 // WHY THE ROUND TRIP IS BYTE-EXACT AND NOT "CLOSE". The surface series is

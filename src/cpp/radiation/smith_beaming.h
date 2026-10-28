@@ -89,7 +89,7 @@ inline double integral(const double s[3], const double d[3], double w,
 // the wall->floor flux sits right ON the boundary (near-zero phase, cos_phi ~ +1),
 // which is where chi is largest and varies fastest.
 //
-// MEASURED on the real flux-weighted wall->floor pair distribution (Fermi's
+// MEASURED on the real flux-weighted wall->floor pair distribution (the physics review's
 // calc10_pairs.npy, 5.3M pairs, w = 32.5 deg): exact flux-weighted mean chi
 // 1.657; the old cos_psi-indexed 24x24x33 table read 1.595 (-3.8%, p95 pointwise
 // error 24%), and refining that grid to 64x128x129 only reached 1.617 -- the bias

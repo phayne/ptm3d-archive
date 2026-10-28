@@ -1,4 +1,4 @@
-// Unit test for multiscale snapshot timing (PTM-636).
+// Unit test for multiscale snapshot timing.
 // Self-contained; exit code 0 = all checks pass.
 //
 // A multiscale snapshot labeled L must be the state after exactly L epochs, with

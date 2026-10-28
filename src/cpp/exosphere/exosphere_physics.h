@@ -255,7 +255,7 @@ public:
     }
 };
 
-// Per-call options for BallisticTransport::computeTransportProduct (PTM-642).
+// Per-call options for BallisticTransport::computeTransportProduct.
 struct TransportCallOptions {
     // Remove the Jeans-escaping share of each source's Maxwellian. false = the
     // source is already a bound population (its escaping share was removed
@@ -266,7 +266,7 @@ struct TransportCallOptions {
     // persistent index untouched so the sublimation transport stays bit-stable.
     bool private_index_if_needed = false;
 
-    // Face-local refresh (PTM-657). The product is linear per source up to the
+    // Face-local refresh. The product is linear per source up to the
     // row-bias correction and the final mass fix, which are functions of the
     // summed raw deposition and calibration only (see finalizeTransport). These
     // options expose the raw sums so a caller can update them source by source:
@@ -443,7 +443,7 @@ public:
         TransportTotals* totals = nullptr) const;
 
     // The correction step of computeTransportProduct (row-bias correction from the
-    // calibration sums, then the global mass fix), applied to raw sums (PTM-657).
+    // calibration sums, then the global mass fix), applied to raw sums.
     // Requires spatial smoothing off (throws otherwise). Returns max |bias - 1|.
     static double finalizeTransport(const std::vector<double>& face_areas,
                                     const std::vector<double>& raw,
@@ -474,7 +474,7 @@ public:
     double bodyRadius() const { return body_radius_; }
 }; // <-- ensure class ends with semicolon
 
-// PTM-671: the ballistic transport operator for ONE uniform launch temperature,
+// the ballistic transport operator for ONE uniform launch temperature,
 // built once and applied to any number of source fields. The sputtered-H2O
 // transport launches every source at the same temperature on fixed geometry, so
 // everything computeTransportProduct derives from the kernel is invariant over
@@ -500,7 +500,7 @@ public:
 //
 // Products are evaluated per TARGET face (each output entry is a sum over
 // sources in a fixed order), so the result does not depend on the thread
-// count, unlike the thread-local scatter of computeTransportProduct (PTM-660).
+// count, unlike the thread-local scatter of computeTransportProduct.
 // Memory is O(N) plus the table: no N^2 storage.
 class FixedKernelTransportOperator {
 public:
@@ -604,7 +604,7 @@ private:
     
     std::vector<std::array<double, 3>> face_centers_;
     std::vector<double> face_areas_;
-    std::unique_ptr<FixedKernelTransportOperator> fixed_op_;  // PTM-671
+    std::unique_ptr<FixedKernelTransportOperator> fixed_op_;  // cached sputter operator
     std::vector<double> face_latitudes_;
     std::vector<double> face_longitudes_;
     
@@ -706,7 +706,7 @@ public:
         TransportTotals* totals = nullptr);
 
     /**
-     * PTM-671. The fixed-temperature transport operator for `temperature_K`,
+     * Cached sputter operator. The fixed-temperature transport operator for `temperature_K`,
      * built on first use and reused while (temperature, Jeans option,
      * EXO_XI_CUTOFF) are unchanged; a change rebuilds it (and says so).
      */
@@ -716,7 +716,7 @@ public:
         return (fixed_op_ && fixed_op_->built()) ? fixed_op_.get() : nullptr;
     }
 
-    /** BallisticTransport::finalizeTransport with this model's face areas (PTM-657). */
+    /** BallisticTransport::finalizeTransport with this model's face areas. */
     double finalizeTransport(const std::vector<double>& raw, const std::vector<double>& calibration,
                              std::vector<double>& deposition) const {
         return BallisticTransport::finalizeTransport(face_areas_, raw, calibration, deposition);

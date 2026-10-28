@@ -55,12 +55,12 @@ namespace ptm {
             double grain_ratio = 10.0;
             std::string albedo_map_path;     // per-face .bin (size_t count + double[count])
             std::string fill_fits_path;      // "" = sibling FITS next to the .bin; "none" = skip
-            // Fill faces (PTM-637). true (default): a fill face whose map value is a
+            // Fill faces. true (default): a fill face whose map value is a
             // finite albedo in [0, 1] is inverted from THAT value, the one the thermal
             // run used for it, like any other face (clamped at f = 0 / 1 outside the
             // endmember range), so its composition and its temperature agree. Only fill
             // faces without a usable value get fill_exposed_ice_fraction. false (the
-            // pre-PTM-637 behavior, --fill-ice-fraction=uniform): every fill face gets
+            // pre-fix behavior, --fill-ice-fraction=uniform): every fill face gets
             // fill_exposed_ice_fraction, which disagrees with the thermal albedo there.
             bool fill_from_map_value = true;
             double fill_exposed_ice_fraction = 0.95;
@@ -151,7 +151,7 @@ namespace ptm {
             std::unique_ptr<SputteringState> sputtering_state_;
             bool sputtering_enabled_ = false;
 
-            // PTM-642: true when sputtering is on with the mass-conserving
+            // true when sputtering is on with the mass-conserving
             // accounting (not --sputter-legacy-escape-only). Multiscale path only.
             bool sputterTransportActive() const;
             // Print the global sputter mass audit of the current multiscale flux
@@ -192,7 +192,7 @@ namespace ptm {
             // clamped classes): anchored at their t = 0 composition albedo instead.
             size_t albedo_anchored_faces_ = 0;
             // Final-snapshot sublimation split into map-fill faces and the rest
-            // (PTM-637; Paul's ruling: a face with no value leaves both the
+            // (Paul's ruling: a face with no value leaves both the
             // numerator and the denominator, so report it separately, with N).
             std::string fill_contribution_report_;
 
@@ -218,7 +218,7 @@ namespace ptm {
             bool diurnal_albedo_response_ = false;
             std::vector<float> diurnal_T0_, diurnal_g1_, diurnal_g2_;
             std::vector<double> diurnal_reference_albedo_;
-            // PTM-675 trust region: the law is an expansion about an ANCHOR state (r_a,
+            // Diurnal-law trust region: the law is an expansion about an ANCHOR state (r_a,
             // T_a(t), g1, g2), initially the thermal run itself (r_a = 1, T_a = T0). When
             // |ln(r / r_a)| exceeds the trust radius the face is re-anchored by an exact
             // periodic solve at r (solveDiurnalAnchor). Fs, Qir are kept for that.
@@ -238,7 +238,7 @@ namespace ptm {
             double diurnal_apply_seconds_ = 0.0;
             long long albedo_refreshes_fired_ = 0;
 
-            // PTM-675: re-anchor face f at absorbed-solar ratio `ratio` (thread-safe; called
+            // re-anchor face f at absorbed-solar ratio `ratio` (thread-safe; called
             // from the parallel refresh loop). On failure the old anchor is kept and counted.
             void reanchorDiurnalFace(size_t f, double ratio);
 
@@ -261,12 +261,12 @@ namespace ptm {
             // Convergence thresholds (set via CLI, applied to MultiTimescaleConfig)
             double convergence_threshold_ = -1.0;       // <0 means use default
             double flux_convergence_threshold_ = -1.0;   // <0 means use default
-            bool superstep_consistent_deposition_ = true;  // PTM-644
-            bool albedo_step_limit_ = true;                 // PTM-640
+            bool superstep_consistent_deposition_ = true;  // super-step deposition consistency
+            bool albedo_step_limit_ = true;                 // albedo step limit
             double albedo_limit_seconds_ = 0.0;
             double max_refresh_deviation_ = 0.0;            // max |A - A_ref| when a refresh fired
 
-            // PTM-657 face-local refresh: raw transport sums of the represented source field.
+            // face-local refresh: raw transport sums of the represented source field.
             struct TransportCache {
                 std::vector<double> raw, cal, src, temp;
                 bool valid = false;
@@ -283,14 +283,14 @@ namespace ptm {
                                       bool private_index, bool temperature_dependent, std::vector<double>& deposition,
                                       long long& sources_updated,
                                       const FixedKernelTransportOperator* op = nullptr);
-            // PTM-671: the sputtered-H2O transport reuses one fixed-temperature
+            // the sputtered-H2O transport reuses one fixed-temperature
             // operator (default); false = the per-refresh kernel of 683f1cc.
             bool sputter_operator_cache_ = true;
             double sputter_operator_seconds_ = 0.0;  // applying it (build excluded)
             double sputter_transport_seconds_ = 0.0; // sputtered-H2O transport, either path
             void applyRepresentedSourceTotals();
             int max_superstep_epochs_ = 0;                  // 0 = no cap
-            double garden_subcycle_kappa_ = 0.1;            // PTM-676 (0 = off)
+            double garden_subcycle_kappa_ = 0.1;            // garden-step subcycling (0 = off)
             int garden_subcycle_cap_ = 1024;
 
             // Lag-layer diffusion barrier (multiscale; see LagBarrierConfig in ice_layer_model.h).
@@ -470,7 +470,7 @@ namespace ptm {
 
             /**
              * Enable sputtering with a full configuration (mass accounting,
-             * species split, escape fractions, launch temperature; PTM-642).
+             * species split, escape fractions, launch temperature).
              * Throws std::invalid_argument on an invalid configuration.
              */
             void enableSputtering(const SputteringConfig& config);
@@ -620,9 +620,9 @@ namespace ptm {
             bool prepareDiurnalAlbedoResponse(const ThermalColumn& column, const std::string& thermal_dir,
                                               const DiurnalResponseOptions& options);
             bool diurnalAlbedoResponseActive() const { return diurnal_albedo_response_; }
-            /** PTM-675: trust radius in |ln(r / r_a)| (0 = never re-anchor: the 65cd8c5 law). */
+            /** trust radius in |ln(r / r_a)| (0 = never re-anchor: the 65cd8c5 law). */
             void setDiurnalTrustRadius(double t) { diurnal_trust_ = t; }
-            /** PTM-676: garden-step subcycling kappa (0 = off) and substep cap. */
+            /** garden-step subcycling kappa (0 = off) and substep cap. */
             void setGardenSubcycle(double kappa, int cap) { garden_subcycle_kappa_ = kappa; garden_subcycle_cap_ = cap; }
             bool loadThermalAlbedoMap(const std::string& path);
             const std::vector<double>& getThermalFaceAlbedos() const { return thermal_face_albedos_; }
@@ -711,7 +711,7 @@ namespace ptm {
             void setFluxConvergenceThreshold(double threshold) { flux_convergence_threshold_ = threshold; }
 
             /**
-             * PTM-644. false = legacy super-step deposition (held at its start-of-step
+             * Super-step deposition consistency. false = legacy super-step deposition (held at its start-of-step
              * value; reproduces pre-fix products, not mass-conserving).
              */
             void setSuperstepConsistentDeposition(bool on) { superstep_consistent_deposition_ = on; }
@@ -727,19 +727,19 @@ namespace ptm {
             void setMaxSuperstepEpochs(int n) { max_superstep_epochs_ = std::max(0, n); }
 
             /**
-             * PTM-640. false = legacy: super-steps are not limited by the albedo
+             * Albedo step limit. false = legacy: super-steps are not limited by the albedo
              * change (the temperature refresh can lag by a whole step).
              */
             void setAlbedoStepLimit(bool on) { albedo_step_limit_ = on; }
 
             /**
-             * PTM-657. Face-local albedo refresh (default on): after the first full
+             * Face-local albedo refresh (default on): after the first full
              * diurnal computation, a refresh updates the transport only for sources
              * whose emission or temperature moved beyond `tol` of the totals (0 = every
              * changed source; exact). false = the full (global) recompute.
              */
             /**
-             * PTM-671. Build the sputtered-H2O transport operator once and reuse it
+             * Cached sputter operator. Build the sputtered-H2O transport operator once and reuse it
              * (default on). false = recompute the kernel at every refresh (683f1cc).
              */
             void setSputterOperatorCache(bool on) { sputter_operator_cache_ = on; }

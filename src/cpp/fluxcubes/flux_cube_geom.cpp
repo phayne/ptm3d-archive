@@ -17,7 +17,7 @@
 // build it inline, because a 7,542-row hemisphere sweep starting unannounced
 // inside a production window is the kind of surprise that ends campaigns. The
 // engine LOADS this file and refuses if the key does not match -- it never
-// rebuilds (PTM-19 doctrine).
+// rebuilds (the never-rebuild rule).
 //
 // ESTIMATOR
 // ---------

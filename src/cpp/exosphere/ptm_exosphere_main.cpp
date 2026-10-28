@@ -1277,7 +1277,7 @@ public:
             net_flux_[t].resize(n_faces);
             accumulated_mass_[t].resize(n_faces, 0.0);  // Initialize to zero
             
-            // Either naming generation (BUGS.md PTM-664): >= 6-digit indices
+            // Either naming generation: >= 6-digit indices
             // from current engines, 4-digit from runs written before.
             const std::string frame_path = ptm::resolveFrameFile(
                 ptm_dir + "/temperature", "temperature", t);
@@ -1936,7 +1936,7 @@ int main(int argc, char** argv)
     bool sputtering_enabled = false;
     double sputtering_rate_scale = 1.0;
     double sputtering_hemisphere_contrast = 3.0;
-    // Sputter mass accounting / products (PTM-642). Defaults live in SputteringConfig.
+    // Sputter mass accounting / products. Defaults live in SputteringConfig.
     ptm::exosphere::SputteringConfig sputter_cfg;
     std::string sputter_physics_flag;   // first sputter-physics flag seen (needs --sputtering)
     std::vector<std::pair<std::string, double>> sputter_overrides;  // numeric sputter flags, in order
@@ -1959,22 +1959,22 @@ int main(int argc, char** argv)
     double convergence_threshold = -1.0;    // <0 = use default (1e-6)
     double flux_convergence_threshold = -1.0; // <0 = use default (0.01 = 1%)
     int diurnal_stride = 1;                 // Use every Nth timestep in diurnal averaging
-    bool superstep_legacy_deposition = false;  // PTM-644: reproduce the pre-fix super-step
-    bool no_albedo_step_limit = false;         // PTM-640: reproduce the unlimited super-step
-    bool albedo_refresh_global = false;        // PTM-657: full recompute at every refresh
-    double albedo_refresh_tol = 1e-2;          // PTM-657 face-local refresh tolerance
-    double albedo_refresh_fraction = 0.0;      // PTM-657 faces past this x threshold are rescaled
+    bool superstep_legacy_deposition = false;  // reproduce the pre-fix super-step
+    bool no_albedo_step_limit = false;         // reproduce the unlimited super-step
+    bool albedo_refresh_global = false;        // full recompute at every refresh
+    double albedo_refresh_tol = 1e-2;          // face-local refresh tolerance
+    double albedo_refresh_fraction = 0.0;      // face-local refresh: faces past this x threshold are rescaled
     std::string albedo_response = "diurnal";   // temperature law at an albedo refresh
     bool albedo_response_flag = false;         // --albedo-response given explicitly
-    double albedo_response_trust = 0.35;       // PTM-675 trust radius in |ln(r / r_anchor)|
-    double garden_subcycle_kappa = 0.1;        // PTM-676 garden-step subcycling (0 = off)
+    double albedo_response_trust = 0.35;       // diurnal-law trust radius in |ln(r / r_anchor)|
+    double garden_subcycle_kappa = 0.1;        // garden-step subcycling (0 = off)
     int max_superstep_epochs = 0;              // 0 = no cap
     std::string superstep_flag;                // first super-step flag seen (needs --multiscale)
     // Lag-layer diffusion barrier (multiscale; on by default, --no-lag-barrier = legacy).
     ptm::exosphere::LagBarrierConfig lag_cfg;
     bool no_lag_barrier = false;
-    bool no_gardening = false, no_sputter_shield = false;   // PTM-669
-    bool no_sputter_operator_cache = false;                  // PTM-671
+    bool no_gardening = false, no_sputter_shield = false;   // lag gardening
+    bool no_sputter_operator_cache = false;                  // cached sputter operator
     std::string garden_param_flag;
     std::string lag_param_flag;                // first lag parameter flag seen
 
@@ -2036,7 +2036,7 @@ int main(int argc, char** argv)
                   a == "--sputter-radiolysis-q0" ||
                   a == "--sputter-polar-enhancement") && i+1 < argc) {
             if (sputter_physics_flag.empty()) sputter_physics_flag = a;
-            // Applied after parsing, once the parameter set is known (PTM-649).
+            // Applied after parsing, once the parameter set is known.
             sputter_overrides.emplace_back(a, std::stod(argv[++i]));
         }
         else if (a == "--sputter-o2-map-absolute" && i+1 < argc) {
@@ -2146,7 +2146,7 @@ int main(int argc, char** argv)
         else if (a == "--no-lag-barrier") {
             no_lag_barrier = true;
         }
-        // Garden mode (PTM-669): on by default with the lag barrier.
+        // Garden mode: on by default with the lag barrier.
         else if (a == "--no-gardening") { no_gardening = true; }
         else if (a == "--no-sputter-operator-cache") { no_sputter_operator_cache = true; }
         else if (a == "--no-sputter-shield") { no_sputter_shield = true; }
@@ -2685,7 +2685,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Sputter parameter set (PTM-649). The legacy set (--sputter-legacy-params, implied
+    // Sputter parameter set. The legacy set (--sputter-legacy-params, implied
     // by --sputter-legacy-escape-only) takes the old values, then the overrides. The
     // current set DERIVES the H2O escape fraction and launch temperature from the
     // binding energy U and fixes the O2/H2 fates, so those overrides are refused.

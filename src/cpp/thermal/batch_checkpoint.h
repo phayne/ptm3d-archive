@@ -29,7 +29,7 @@
 //     about `n_faces` (losing the global face range, so nothing could place the
 //     columns back) or by laying down a full-width body that is mostly zeros --
 //     which is EXACTLY the "banks un-solved faces at 0 K" footgun the audit
-//     names and the PTM-78 zero-column runaway already cost this project once.
+//     names and the post-equilibration hand-off zero-column runaway already cost this project once.
 //   * A partial must carry far more than a column. A completed batch also owns
 //     its faces' whole SURFACE TIME SERIES (every statistic, every per-step
 //     product and every location export is a reduction of it) and its slice of
