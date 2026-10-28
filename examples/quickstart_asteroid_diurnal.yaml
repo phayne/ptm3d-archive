@@ -86,7 +86,7 @@ thermal:
   crater_dd_ratio: 8.0
   geothermal_heat_flow: -1.0           # -1 = leave the generic-body Qb (below) alone
 thermophysical:
-  # PTM-67: for a GENERIC body (this config), the plain-named keys in THIS
+  # for a GENERIC body (this config), the plain-named keys in THIS
   # top-level block (ks, kd, H, rhos, rhod, cp0, Qb, chi, albedo, emissivity)
   # are NOT read at all — only `generic_body.surface:` below is. We therefore
   # deliberately omit them here rather than ship a block that looks load-

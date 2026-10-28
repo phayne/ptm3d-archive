@@ -1,6 +1,6 @@
 # Tutorial 04: lunar 80N bowl crater WITH inter-face radiation exchange
 # (radiosity). Compare against tutorial04_crater80N_radoff.yaml — radiation
-# warms the shadowed crater floor (docs/tutorials/04_crater_radiosity.md).
+# warms the shadowed crater floor (docs/tutorials/02_crater_radiosity.md).
 # Run from the repo root after `python3 scripts/fetch_kernels.py`.
 #
 # The first run builds an H-matrix view-factor set for the 12,800-face mesh

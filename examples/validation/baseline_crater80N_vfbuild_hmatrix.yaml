@@ -5,7 +5,7 @@
 # builders with two different near-field estimators, and ptm_thermal_sim picks
 # between them by a MEMORY THRESHOLD as well as by this config key. A suite that
 # only ever exercises one of them cannot say anything about a production run
-# that took the other. (Paul's standing priority: one physics across all paths.)
+# that took the other. (The aim is one physics across all paths.)
 #
 # The two builders are not expected to produce identical matrices, and this arm
 # does not assert that they do -- test_vf_production's arm [H] scores their

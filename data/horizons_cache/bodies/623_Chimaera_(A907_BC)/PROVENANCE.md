@@ -21,7 +21,7 @@ radius of **22.045 km**, which is `generic_body.shape.radius_km` in
 **Re-downloaded and checked on 2026-08-31**: fetching DAMIT 9110 again at the
 same `radius_km = 22.045` produced a **byte-identical** file, same md5. This is
 the archive model as the converter writes it, unmodified — no reconstruction
-step ever stood between DAMIT and this file (unlike Justitia's, see PTM-303).
+step ever stood between DAMIT and this file (unlike Justitia's).
 
 DAMIT lists exactly one model for this asteroid, so there was no spin solution to
 choose. The pole travels with it: ecliptic (λ, β) = (139°, 5°) → equatorial

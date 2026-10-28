@@ -39,7 +39,7 @@ recorded.
 
 ## `shape_reconstructed_20260704.obj` — superseded, not on any engine path
 
-The 2026-07-04 hand reconstruction described in **PTM-303**: rebuilt from
+The 2026-07-04 hand reconstruction described here: rebuilt from
 `mesh.ply` vertex/face data preserved in prior thermal-sim output, because the
 `shape.obj` the configurations referenced was missing from disk. Its own header
 was, until 2026-08-31, the only provenance record it had. 41,016 bytes,

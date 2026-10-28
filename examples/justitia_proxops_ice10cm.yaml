@@ -1,10 +1,10 @@
-# Paths below are REPOSITORY-ROOT-RELATIVE (PTM-145 convention). The engine
+# Paths below are REPOSITORY-ROOT-RELATIVE. The engine
 # resolves a `data/...` value against the repository root, which it finds by
 # walking up from THIS FILE's directory to the one holding
 # data/data_manifest.json (src/cpp/tools/config_parser.cpp, findRepoRootForData
 # / resolveDataPath), so these resolve from any working directory and honor
 # $PTM_DATA_ROOT. They previously named an absolute OneDrive path that does not
-# exist on every machine (PTM-446). Do not re-absolutize them.
+# exist on every machine. Do not re-absolutize them.
 #
 # ONE EXCEPTION, and it is a real one: the paths INSIDE
 # data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm are resolved
@@ -40,7 +40,7 @@ thermal:
   integration_offset_days: 0.0
   integration_offset_steps: 0
   geothermal_heat_flow: -1.0
-  # DEPTH-GRID FIX (Rocky, 2026-07-06): see justitia_proxops_ice2cm.yaml for
+  # DEPTH-GRID FIX : see justitia_proxops_ice2cm.yaml for
   # the full derivation. thermal_m=150 gives ~58 layers up to the 10cm
   # boundary (64 layers total to zmax~29cm) -- verified in Python against
   # generateAdaptiveGrid(); default thermal_m=10 would give only 5.

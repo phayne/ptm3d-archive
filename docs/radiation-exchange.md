@@ -559,7 +559,7 @@ All numbers below are measurements on this machine's four AMD Radeon PRO W6800X 
 dies, 2026-08-16, on two real view-factor matrices. Nothing here is derived except
 the clearly-labeled campaign projection at the end.
 
-**Traversals.** The honest unit of radiosity cost is the number of times the matrix
+**Traversals.** The  unit of radiosity cost is the number of times the matrix
 is read, and it is *not* the Jacobi iteration count: every solve also pays one final
 matvec to turn the converged radiosity into absorbed flux, and the band-separated GPU
 route used to pay it twice per timestep. `PTM_RAD_COST_REPORT` counts dispatches.
@@ -659,7 +659,7 @@ each coupling iteration $k = 1, 2, \ldots, k_{\max}$:
    selected face moved by the two integrators' difference even at zero
    exchange: 0.26 K on a convex asteroid with 2.4e-5 W/m² of indirect flux.
    On the coupled faces of the 80 N crater the mean error against a 32x finer
-   time step fell from 0.14 K (scalar re-run) to 0.08 K (BUGS.md PTM-665).
+   time step fell from 0.14 K (scalar re-run) to 0.08 K.
    `scripts/test_rethermal_zero_exchange.py` holds that line.
 5. **Update** the temperatures and return to step 1.
 
@@ -1071,7 +1071,7 @@ the shaded ones run cold within what the model treats as a single isothermal fac
 isolation sets in at **millimeters to centimeters** on lunar regolith — the scale the published
 RMS-slope values of §8.3 characterize.
 
-> **Paul's ruling, 2026-08-25.** "The Moon3D mesh resolution is comparable to the roughness scale
+> **2026-08-25.** "The Moon3D mesh resolution is comparable to the roughness scale
 > (millimeters to centimeters) that the beaming is intended to capture, so the beaming should be
 > OFF for small local meshes like this."
 
@@ -1108,7 +1108,7 @@ radiation:
 Deliberately **not** switched on, and why:
 
 - `examples/moon3d_native_yearlong/*.yaml` — the 509k mesh in the table above. Sub-cm facets;
-  beaming would double-count the roughness the mesh already carries (Paul, 2026-08-25).
+  beaming would double-count the roughness the mesh already carries .
 - `examples/validation/baseline_crater80N_*.yaml` — these are the byte-identical regression
   baselines (`scripts/ptm_validate_baseline.py`). Turning beaming on there would move the
   baselines, which is the one thing they exist not to do.
@@ -1149,7 +1149,7 @@ and note that the winter and margin *means* rise (winter_mean 4.89 → 5.35 K).
 
 **Known open items that beaming does NOT address (parked by Paul, 2026-08-25):** the winter and
 margin warm biases above. Beaming is not a fix for those and was never claimed to be; they remain
-open and are not to be reopened without Paul's word.
+open and are not to be reopened without new evidence.
 
 ### 8.6 What it costs
 
@@ -1286,9 +1286,9 @@ beaming fits on a given mesh at all.
 
 ### 8.8 Caveats
 
-- **Chunk dependence (PTM-101).** The emitter and receiver sets are selected from shadow fractions
+- **Chunk dependence.** The emitter and receiver sets are selected from shadow fractions
   measured over *this window*, so a beaming run remains dependent on the chunk decomposition even
-  though the radiation-exchange set (PTM-98) no longer is. Measured on r50: 126,787 receivers /
+  though the radiation-exchange set no longer is. Measured on r50: 126,787 receivers /
   247.4 M pairs in chunk 000 against 128,794 / 242.5 M in chunk 001. The run warns. Remedy: run
   beaming single-shot, or state the chunk decomposition with the result.
 - **`test_bowl_crater` does not cover it.** The Ingersoll gate constructs `RadiositySolver`

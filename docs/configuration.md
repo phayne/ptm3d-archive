@@ -650,7 +650,7 @@ estimated 22–28 GiB on a 2.4 M-face A3GT site — measure before flipping it o
 run with beaming on prints its own `[beam-cost]` breakdown.
 
 **Two caveats worth knowing before you turn it on.** Beaming makes a run
-chunk-decomposition dependent (its emitter/receiver sets are window-scoped, PTM-101 — the run
+chunk-decomposition dependent (its emitter/receiver sets are window-scoped; the run
 warns), and it does **not** address the known winter/margin warm biases; those are open and parked.
 
 ## flux_cubes
@@ -658,7 +658,7 @@ warns), and it does **not** address the known winter/margin warm biases; those a
 A passive probe that samples the flux field at fixed points in space. The block
 is **top level**, not nested under `output:` — deliberately, so it cannot be
 reached by the body-defaults machinery that makes `thermophysical:` decorative
-on a built-in body (PTM-67). The physics, the geometry cache, the ray budget and
+on a built-in body. The physics, the geometry cache, the ray budget and
 the outputs are all in [flux-cubes.md](flux-cubes.md); this table is the key
 list.
 
@@ -714,7 +714,7 @@ produces a byte-identical flux payload either way.
 
 **The maximum height above the local surface at which the Sun is not even
 partially visible** — the *umbral* ceiling — per face and per output epoch. Top
-level, for the same PTM-67 reason `flux_cubes` is.
+level, for the same reason `flux_cubes` is.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -866,7 +866,7 @@ produces them:
 |---|---|---|
 | `indirect_solar/`, `statistics/indirect_solar_{avg,max,min}.bin` | a two-band radiosity run | per-step series + statistics |
 | `indirect_ir/`, `statistics/indirect_ir_{avg,max,min}.bin` | a two-band radiosity run | per-step series + statistics |
-| `statistics/effective_albedo.bin` | every run with a per-face flux path (PTM-107a) | one value per face |
+| `statistics/effective_albedo.bin` | every run with a per-face flux path | one value per face |
 
 All three appear in the GUI's 3D viewer Field drop-down. Two things about them
 are not visible in the numbers:
@@ -908,8 +908,7 @@ output file; that is an acceptance test of the feature, not a side effect.
 export (GeoTIFF/HDF5/COG) and read from Python normally, and
 `ptm.results.detect_available_statistics` reports them, but the viewer's field
 menu is built from a static catalog and these names carry the depth, so no
-static catalog can hold them. Owed ledger row:
-`PTM-GUI-DEPTH-MAPS-UNVIEWABLE`.
+static catalog can hold them.
 
 **Both list keys must be written as YAML lists, and the engine refuses anything
 else.** `map_depths_m: 0.05` and `map_depths_m: "0.05, 0.25"` are scalars, and a
@@ -1188,7 +1187,7 @@ carries the full thermophysical property set. See the asteroid examples in
 
 Before 2026-09-24, `orbit.epoch` and `spin.prime_meridian_deg` were parsed and
 **ignored**: every generic body rotated from W = 0 at J2000 and applied its mean
-anomaly at J2000 (BUGS.md PTM-663). A config that set them to anything but the
+anomaly at J2000. A config that set them to anything but the
 J2000 defaults produces a different, now correct, run.
 
 **Epoch formats** (both `*.epoch` keys, all on the **TDB** scale, the scale of

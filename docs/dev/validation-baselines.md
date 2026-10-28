@@ -26,7 +26,7 @@ git merge-base origin/main pre-multi-gpu-baseline     # exit 1, empty output
 
 All three tags hang off the discarded history. Checking one out yields a May
 engine with no two-band radiosity, no row-norm operator, no equilibration seed,
-and none of the PTM-89/98/106 radiation fixes. Byte-identity to it is neither
+and none of the 2026-08 radiation fixes (chunk-independent coupling, exchange selection, source albedo). Byte-identity to it is neither
 achievable nor desirable, so section 1 as written was unexecutable — not
 failing, *unexecutable*, which is worse, because a suite that cannot run
 produces no red flag.
@@ -63,7 +63,7 @@ what the engine looked like when someone last cared.
     DO-NOT-DELETE.md                      what this directory is, and why it must not be swept
 ```
 
-⛔ **Never delete this directory without Paul's explicit word.** Its predecessor
+⛔ **Never delete this directory without the maintainer's approval.** Its predecessor
 (`postmerge-baseline-2026-08-24`, at `~/projects/ada_postmerge_2026-08-24/`)
 was removed in a routine disk cleanup on 2026-09-03 because nothing on disk
 said it was load-bearing, taking the corrected `crater80N_sparse.vf` with it and
@@ -310,7 +310,7 @@ They were run with `PTM_ILLUM_TRUE_NORMALS=1`, `PTM_ILLUM_RISE_HABS=0`,
 view-factor settings) and `PTM_MAX_TIMESTEPS_PER_DISPATCH=50` (a wedge
 mitigation that also fixes the GPU dispatch chunking). Reproducing their bytes
 requires the same environment; the exact strings are in the flagship manifest.
-⛔ The 25 GB `.vf` is **loaded, never rebuilt** (PTM-19), and then replaced by
+⛔ The 25 GB `.vf` is **loaded, never rebuilt**, and then replaced by
 the corrected CSR.
 
 Banked digests, per-arm run logs, and full provenance:
@@ -398,7 +398,7 @@ verification is one command: `git diff fc57d58 51bf168` touches exactly one file
 `.github/workflows/ci.yml`. "The branch was merged unchanged" is a claim about
 the tree, and a merge commit is where such a claim quietly stops being true.
 
-### Two arms exist only to keep a gate honest
+### Two arms exist only to keep a gate 
 
 The two `examples/validation/` configs are not variants for variety's sake:
 
@@ -735,7 +735,7 @@ two-band is affected, because two-band clears `warm_start` on both paths.
 ## 9. Flagship scale: the N=1/2/4 ladder and what it cost
 
 Measured on the 509,337-face lunar mesh with the corrected view-factor CSR
-loaded (nnz 495,163,704; ⛔ never rebuilt, PTM-19), 600 equilibration steps and
+loaded (nnz 495,163,704; ⛔ never rebuilt), 600 equilibration steps and
 20 output steps, `gpu_batch_size: 4000`, `PTM_MAX_TIMESTEPS_PER_DISPATCH=50`.
 
 | Arm | Wall clock | GPU kernel device-time | Kernel dispatches |
@@ -761,7 +761,7 @@ Two things make the speedup credible rather than merely observed:
   independent, and the one other phase the log times directly — the coupling's
   indirect-flux sweeps — is 50 s at N=2 and 51 s at N=4.
 
-### ⚠️ The third point is what made the scaling honest
+### ⚠️ The third point is what made the scaling 
 
 There is no per-phase timer in the log, so isolating the thermal phase requires
 a model: `T(N) = F + C/N`, with `F` device-count independent. **Two points

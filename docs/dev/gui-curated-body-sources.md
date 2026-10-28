@@ -119,11 +119,11 @@ configuration for the same body.
    `bennu.tm`: `PATH_VALUES = ( 'data/kernels' )`, a `$KERNELS/...` entry per
    member, and a prose header giving the solution, its coverage, its citation,
    and what it supersedes. Paths longer than about 99 characters need SPICE's
-   `+` continuation (PTM-145).
+   `+` continuation.
 3. **Ship the shape,** with a `PROVENANCE.md` beside it naming the archive
    (a PDS LID, a DAMIT model id), the vertex and facet counts, the units, and
    what it supersedes. `.gitignore` line 14 is `*.obj` — a rule written for C
-   object files that matches every asteroid shape model here (PTM-303) — so a
+   object files that matches every asteroid shape model here — so a
    shape that is meant to ship must be added with `git add -f`, and the
    registry's `tracked` field must say so. The test compares that field
    against `git ls-files`.
@@ -157,7 +157,7 @@ It does not mean being quiet. A curated body still:
 * has its coverage **read back out of the kernel** and compared with the run
   window *including the equilibration reach-back*, and is refused if it does
   not span it — same discipline as the HORIZONS path, for the same reason
-  (PTM-145: the engine substitutes Keplerian elements per epoch and logs
+  (the engine substitutes Keplerian elements per epoch and logs
   nothing);
 * says which source answered, and that the live service was skipped;
 * names anything on disk that it supersedes. Bennu's body cache holds

@@ -289,8 +289,8 @@ Every one of these is a hard error with a reason, and each has a negative-contro
 
 | condition | why it is refused |
 |---|---|
-| cache built for a different mesh | never apply a foreign cache; the exact regeneration command is printed, and it is never rebuilt inline (PTM-19) |
-| `equilibration_steps + n_steps != total_time_steps` | cube rows would stop lining up with `time_steps.txt` (PTM-250/251) |
+| cache built for a different mesh | never apply a foreign cache; the exact regeneration command is printed, and it is never rebuilt inline |
+| `equilibration_steps + n_steps != total_time_steps` | cube rows would stop lining up with `time_steps.txt` |
 | gray path (no band-separated series) | one mixed radiosity cannot be split; emitting zeros or a merged column would be worse than failing |
 | no ray-occlusion function | assuming every cube is unshadowed fabricates direct solar flux at every shadowed cube in the grid |
 | `eps` or `(1-A)` collapsing | the inversion is ill-posed and the solver's own `REFL_GUARD` fallback is invisible from the host |
@@ -322,7 +322,7 @@ flux_cubes:
 ```
 
 The block is **top level**, not nested under `output:`, so it cannot be reached by the
-body-defaults machinery that makes `thermophysical:` decorative on a built-in body (PTM-67). A
+body-defaults machinery that makes `thermophysical:` decorative on a built-in body. A
 `warnUnreadFluxCubeKeys()` names any key the parser does not consume. The geometry keys
 (`spacing_m`, `height_factor`, `n_rays`, ...) are accepted but reported as **inert**: they live in
 the cache header, and honoring a YAML copy would create two sources of truth for one number.
@@ -424,7 +424,7 @@ finer global grid — see §11.
 
 ## 11. Targeted PSR array — CANCELED
 
-**Paul's ruling (2026-08-19): PSR flux cubes serve no engineering need**, because landed hardware
+**PSR flux cubes serve no engineering need**, because landed hardware
 and crew will never remain inside a permanently shadowed region long enough for the distinction to
 matter. The targeted dense array is **canceled permanently**, not deferred.
 

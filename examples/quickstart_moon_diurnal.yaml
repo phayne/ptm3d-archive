@@ -39,7 +39,7 @@ thermophysical:
   #    H_override).
   # Plainly-named properties (albedo, emissivity, ks, kd, H, rhos, ...) are
   # honored only under `generic_body.surface:`; here they change nothing and the
-  # run warns about them. See docs/KNOWN_LIMITATIONS.md (PTM-67).
+  # run warns about them. See docs/KNOWN_LIMITATIONS.md.
   use_default_albedo: true
   incidence_angle_albedo: true
 radiation:

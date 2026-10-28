@@ -283,7 +283,7 @@ The lines report:
 > the fix on, so illumination — and therefore temperatures — differ from
 > earlier GUI runs of the same config.
 >
-> `PTM_EQ_PERFACE_FLUX` is deliberately **no longer injected** (PTM-276). The
+> `PTM_EQ_PERFACE_FLUX` is deliberately **no longer injected**. The
 > engine reports it has no effect on the CPU path, and on the GPU path with
 > `thermal.spinup_seed: legacy` it silently overrides the one setting whose
 > whole purpose is reproducing a pre-fix baseline digit-for-digit. A config
@@ -502,7 +502,7 @@ nobody could choose. If Face Fraction is changed without setting
 `coupling_mode: legacy`, the engine prints a console warning:
 
   ```
-  WARNING [PTM-89]: radiation.coupling_face_fraction=0.02 is IGNORED in
+  WARNING: radiation.coupling_face_fraction=0.02 is IGNORED in
   coupling_mode='bounded' (the face-fraction exit has no error bound).
   Use coupling_mode: legacy to restore it.
   ```

@@ -1,6 +1,6 @@
 # Tutorial 04 (control): lunar 80N bowl crater, radiation exchange OFF.
 # Companion to tutorial04_crater80N_coupled.yaml — run both and compare
-# crater-floor temperatures (docs/tutorials/04_crater_radiosity.md).
+# crater-floor temperatures (docs/tutorials/02_crater_radiosity.md).
 # Run from the repo root after `python3 scripts/fetch_kernels.py`.
 
 # The validated fine-mesh illumination settings (opt-in, default OFF). They
