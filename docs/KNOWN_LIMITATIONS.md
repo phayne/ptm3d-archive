@@ -19,9 +19,12 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
 
 3. **Radiation exchange during spin-up is approximate.** In a coupled run the spin-up is forced
    with an estimate of the indirect (scattered and re-emitted) flux taken from the first
-   radiation solution, folded over whole diurnal cycles. Absolute mean and minimum temperatures
-   of never-lit faces in short coupled runs are therefore uncertain by about 1 to 2 K; the
-   difference between coupled and uncoupled runs is more robust.
+   radiation solution, folded over whole diurnal cycles. On the shipped 80°N crater a one-cycle spin-up
+   then lies within about 0.4 K (median) of a 40-cycle reference, for lit and never-lit faces
+   alike. Where this seed cannot act (a warm-started chunk, the CPU scalar solver, an output
+   window shorter than one diurnal cycle) the run says so and uses the previous seed, and
+   absolute temperatures are uncertain by about 1 to 2 K. The difference between coupled and
+   uncoupled runs is more robust than either absolute value.
 
 4. **The column solver is first order in time.** The surface temperature is solved from the
    previous substep's subsurface state, so the error falls linearly with the substep. At the
@@ -38,12 +41,15 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
    T = (Q_b/εσ)^(1/4): 24.04 K on the Moon at the default Q_b = 0.018 W/m² (25.28 K at
    0.022 W/m²). A value at the floor is the bound, not a solution.
 
-7. **View factors depend on mesh orientation.** View factors trust the triangle winding: a mesh
-   wound into the body yields the view factors of the surface's underside, and reciprocity,
-   row-sum and nonzero checks all still pass. Check that face normals point out of the body
-   before building view factors, and reuse a view-factor file only with the exact mesh it was
-   built from. (A precomputed matrix loaded with `PTM_HMATRIX_VF_REPLACE` is checked against the
-   run's surface side and refused if they differ.)
+7. **View factors follow the engine's face-orientation rule.** By default each face normal is
+   flipped radially outward; with `PTM_ILLUM_TRUE_NORMALS=1` the triangle winding is kept, with
+   one sign per connected surface. A wrong side is not caught by the usual checks: a view-factor
+   matrix traced on the underside still passes reciprocity, row-sum and nonzero tests. The
+   offline referee applies the same rule and refuses a mesh it would reverse on more than 1% of
+   faces. A precomputed matrix loaded with `PTM_HMATRIX_VF_REPLACE` is refused if its recorded
+   orientation differs from the run's; a matrix with no orientation record is treated as raw
+   winding. Reuse a view-factor file only with the exact mesh it was built from. On closed,
+   non-convex bodies the radial rule can choose the wrong side of true overhangs.
 
 8. **Fine-mesh illumination corrections are opt-in.** By default the shadow ray starts about
    1 cm above the face and normals are flipped radially outward, which can light

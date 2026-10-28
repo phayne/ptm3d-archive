@@ -173,7 +173,7 @@ Sharp flux discontinuities — most importantly Jupiter eclipses on Europa, whic
 
 Before the output window the thermal model is spun up for `thermal.equilibration_orbits` diurnal cycles of the run's own forcing (illumination, shadowing, primary-body flux and, in coupled runs, indirect flux). The same number is integrated on every solver path.
 
-**Initial condition** (`thermal.spinup_seed: physical`, the default). Each face starts from its own conductive steady profile: the surface value is anchored at the cycle-mean temperature implied by the face's absorbed flux, and the profile below follows $T(z) = T_0 + Q_b\int_0^z dz'/k(z')$. A permanently shadowed face therefore starts at the geothermal floor rather than at a clear-sky temperature. In radiation-coupled runs the seed of the second whole-mesh pass also includes the time-varying indirect flux of the first radiation solution, folded over whole diurnal cycles (`thermal.seed_indirect: series`, the default; see [radiation-exchange.md](radiation-exchange.md) §7.7).
+**Initial condition** (`thermal.spinup_seed: physical`, the default). Each face starts from its own conductive steady profile: the surface value is anchored at the cycle-mean temperature implied by the face's absorbed flux, and the profile below follows $T(z) = T_0 + Q_b\int_0^z dz'/k(z')$. A permanently shadowed face therefore starts at the geothermal floor rather than at a clear-sky temperature. In radiation-coupled runs the seed of the second whole-mesh pass also includes the time-varying indirect flux of the first radiation solution, folded over whole diurnal cycles (`thermal.seed_indirect: series`, the default; see [radiation-exchange.md](radiation-exchange.md) §7.8).
 
 **Legacy initial condition** (`spinup_seed: legacy`, for reproducing runs made before 2026-08-11): an exponential blend toward radiative equilibrium,
 
@@ -211,13 +211,13 @@ The shape and depth dependence of the diurnal thermal wave provide a second inte
 
 ### 8.3 Equilibration Convergence
 
-The equilibration cadence accuracy is documented by the `tools/test_equilibration_dt` test program, which runs `fastEquilibrate` over 24 lunar diurnal cycles at four latitudes (0°, 30°, 60°, 85°) and reports the maximum and mean per-layer temperature differences against a Fourier-stable reference solution. Figure B.3 visualizes the resulting convergence: at the production cadence `EQUILIBRATION_STEPS_PER_DAY = 192`, the worst-case error across all latitudes and depth nodes is 0.99 K (latitude 85°), just below the 1 K production target. Coarsening to 96 steps day⁻¹ raises the worst-case error to 2.2 K, and to 24 steps day⁻¹ to 11.9 K; refining to 768 steps day⁻¹ reduces the error to 0.21 K. The error scales as $\Delta t^2$, consistent with the second-order accuracy of Crank–Nicolson.
+The equilibration cadence accuracy is documented by the `tools/test_equilibration_dt` test program, which runs `fastEquilibrate` over 24 lunar diurnal cycles at four latitudes (0°, 30°, 60°, 85°) and reports the maximum and mean per-layer temperature differences against a Fourier-stable reference solution. At the production cadence `EQUILIBRATION_STEPS_PER_DAY = 192` the worst case on this release is 0.55 K (latitude 85°), within the 1 K tolerance. The error falls roughly linearly with the step, as expected for a first-order scheme (§6.1); Figure B.3 shows the sweep from an earlier build.
 
 ![Figure B.3: Equilibration cadence convergence](figures/v2/equilibration_convergence.png)
 
 ### 8.4 Surface Energy Conservation
 
-Figure B.4 quantifies the closure of the surface energy balance over a fully integrated synodic month on the ico7 topographic mesh (327,680 faces) after six equilibration orbits. For an equilibrated diurnal cycle the per-face energy budget should satisfy $\langle Q_{\mathrm{abs}}\rangle_t = \langle\varepsilon\sigma T^4\rangle_t - Q_b$. Both the simulation and the post-hoc accounting in this figure apply the Hayne et al. (2017) angular albedo correction $A(\theta)$ on top of the per-face base albedo $A_0$, so any residual reflects an actual closure error rather than a parameter mismatch. The bulk-mean fractional residual is 3.7 %, with a global imbalance of 2.0 % between absorbed and emitted radiation integrated over the synodic month (panel c). The remaining residual reflects a combination of (i) finite-time-of-flight thermal lag between absorbed solar input and re-radiated thermal emission and (ii) the difference between $\langle T \rangle^4$ and $\langle T^4 \rangle$ that Jensen's inequality introduces when applying $\sigma T^4$ to time-averaged temperatures.
+Figure B.4 quantifies the closure of the surface energy balance over a fully integrated synodic month on the ico7 topographic mesh (327,680 faces) after six equilibration orbits. For an equilibrated diurnal cycle the per-face energy budget should satisfy $\langle Q_{\mathrm{abs}}\rangle_t = \langle\varepsilon\sigma T^4\rangle_t - Q_b$. Both the simulation and the post-hoc accounting in this figure apply the Hayne et al. (2017) angular albedo correction $A(\theta)$ on top of the per-face base albedo $A_0$, so any residual reflects an actual closure error rather than a parameter mismatch. The bulk-mean fractional residual is 3.7 %, with a global imbalance of 2.0 % between absorbed and emitted radiation integrated over the synodic month (panel c). For a column in periodic steady state this balance holds exactly whatever the thermal lag, and Jensen's inequality enters only if σ⟨T⟩⁴ is used in place of σ⟨T⁴⟩. A residual of this size after six equilibration orbits most likely reflects heat still going into storage in the deep column, which relaxes over 15 to 23 lunations; this has not been tested.
 
 ![Figure B.4: Surface energy-balance closure](figures/v2/energy_conservation.png)
 
@@ -231,7 +231,7 @@ The post-illumination phase (thermal solver plus statistics export and binary ou
 
 ### 8.6 Europa Validation
 
-Validation of PTM3D against Europa-specific observations (Galileo PPR diurnal curves and depth-resolved millimeter brightness temperatures) is presented in the main text Section 3 and is not repeated here. The 1D thermal solver is identical for the Moon and Europa runs; only the input parameters of §3.5 and the orbital/illumination geometry change.
+Comparisons with Europa observations are not part of this release's validation set. The 1D thermal solver is identical for the Moon and Europa; only the input parameters of §3.5 and the orbital and illumination geometry change.
 
 ## 9. Configuration Reference
 

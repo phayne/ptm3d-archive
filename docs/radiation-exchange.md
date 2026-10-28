@@ -320,7 +320,7 @@ which is reciprocal by construction and has lower variance. The Moon3D revision'
 used pooled; its Haworth matrix used tried, where the two agree (median ratio 1.0004, 95th
 percentile 1.011).
 
-For `tried` the divisor is **2, the number of ray directions tried**, and and a direction that registered no
+For `tried` the divisor is **2, the number of ray directions tried**, and a direction that registered no
 hit contributes the zero it measured. That matters because in the far field neither direction
 fires reliably. Dividing instead by the number of directions that *happened to hit* conditions on
 detection and inflates the estimate by
@@ -996,7 +996,7 @@ off, no internal eq-indirect pass (`eq_indirect_source: off`, an `eq_indirect_fl
 equilibration span), the CPU scalar solver, a warm-started chunk (its column comes from the
 checkpoint), a measured $\langle q_{\text{ind}}\rangle = 0$, or an output window shorter than one diurnal cycle. An **explicit** `series`/`mean`
 that cannot act is FATAL instead. Those runs are byte-identical to `off` by construction, and the
-validation suite checks it (`ptm-validate`, default arm with `--expect-differ-if-log`).
+validation suite checks it (`scripts/ptm_validate_baseline.py`, default arm with `--expect-differ-if-log`).
 
 With `off`, the equilibration forcing uses the constant $\langle q_{\text{ind}}\rangle$ of §7.7.
 
@@ -1091,7 +1091,7 @@ mesh (or from its view-factor provenance sidecar's `total_area_m2 / n_faces`), n
 | A3GT lunar polar site A 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
 | `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** — the mesh *is* at the roughness scale |
 
-The 509k `moon3d` mesh is a simulated crater roughly **1.6 m across** whose facets are ~2 mm. It
+The 509k `moon3d` mesh is a laboratory scan of a testbed crater about 1.2 m across (scanned domain 1.34 × 1.35 m) with a mean facet edge of about 2.5 mm. It
 resolves exactly the sub-facet structure $\chi$ is a stand-in for. Beaming there is not a
 refinement, it is the same physics counted twice.
 
