@@ -31,7 +31,7 @@ For faces where the Sun is well above the local horizon and unobstructed, a sing
 
 $$F_{\mathrm{direct},i} = E_\odot \cos\theta_i$$
 
-where $\theta_i$ is the solar incidence angle, i.e., $\cos\theta_i = \hat{\mathbf{n}}_i \cdot \hat{\mathbf{s}}$, with $\hat{\mathbf{n}}_i$ the outward face normal and $\hat{\mathbf{s}}$ the unit vector from the face center toward the Sun. This fast path is taken when the solar elevation satisfies $\sin(\mathrm{elev}) > 2\sin\alpha_\odot$ and $\cos\theta_i > 0.10$, and the center ray is unobstructed by both terrain and the primary body.
+where $\theta_i$ is the solar incidence angle, i.e., $\cos\theta_i = \hat{\mathbf{n}}_i \cdot \hat{\mathbf{s}}$, with $`\hat{\mathbf{n}}_i`$ the outward face normal and $\hat{\mathbf{s}}$ the unit vector from the face center toward the Sun. This fast path is taken when the solar elevation satisfies $`\sin(\mathrm{elev}) > 2\sin\alpha_\odot`$ and $\cos\theta_i > 0.10$, and the center ray is unobstructed by both terrain and the primary body.
 
 ### Finite Solar Disk Model
 
@@ -45,7 +45,7 @@ where $R_\odot = 695{,}700\thickspace\text{km}$.
 
 The solar disk is sampled by $N$ points distributed uniformly over the disk area using a low-discrepancy (quasi-random) sequence, which provides more uniform coverage than pseudo-random sampling for the same number of points (e.g., Niederreiter 1992). The sample positions are randomized independently for each face to prevent coherent artifacts across the mesh.
 
-An orthonormal basis $(\hat{\mathbf{u}}, \hat{\mathbf{v}})$ is constructed perpendicular to the Sun direction $\hat{\mathbf{s}}$. Each disk sample $k$ with coordinates $(d_{x,k}, d_{y,k})$ satisfying $d_{x,k}^2 + d_{y,k}^2 \leq 1$ generates a ray direction
+An orthonormal basis $(\hat{\mathbf{u}}, \hat{\mathbf{v}})$ is constructed perpendicular to the Sun direction $`\hat{\mathbf{s}}`$. Each disk sample $k$ with coordinates $(d_{x,k}, d_{y,k})$ satisfying $d_{x,k}^2 + d_{y,k}^2 \leq 1$ generates a ray direction
 
 $$\hat{\mathbf{d}}_k = \frac{\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\thinspace\hat{\mathbf{u}} + d_{y,k}\thinspace\hat{\mathbf{v}}\right)}{\left\lVert\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\thinspace\hat{\mathbf{u}} + d_{y,k}\thinspace\hat{\mathbf{v}}\right)\right\rVert}$$
 
@@ -126,7 +126,7 @@ Terrain visibility is checked by ray tracing.
 
 The total radiative flux absorbed by face $i$ at time $t$ is the sum of the three components:
 
-$$F_{\mathrm{abs},i}(t) = (1 - A)\thinspaceF_{\mathrm{direct},i}(t) + \varepsilon\thinspaceF_{\mathrm{IR},i}(t) + (1 - A)\thinspaceF_{\mathrm{refl},i}(t)$$
+$$F_{\mathrm{abs},i}(t) = (1 - A)\thinspace F_{\mathrm{direct},i}(t) + \varepsilon\thinspace F_{\mathrm{IR},i}(t) + (1 - A)\thinspace F_{\mathrm{refl},i}(t)$$
 
 where $A$ is the surface Bond albedo, which depends on the incidence angle (Hayne et al. 2017 by default, or the Hapke directional-hemispheric albedo), and $\varepsilon$ is the infrared emissivity. In radiation-coupled runs the indirect flux of [radiation-exchange.md](radiation-exchange.md) is added. For heliocentric bodies without a parent planet (e.g., asteroids), the primary IR and reflected terms vanish and only the direct solar term contributes.
 

@@ -10,7 +10,7 @@ The model was originally developed for the lunar regolith (Hayne et al., 2017) a
 
 At each face, the temperature $T(z, t)$ in the subsurface satisfies
 
-$$\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t}  =  \frac{\partial}{\partial z}\negthinspace\left[\thinspace k(T, z)\thinspace \frac{\partial T}{\partial z} \thinspace\right] \tag{B1}$$
+$$\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t} \thickspace=\thickspace \frac{\partial}{\partial z}\negthinspace\left[\thinspace k(T, z)\thinspace \frac{\partial T}{\partial z} \thinspace\right] \tag{B1}$$
 
 where $\rho$ is bulk density (kg m⁻³), $c_p$ is specific heat capacity (J kg⁻¹ K⁻¹), $k$ is bulk thermal conductivity (W m⁻¹ K⁻¹), $z$ is depth below the surface (m, positive downward), and $t$ is time (s). The PDE is parabolic and quasi-linear: nonlinearity enters only through the temperature dependence of $c_p$ and $k$. There is no internal volumetric source term; all heat input is supplied through the boundary conditions (§5).
 
@@ -22,7 +22,7 @@ The 1D-vertical assumption is justified when the diurnal thermal skin depth (§4
 
 We adopt the Hayne et al. (2017) formulation, which augments a depth-stratified lattice (contact) conductivity with a $T^3$ radiative term that approximates radiative heat transfer through pore spaces:
 
-$$k(T, z)  =  k_c(z)\thinspace\bigl[\thinspace1 + \chi\thinspace(T / 350\thickspace\text{K})^3\thinspace\bigr] \tag{B2}$$
+$$k(T, z) \thickspace=\thickspace k_c(z)\thinspace\bigl[\thinspace 1 + \chi\thinspace(T / 350\thickspace\text{K})^3\thinspace\bigr] \tag{B2}$$
 
 where $k_c(z)$ is the contact conductivity (§3.3) and $\chi$ is a dimensionless radiative parameter. We use $\chi = 2.7$ following Mitchell & de Pater (1994). The reference temperature 350 K is the value at which the formula was calibrated against laboratory measurements; above ~250 K the radiative contribution exceeds the lattice term, while at lunar nighttime temperatures (~100 K) it is negligible. Equation (B2) is evaluated as $k = k_c(1 + R_{350} T^3)$ with the precomputed constant $R_{350} = \chi/350^3 \approx 6.3 \times 10^{-8}$ K⁻³.
 
@@ -30,17 +30,17 @@ where $k_c(z)$ is the contact conductivity (§3.3) and $\chi$ is a dimensionless
 
 Heat capacity is evaluated as a polynomial in temperature,
 
-$$c_p(T)  =  c_0  +  \sum_{j=1}^{N_c} c_j\thinspace T^j \tag{B3}$$
+$$c_p(T) \thickspace=\thickspace c_0 \thickspace+\thickspace \sum_{j=1}^{N_c} c_j\thinspace T^j \tag{B3}$$
 
-stored as a constant term $c_0$ plus an ordered coefficient list $\lbracec_j\rbrace$ in the body's `ThermophysicalProperties` record (`planetary_properties.h`). The polynomial is evaluated by Horner's method to reduce $2N_c$ multiplications to $N_c$ per call; in the inner thermal loop this is vectorized with AVX-512 or AVX2 fused multiply-add instructions where available, with a scalar fallback (`thermal_model.cpp`). For the Moon we use the four-term polynomial of Hayne et al. (2017), Table A1; for water-ice surfaces we use the linear approximation $c_p(T) \approx 7.49\thinspace T$ (J kg⁻¹ K⁻¹) derived from the heat-capacity data of Giauque & Stout (1936), valid below $\sim$270 K.
+stored as a constant term $c_0$ plus an ordered coefficient list $\lbrace c_j\rbrace$ in the body's `ThermophysicalProperties` record (`planetary_properties.h`). The polynomial is evaluated by Horner's method to reduce $2N_c$ multiplications to $N_c$ per call; in the inner thermal loop this is vectorized with AVX-512 or AVX2 fused multiply-add instructions where available, with a scalar fallback (`thermal_model.cpp`). For the Moon we use the four-term polynomial of Hayne et al. (2017), Table A1; for water-ice surfaces we use the linear approximation $c_p(T) \approx 7.49\thinspace T$ (J kg⁻¹ K⁻¹) derived from the heat-capacity data of Giauque & Stout (1936), valid below $`\sim`$270 K.
 
 ### 3.3 Density and Contact-Conductivity Stratification
 
 Both the bulk density and the contact conductivity decay exponentially from surface to deep values with a common e-folding scale height $H$:
 
-$$\rho(z)  =  \rho_d  +  (\rho_s - \rho_d)\thinspace \exp(-z / H), \tag{B4}$$
+$$\rho(z) \thickspace=\thickspace \rho_d \thickspace+\thickspace (\rho_s - \rho_d)\thinspace \exp(-z / H), \tag{B4}$$
 
-$$k_c(z)  =  k_d  +  (k_s - k_d)\thinspace \exp(-z / H). \tag{B5}$$
+$$k_c(z) \thickspace=\thickspace k_d \thickspace+\thickspace (k_s - k_d)\thinspace \exp(-z / H). \tag{B5}$$
 
 At $z = 0$, $\rho = \rho_s$ and $k_c = k_s$ (the porous, low-conductivity surface values); as $z \to \infty$, $\rho \to \rho_d$ and $k_c \to k_d$ (the compacted, higher-conductivity deep values). This two-parameter form follows Hayne et al. (2017) for the Moon and is retained for icy bodies with body-specific $\lbrace\rho_s, \rho_d, k_s, k_d, H\rbrace$.
 
@@ -59,13 +59,13 @@ The defaults adopted in this work are listed below. Moon values reproduce Hayne 
 | $H$ | Density/conductivity scale height | 0.06 | 0.07 | m | Hayne et al. (2017); model default |
 | $k_s$ | Surface contact conductivity | $7.4 \times 10^{-4}$ | $9.6 \times 10^{-3}$ | W m⁻¹ K⁻¹ | Hayne et al. (2017); $TI \approx 60$ tiu fit |
 | $k_d$ | Deep contact conductivity | $3.4 \times 10^{-3}$ | $5.0 \times 10^{-2}$ | W m⁻¹ K⁻¹ | Hayne et al. (2017); model default |
-| $c_p$ coefficients | $\lbracec_0; c_1, c_2, c_3, c_4\rbrace$ | $\lbrace-3.6125;\thinspace 2.7431,\thinspace 2.36 \times 10^{-3},\thinspace -1.234 \times 10^{-5},\thinspace 8.91 \times 10^{-9}\rbrace$ | $\lbrace0;\thinspace 7.49\rbrace$ | (J kg⁻¹ K⁻¹ per power) | Ledlow et al. (1992) via Hayne et al. (2017); Giauque & Stout (1936) |
+| $c_p$ coefficients | $\lbrace c_0; c_1, c_2, c_3, c_4\rbrace$ | $\lbrace-3.6125;\thinspace 2.7431,\thinspace 2.36 \times 10^{-3},\thinspace -1.234 \times 10^{-5},\thinspace 8.91 \times 10^{-9}\rbrace$ | $\lbrace 0;\thinspace 7.49\rbrace$ | (J kg⁻¹ K⁻¹ per power) | Ledlow et al. (1992) via Hayne et al. (2017); Giauque & Stout (1936) |
 | $\chi$ | Radiative conductivity parameter | 2.7 | 2.7 | – | Mitchell & de Pater (1994) |
 | $\varepsilon$ | Broadband IR emissivity | 0.95 | 0.90 | – | Hayne et al. (2017); model default |
 | $A$ | Bond albedo | 0.12 | 0.50 | – | Hayne et al. (2017); model default |
 | $Q_b$ | Internal heat flux | 0.018 | 0.030 | W m⁻² | Langseth et al. (1976); model default |
 
-The Moon entry additionally carries an incidence-angle-dependent albedo correction $A(\theta) = A_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$ with $\lbracea, b\rbrace = \lbrace0.06, 0.25\rbrace$ (Hayne et al., 2017); this is the default (`thermophysical.albedo_model`). The Moon3D paper used the Hapke directional-hemispheric albedo instead (single-scattering albedo $w = 0.4964$, which gives $A = 0.12$ at normal incidence; `thermophysical.incidence_angle_albedo: true` or `albedo_model: hapke`). For Europa we use a constant Bond albedo, optionally overridden per face by a high-resolution albedo map (see [illumination-model.md](illumination-model.md)).
+The Moon entry additionally carries an incidence-angle-dependent albedo correction $A(\theta) = A_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$ with $\lbrace a, b\rbrace = \lbrace 0.06, 0.25\rbrace$ (Hayne et al., 2017); this is the default (`thermophysical.albedo_model`). The Moon3D paper used the Hapke directional-hemispheric albedo instead (single-scattering albedo $w = 0.4964$, which gives $A = 0.12$ at normal incidence; `thermophysical.incidence_angle_albedo: true` or `albedo_model: hapke`). For Europa we use a constant Bond albedo, optionally overridden per face by a high-resolution albedo map (see [illumination-model.md](illumination-model.md)).
 
 ## 4. Spatial Discretization
 
@@ -73,7 +73,7 @@ The Moon entry additionally carries an incidence-angle-dependent albedo correcti
 
 The diurnal thermal skin depth is
 
-$$\delta_1  =  \sqrt{\thinspace\kappa\thinspace P / \pi\thinspace} \tag{B6}$$
+$$\delta_1 \thickspace=\thickspace \sqrt{\thinspace\kappa\thinspace P / \pi\thinspace} \tag{B6}$$
 
 where $\kappa = k / (\rho c_p)$ is the thermal diffusivity and $P$ is the diurnal period. $\delta_1$ is the depth at which the diurnal temperature oscillation has decayed by a factor of $e$. In practice $\delta_1$ is evaluated at the surface using $k_s$, $\rho_s$, and a representative $c_p(200~\text{K})$ to set grid scales (`thermal_model.cpp`).
 
@@ -97,11 +97,11 @@ Columns whose *pre-2026-08* grid was already shorter than `MIN_TOTAL_LAYERS_FOR_
 
 On a non-uniform vertical grid, the second-order central approximation of $\partial_z(k\thinspace \partial_z T)$ at interior node $i$ is
 
-$$\frac{\partial}{\partial z}\negthinspace\left(k\thinspace \frac{\partial T}{\partial z}\right)_i \thickspace\approx\thickspace g_{1,i}\thinspace k_{i-1}(T_{i-1} - T_i)  +  g_{2,i}\thinspace k_i\thinspace(T_{i+1} - T_i) \tag{B8}$$
+$$\frac{\partial}{\partial z}\negthinspace\left(k\thinspace \frac{\partial T}{\partial z}\right)_i \thickspace\approx\thickspace g_{1,i}\thinspace k_{i-1}(T_{i-1} - T_i) \thickspace+\thickspace g_{2,i}\thinspace k_i\thinspace(T_{i+1} - T_i) \tag{B8}$$
 
 with grid coupling coefficients
 
-$$g_{1,i}  =  \frac{2\thinspace\Delta z_{i+1}}{D_i}, \qquad g_{2,i}  =  \frac{2\thinspace\Delta z_i}{D_i}, \qquad D_i  =  \Delta z_i\thinspace \Delta z_{i+1}\thinspace (\Delta z_i + \Delta z_{i+1}). \tag{B9}$$
+$$g_{1,i} \thickspace=\thickspace \frac{2\thinspace\Delta z_{i+1}}{D_i}, \qquad g_{2,i} \thickspace=\thickspace \frac{2\thinspace\Delta z_i}{D_i}, \qquad D_i \thickspace=\thickspace \Delta z_i\thinspace \Delta z_{i+1}\thinspace (\Delta z_i + \Delta z_{i+1}). \tag{B9}$$
 
 For uniform spacing this reduces to the familiar $1/\Delta z^2$ stencil; for stretched grids the asymmetric weighting in (B9) preserves second-order accuracy. The coefficients $g_1$, $g_2$, and $D \equiv d_{3z}$ are pre-computed once during `Profile` construction (`thermal_model.cpp`) and reused on every timestep. Cell-centered conductivities $k_{i-1}$ (lower interface) and $k_i$ (upper interface) are used directly without arithmetic or harmonic averaging, consistent with the cell-centered finite-difference convention.
 
@@ -111,11 +111,11 @@ For uniform spacing this reduces to the familiar $1/\Delta z^2$ stencil; for str
 
 At $z = 0$, the surface temperature $T_0$ satisfies the energy balance
 
-$$Q_s  +  k_0\thinspace \frac{T_1 - T_0}{\Delta z_0}  =  \varepsilon\thinspace \sigma\thinspace T_0^{\thinspace4} \tag{B10}$$
+$$Q_s \thickspace+\thickspace k_0\thinspace \frac{T_1 - T_0}{\Delta z_0} \thickspace=\thickspace \varepsilon\thinspace \sigma\thinspace T_0^{\thinspace 4} \tag{B10}$$
 
 where $\sigma = 5.670374419\times 10^{-8}$ W m⁻² K⁻⁴ is the Stefan–Boltzmann constant, $\varepsilon$ is the broadband IR emissivity, $k_0$ and $\Delta z_0$ are the surface-layer conductivity and thickness, and $T_1$ is the temperature of the first subsurface node. The absorbed surface flux $Q_s(t)$ is composed by the upstream modules,
 
-$$Q_s  =  (1 - A)\thinspace\bigl[\thinspaceQ_{\text{solar}} + Q_{\text{refl}}\thinspace\bigr]  +  \varepsilon\thinspace Q_{\text{IR}}  +  Q_{\text{indirect}}, \tag{B11}$$
+$$Q_s \thickspace=\thickspace (1 - A)\thinspace\bigl[\thinspace Q_{\text{solar}} + Q_{\text{refl}}\thinspace\bigr] \thickspace+\thickspace \varepsilon\thinspace Q_{\text{IR}} \thickspace+\thickspace Q_{\text{indirect}}, \tag{B11}$$
 
 with $Q_{\text{solar}}$, $Q_{\text{refl}}$, $Q_{\text{IR}}$ from [illumination-model.md](illumination-model.md) §3–§5 and $Q_{\text{indirect}}$ from [radiation-exchange.md](radiation-exchange.md) §3 (already weighted by $\varepsilon$ via Kirchhoff's law inside that module).
 
@@ -123,15 +123,15 @@ with $Q_{\text{solar}}$, $Q_{\text{refl}}$, $Q_{\text{IR}}$ from [illumination-m
 
 Equation (B10) is nonlinear in $T_0$ through the $T_0^4$ term and is solved at each timestep by Newton iteration (`thermal_model.cpp`). Defining the residual
 
-$$f(T_0)  =  Q_s + k_0\thinspace(T_1 - T_0)/\Delta z_0  -  \varepsilon\thinspace \sigma\thinspace T_0^{\thinspace4}, \tag{B12}$$
+$$f(T_0) \thickspace=\thickspace Q_s + k_0\thinspace(T_1 - T_0)/\Delta z_0 \thickspace-\thickspace \varepsilon\thinspace \sigma\thinspace T_0^{\thinspace 4}, \tag{B12}$$
 
-with derivative $f'(T_0) = -k_0/\Delta z_0 - 4\thinspace\varepsilon\thinspace\sigma\thinspace T_0^{\thinspace3}$, the iterate is updated by full Newton steps with a step limiter, from a bracketed initial guess. Iteration stops when the residual, converted to temperature, is below $10^{-4}$ K (or at floating-point resolution), with a cap of 10 iterations; typical convergence takes 2 to 3 iterations. The same routine serves the CPU scalar, CPU SIMD and GPU solvers, and every run reports the worst residual it accepted ("surface-BC certificate").
+with derivative $f'(T_0) = -k_0/\Delta z_0 - 4\thinspace\varepsilon\thinspace\sigma\thinspace T_0^{\thinspace 3}$, the iterate is updated by full Newton steps with a step limiter, from a bracketed initial guess. Iteration stops when the residual, converted to temperature, is below $10^{-4}$ K (or at floating-point resolution), with a cap of 10 iterations; typical convergence takes 2 to 3 iterations. The same routine serves the CPU scalar, CPU SIMD and GPU solvers, and every run reports the worst residual it accepted ("surface-BC certificate").
 
 ### 5.3 Bottom Boundary
 
 A prescribed conductive heat flux $Q_b$ is imposed at the deepest node, giving the linear update
 
-$$T_n  =  T_{n-1}  +  Q_b\thinspace \frac{\Delta z_{n-1}}{k_n} \tag{B13}$$
+$$T_n \thickspace=\thickspace T_{n-1} \thickspace+\thickspace Q_b\thinspace \frac{\Delta z_{n-1}}{k_n} \tag{B13}$$
 
 (`thermal_model.cpp`). Body-specific values are listed in §3.5.
 
@@ -145,9 +145,9 @@ Non-finite values are rolled back to the previous step's value. There is no uppe
 
 Time integration of the interior uses the implicit Crank–Nicolson scheme. The column as a whole is first order in time: the massless surface node (§5.2) is solved from the previous step's $T_1$, and $k$ and $c_p$ are evaluated at $T^n$ (lagged, not iterated), so the error falls linearly with the substep. At the default substep the bias in time-mean temperature is at most about 0.1 K. Substituting (B8) into (B1) and centering the spatial operator at the midpoint $t^{n+1/2}$ yields, for each interior node $i$ and timestep $\Delta t$,
 
-$$T_i^{n+1}  -  T_i^n  =  \frac{\Delta t}{2\thinspace\rho_i\thinspace c_{p,i}} \Bigl[\thinspace \mathcal{L}\thinspace T^{n+1}  +  \mathcal{L}\thinspace T^n \thinspace\Bigr], \tag{B14}$$
+$$T_i^{n+1} \thickspace-\thickspace T_i^n \thickspace=\thickspace \frac{\Delta t}{2\thinspace\rho_i\thinspace c_{p,i}} \Bigl[\thinspace \mathcal{L}\thinspace T^{n+1} \thickspace+\thickspace \mathcal{L}\thinspace T^n \thinspace\Bigr], \tag{B14}$$
 
-with $\mathcal{L}\thinspaceT \equiv g_{1,i} k_{i-1}(T_{i-1} - T_i) + g_{2,i} k_i (T_{i+1} - T_i)$. Defining $\alpha = g_{1,i} k_{i-1}$, $\beta = g_{2,i} k_i$, and $\nu = \Delta t / (2\thinspace\rho_i c_{p,i})$, the resulting tridiagonal system $a_i T_{i-1}^{n+1} + b_i T_i^{n+1} + c_i T_{i+1}^{n+1} = d_i$ has
+with $\mathcal{L}\thinspace T \equiv g_{1,i} k_{i-1}(T_{i-1} - T_i) + g_{2,i} k_i (T_{i+1} - T_i)$. Defining $\alpha = g_{1,i} k_{i-1}$, $\beta = g_{2,i} k_i$, and $\nu = \Delta t / (2\thinspace\rho_i c_{p,i})$, the resulting tridiagonal system $a_i T_{i-1}^{n+1} + b_i T_i^{n+1} + c_i T_{i+1}^{n+1} = d_i$ has
 
 $$a_i = -\nu\thinspace\alpha, \quad b_i = 1 + \nu\thinspace(\alpha + \beta), \quad c_i = -\nu\thinspace\beta, \tag{B15}$$
 
@@ -165,7 +165,7 @@ Within each output interval the CPU solvers take $n_{\text{sub}} = \lceil \Delta
 
 ### 6.4 Event-Aware Refinement
 
-Sharp flux discontinuities (most importantly Jupiter eclipses on Europa, which can drop the absorbed flux by an order of magnitude in $\sim$1 minute) are handled by the event-aware controller (`thermal_model.cpp`). When `EVENT_AWARE_DT = true`, the timestep is additionally limited so that the linearly extrapolated change in $Q_s$ across the step satisfies $|\Delta Q_s| \le$ `FLUX_DQ_TARGET` ($= 0.1$ W m⁻²), with a floor of `MIN_EVENT_DT` ($= 0.25$ s). Refinement is triggered when the local flux derivative exceeds `FLUX_DERIV_THRESH` ($= 5\times 10^{-4}$ W m⁻² s⁻¹). For known flux knots (e.g., eclipse ingress and egress times tagged in the precomputed flux series) the controller additionally aligns one timestep boundary to each knot, so the discontinuity is sampled exactly rather than smeared across a CN step.
+Sharp flux discontinuities (most importantly Jupiter eclipses on Europa, which can drop the absorbed flux by an order of magnitude in $`\sim`$1 minute) are handled by the event-aware controller (`thermal_model.cpp`). When `EVENT_AWARE_DT = true`, the timestep is additionally limited so that the linearly extrapolated change in $Q_s$ across the step satisfies $|\Delta Q_s| \le$ `FLUX_DQ_TARGET` ($= 0.1$ W m⁻²), with a floor of `MIN_EVENT_DT` ($= 0.25$ s). Refinement is triggered when the local flux derivative exceeds `FLUX_DERIV_THRESH` ($= 5\times 10^{-4}$ W m⁻² s⁻¹). For known flux knots (e.g., eclipse ingress and egress times tagged in the precomputed flux series) the controller additionally aligns one timestep boundary to each knot, so the discontinuity is sampled exactly rather than smeared across a CN step.
 
 ## 7. Equilibration
 
@@ -177,7 +177,7 @@ Before the output window the thermal model is spun up for `thermal.equilibration
 
 **Legacy initial condition** (`spinup_seed: legacy`, for reproducing runs made before 2026-08-11): an exponential blend toward radiative equilibrium,
 
-$$T(z,\thinspace t = 0)  =  T_{\text{deep}} + (T_{\text{avg}} - T_{\text{deep}})\thinspace \exp(-z / \delta_1), \tag{B17}$$
+$$T(z,\thinspace t = 0) \thickspace=\thickspace T_{\text{deep}} + (T_{\text{avg}} - T_{\text{deep}})\thinspace \exp(-z / \delta_1), \tag{B17}$$
 
 with $T_{\text{max}} = ((1-A)\thinspace S/(\varepsilon\sigma))^{1/4}$, $T_{\text{avg}} = T_{\text{max}}/\sqrt{2}$ and $T_{\text{deep}} = T_{\text{avg}} + \min(Q_b\thinspace z/k,\thinspace 50\thickspace\text{K})$, followed on the CPU paths by an analytic clear-sky pre-conditioner (24 cycles on the Moon, 2 on Europa, 4 on Mercury) with no topography or shadowing.
 
@@ -205,7 +205,7 @@ PTM3D reproduces the Hayne et al. (2017) lunar surface temperatures to within 1.
 
 ### 8.2 Subsurface Diurnal Wave
 
-The shape and depth dependence of the diurnal thermal wave provide a second internal-consistency check. Figure B.2 shows the modeled subsurface temperature evolution at the lunar equator: panel (a) displays $T(z)$ at six local times spanning one synodic day, panel (b) shows the corresponding depth–time heatmap with the diurnal skin depth $\delta_1 = 3.4$ cm (eq. B6) marked, and panel (c) compares the diurnal amplitude to the analytic semi-infinite slab decay $\exp(-z/\delta_1)$. The amplitude decays approximately exponentially within the upper $\sim$5 skin depths and the wave acquires a phase lag with depth, both as expected for a linear semi-infinite slab with constant properties; departures from the analytical solution at depth reflect the depth-dependent $\rho(z)$ and $k(z)$ of (B4)–(B5).
+The shape and depth dependence of the diurnal thermal wave provide a second internal-consistency check. Figure B.2 shows the modeled subsurface temperature evolution at the lunar equator: panel (a) displays $T(z)$ at six local times spanning one synodic day, panel (b) shows the corresponding depth–time heatmap with the diurnal skin depth $\delta_1 = 3.4$ cm (eq. B6) marked, and panel (c) compares the diurnal amplitude to the analytic semi-infinite slab decay $\exp(-z/\delta_1)$. The amplitude decays approximately exponentially within the upper $`\sim`$5 skin depths and the wave acquires a phase lag with depth, both as expected for a linear semi-infinite slab with constant properties; departures from the analytical solution at depth reflect the depth-dependent $\rho(z)$ and $k(z)$ of (B4)–(B5).
 
 ![Figure B.2: Lunar subsurface diurnal thermal wave](figures/v2/thermal_wave_profiles.png)
 
@@ -252,12 +252,12 @@ The key user-facing parameters of the thermal solver are summarized below; a com
 | `IMPLICIT_ALL` | true | Force CN+Thomas for all profiles |
 | `THOMAS_LIMIT` | 4096 | Profile-size limit for the Thomas path |
 | `MULTIRATE_ADAPTIVE_STEP` | true | Enable surface-driven adaptive $\Delta t$ (§6.3) |
-| `SURF_DMAX` | 0.1 | Target maximum $|\Delta T_{\text{surf}}|$ per step (K) |
+| `SURF_DMAX` | 0.1 | Target maximum $\lvert \Delta T_{\text{surf}}\rvert$ per step (K) |
 | `DT_GROW`, `DT_SHRINK` | 1.0, 0.1 | Adaptive-step multipliers |
 | `MAX_DT_SCALE` | 8.0 | Cap on the adaptive-step multiplier |
 | `EVENT_AWARE_DT` | true | Enable flux-event $\Delta t$ refinement (§6.4) |
-| `FLUX_DERIV_THRESH` | $5 \times 10^{-4}$ | $|dQ_s/dt|$ trigger threshold (W m⁻² s⁻¹) |
-| `FLUX_DQ_TARGET` | 0.1 | Target maximum $|\Delta Q_s|$ per step (W m⁻²) |
+| `FLUX_DERIV_THRESH` | $5 \times 10^{-4}$ | $\lvert dQ_s/dt\rvert$ trigger threshold (W m⁻² s⁻¹) |
+| `FLUX_DQ_TARGET` | 0.1 | Target maximum $\lvert \Delta Q_s\rvert$ per step (W m⁻²) |
 | `MIN_EVENT_DT` | 0.25 | Minimum $\Delta t$ during flux events (s) |
 
 ## 10. Symbols and Units
