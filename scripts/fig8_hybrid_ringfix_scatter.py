@@ -200,8 +200,8 @@ def main():
                          "corner, axes-fraction placement, plain text, no box) naming "
                          "each panel's quantity ('Summer max', 'Summer mean', 'Winter "
                          "max', 'Winter mean'). Distinct from an on-figure title/stat "
-                         "box -- those stay suppressed under --pubclean; Paul confirmed "
-                         "in-panel labels are fine under the no-on-figure-notes rule. "
+                         "box -- those stay suppressed under --pubclean; in-panel labels "
+                         "are allowed under the no-on-figure-notes rule. "
                          "Appends _v2 to the output filename suffix.")
     args = ap.parse_args()
     apply_style()
