@@ -324,7 +324,7 @@ ViewFactorMatrix computeMonteCarlo(
         // which restores A_i F_ij == A_j F_ji exactly and is the lower-variance
         // estimate of both. The divisor is 2 unconditionally: a direction the
         // gather never sampled is a MEASURED ZERO, not a missing datum. That is
-        // FC-08's ruling, and dividing by "the directions that reported" is
+        // the view-factor divisor ruling, and dividing by "the directions that reported" is
         // exactly the bug it was.
         std::vector<std::unordered_map<int, double>> Fs(n_faces);
         for (size_t i = 0; i < n_faces; ++i) {

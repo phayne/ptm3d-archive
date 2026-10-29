@@ -918,7 +918,7 @@ void RadiosityOpenCLSolver::uploadViewFactorsT(
         return;
     }
 
-    // PTM-25: choose the single-buffer path or the chunked path. The SpMV kernel
+    // choose the single-buffer path or the chunked path. The SpMV kernel
     // addresses the CSR values/col_indices buffers with a signed-int32 byte
     // offset; on a 32-bit-addressing device (W6800X/macOS reports
     // CL_DEVICE_ADDRESS_BITS=32) a single indexed buffer >= 2^31 bytes overflows
@@ -1074,7 +1074,7 @@ void RadiosityOpenCLSolver::buildChunkedCsrT(
             if (nnz_if_add > max_chunk_nnz) {
                 if (next == chunk_row_begin) {
                     // A single row exceeds the budget: it cannot be split on a row
-                    // boundary. Fail loud (PTM-25 backstop) rather than abort.
+                    // boundary. Fail loud (2^31-wall backstop) rather than abort.
                     const size_t row_nnz =
                         static_cast<size_t>(row_ptrs[next + 1]) -
                         static_cast<size_t>(row_ptrs[next]);
@@ -1083,7 +1083,7 @@ void RadiosityOpenCLSolver::buildChunkedCsrT(
                         " has " + std::to_string(row_nnz) +
                         " non-zeros, exceeding the per-chunk budget of " +
                         std::to_string(max_chunk_nnz) +
-                        " nnz (2^31-byte GPU addressing wall, PTM-25). This "
+                        " nnz (2^31-byte GPU addressing wall). This "
                         "matrix cannot run on this GPU without a wider SpMV "
                         "kernel; use CPU radiosity.");
                 }
@@ -1204,7 +1204,7 @@ double RadiosityOpenCLSolver::benchmarkSpMV(int n_reps, int mode)
     if (use_chunked_csr_) {
         throw std::runtime_error(
             "benchmarkSpMV: this matrix (" + std::to_string(nnz_) +
-            " nnz) was uploaded through the CHUNKED CSR path (PTM-25), so the "
+            " nnz) was uploaded through the CHUNKED CSR path, so the "
             "single-buffer CSR buffers this benchmark drives do not exist. "
             "Benchmarking it here would time the kernels against null buffers "
             "and report a meaningless number. Use the solver's own per-solve "
@@ -1307,7 +1307,7 @@ void RadiosityOpenCLSolver::enqueueSpMV(cl_mem x, cl_mem y,
         return;
     }
 
-    // Chunked path (PTM-25) + vector coalescing: one wavefront per chunk-local row.
+    // Chunked path + vector coalescing: one wavefront per chunk-local row.
     for (const CsrChunk& ch : csr_chunks_) {
         err = clSetKernelArg(spmv_vector_chunk_kernel_, 0, sizeof(cl_mem), &ch.values);
         checkErr(err, "clSetKernelArg(spmv_vchunk,values)");
@@ -1701,7 +1701,7 @@ void RadiosityOpenCLSolver::solve(
     }
 
     // SpMV kernel args are set inside enqueueSpMV (which also dispatches to the
-    // chunked path when the matrix exceeds the single-buffer wall, PTM-25).
+    // chunked path when the matrix exceeds the single-buffer wall).
 
     // Jacobi iteration with periodic convergence checking. A check costs one
     // device->host round trip; not checking costs iterations the solve did not
@@ -1751,7 +1751,7 @@ void RadiosityOpenCLSolver::solve(
     }
 
     for (int iter = 0; iter < config_.max_iterations; ++iter) {
-        // SpMV: F_B = F * radiosity (single-buffer or chunked, PTM-25)
+        // SpMV: F_B = F * radiosity (single-buffer or chunked)
         enqueueSpMV(buf_radiosity_, buf_F_B_, global_size, local_size);
 
         // Jacobi update: B_new = E + rho*Q_solar + rho*F*B
@@ -1814,7 +1814,7 @@ void RadiosityOpenCLSolver::solve(
         }
     }
 
-    // Compute final SpMV to get F * B_final (single-buffer or chunked, PTM-25)
+    // Compute final SpMV to get F * B_final (single-buffer or chunked)
     enqueueSpMV(buf_radiosity_, buf_F_B_, global_size, local_size);
 
     // Compute indirect flux: Q_indirect = eps * (F * B)
@@ -2095,7 +2095,7 @@ void RadiosityOpenCLSolver::solveTwoBandFused(
     last_iterations_ = it_vis;
     // A two-band solve has converged only when BOTH bands have, and its residual
     // is the worse of the two -- the same rule solveTwoBandJacobiFused() adopted
-    // under PTM-102, rather than silently reporting the second band alone.
+    // under the coupling-mode control, rather than silently reporting the second band alone.
     converged_ = conv_ir && conv_vis;
     last_residual_ = std::max(res_ir, res_vis);
 
@@ -2221,7 +2221,7 @@ void RadiosityOpenCLSolver::release() {
     if (buf_csr_col_indices_) { clReleaseMemObject(buf_csr_col_indices_); buf_csr_col_indices_ = nullptr; }
     if (buf_csr_row_ptrs_) { clReleaseMemObject(buf_csr_row_ptrs_); buf_csr_row_ptrs_ = nullptr; }
 
-    // Release chunked CSR sub-buffers (PTM-25)
+    // Release chunked CSR sub-buffers
     releaseChunkBuffers();
 
     // Release state buffers

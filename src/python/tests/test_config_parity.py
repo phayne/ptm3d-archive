@@ -79,10 +79,10 @@ EXPECTED_SECTIONS = (
     # SEQUENCE OF MAPS; its per-entry fields are deliberately absent from the
     # table because there is no dotted key for them -- see the note at the
     # locations block in config_parser.cpp.
-    # `gpu` is the cross-cutting GPU safety policy (docs/gpu-wedge-guardrails.md).
+    # `gpu` is the cross-cutting GPU safety policy (docs/dev/gpu-wedge-guardrails.md).
     # `shadow_depth` is the umbral-ceiling product (the maximum height above the
     # local surface at which the Sun is not even partially visible). Top level
-    # for the same PTM-67 reason `flux_cubes` is.
+    # for the same unread-config-key reason `flux_cubes` is.
     "advanced", "flux_cubes", "generic_body", "gpu", "illumination", "mesh",
     "output",
     "radiation", "shadow_depth", "simulation", "thermal", "thermophysical",
@@ -119,7 +119,7 @@ GUI_GENERIC_BODY_DEAD_KEYS = (
 
 #: ⛔ NOT a harmless dead key, and it is listed here only so the fourteen
 #: Justitia configurations can be tracked without switching this gate off for
-#: everything else. Owed as **PTM-ICE-LAYER-KEYS-UNREAD**.
+#: everything else. The unread ice-layer keys are still owed.
 #:
 #: These seven describe a DISCRETE buried-ice layer -- the depth of the
 #: regolith/ice interface and the ice's own conductivity, density and heat
@@ -256,7 +256,7 @@ def test_committed_table_matches_cxx_sources():
 def test_an_aliased_key_is_not_read_as_a_section():
     """``const auto& d = output["k"];`` is a KEY, not a section declaration.
 
-    PTM-ENGINECONFIG-ALIAS-DROPS-KEY. The extractor classified every
+    Config-alias key drop. The extractor classified every
     ``const auto& X = Y["Z"];`` as a section declaration, put ``Y.Z`` in the
     SECTIONS set, and then excluded sections from the defaults table -- so a
     key written that way vanished from the parity table while

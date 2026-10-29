@@ -170,8 +170,8 @@ private:
 // = 0.552 m against z_max/2 = 0.502 m, i.e. 4.55 skin depths).
 //
 // WHAT THIS DOES NOT CATCH, stated so nobody assumes otherwise: it is a
-// SELF-CONSISTENCY test. A column driven by the wrong Qb (BUGS.md PTM-161) or
-// pinned on a clamp (PTM-159) is perfectly self-consistent and certifies.
+// SELF-CONSISTENCY test. A column driven by the wrong Qb or
+// pinned on a clamp is perfectly self-consistent and certifies.
 // eqQbFromState() exists so the Qb actually in force is printed next to the
 // configured one every time, which is the only defense against the first.
 
@@ -194,8 +194,8 @@ bool eqInterfaceFlux(const double* z, const double* T, const double* k, int n,
 // not use the same one, and getting that backwards misreads Qb by the k ratio.
 //
 // This is measured, not configured, and that matters: `geothermal_heat_flow`
-// was inert on every solver entry point for the whole moon3d campaign
-// (BUGS.md PTM-161), so a certificate that trusted the config would have
+// was inert on every solver entry point for the whole moon3d campaign,
+// so a certificate that trusted the config would have
 // scored the residual against a Qb 22% off the one the state was integrated
 // with. Returns <= 0 on a degenerate column.
 double eqQbFromState(const double* z, const double* T, const double* k, int n);

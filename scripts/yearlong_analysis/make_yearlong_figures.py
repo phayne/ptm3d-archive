@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Moon3D year-long campaign — annual mean/max temperature & volatile-stability
-figure set (Paul's overnight mandate, 2026-07-20/21, executed by Luna).
+figure set (2026-07-20/21).
 
 Inputs (see SESSION-NOTES-2026-07-21-moon3d-yearlong-figures.md for full
 provenance/verification trail):
@@ -12,7 +12,7 @@ provenance/verification trail):
       FIRST-LUNATION window (steps 1-140, i.e. chunk_000's real steps 1-20
       plus a supplemental 120-step continuation run from the chunk_000
       checkpoint -- NOT part of the original completed campaign; launched by
-      Luna to fill a genuine gap, see caption below and the session note).
+      to fill a genuine gap, see caption below and the session note).
 
 Cadence: both windows are the SAME 120-samples/lunation cadence (the merged
 per-face statistics are single-window min/avg/max/sum/count aggregates over
@@ -35,6 +35,7 @@ limits use robust (1st/99th percentile) bounds with an extended colorbar so
 the rare outliers don't wash out the scale, but no data is hidden or altered.
 """
 from __future__ import annotations
+import os
 import argparse
 import json
 import sys
@@ -50,8 +51,6 @@ from matplotlib import colormaps
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import pyvista as pv
 
-sys.path.insert(0, "/Users/paha3326/projects/ptm/src/python")
-sys.path.insert(0, "/Users/paha3326/projects/ptm/scripts/yearlong_analysis")
 # APPENDED, deliberately not inserted: the two absolute paths above pin one
 # checkout, so a copy of this script running from a worktree would otherwise be
 # unable to find its own src/python. Appending leaves every import below
@@ -62,8 +61,8 @@ from ptm_pubstyle import apply_style, DOUBLE_W, COLORS
 from ptm_stats_io import read_f32_array
 import ptm_population as pop
 
-BASE = Path("/Users/paha3326/projects/moon3d/outputs/moon3d_native_yearlong")
-OUT = Path("/Users/paha3326/projects/moon3d/figures_yearlong")
+BASE = Path(os.environ.get("PTM_RESULTS_ROOT", "output")) / "moon3d_native_yearlong"
+OUT = Path(os.environ.get("PTM_FIGURES_ROOT", "output/figures_yearlong"))
 OUT.mkdir(parents=True, exist_ok=True)
 MESH_PLY = BASE / "coupled" / "chunk_000" / "mesh.ply"
 
@@ -397,7 +396,7 @@ def hist_figure_v2(coupled, radoff):
     the first_lunation window) carries the same mislabeling -- flagged here,
     NOT fixed in this pass (out of scope: that file is an already-delivered,
     cited provenance record; a correction there is a separate, deliberate
-    edit for Paul/Sagan to green-light, not a silent piggyback on a figure
+    edit for Paul to green-light, not a silent piggyback on a figure
     legend fix).
     """
     apply_style()
@@ -572,21 +571,21 @@ def main():
 
     summary = dict(
         provenance=dict(
-            binary="/Users/paha3326/projects/ptm-bin/ptm_thermal_sim",
+            binary="ptm_thermal_sim (pinned production build)",
             binary_md5="141922269e74424019e436e259c24a26",
             binary_built="2026-07-19T18:27:32-06:00 (predates all Phase-R portability commits, "
                           "which start 2026-07-21T00:41 -- confirmed by absence of Phase-R log "
                           "banners in every run log)",
-            merge_binary="/Users/paha3326/dev/heat3d/ptm-build/bin/ptm_merge_chunks (2026-06-23)",
+            merge_binary="ptm_merge_chunks (2026-06-23 build)",
             mesh=str(MESH_PLY), n_faces=int(len(f)),
-            vf_file="/Users/paha3326/projects/moon3d/vf/moon3d_c_cartesian_NEW_500k_clean.vf",
-            vf_replace_csr="/Users/paha3326/projects/moon3d/vf/moon3d_c_cartesian_NEW_500k_clean_corrected_pp.csr",
+            vf_file="moon3d_c_cartesian_NEW_500k_clean.vf",
+            vf_replace_csr="moon3d_c_cartesian_NEW_500k_clean_corrected_pp.csr",
         ),
         windows=dict(
             annual="steps 1-1484 (2030-09-01 -> 2031-09-01, 365.25 d, 120 samples/lunation, ORIGINAL completed campaign)",
             first_lunation="steps 1-140 (2030-09-01 -> 2030-10-05, 29.53 d, SAME 120/lunation cadence; "
                             "steps 1-20 = chunk_000 of the original campaign, steps 21-140 = a supplemental "
-                            "120-step continuation Luna ran from the chunk_000 checkpoint, same pinned binary/"
+                            "120-step continuation run from the chunk_000 checkpoint, same pinned binary/"
                             "batch/env, to fill a gap the original campaign did not produce (see caveats)",
         ),
         cadence_caveat=("Both windows share the SAME 120-samples/lunation cadence (verified: every face has "

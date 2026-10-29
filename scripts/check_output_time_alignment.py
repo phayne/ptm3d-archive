@@ -20,7 +20,7 @@ interval:
 
   --checkpoint <file.ptmt>   A warm-started GPU run (thermal.initial_state_file)
                              reproduces the checkpoint's surface layer exactly
-                             at index 0. GPU PATH ONLY. Since BUGS.md PTM-662
+                             at index 0. GPU PATH ONLY. Since the warm-start seam fix
                              the CPU drivers re-solve a warm start's index-0
                              surface at its own epoch -- the number an
                              unchunked run files there -- so on a CPU run this
@@ -120,7 +120,7 @@ def compare(frame, reference, tol, what, frame_path, ref_path):
               ' already been integrated past its own epoch.')
         if what == 'checkpoint':
             print('  NOTE: on a CPU-solver run this anchor is expected to differ'
-                  ' (BUGS.md PTM-662: index 0 is re-solved at its epoch); use'
+                  ' (index 0 is re-solved at its epoch since the warm-start seam fix); use'
                   ' scripts/test_chunk_seam_equivalence.py there.')
         return 1
     print('  PASS: output index 0 is the state at times[0].')

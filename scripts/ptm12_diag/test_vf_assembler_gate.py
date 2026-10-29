@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FC-08 regression gate for the offline view-factor referee and assembler.
+"""View-factor divisor regression gate for the offline view-factor referee and assembler.
 
 Three arms. A and B drive the ACTUAL referee pipeline end to end -- mc_ref_pp sweep ->
 assemble_vf_haworth.py -> CSR -- so a defect anywhere between the ray sampler and the
@@ -12,7 +12,7 @@ written matrix is in scope.
          O((e0/H)^2) -- 2e-6 at the historical 0.01 m^2, 9e-5 at the CI default of
          2 m^2, both far below any tolerance here.  The disk is cut into enough facets
          that every pair sits at lambda = NRAYS * F_ij of order 1 -- the production
-         regime, and the ONLY regime where the FC-08 defect is visible.  The assembled
+         regime, and the ONLY regime where the view-factor divisor defect is visible.  The assembled
          row 0 must reproduce 0.250000 to within --closed-form-tol-pct.
 
          SIZING (measured 2026-08-22, and the reason --disk-a0 exists).  Arm A's
@@ -239,6 +239,7 @@ def sweep(binary, mesh, tmax, nfaces, nrays, outdir, jobs, no_backface_cull=Fals
     env = dict(os.environ)
     env.pop("PTM_PP_RING_PLY", None)          # no occluder mesh in either arm
     env.pop("PTM_PP_NO_BACKFACE_CULL", None)
+    env["PTM_PP_ORIENT"] = "raw"  # the closed-form test meshes are local-frame and wound raw by design
     if no_backface_cull:
         env["PTM_PP_NO_BACKFACE_CULL"] = "1"
     procs = []
@@ -446,7 +447,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=min(20, os.cpu_count() or 4))
     ap.add_argument("--mc-ref-pp", default=None, help="prebuilt referee binary")
     ap.add_argument("--arm", choices=("A", "B", "C", "all"), default="all")
-    # Arm-A tessellation. The controlling variable for the FC-08 defect is
+    # Arm-A tessellation. The controlling variable for the view-factor divisor defect is
     # lambda = NRAYS * F_ij, NOT the ray budget alone: a coarse disk with a big
     # budget puts every pair in the well-sampled regime and hides the bug
     # completely. So --disk-nth/--disk-k and --nrays-closed-form must be scaled

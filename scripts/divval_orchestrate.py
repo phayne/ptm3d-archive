@@ -15,12 +15,12 @@ from pathlib import Path
 # ~100k radiation core compress instead of zeroing (full wall->floor coupling).
 RUN_ENV = {**os.environ, "PTM_HMATRIX_ACA_CAP": "60000"}
 
-REPO = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm")
+REPO = Path(__file__).resolve().parents[1]
 PTM = REPO / "build/bin/ptm_thermal_sim"
-PY = "/Users/paha3326/anaconda3/envs/europa_viz/bin/python"
-MAT = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/Collaborators/LandisM/moon/Tbols_SP_new_full_run_hires_bad_orbit_removed_channel_all.mat"
+PY = sys.executable
+MAT = os.environ.get("PTM_DIVINER_MAT", "")   # Diviner polar Tbol .mat (not distributed)
 MESHDIR = REPO / "data/dem/validation/meshes"
-OUTROOT = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/output")
+OUTROOT = Path(os.environ.get("PTM_RESULTS_ROOT", str(REPO / "output")))
 FIGDIR = REPO / "docs/figures/diviner_validation"
 
 SITES = [("haworth", -87.45, -2.1), ("faustini", -87.3, 84.0),

@@ -430,7 +430,7 @@ def test_the_help_text_carries_no_internal_shorthand():
 #   * RENDERED -- every text/title/tooltip/placeholder on a live offscreen
 #     ConfigurationPanel. Catches anything a future surface puts on screen
 #     without going through a table. Misses state-dependent strings: the
-#     Radiation page's coupling-mode note said "legacy re-introduces PTM-89"
+#     Radiation page's coupling-mode note said "legacy re-introduces the chunking dependence"
 #     only while the combo sat on `legacy`, and the rendered sweep never saw it.
 #   * SOURCE -- every string constant handed to a user-visible Qt setter
 #     anywhere under gui/, plus the copy tables (TOOLTIPS, LABELS, the body

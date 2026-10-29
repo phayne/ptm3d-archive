@@ -1,4 +1,4 @@
-// PTM-13 rise-epsilon unit test: the OUT-OF-PLANE RISE discriminator vs the 1 cm ray-origin offset
+// Shadow-ray rise-epsilon unit test: the OUT-OF-PLANE RISE discriminator vs the 1 cm ray-origin offset
 // on a synthetic steep sunward wall inside a rim shadow. Reproduces the exact algorithm in
 // IlluminationModel::traceOccludedRiseEps (iterative rtcIntersect1 from the TRUE centroid, tnear~0,
 // NO metric offset, NO ring skip; a hit is a real occluder iff its rise dz = (P_hit - c_src)*n_src
@@ -254,7 +254,7 @@ int main() {
         else {++fail; printf("  FAIL %-56s got %.4f mm want [%.3f,%.3f]\n",name,got*1000,lo*1000,hi*1000);}
     };
 
-    printf("PTM-13 rise-epsilon occlusion test (steep sunward wall, 6.8deg sun; h_eps = %.1f x %.1f mm = %.2f mm)\n",
+    printf("Rise-epsilon occlusion test (steep sunward wall, 6.8deg sun; h_eps = %.1f x %.1f mm = %.2f mm)\n",
            rise_keps, local_edge*1000, h_eps*1000);
 
     // -- MEASURE the separating quantity: self-relief rise vs real occluder rise --

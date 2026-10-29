@@ -123,7 +123,7 @@ struct LagBarrierConfig {
     double warn_thickness = 5e-3;     // warn once any d exceeds this [m]
     double source_refresh_tol = 0.02; // transport refresh when the emission pattern moves this much
 
-    // Gardening and the sputter split (PTM-669; Paul's rulings 2026-09-24, Fermi's design).
+    // Gardening and the sputter split (design of 2026-09-24).
     // sputter_shield: H2O sputter EJECTION crosses the lag like sublimation (ejected H2O
     //   below the top grains sticks: Johnson et al. 2004, Jupiter ch. 20, pp. 494, 502;
     //   Cassidy & Johnson 2005); radiolytic O2 + H2 stay unshielded (O2 does not stick
@@ -139,7 +139,7 @@ struct LagBarrierConfig {
     //   level, secondaries v = -4: K99 = u pi c^2 h^2 / (2 x 4.605); Case B 3.84e-9,
     //   Case A 1.10e-9 m^2/yr; h = 0.04 and c = 1 are UNVERIFIED, not in Costello 2021);
     //   column material at the t = 0 composition c_0 is entrained at dh_g/dt.
-    // Both off (--no-gardening --no-sputter-shield) = PTM-659 exactly.
+    // Both off (--no-gardening --no-sputter-shield) = the lag layer and diffusion barrier model exactly.
     bool sputter_shield = false;
     bool gardening = false;
     double gardening_rate = 0.3e-6 / (365.25 * 86400.0);   // v_m [m/s]
@@ -208,7 +208,7 @@ struct IceLayerState {
     std::vector<double> substrate_ice;           // ice left in the mixed layer [kg/m²]
     std::vector<double> lag_exposed_fraction;    // f(x_n), the mixture's exposed ice area (frozen)
     std::vector<double> lag_beta;                // beta [m³/kg]: d(lag_d) per kg/m² of net ice loss
-    // Garden mode (PTM-669): the box composition moves. c = N / (N + M / rho_ice).
+    // Garden mode: the box composition moves. c = N / (N + M / rho_ice).
     std::vector<double> box_nonice_volume;       // N [m³/m²], non-ice grains in the box
     std::vector<double> box_c0;                  // column composition entrained by gardening (t = 0 c)
     double lag_time = 0.0;                       // [s] model time of the lag state (box depth)
@@ -522,7 +522,7 @@ public:
     /**
      * updateBoxComposition() for a box that is not (yet) in the state: the same
      * c, f, beta from its non-ice volume N [m³/m²] and ice M [kg/m²]. Used by the
-     * garden-step subcycling (PTM-676) between substeps. updateBoxComposition() is
+     * garden-step subcycling between substeps. updateBoxComposition() is
      * deliberately left as it was (its -ffast-math rounding is part of the byte
      * gates); test_diurnal_albedo_response checks that the two agree.
      */

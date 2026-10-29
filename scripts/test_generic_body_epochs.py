@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Engine test: generic_body spin.prime_meridian_deg, spin.epoch and orbit.epoch
-move the Sun exactly as specified (BUGS.md PTM-663).
+move the Sun exactly as specified.
 
 Until 2026-09-24 ``generic_body.spin.prime_meridian_deg`` and
 ``generic_body.orbit.epoch`` were parsed and dropped: every generic body rotated

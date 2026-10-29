@@ -478,7 +478,7 @@ def test_reproduce_a_baseline_reads_the_runs_own_record():
 
 
 def test_the_baseline_card_honors_the_files_engine_env():
-    """PTM-276 could not have happened through this path.
+    """The injected-variable defect could not have happened through this path.
 
     The baseline's own `engine_env: {}` means "no fix flags", and Stage 1's
     load rule takes a present block at its word. If the card re-injected the

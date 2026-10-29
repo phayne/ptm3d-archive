@@ -22,7 +22,7 @@
  *           the O2 yield law of Cassidy et al. 2013 p. 71 (q0 = 1000, E_a = 0.06 eV,
  *           after Teolis et al. 2010). Continuous and monotonic, no cutoff (the
  *           legacy factor was 0 below 50 K, 1 from 50-80 K, 0.599 at 80 K, and applied
- *           to the whole yield; PTM-649).
+ *           to the whole yield).
  *   --sputter-o2-map-absolute FILE: the radiolytic part comes from a per-face O2
  *           production map instead (O2 molecules cm^-2 s^-1; H2 stoichiometric;
  *           H2O = gross - O2 - H2). tau(T) is NOT applied to it: the Addison et al.
@@ -57,7 +57,7 @@
  *                         analytic form; cos(theta) from the trailing apex is the
  *                         cold-ion flux only (p. 70). The map also rises with
  *                         latitude on the leading hemisphere (Fig. 7 caption),
- *                         which the cosine omits (PTM-652).
+ *                         which the cosine omits.
  *   Polar 1.2 (linear)    NOT in Cassidy, and no such number in Nordheim 2022      NOT-FOUND; default 1.0
  *                         (below). Default is now 1 (BASE = Cassidy).              (legacy set keeps 1.2)
  *   tau(T): q0 = 1000,    Cassidy p. 71 O2-yield equation (after Teolis et al.     VERIFIED (Teolis 2010
@@ -81,7 +81,7 @@
  *     units R [cm^-2 s^-1]   pp. 21, 30 (H2O-equivalent and O2 sputtering rates)    VERIFIED
  *     H2O total, draped      p. 25: P_T ~ 5.9e27 /s (uniform fields 1.16e28, p. 24)  DIFFERS: the shipped
  *                            p. 12: yields x 0.3 for regolith sticking; the GENTOo   map is 1.98e28 = 5.9e27
- *                            source has no such factor                               / 0.3 (PTM-654)
+ *                            source has no such factor                               / 0.3
  *     H2O yield T-indep.     p. 11 (below 140 K, after Baragiola 2003); the GENTOo   DIFFERS (source keeps
  *                            H2O source still applies 1 + 220 e^(-0.06/kT) at 100 K  1.21 at <= 100 keV)
  *     O2 total, thin layer   p. 32: 1.5e26 - 4.9e26 /s over five T profiles; map     VERIFIED (in range)
@@ -155,7 +155,7 @@ namespace sputtering_constants {
 }
 
 /**
- * Sigmund-Thompson H2O ejecta, f(E) ~ E / (E + U)^3 (PTM-649).
+ * Sigmund-Thompson H2O ejecta, f(E) ~ E / (E + U)^3.
  * escapeFraction: share with E >= E_esc, 1 - [E_esc / (E_esc + U)]^2.
  * meanBoundEnergy: mean E over [0, E_esc) [same unit as U, E_esc].
  */
@@ -198,7 +198,7 @@ struct SputteringConfig {
     // Temperature dependence enable (Teolis et al. 2017)
     bool temperature_dependent = true;
 
-    // Mass accounting (PTM-642). The gross sputtered mass (Cassidy et al. 2013,
+    // Mass accounting. The gross sputtered mass (Cassidy et al. 2013,
     // GLOBAL_H2O_RATE x H2O_MASS ~ 60 kg/s H2O-equivalent at rate_scale 1) is ice
     // REMOVED from the face. It leaves as three products:
     //   H2O (fraction h2o_fraction), and radiolytic O2 + H2 (the remainder),
@@ -210,7 +210,7 @@ struct SputteringConfig {
     // ionization/dissociation/pickup at the rate it is supplied. Surface ice loss
     // from sputtering = escaped + reservoir = gross x (1 - h2o_fraction x (1 - h2o_escape)).
     //
-    // legacy_escape_only = true restores the pre-PTM-642 accounting: only the
+    // legacy_escape_only = true restores the pre-fix accounting: only the
     // escaping share is removed from the surface, the non-escaping ~78% is neither
     // removed nor transported (NOT mass-conserving), the species split is the
     // non-stoichiometric 0.85/0.10/0.05, and the multiscale deposition rescale uses
@@ -238,7 +238,7 @@ struct SputteringConfig {
     // 0.90 = Cassidy et al. 2013 (UNVERIFIED); the legacy set uses 0.85.
     double h2o_fraction = sputtering_constants::DEFAULT_H2O_FRACTION;
 
-    // Parameter set (PTM-649). false = the current set described in the header;
+    // Parameter set. false = the current set described in the header;
     // true = the pre-2026-09-23 set (--sputter-legacy-params; implied by
     // legacy_escape_only). applyLegacyParams() sets the legacy values.
     bool legacy_params = false;
@@ -341,7 +341,7 @@ struct SputteringConfig {
     // escape:    escaping share of every product, lost to space.
     // reservoir: non-escaping O2 + H2 (non-condensable), never returned as ice.
     // In the current set these are the shares at T_ref; per face the composition
-    // follows tau(T), and the multiscale path uses per-face shares (PTM-649).
+    // follows tau(T), and the multiscale path uses per-face shares.
     // "reservoir" is the atmospheric loss of the non-condensable products (current
     // set: all O2, lost by ionization/dissociation/pickup).
     double transportShare() const { return h2o_fraction * (1.0 - h2oEscapeFraction()); }
@@ -429,7 +429,7 @@ private:
     std::vector<double> spatial_weight_;
     bool spatial_initialized_ = false;
 
-    // Current parameter set (PTM-649): H2O-equivalent molecule flux per face at
+    // Current parameter set: H2O-equivalent molecule flux per face at
     // T_ref [molecules m^-2 s^-1] before rate_scale, and its source.
     std::vector<double> ion_molecule_flux_;
     std::vector<double> ion_map_values_;   // optional per-face map (weights or absolute)

@@ -124,7 +124,7 @@ public:
      * float32 IS the device format: the SpMV kernel reads a `__global const
      * float*`, so this overload hands the caller's array straight to
      * clEnqueueWriteBuffer with no host-side copy of the values, on both the
-     * single-buffer and the chunked (PTM-25) path. A caller that already holds
+     * single-buffer and the chunked path. A caller that already holds
      * float32 -- the PTM_HMATRIX_VF_REPLACE CSR is float32 on disk AND float32
      * in the CPU SparseVFOperator -- must use this overload, not the fp64 one.
      *
@@ -246,7 +246,7 @@ public:
      *
      * @param temperatures Surface temperatures [K] (IR band source).
      * @param solar_flux Incident solar flux [W/m^2], already carrying any
-     *        direct-beam source-albedo prescale (PTM-106) the caller applies.
+     *        direct-beam source-albedo prescale the caller applies.
      * @param indirect_ir_out Output: absorbed indirect IR flux [W/m^2].
      * @param indirect_vis_out Output: absorbed indirect visible flux [W/m^2].
      * @throws std::runtime_error if uploadVisibleProperties() has not run.
@@ -330,7 +330,7 @@ private:
                             const std::vector<int>& col_indices,
                             const std::vector<int64_t>& row_ptrs);
 
-    // Build the chunked CSR sub-buffers (PTM-25) when the matrix exceeds the
+    // Build the chunked CSR sub-buffers when the matrix exceeds the
     // per-buffer chunk budget. Fails loud if a single row exceeds the budget.
     // float32 values are written to each chunk buffer directly out of the
     // caller's array; float64 values are narrowed one chunk at a time.
@@ -368,14 +368,14 @@ public:
     // chosen kernel n_reps times back-to-back with clFinish fences, return total
     // milliseconds. mode 0 = scalar (one work-item/row), 1 = vector (one
     // wavefront/row, coalesced). Uses the uploaded CSR + buf_radiosity_ as x.
-    // THROWS if the matrix went through the chunked upload path (PTM-25) or no
+    // THROWS if the matrix went through the chunked upload path or no
     // CSR is resident: the single-buffer kernel arguments would otherwise be NULL
     // cl_mem handles, which OpenCL accepts, producing a timing measured against
     // null pointers instead of an error.
     double benchmarkSpMV(int n_reps, int mode);
 private:
 
-    // Release the chunked CSR sub-buffers and reset the chunked state (PTM-25).
+    // Release the chunked CSR sub-buffers and reset the chunked state.
     void releaseChunkBuffers();
 
     size_t n_faces_;
@@ -394,7 +394,7 @@ private:
     cl_kernel emission_kernel_ = nullptr;       // Compute thermal emission
     cl_kernel solar_source_kernel_ = nullptr;   // Compute reflected solar
     cl_kernel indirect_flux_kernel_ = nullptr;  // Compute absorbed indirect flux
-    cl_kernel spmv_chunk_kernel_ = nullptr;     // Chunked CSR SpMV (PTM-25 workaround)
+    cl_kernel spmv_chunk_kernel_ = nullptr;     // Chunked CSR SpMV (2^31-wall workaround)
     cl_kernel spmv_vector_chunk_kernel_ = nullptr;  // Chunked CSR-Vector SpMV (coalesced)
     cl_kernel spmv_vector2_kernel_ = nullptr;       // Width-2 CSR-Vector SpMV (both bands)
     cl_kernel spmv_vector2_chunk_kernel_ = nullptr; // Width-2 chunked CSR-Vector SpMV
@@ -406,7 +406,7 @@ private:
     cl_mem buf_csr_col_indices_ = nullptr; // int [nnz]
     cl_mem buf_csr_row_ptrs_ = nullptr;    // int [n_faces + 1]
 
-    // Chunked CSR (PTM-25): used only when a single values/col_indices buffer
+    // Chunked CSR: used only when a single values/col_indices buffer
     // would reach the 2^31-byte GPU addressing wall. The matrix is split on ROW
     // boundaries into sub-buffers each below the wall; the SpMV runs one launch
     // per chunk. Below the wall csr_chunks_ is empty and the single-buffer path

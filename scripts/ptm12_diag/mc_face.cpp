@@ -1,4 +1,4 @@
-// PTM-12 per-face occlusion-aware MC view factor (ground truth), outward normals forced.
+// Per-face occlusion-aware MC view factor (ground truth), outward normals forced.
 // Usage: mc_face <mesh.ply> <coupled_tmax.bin> <facelist.txt> <n_rays>
 // For each listed face: true SumF (terrain hit-fraction, exact occlusion), F_sky,
 // F_warm(>384K), and MC incident IR = eps*(1/N)Sum eps*sigma*Tmax_hit^4  (cosine-weighted).

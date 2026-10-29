@@ -119,7 +119,7 @@ def read_data_files(data_dir, pattern, face_count, time_count):
     data = np.zeros((face_count, time_count), dtype=np.float32)
     
     for t in range(1, time_count+1):
-        # Either naming generation (BUGS.md PTM-664).
+        # Either naming generation.
         filename = str(_frame_path(data_dir, pattern, t))
         
         if not os.path.exists(filename):

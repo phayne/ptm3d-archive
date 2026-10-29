@@ -66,7 +66,7 @@ LAMBDA_SAT = 4.605        # 99 % — saturation / homogenized-reworking-zone bou
 
 # Geometric defaults. h = excavation-depth fraction of crater diameter,
 # c = overlap-scaling parameter. UNVERIFIED: neither h = 0.04 nor c = 1 appears
-# in Costello et al. (2021) (Fermi audit, 2026-09-24). h ~ 0.04 is attributed
+# in Costello et al. (2021). h ~ 0.04 is attributed
 # here to the Costello et al. (2018, Icarus) lunar Apollo-core calibration, which
 # has not been checked against the paper; c = 1 is the geometric-saturation
 # Poisson choice. Treat both as assumptions until sourced.

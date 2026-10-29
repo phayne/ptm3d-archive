@@ -27,7 +27,7 @@ target_link_libraries(spatial_maps
     ${CFITSIO_LIBRARIES}  # Make CFITSIO link public
 )
 
-# Standalone gate for the albedo-map registration tripwire (PTM-34/PTM-35).
+# Standalone gate for the albedo-map registration tripwire.
 # Synthetic meshes only - no data files, so it runs anywhere.
 add_executable(test_albedo_registration_check test_albedo_registration_check.cpp)
 target_link_libraries(test_albedo_registration_check PRIVATE spatial_maps)

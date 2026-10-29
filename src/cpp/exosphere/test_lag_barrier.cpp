@@ -12,7 +12,7 @@
 //      (E_S < B < Js + Jp): emission = B, state unchanged.
 //  (4) Global mass conservation (64-face synthetic system, two source groups):
 //      inventory change + (sublimated + sputtered - deposited) = 0 to rounding,
-//      every step passes the PTM-644 audit, lag forms on the hot faces and a veneer
+//      every step passes the super-step deposition audit, lag forms on the hot faces and a veneer
 //      on the cold ones.
 //  (5) t = 0 invariance: at d = 0 the availabilities, the albedo, and the scaled
 //      fluxes and deposition are bit-identical to the legacy model.
@@ -310,7 +310,7 @@ static void test_global_mass() {
             }
         } catch (const std::exception& x) { err = x.what(); }
         const std::string tag = " (l = " + std::to_string(ell * 1e6).substr(0, 4) + " um)";
-        check(err.empty(), "every step passes the PTM-644 audit" + tag + (err.empty() ? "" : ": " + err));
+        check(err.empty(), "every step passes the super-step deposition audit" + tag + (err.empty() ? "" : ": " + err));
         const auto& st = s.mte->getStatistics();
         const double net = st.total_sublimated_mass + st.total_sputtered_mass - st.total_deposited_mass;
         const double resid = (st.lag_inventory_mass - st.lag_inventory_initial_mass) + net;

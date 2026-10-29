@@ -31,7 +31,7 @@ boundary polygon**, and adds a registration gate that refuses to emit a ring
 that overlaps the core.
 
 The ring is shadow-only geometry: it never enters a view-factor matrix, so
-re-clipping a ring never requires a VF rebuild (PTM-19 is untouched).
+re-clipping a ring never requires a VF rebuild (the never-rebuild rule is untouched).
 """
 from __future__ import annotations
 

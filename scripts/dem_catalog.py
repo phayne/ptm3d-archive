@@ -64,9 +64,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from a3gt_v2_site_filter import gdal_extent  # noqa: E402
 
-REPO = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm")
-DEFAULT_DEM_ROOT = Path(
-    "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/DEM/a3gt")
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_DEM_ROOT = Path(os.environ.get("PTM_DEM_ROOT", str(REPO / "data" / "dem")))
 
 # Canonical lunar south-polar-stereographic frame shared by every A3GT SfS DEM
 # and required for the per-site VRT mosaic (the C++ mesh tool converts the ROI

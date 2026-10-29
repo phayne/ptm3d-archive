@@ -5,7 +5,7 @@ disk -- built by a previous run, copied from a colleague, or delivered with the
 DEM. Nothing in this project told them so. The View-factor cache box stayed
 empty, the run rebuilt a multi-gigabyte matrix that was already there, and on a
 full core+ring lunar mesh that rebuild is the reliable GPU-wedge trigger the
-whole reuse doctrine (PTM-19) exists to prevent.
+whole reuse doctrine exists to prevent.
 
 So: when a mesh is chosen, LOOK. In the mesh's own directory, and in the
 directory the configuration's ``radiation.view_factor_file`` already points at,
@@ -119,7 +119,7 @@ __all__ = [
 #: current empty stubs, named ``.vf``, are H-matrix version 2. Anything here
 #: that trusted the extension would report both backwards.
 #:
-#: (Those legacy files are the ones PTM-24 records as "the old MFFV/v1 format".
+#: (Those legacy files are the ones the stale-format fallback reports as "the old MFFV/v1 format".
 #: ``MFFV`` is not a third magic number: it is ``VFFM``'s four bytes as they sit
 #: on disk, little-endian. What made them a trap was the version, and the
 #: current engine reads versions 1 and 2 deliberately -- ``view_factor.cpp:525``
@@ -491,8 +491,8 @@ def _probe_magic(path, stat_result, mesh_faces):
                 size_bytes=stat_result.st_size,
                 refusal=(f"its H-matrix version is {version} and this build "
                          f"reads 2 only. The engine FAILS to load it and then "
-                         f"rebuilds the matrix from scratch — the recompute "
-                         f"wedge PTM-24 records."))
+                         f"rebuilds the matrix from scratch, the recompute "
+                         f"wedge this check exists to prevent."))
         # `total_nnz_` is the last of six size_t statistics written after the
         # blocks (hmatrix_view_factor.cpp:5270-5275), so it is one 8-byte read
         # from the end of the file rather than a parse of every block.
@@ -517,7 +517,7 @@ def _probe_magic(path, stat_result, mesh_faces):
                  f"identify is not an error the run stops on — the loader "
                  f"returns false and the matrix is REBUILT from scratch, "
                  f"which on a site-scale surface is hours and tens of "
-                 f"gigabytes (PTM-24)."))
+                 f"gigabytes."))
 
 
 def _probe_csr(path, stat_result, mesh_faces, mesh_path):

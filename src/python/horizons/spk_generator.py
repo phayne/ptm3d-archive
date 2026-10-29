@@ -22,7 +22,7 @@ def _default_kernels_base_dir() -> str:
 
     This is NOT the metakernel's own output directory (a body's cache dir
     under data/horizons_cache/bodies/<body>/) -- pointing PATH_VALUES at the
-    body directory was PTM-145's companion bug: KERNELS_TO_LOAD entries like
+    body directory was the generic-body metakernel resolution's companion bug: KERNELS_TO_LOAD entries like
     $KERNELS/lsk/naif0012.tls then look for a lsk/ subdirectory inside the
     body's own cache dir, where it never exists.
     """
@@ -87,7 +87,7 @@ class SPKGenerator:
             Base directory where standard SPICE kernels (lsk/pck/spk/fk) are
             stored. If empty (the default), resolves to the shared
             data/kernels directory -- see _default_kernels_base_dir() --
-            NOT the metakernel's own output directory (PTM-145's companion
+            NOT the metakernel's own output directory (the generic-body metakernel resolution's companion
             bug). Callers that pass a directory explicitly are unaffected.
         """
         self.kernels_base_dir = kernels_base_dir or _default_kernels_base_dir()

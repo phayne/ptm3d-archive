@@ -8,7 +8,7 @@
  * load; if it exists AND loads, it is used and then overridden at run time by
  * PTM_HMATRIX_VF_REPLACE (the corrected per-partner CSR). A stale-format base
  * (e.g. the old MFFV/v1 lunar polar site D file) FAILS to load and silently triggers the
- * full recompute -- the exact wedge we avoid (see BUGS PTM-24). This tool
+ * full recompute -- the exact wedge we avoid (the stale-format fallback). This tool
  * writes a base that the CURRENT binary loads clean with nnz=0, using the
  * production serializer so the format can never drift from the loader.
  *

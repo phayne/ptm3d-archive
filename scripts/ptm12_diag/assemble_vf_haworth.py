@@ -12,13 +12,13 @@ so this second filter is a no-op safety net, not a re-introduction of the old bu
 uses the SAME NRAYS the sweep actually ran at (passed explicitly, no silent default).
 
 Symmetrization divides each undirected pair by the 2 ray directions that were TRIED, not
-by the number that happened to hit (FC-08, 2026-08-19) -- see the comment at the
+by the number that happened to hit (2026-08-19) -- see the comment at the
 symmetrize block and scripts/ptm12_diag/test_vf_assembler_gate.py.
 
 Usage: assemble_vf_haworth.py <mesh.ply> <sweep_chunks_glob> <nrays> <min_hits> <out.csr>
   [--floor-idx floor_idx.npy]   # for the before/after floor-far-wall-aggregate report
 """
-import numpy as np, glob, time, sys, argparse, os, json
+import numpy as np, glob, time, sys, argparse, os, json, re
 from pathlib import Path
 
 SIGMA = 5.670374419e-8  # Stefan-Boltzmann
@@ -124,7 +124,7 @@ def read_ply_geometry(path):
     """Header-aware PLY vertex+face reader (PLY face order), reading vertices in
     their NATIVE precision widened to float64.
 
-    PTM-23 fix: the old path used pyvista's ``mesh.points``, which VTK downcasts
+    Geometry-hash fix: the old path used pyvista's ``mesh.points``, which VTK downcasts
     to float32; the resulting float32 areas made the VF_REPLACE geomhash
     (Sum_i area_i + (i+1)*area_i*1e-9) differ from the C++ sim's float64
     ``areas_`` by ~1e-4 (lunar polar site A: 1.37e-4 of the 1e-3 gate) -- fine here but
@@ -170,6 +170,73 @@ def read_ply_geometry(path):
     return xyz, F["i"].astype(np.int64)
 
 
+ORIENT_RE = re.compile(r"^# ORIENTATION rule=(\S+) requested=(\S+) reversed=(\d+)/(\d+) \([^)]*\) "
+                       r"inconsistent_half_edges=(\d+) fell_back=(\d) digest=([0-9a-f]{16})")
+
+
+def sweep_orientation(sweep_logs_glob, n_faces):
+    """The shared surface-side rule: the face-orientation rule every chunk of the sweep traced with. All chunks must
+    agree exactly (rule, digest, counts); the result goes into the CSR provenance, and the engine
+    refuses a CSR whose recorded orientation differs from its own. No sweep logs, or logs from a
+    pre-fix referee, are recorded as such (never silently as 'fine')."""
+    if not sweep_logs_glob:
+        print("[assemble] *** WARNING: no --sweep-logs: the face-orientation rule of this sweep is "
+              "UNKNOWN. The engine will treat this CSR as legacy (raw winding) and accept it only "
+              "where its own orientation equals the raw winding on every face. ***", file=sys.stderr)
+        return {"orientation_rule": "unknown_no_sweep_logs"}
+    logs = sorted(glob.glob(sweep_logs_glob))
+    found, missing = set(), []
+    for lp in logs:
+        hit = None
+        for ln in open(lp, errors="replace"):
+            m = ORIENT_RE.match(ln)
+            if m:
+                hit = m.groups(); break
+        if hit is None:
+            missing.append(Path(lp).name)
+        else:
+            found.add(hit)
+    if found and missing:
+        raise SystemExit(f"FATAL: {len(missing)} sweep log(s) carry no ORIENTATION line while others do "
+                         f"({missing[:3]}): chunks from different referee builds were mixed.")
+    if not found:
+        print("[assemble] *** WARNING: the sweep logs carry no ORIENTATION line (referee predates the shared surface-side rule): "
+              "the sweep traced the RAW winding. Recorded as raw_winding_legacy. ***", file=sys.stderr)
+        return {"orientation_rule": "raw_winding_legacy"}
+    if len(found) != 1:
+        raise SystemExit(f"FATAL: sweep chunks disagree on the face orientation: {sorted(found)}")
+    rule, req, rev, nf, inc, fb, dig = found.pop()
+    if int(nf) != n_faces:
+        raise SystemExit(f"FATAL: ORIENTATION line covers {nf} faces, mesh has {n_faces}")
+    print(f"[assemble] face orientation: rule={rule} (requested {req}) reversed={rev}/{nf} digest={dig}")
+    return {"orientation_rule": rule, "orientation_rule_requested": req,
+            "orientation_n_reversed": int(rev), "orientation_n_faces": int(nf),
+            "orientation_inconsistent_half_edges": int(inc), "orientation_fell_back": bool(int(fb)),
+            "orientation_digest": dig}
+
+
+REFEREE_RE = re.compile(r"^# CORRECTED referee: offset=(\S+) m\s+keps=(\S+)\s+nrays=(\d+)")
+
+
+def sweep_referee_params(sweep_logs_glob):
+    """The referee settings every chunk swept with (offset, keps, nrays), from its own banner. All
+    chunks must agree; recorded in the provenance (keps changes the matrix; a follow-up of the inward-wound Moon3D mesh fix)."""
+    if not sweep_logs_glob:
+        return {"sweep_keps": None, "sweep_offset_m": None}
+    found = set()
+    for lp in sorted(glob.glob(sweep_logs_glob)):
+        for ln in open(lp, errors="replace"):
+            m = REFEREE_RE.match(ln)
+            if m:
+                found.add(m.groups()); break
+    if len(found) > 1:
+        raise SystemExit(f"FATAL: sweep chunks disagree on the referee settings: {sorted(found)}")
+    if not found:
+        return {"sweep_keps": None, "sweep_offset_m": None}
+    off, keps, nr = found.pop()
+    return {"sweep_keps": float(keps), "sweep_offset_m": float(off), "sweep_nrays_banner": int(nr)}
+
+
 def face_areas(mesh_path):
     v, f = read_ply_geometry(mesh_path)
     p0, p1, p2 = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
@@ -200,7 +267,7 @@ def main():
                          "(W/m^2, e.g. an illumination-proxy). Required when --radiance-prune-eps>0.")
     ap.add_argument("--radiance-albedo", type=float, default=0.12,
                     help="A0 for the visible-band radiance weight (reflected solar). Default 0.12.")
-    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits"), default="tried",
+    ap.add_argument("--symmetrize-divisor", choices=("tried", "hits", "pooled"), default="tried",
                     help="Divisor used when averaging the two ray directions of an undirected "
                          "pair. 'tried' (DEFAULT, correct): divide by the 2 directions that were "
                          "TRIED, counting a direction that registered no hit as the measured zero "
@@ -208,7 +275,15 @@ def main():
                          "pre-2026-08-19 DEFECTIVE estimator (divide by the number of directions "
                          "that happened to hit), which inflates far-field entries by up to 2x. "
                          "'hits' exists ONLY so the regression gate can prove the defect; it must "
-                         "never be used to build a view-factor matrix for science.")
+                         "never be used to build a view-factor matrix for science. 'pooled': pool the HITS of both directions, weighted by rays per area, "
+                         "G_ij = (h_ij + h_ji) / (n_i/A_i + n_j/A_j) -- reciprocal by construction and "
+                         "the minimum-variance combination; with every face swept at the same NR it is "
+                         "G = (V_ij + V_ji) / (1/A_i + 1/A_j). It stops a noisy or biased estimate from a "
+                         "much LARGER partner pulling a small face's row down with equal weight.")
+    ap.add_argument("--sweep-logs", default=None,
+                    help="glob of the mc_ref_pp chunk logs (stderr) for this sweep. Their "
+                         "'# STATS' lines feed the back-face / ring / sky ray fractions in "
+                         "<csr>.vf_stats.json (C4). Optional; omitted -> those fields are absent.")
     ap.add_argument("--allow-incomplete-sweep", action="store_true",
                     help="Assemble even when the sweep does not cover every face exactly once. "
                          "The result is BIASED on the affected faces (divisor 2 assumes both ray "
@@ -228,6 +303,10 @@ def main():
     print(f"[assemble] mesh={a.mesh}  N={N} faces  total_area={area.sum():.3f} m^2")
     GEOMHASH = float(area.sum()) + float((area * np.arange(1, N + 1)).sum()) * 1e-9
 
+    ORIENT = sweep_orientation(a.sweep_logs, N)   # before any heavy work (fails fast)
+    REFEREE = sweep_referee_params(a.sweep_logs)
+    print(f"[assemble] referee settings from the sweep logs: {REFEREE}")
+
     FTHR = a.min_hits / a.nrays
     files = sorted(glob.glob(a.chunks_glob))
     assert files, f"no chunk files matched {a.chunks_glob}"
@@ -238,14 +317,14 @@ def main():
     # direction that DID fire, and the divisor then counts it as a measured zero. The
     # reverse direction of an unequal-area pair fires ~A_i/A_j times less often, so it is
     # the one systematically filtered -- an up-to-2x UNDER-estimate, the mirror image of
-    # the FC-08 bias. The sweep must also have run at min_hits=1 (mc_ref_pp applies its
+    # the view-factor divisor bias. The sweep must also have run at min_hits=1 (mc_ref_pp applies its
     # own absolute keep-rule); this script cannot verify that, so it is stated here.
     if a.min_hits > 1 and a.symmetrize_divisor == "tried":
         raise SystemExit(
             f"FATAL: min_hits={a.min_hits} with --symmetrize-divisor tried. The filter drops "
             "ray directions that DID register hits, which the divisor then counts as measured "
             "zeros -- an up-to-2x UNDER-estimate on unequal-area pairs. Pass min_hits=1 (the "
-            "referee's own absolute keep-rule already applies at sweep time). See FC-08.")
+            "referee's own absolute keep-rule already applies at sweep time).")
 
     seen = np.zeros(N, dtype=np.int32)   # sweep coverage: records per source face
     Is, Js, Vs = [], [], []
@@ -299,7 +378,7 @@ def main():
     del Is, Js, Vs                       # the per-chunk lists duplicate I/J/V; drop them now
     print(f"[assemble] NEW rule directed nnz={len(I)} ({len(I)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
-    # ---- before/after floor-far-wall-aggregate report (Sagan's requested checkpoint number) ----
+    # ---- before/after floor-far-wall-aggregate report ----
     if a.floor_idx:
         floor_idx = set(np.load(a.floor_idx).tolist())
         is_floor = np.isin(I, list(floor_idx))
@@ -322,16 +401,19 @@ def main():
     # sweep visits every face in both roles (the run's coverage line proves it), so a
     # missing direction is a measurement, not missing data.
     #
-    # FC-08 (2026-08-19): this line used to divide by the number of directions that
+    # this line used to divide by the number of directions that
     # HAPPENED TO REGISTER A HIT. That conditions on detection and inflates the result
     # by E[assembled]/S_true = 2 - (p1+p2)/2, where p_k = P(direction k hits at least
     # once): 1 where both directions are well sampled, and exactly 2 in the far field
     # where neither fires reliably. Closed-form arbitration on a coaxial disk
     # (F = a^2/(a^2+H^2) = 0.250000): raw MC 0.249965, old divisor 0.437889 (+75%),
     # divisor 2 -> 0.251458. The old estimator is also ray-budget dependent; this one
-    # is not. See test_vf_assembler_gate.py and
-    # SESSION-NOTES-2026-08-19-fc08-far-field-vf-rootcause.md.
-    S = area[I] * V.astype(np.float64)
+    # is not. See test_vf_assembler_gate.py, which measures
+    # both estimators.
+    pooled = a.symmetrize_divisor == "pooled"
+    # tried / hits: area-weighted directed estimates S = A_i F_ij, averaged per pair.
+    # pooled: the raw hit fractions V = h/NR are summed per pair and divided by sum(1/A).
+    S = V.astype(np.float64) if pooled else area[I] * V.astype(np.float64)
     lo = np.minimum(I, J).astype(np.int32); hi = np.maximum(I, J).astype(np.int32)
     key = np.multiply(lo, np.int64(N), dtype=np.int64)   # int64 accumulator: range ~N**2
     key += hi
@@ -341,16 +423,20 @@ def main():
     gs = bnd[:-1]; ge = bnd[1:]; csum = np.concatenate(([0.0], np.cumsum(S)))
     if a.symmetrize_divisor == "hits":
         print("[assemble] *** WARNING: --symmetrize-divisor hits reproduces the pre-2026-08-19 "
-              "DEFECTIVE FC-08 estimator: far-field entries are inflated by up to 2x and the "
+              "DEFECTIVE pre-2026-08-19 estimator: far-field entries are inflated by up to 2x and the "
               "result depends on the ray budget. This CSR is for gate use only -- DO NOT USE "
               "IT FOR SCIENCE. ***", file=sys.stderr)
         ndir = (ge - gs).astype(np.float64)
     else:
         ndir = 2.0
-    Ssym = (csum[ge] - csum[gs]) / ndir
-    print(f"[assemble] symmetrization divisor = {a.symmetrize_divisor} "
-          f"({'2 (directions tried; unbiased)' if a.symmetrize_divisor == 'tried' else 'directions HIT -- DEFECTIVE, gate use only'})")
     a_idx = lo[gs]; b_idx = hi[gs]
+    if pooled:
+        # every source face is swept with the same NR rays (mc_ref_pp), so n_i/A_i = NR/A_i
+        Ssym = (csum[ge] - csum[gs]) / (1.0 / area[a_idx] + 1.0 / area[b_idx])
+    else:
+        Ssym = (csum[ge] - csum[gs]) / ndir
+    print(f"[assemble] symmetrization divisor = {a.symmetrize_divisor} "
+          f"({'2 (directions tried; unbiased)' if a.symmetrize_divisor == 'tried' else ('POOLED hits / (1/A_i + 1/A_j) (reciprocal, minimum variance)' if pooled else 'directions HIT -- DEFECTIVE, gate use only')})")
     del S, lo, hi, key, o, csum, bnd, gs, ge   # grouping scratch; a_idx/b_idx/Ssym carry it now
     print(f"[assemble] unique undirected pairs={len(a_idx)} ({len(a_idx)/1e6:.2f}M)  {time.time()-t0:.0f}s")
 
@@ -360,11 +446,14 @@ def main():
     del Sd, Aend                         # both were consumed by F
 
     # ---- symmetric ΣF<=1 cap (reciprocity-preserving congruence) ----
+    cap_rows_scaled = 0                  # C4 stats: rows over 1 before the first sweep
     for it in range(40):
         rs = np.zeros(N); np.add.at(rs, rows, F)
         if rs.max() <= 1.0 + 1e-9:
             break
         c = np.ones(N); over = rs > 1.0; c[over] = 1.0 / rs[over]
+        if it == 0:
+            cap_rows_scaled = int(over.sum())
         F = F * np.sqrt(c[rows] * c[cols])
     rs = np.zeros(N); np.add.at(rs, rows, F)
     print(f"[assemble] symmetric-cap sweeps={it+1} -> SigmaF max={rs.max():.4f} (#>1={(rs>1.0+1e-6).sum()}) "
@@ -403,13 +492,16 @@ def main():
     # itself distinguishes a matrix built with the corrected divisor from one built with the
     # pre-2026-08-19 estimator. Every .csr already on disk predates the fix and loads
     # silently. This sidecar makes the estimator, the ray budget and the sweep coverage
-    # readable after the fact; a .csr WITHOUT one was built before FC-08 was fixed.
+    # readable after the fact; a .csr WITHOUT one was built before the view-factor divisor was fixed.
     prov = {
-        "estimator": "FC-08 corrected" if a.symmetrize_divisor == "tried" else "PRE-FC-08 DEFECTIVE",
+        "estimator": {"tried": "FC-08 corrected", "pooled": "pooled-hit (rays per area)",
+                      "hits": "PRE-FC-08 DEFECTIVE"}[a.symmetrize_divisor],
         "symmetrize_divisor": a.symmetrize_divisor,
-        "symmetrize_divisor_meaning": ("mean over the 2 ray directions TRIED (unbiased)"
-                                       if a.symmetrize_divisor == "tried"
-                                       else "mean over the directions that HIT (inflates far field up to 2x)"),
+        "symmetrize_divisor_meaning": {"tried": "mean over the 2 ray directions TRIED (unbiased)",
+                                       "pooled": "G_ij = (h_ij + h_ji) / (n_i/A_i + n_j/A_j): hits of both "
+                                                 "directions pooled, weighted by rays per area",
+                                       "hits": "mean over the directions that HIT (inflates far field up to 2x)"}[a.symmetrize_divisor],
+        **REFEREE,
         "nrays": int(a.nrays), "min_hits": float(a.min_hits),
         "mesh": str(a.mesh), "n_faces": int(N), "nnz": int(len(F)),
         "geomhash": float(GEOMHASH), "total_area_m2": float(area.sum()),
@@ -420,12 +512,22 @@ def main():
         "allow_incomplete_sweep": bool(a.allow_incomplete_sweep),
         "sigma_f_max": float(rs.max()), "sigma_f_mean": float(rs.mean()),
         "radiance_prune_eps": float(a.radiance_prune_eps),
+        **ORIENT,
         "assembler": str(Path(__file__).resolve()),
         "assembled_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     with open(str(out) + ".provenance.json", "w") as fh:
         json.dump(prov, fh, indent=2)
     print(f"[assemble] provenance -> {out}.provenance.json  (estimator: {prov['estimator']})")
+
+    # ---- C4 view-factor statistics sidecar (stats only; the CSR above is final) ----
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import vf_stats
+    st = vf_stats.compute(indptr, cols, F.astype(np.float32), N, area=area, nrays=int(a.nrays),
+                          min_hits=float(a.min_hits), cap_sweeps=it + 1,
+                          rows_scaled=cap_rows_scaled, sweep_logs=a.sweep_logs, csr_path=out)
+    print(vf_stats.banner(st))
+    print(f"[assemble] vf stats -> {vf_stats.write_sidecar(out, st)}")
 
 
 if __name__ == "__main__":

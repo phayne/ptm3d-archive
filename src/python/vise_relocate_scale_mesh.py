@@ -8,7 +8,7 @@ loads natively.
 
 Example:
   python3 src/python/vise_relocate_scale_mesh.py \
-    --input /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/cp22_1m_SFS_2M.ply \
+    --input <dtm-dir>/cp22_1m_SFS_2M.ply \
     --output tmp/vise/cp22_fine_site.ply \
     --target-lat 36.5 --target-lon -40.7 --scale 0.01
 """

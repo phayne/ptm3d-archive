@@ -1,5 +1,5 @@
 // test_state_io -- gate for the thermal-state checkpoint ("PTMT") format and
-// for Model::restoreState / Model::captureState (BUGS.md PTM-76).
+// for Model::restoreState / Model::captureState.
 //
 // What this gate is for. thermal.initial_state_file / thermal.final_state_file
 // were read and written by the GPU persistent solver only; on any CPU path both
@@ -16,7 +16,7 @@
 //   G4  every failure mode refuses with a message: missing file, bad magic,
 //       truncated body, wrong face count, wrong layer count, wrong buffer size
 //       on write, and a restoreState onto a mismatched grid.
-//   G5  the write is ATOMIC (BUGS.md PTM-STATE-ATOMIC): a writer killed
+//   G5  the write is ATOMIC: a writer killed
 //       mid-stream leaves the PREVIOUS checkpoint intact and loadable, and a
 //       write that fails leaves the destination untouched and no temp behind.
 //   G6  probe() answers "what is this file" without being told the shape, and
@@ -98,7 +98,7 @@ std::vector<std::string> namesStartingWith(const std::string& dir,
 }  // namespace
 
 int main() {
-    std::cout << "=== test_state_io: thermal-state checkpoint format (PTM-76) ==="
+    std::cout << "=== test_state_io: thermal-state checkpoint format ==="
               << std::endl;
 
     const std::size_t NF = 37;    // deliberately not a multiple of the SIMD width
@@ -245,7 +245,7 @@ int main() {
         std::remove(pgood.c_str());
     }
 
-    // ---- G5: the write is ATOMIC (PTM-STATE-ATOMIC) ----------------------
+    // ---- G5: the write is ATOMIC ----------------------
     //
     // The falsifier. Before the temp-then-rename, write() opened the
     // destination with ios::trunc, so the PREVIOUS checkpoint was destroyed the
@@ -779,7 +779,7 @@ int main() {
                   "G8: WRONG BODY refuses, naming both bodies");
         }
 
-        // --- wrong depth grid, SAME layer count: PTM-STATE-GRID-BLIND ------
+        // --- wrong depth grid, SAME layer count: the unchecked checkpoint grid ------
         {
             sio::Identity r = matchingRun();
             r.z[NL / 2] *= 1.001;              // same count, different depths
@@ -789,7 +789,7 @@ int main() {
                       v.refusals[0].find("node " + std::to_string(NL / 2)) !=
                           std::string::npos,
                   "G8: a DIFFERENT depth grid with the SAME layer count refuses, "
-                  "naming the first node that differs (PTM-STATE-GRID-BLIND)");
+                  "naming the first node that differs (unchecked depth grid)");
         }
 
         // --- wrong grid_b (the D14 clause's own knob) ----------------------
@@ -797,8 +797,8 @@ int main() {
         // C++ field `thermal.grid_b`. The clause NAME stays `grid_b` -- that is
         // what `state_restore_allow_mismatch` accepts and what
         // docs/configuration.md lists -- but a refusal telling a user to change
-        // `thermal.grid_b` sends them after a key the parser never reads
-        // (PTM-STATEIO-REFUSAL-NAMES-A-NONEXISTENT-KEY). Both directions are
+        // `thermal.grid_b` sends them after a key the parser never reads.
+        // Both directions are
         // asserted: the old spelling is not a substring of the new one, so the
         // negative half is what fails if it ever comes back.
         {
@@ -930,12 +930,14 @@ int main() {
                       " unverified quantities by name");
             bool names_grid = false, names_epoch = false;
             for (const auto& u : v.unverified) {
-                if (u.find("PTM-STATE-GRID-BLIND") != std::string::npos) names_grid = true;
-                if (u.find("PTM-STATE-NO-EPOCH") != std::string::npos) names_epoch = true;
+                if (u.find("depth grid z[]") != std::string::npos &&
+                    u.find("accepted in silence") != std::string::npos) names_grid = true;
+                if (u.rfind("epoch", 0) == 0 &&
+                    u.find("cannot be") != std::string::npos) names_epoch = true;
             }
             check(names_grid && names_epoch,
-                  "G8: the v1 report names PTM-STATE-GRID-BLIND and "
-                  "PTM-STATE-NO-EPOCH explicitly");
+                  "G8: the v1 report names the unchecked depth grid and the "
+                  "unrecorded epoch explicitly");
         }
 
         // --- coupling provenance -------------------------------------------
@@ -944,9 +946,9 @@ int main() {
             r.coupled_run = true;
             sio::checkRestore(&file, sio::TrailerStatus::Ok, r, no_allow, v);
             check(v.ok() && v.warnings.size() == 1 &&
-                      v.warnings[0].find("PTM-57") != std::string::npos,
+                      v.warnings[0].find("PRE-coupling") != std::string::npos,
                   "G8: a PRE-coupling checkpoint into a coupled run warns, "
-                  "naming PTM-57");
+                  "saying so");
 
             sio::Trailer post = file;
             post.flags |= sio::flag::kPostCouplingComplete;
@@ -971,7 +973,7 @@ int main() {
             for (const auto& w : v.warnings)
                 if (w.find("coupling_select_dt") != std::string::npos) named = true;
             check(named, "G8: coupling_select_dt > 0 in the writing run is "
-                         "reported to the restore (Fermi F4)");
+                         "reported to the restore");
         }
     }
 

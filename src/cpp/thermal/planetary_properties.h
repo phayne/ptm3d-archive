@@ -45,7 +45,7 @@ struct ThermophysicalProperties {
     // spectral equilibrator's `cycle_s`, and the output cadence. On a
     // synchronous rotator (Europa) and on the Moon the distinction is either
     // nil or already folded in; on Mercury it is a factor of three, and
-    // getting it wrong there was BUGS.md ENG-MERCURY-SOLAR-DAY.
+    // getting it wrong there was the Mercury solar-day defect.
     double day;           // Solar (synodic) day (seconds)
     double year;          // Orbital period (seconds)
     double rAU;           // Distance from Sun (AU)
@@ -86,7 +86,7 @@ struct ThermophysicalProperties {
 // metakernel, a 3.55-day synodic banner, and 0.000000000 W/m^2 of flux on every
 // one of its faces -- sixteen statistics binaries of a simulation of nothing.
 // Measured on four arms (Mars, Ceres, Titan, Enceladus). `ptm_thermal_sim` now
-// refuses such a config at parse time (BUGS.md ENG-BODY-UNBACKED-RUN).
+// refuses such a config at parse time.
 //
 // Adding a body means adding a getXxxProperties() function AND a row here AND
 // regenerating src/python/ptm/body_capabilities.py; the parity test
@@ -163,7 +163,7 @@ public:
         // read, so an asteroid's Planet is briefly seeded with these
         // placeholders and then overwritten field by field from the generic
         // body. Every other route is refused by name at config parse
-        // (isImplementedBody / ENG-BODY-UNBACKED-RUN), which is what this
+        // (isImplementedBody / the unknown-body fallback), which is what this
         // warning could not do on its own -- it was one stderr line in front of
         // a complete, exit-0, all-zero-flux simulation.
         static bool warned = false;
@@ -295,7 +295,7 @@ private:
         // dataset selects Mercury (0 of 78 run configs, `ALBEDO_BODIES` and
         // `TOPO_BODIES` exclude it), so the blast radius is the tutorial and
         // testing surface only -- but a Mercury run on this binary is not
-        // comparable with one from before. BUGS.md ENG-MERCURY-SOLAR-DAY.
+        // comparable with one from before.
         constexpr double kMercurySiderealRotationDays = 58.646;
         constexpr double kMercuryOrbitalPeriodDays    = 87.969;
         constexpr double kMercurySolarDayDays         = 3.0 * kMercurySiderealRotationDays;

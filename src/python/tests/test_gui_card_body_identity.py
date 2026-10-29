@@ -423,7 +423,7 @@ def test_every_route_emits_its_own_body_after_every_other_route():
 
 
 # --------------------------------------------------------------------------
-# 3. The dead thermophysical block (PTM-67)
+# 3. The dead thermophysical block
 # --------------------------------------------------------------------------
 
 #: Keys the engine's config parser does NOT read on a built-in body. It reads
@@ -761,7 +761,7 @@ def test_a_missing_view_factor_cache_offers_the_choice_not_a_refusal():
     (``ptm_thermal_sim.cpp:15716-15734``).
 
     So it is a CHOICE -- point at an existing matrix, or let this run build one
-    -- and the message has to say so. It is still gated: the PTM-19 override
+    -- and the message has to say so. It is still gated: the view-factor rebuild hazard override
     checkbox and the cost estimate are what stand between a user and an
     accidental multi-GB rebuild.
 
@@ -882,7 +882,7 @@ def test_the_terrain_card_writes_its_dem_only_into_a_europa_run():
 def test_the_europa_cards_never_emit_two_albedo_fields():
     """`use_albedo_map: false` now DOES stop radiation coupling loading a map.
 
-    UPDATED 2026-08-30 with the engine fix (BUGS.md PTM-454). Until then the
+    UPDATED 2026-08-30 with the engine fix. Until then the
     radiation-coupling albedo load honored no configuration key at all, so a
     `use_albedo_map: false` run could still take its radiosity source albedo
     off the map -- two albedo fields in one simulation -- and the engine only
@@ -978,7 +978,7 @@ def test_the_europa_cards_never_emit_two_albedo_fields():
             "the retired mixed-albedo warning still fires on a uniform-albedo "
             "radiation run with a res-matched per-face map on disk. The engine "
             "honors illumination.use_albedo_map at that call site since "
-            "BUGS.md PTM-454, so this warning is now false -- and its advice "
+            "the coupling albedo-load fix, so this warning is now false -- and its advice "
             "('turn the albedo map on so both use it') would change the "
             "physics of the run")
 

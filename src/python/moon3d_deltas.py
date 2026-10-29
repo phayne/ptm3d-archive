@@ -32,9 +32,10 @@ psr_* fractions are computed on the coupled run only.
         --json-out /path/dt_rows.json     # optional JSON fragment for deltas.json
 
 With --check it compares psr_count_frac / psr_area_frac / median_tmax_all against
-Luna's verified hand table and flags any deviation beyond --tol.
+the hand-verified table and flags any deviation beyond --tol.
 """
 from __future__ import annotations
+import os
 import argparse
 import json
 from pathlib import Path
@@ -50,13 +51,13 @@ from ptm_population import (area_fraction, count_fraction, population_note,
 
 PSR_THRESH = 1.0    # W/m^2  direct-solar max below this = permanent shadow
 COLD_THRESH = 110.0  # K
-HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
+HEAT3D = Path(os.environ.get("PTM_HEAT3D_ROOT", str(Path(__file__).resolve().parents[3])))   # holds output/<run>
 
 # de-tilted sweep tags, latitude in degrees (clean integer placements)
 DT = [("dt85", -85.0), ("dt80", -80.0), ("dt75", -75.0),
       ("dt70", -70.0), ("dt65", -65.0), ("dt60", -60.0)]
 
-# Luna's verified hand table: tag -> (psr_count_frac, psr_area_frac, median_tmax_all)
+# the hand-verified table: tag -> (psr_count_frac, psr_area_frac, median_tmax_all)
 LUNA = {
     "dt60": (0.1446, 0.0365, 316.07),
     "dt65": (0.2110, 0.0618, 302.57),

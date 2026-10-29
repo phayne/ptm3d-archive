@@ -203,8 +203,8 @@ class ThermalModule(AbstractModule):
         # Write the run config BESIDE the output directory, never a temp
         # file: the engine resolves a relative radiation.view_factor_file
         # against the YAML's own directory, so a config in /var/folders/...
-        # silently missed the VF cache and triggered an (hours-long, and per
-        # PTM-19 potentially wrong) rebuild. save_run_yaml absolutizes all
+        # silently missed the VF cache and triggered an (hours-long, and
+        # potentially wrong) rebuild. save_run_yaml absolutizes all
         # path fields against the project root for the same reason.
         try:
             out_dir = resolve_path(

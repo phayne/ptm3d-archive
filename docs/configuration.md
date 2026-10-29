@@ -120,7 +120,7 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `thermal_m` | int | 10 | Layers within the upper skin depth |
 | `thermal_n` | int | 15 | Inert. The legacy non-adaptive grid it feeds cannot be selected from any config key, flag or environment variable, so this value and the `--thermal-n` flag have no effect |
 | `thermal_b` | int | 15 | Skin depths to the bottom layer |
-| `equilibration_orbits` | float | 1.0 | **Integrated** diurnal cycles of real, ephemeris-driven spin-up before the output window. The same number on the CPU scalar, CPU SIMD and GPU persistent paths; `equilibration_cycles` changes how it is reached, never the total. The CPU paths additionally run a fixed analytic pre-conditioner that this key does not count — see [Equilibration length](#equilibration-length-what-the-number-means). Choose it with [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 1 |
+| `equilibration_orbits` | float | 1.0 | **Integrated** diurnal cycles of real, ephemeris-driven spin-up before the output window. The same number on the CPU scalar, CPU SIMD and GPU persistent paths; `equilibration_cycles` changes how it is reached, never the total. Under the legacy seed the CPU paths also run an analytic pre-conditioner this key does not count; see [Equilibration length](#equilibration-length-what-the-number-means) and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 2 |
 | `equilibration_steps_per_day` | float | -1.0 | Explicit equilibration cadence in steps per Earth-day (-1 = unset) |
 | `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Target illumination samples per diurnal cycle; consulted only when the explicit cadence is unset. 24 gives about 2 K accuracy on the Moon, 48 about 1 K |
 | `equilibration_cycles` | int | -1 | Replays of the equilibration forcing block used to reach `equilibration_orbits`, GPU persistent solver only (-1 = 1 replay). The block is `equilibration_orbits / equilibration_cycles` cycles long, so the integrated total does not change and only the flux RAM and illumination cost fall |
@@ -138,7 +138,7 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `h_parameter_map` | string | `""` | Per-face `float32` H-parameter map (mutually exclusive with the above) |
 | `use_default_property_map` | bool | false | Auto-discover the bundled property map for the body |
 | `property_maps_directory` | string | `"data/property_maps"` | Where to look for property maps |
-| `geothermal_heat_flow` | float | -1.0 | Basal heat flow in W m<sup>-2</sup> (-1 = body default). Live on **every** body since PTM-161 was fixed (`2e06a70`): forwarded to the solvers as `ovr_Qb`, announced as `[Thermo override] applied at solver: Qb …`, and a positive value arms the property-override tripwire that aborts the run if it fails to reach one. It was silently discarded on built-in bodies before that commit — [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) section 4 has the old behavior and the re-measurement |
+| `geothermal_heat_flow` | float | -1.0 | Basal heat flow in W m<sup>-2</sup> (-1 = body default: 0.018 Moon, 0.030 Europa, 0.020 Mercury). Values > 0 are applied by every solver; the run confirms with `[Thermo override] applied at solver: Qb ...`. Note that `0` means "body default", not zero |
 | `heat_flow_mask_file` | string | `""` | Face-index file for locally elevated basal flux |
 | `heat_flow_mask_value` | float | 1.0 | Basal flux on the masked faces (W m<sup>-2</sup>) |
 | `integration_days` | float | -1.0 | Statistics-integration window (-1 = the output window) |
@@ -165,7 +165,6 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `seed_anchor` | string | `lumped` | Which surface anchor the shared seed hangs its conductive profile from. Read **only** under `spinup_seed: physical`. `lumped` anchors at the cycle mean; `warm` uses the fourth-moment anchor, which by Jensen is ≥ the mean (+45 K on the lit population of the shipped lunar 80N crater) and is byte-identical to the pre-2026-08-12 seed |
 | `seed_anchor_refuse_two_timescale` | bool | false | Refuse the lumped anchor on a face carrying both diurnal and seasonal power, where one conductance cannot cover both. Off by default because refusing substitutes `warm`, the estimator with the +45 K bias. Detection and reporting are always on regardless |
 | `analytic_seed_cycles` | float | -1.0 | Diurnal cycles of the CPU analytic clear-sky pre-conditioner: `cos(lat)·cos(h)` insolation with no topography, no shadowing, no IR and no indirect flux. It is a **forcing, not a seed**, it is not counted by `equilibration_orbits`, and the GPU has no analog. -1 follows `spinup_seed` (physical → 0, legacy → the historic count: Moon 24, Europa 2, Mercury 4); 0 is off; a positive value is used exactly and announced |
-| `debug` | bool | false | Verbose per-layer output for one equatorial face |
 
 The checkpoint files are used by the chunked-run workflow
 (`scripts/run_chunked_simulation.py` and `ptm_merge_chunks`).
@@ -404,14 +403,11 @@ Equilibration (configured): 20.00 day/night cycles  (thermal.equilibration_orbit
 Equilibration (integrated): 20.00 day/night cycles = 2 pass(es) x 10.00-cycle forcing block
 ```
 
-**What `equilibration_orbits` does not count.** The CPU scalar and CPU SIMD
-paths run a fixed analytic clear-sky pre-conditioner before the real forcing —
-`NYEARSEQ * round(year/day)` diurnal cycles, which is 24 on the Moon, 2 on
-Europa and 4 on Mercury. It uses a flat, unshadowed diurnal insolation with the
-body-average albedo, it is not configurable from any key, and the GPU path has
-no equivalent. The pre-flight banner prints its length on the CPU paths. So on
-the GPU the integrated spin-up is exactly `equilibration_orbits`, and on the CPU
-it is `equilibration_orbits` of real forcing on top of that fixed analytic seed.
+**What `equilibration_orbits` does not count.** Under `spinup_seed: legacy` the CPU scalar and
+SIMD paths first run an analytic clear-sky pre-conditioner (`NYEARSEQ * round(year/day)` cycles:
+24 on the Moon, 2 on Europa, 4 on Mercury) with flat, unshadowed insolation. Under the default
+`spinup_seed: physical` it is off (`analytic_seed_cycles` resolves to 0) unless requested, and the
+banner prints its length either way.
 
 **Before 2026-08-11** `equilibration_orbits` was the *block* length and the GPU
 pass count defaulted to 2, so a GPU run integrated twice what its config said
@@ -629,12 +625,7 @@ recommended default), ~20° (Bandfield et al. 2015, Diviner global), ~37° (Ruba
 
 **When it applies — compare two lengths, not two mission names.** Beaming is a *sub-facet* model:
 it stands in for roughness the mesh does not resolve, at the scale where surface elements become
-thermally isolated from one another — **millimeters to centimeters** on lunar regolith. Paul's
-ruling of 2026-08-25:
-
-> "The Moon3D mesh resolution is comparable to the roughness scale (millimeters to centimeters)
-> that the beaming is intended to capture, so the beaming should be OFF for small local meshes
-> like this."
+thermally isolated from one another: **millimeters to centimeters** on lunar regolith.
 
 So the rule is: **turn beaming ON only when the facet scale is much larger than ~cm.** At or below
 that scale the mesh already resolves the anisothermality and beaming double-counts it. Measured
@@ -644,13 +635,12 @@ facet scales, $\sqrt{\text{mean face area}}$:
 |---|---|---|
 | `sunlit_radcore_r50` (50 km core, 140k faces) | 237 m | **ON** |
 | `haworth_radcore_r32c` (32 km core, 100k faces) | 181 m | **ON** |
-| A3GT lunar polar site A (3 km core, 2.4 M faces) | 3.46 m | **ON** |
-| `moon3d` 509k (a ~1.6 m simulated crater) | 1.96 mm | **OFF** |
+| a 3 km lunar polar site core (2.4 M faces) | 3.46 m | **ON** |
+| Moon3D testbed scan (509,337 faces) | 1.96 mm | **OFF** |
 
 **Policy.** Beaming is standard for **site and regional** lunar polar configurations — meters and
-up. It is deliberately *not* enabled in `examples/moon3d_native_yearlong/*.yaml` (sub-cm facets,
-per the ruling above), in `examples/validation/baseline_crater80N_*.yaml` (those are the
-byte-identical regression baselines) or in the `tutorial04_crater80N_*` teaching configs, and it
+up. It is deliberately *not* enabled in `examples/moon3d_native_yearlong/*.yaml` (sub-cm facets), in `examples/validation/baseline_crater80N_*.yaml` (those are the
+byte-identical regression baselines) or in the `tutorial04_crater80N_*` tutorial configs, and it
 must not be carried to Europa or asteroid configs — $w = 32.5°$ is a lunar regolith number
 validated on lunar polar-crater geometry.
 
@@ -660,7 +650,7 @@ estimated 22–28 GiB on a 2.4 M-face A3GT site — measure before flipping it o
 run with beaming on prints its own `[beam-cost]` breakdown.
 
 **Two caveats worth knowing before you turn it on.** Beaming makes a run
-chunk-decomposition dependent (its emitter/receiver sets are window-scoped, PTM-101 — the run
+chunk-decomposition dependent (its emitter/receiver sets are window-scoped; the run
 warns), and it does **not** address the known winter/margin warm biases; those are open and parked.
 
 ## flux_cubes
@@ -668,7 +658,7 @@ warns), and it does **not** address the known winter/margin warm biases; those a
 A passive probe that samples the flux field at fixed points in space. The block
 is **top level**, not nested under `output:` — deliberately, so it cannot be
 reached by the body-defaults machinery that makes `thermophysical:` decorative
-on a built-in body (PTM-67). The physics, the geometry cache, the ray budget and
+on a built-in body. The physics, the geometry cache, the ray budget and
 the outputs are all in [flux-cubes.md](flux-cubes.md); this table is the key
 list.
 
@@ -718,14 +708,13 @@ A **single** cache — whether written as `cache_file:` or as a one-element
 `cache_files:` — keeps the historical `flux_cubes/flux_cubes.fcb` name and
 produces a byte-identical flux payload either way.
 
-**CLI-only for now.** There is no GUI surface for this section; whether to build
-one is decision DP-7 in [design/gui-update-plan.md](design/gui-update-plan.md).
+**Configuration file only.** The GUI does not expose this section.
 
 ## shadow_depth
 
 **The maximum height above the local surface at which the Sun is not even
 partially visible** — the *umbral* ceiling — per face and per output epoch. Top
-level, for the same PTM-67 reason `flux_cubes` is.
+level, for the same reason `flux_cubes` is.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -797,7 +786,7 @@ which devices each pool may use. This is distinct from the per-solver
 `gpu_devices` / `gpu_device_ids` / `gpu_batch_size` keys, which tune a rung that
 has already been allowed. The full rationale, the platform-gating table and the
 cost of each guardrail are in
-[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
+[gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -831,7 +820,7 @@ lunar polar site B (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window 
 at all is that the GPU thermal pool allocates roughly 0.77 GiB per device on
 the *same* dies while the replica is resident, and the fit check does not count
 it. Set `thin_margin_policy: refuse` to give up the rung instead; see
-[gpu-wedge-guardrails.md](gpu-wedge-guardrails.md).
+[gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md).
 
 `auto` only engages when **all** of: the thermal solver is on the GPU, the two
 device sets overlap, the margin is below `placement_margin_gib`, the host is
@@ -877,7 +866,7 @@ produces them:
 |---|---|---|
 | `indirect_solar/`, `statistics/indirect_solar_{avg,max,min}.bin` | a two-band radiosity run | per-step series + statistics |
 | `indirect_ir/`, `statistics/indirect_ir_{avg,max,min}.bin` | a two-band radiosity run | per-step series + statistics |
-| `statistics/effective_albedo.bin` | every run with a per-face flux path (PTM-107a) | one value per face |
+| `statistics/effective_albedo.bin` | every run with a per-face flux path | one value per face |
 
 All three appear in the GUI's 3D viewer Field drop-down. Two things about them
 are not visible in the numbers:
@@ -919,8 +908,7 @@ output file; that is an acceptance test of the feature, not a side effect.
 export (GeoTIFF/HDF5/COG) and read from Python normally, and
 `ptm.results.detect_available_statistics` reports them, but the viewer's field
 menu is built from a static catalog and these names carry the depth, so no
-static catalog can hold them. Owed ledger row:
-`PTM-GUI-DEPTH-MAPS-UNVIEWABLE`.
+static catalog can hold them.
 
 **Both list keys must be written as YAML lists, and the engine refuses anything
 else.** `map_depths_m: 0.05` and `map_depths_m: "0.05, 0.25"` are scalars, and a
@@ -1199,7 +1187,7 @@ carries the full thermophysical property set. See the asteroid examples in
 
 Before 2026-09-24, `orbit.epoch` and `spin.prime_meridian_deg` were parsed and
 **ignored**: every generic body rotated from W = 0 at J2000 and applied its mean
-anomaly at J2000 (BUGS.md PTM-663). A config that set them to anything but the
+anomaly at J2000. A config that set them to anything but the
 J2000 defaults produces a different, now correct, run.
 
 **Epoch formats** (both `*.epoch` keys, all on the **TDB** scale, the scale of

@@ -32,7 +32,7 @@ gone wrong in this project:
 * **An SPK is only useful over the window it covers.** When a lookup finds a
   kernel, the result carries the coverage so the card can say whether it
   spans the run -- the engine substitutes Keplerian elements for any epoch
-  outside the kernel and logs NOTHING (PTM-145: fourteen of fifteen Justitia
+  outside the kernel and logs NOTHING (fourteen of fifteen Justitia
   configurations "passed" that way).
 
 No Qt here, so it can be measured without a window.

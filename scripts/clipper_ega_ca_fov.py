@@ -47,7 +47,7 @@ def refine_ca(et_coarse, clipper_id, half_window_s=120.0, n_fine=481):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kernels-dir", default="/Users/paha3326/software/cspice/data")
+    ap.add_argument("--kernels-dir", default=os.environ.get("CSPICE_DATA", str(Path(__file__).resolve().parents[1] / "data" / "kernels")))
     ap.add_argument("--spk", default="data/spice/clipper_ega_moon.bsp")
     ap.add_argument("--clipper-id", default="-159")
     ap.add_argument("--utc-start", default="2026-12-01T23:59:59.803")

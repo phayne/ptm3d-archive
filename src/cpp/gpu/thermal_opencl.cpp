@@ -284,7 +284,7 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
                                            int n_timesteps, int max_ts,
                                            size_t global_size, size_t local_size) {
     if (max_ts < 1) max_ts = 1;
-    // Wedge-efficacy instrumentation (Fermi acceptance test D): when
+    // Wedge-efficacy instrumentation: when
     // PTM_LOG_SUBDISPATCH is set, time each sub-dispatch's clFinish so a run
     // can prove every command buffer stayed bounded. Logging only — inert.
     static const bool log_sub = (std::getenv("PTM_LOG_SUBDISPATCH") != nullptr);
@@ -1423,7 +1423,7 @@ void ThermalOpenCLSolver::buildKernels() {
     // solveSurfaceBC, unconditionally. What the gate still asks for is release
     // of the T_geo floor, and this kernel applies that floor every substep
     // with no way to switch it off. Accepting the flag and keeping the floor
-    // would be a quiet substitution -- the class of failure PTM-115/116 were.
+    // would be a quiet substitution -- the class of failure the GPU radiation-off frame collapse and the surface-Newton under-convergence were.
     // Refuse instead.
     {
         const char* e = std::getenv("PTM_SOLVER_EQFIX");
@@ -1484,7 +1484,7 @@ void ThermalOpenCLSolver::buildKernels() {
         std::exit(1);
     }
 
-    // Phase R / Fermi F5: the kernel source is single-sourced from the embedded
+    // Phase R / the kernel source is single-sourced from the embedded
     // string (see scripts/sync_cl_from_embedded.py). buildKernels() must NEVER
     // silently swap in a different kernel: it (a) announces which source it
     // compiled, (b) warns loudly instead of silently falling back when a
@@ -1627,7 +1627,7 @@ void ThermalOpenCLSolver::reportSurfaceBCCertificate() {
     reported_surf_resid_K_ = max_surf_resid_K_;
     // Local stream: std::cout arrives here carrying std::fixed <<
     // setprecision(1) from an earlier banner, which rendered this certificate
-    // as "0.0 K" -- the PTM-05/PTM-55 archetype, and on the one line whose
+    // as "0.0 K" -- the unwatched side-channel archetype, and on the one line whose
     // whole job is to make a small number visible.
     std::ostringstream o;
     o << "[GPU Thermal] surface-BC certificate: max achieved "
@@ -1692,7 +1692,7 @@ void ThermalOpenCLSolver::createBuffers() {
                             n_faces_ * sizeof(float), nullptr, &err);
     CL_CHECK(err);
 
-    // Phase R (R2 fix, Fermi PORT-R2-01): per-face frozen von-Neumann substep
+    // Phase R (R2 fix): per-face frozen von-Neumann substep
     // count. The persistent kernel derives n_substeps from the session-ENTRY
     // T; a self-chunked session must reuse the SAME count across its
     // sub-dispatches or the integration drifts (the count depends on T, which
@@ -2030,7 +2030,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     // overwrites it per sub-dispatch (kArgTOffset == arg index 25).
     int t_offset_init = 0;
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &t_offset_init));
-    // Phase R (R2 fix, PORT-R2-01): per-face frozen substep-count buffer (arg 26).
+    // Phase R (R2 fix): per-face frozen substep-count buffer (arg 26).
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     // Conductivity law (arg 27). Appended AFTER t_offset so kArgTOffset==25 holds.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &cond_model_));
@@ -2500,7 +2500,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     // overwrites it per sub-dispatch (kArgTOffset == arg index 25).
     int t_offset_init = 0;
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &t_offset_init));
-    // Phase R (R2 fix, PORT-R2-01): per-face frozen substep-count buffer (arg 26).
+    // Phase R (R2 fix): per-face frozen substep-count buffer (arg 26).
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(cl_mem), &buf_n_substeps_frozen_));
     // Conductivity law (arg 27). Appended AFTER t_offset so kArgTOffset==25 holds.
     CL_CHECK(clSetKernelArg(persistent_kernel_, arg++, sizeof(int), &cond_model_));

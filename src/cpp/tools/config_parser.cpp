@@ -12,8 +12,10 @@
 #include <yaml-cpp/yaml.h>
 #endif
 
-// std::sort, for the PTM-67 unread-key report (deterministic key order).
+// std::sort, for the unread-key report (deterministic key order).
 #include <algorithm>
+#include <set>
+#include <tuple>
 // Added for the flux-cube code below: libstdc++ does not pull these in
 // transitively the way libc++ does, which cost a Linux-only CI failure.
 #include <cstddef>
@@ -26,7 +28,26 @@ namespace ptm {
 
 // Helper template for safe YAML node access with defaults
 template<typename T>
+T getWithDefault(const YAML::Node& node, const std::string& key, const T& defaultVal);
+
+namespace {
+// Every (map, key) the parser looks up, keyed by the map node's source position.
+// After parsing, any key present in the file but never looked up is unknown to
+// the engine: a typo, a key from another tool, or a key this version does not
+// read. Those are reported instead of being dropped in silence.
+std::set<std::tuple<int, int, std::string>> g_read_keys;
+int g_unknown_key_count = 0;
+
+void noteRead(const YAML::Node& map, const std::string& key) {
+    if (!map || !map.IsMap()) return;
+    const YAML::Mark m = map.Mark();
+    g_read_keys.emplace(m.line, m.column, key);
+}
+} // namespace
+
+template<typename T>
 T getWithDefault(const YAML::Node& node, const std::string& key, const T& defaultVal) {
+    noteRead(node, key);
     if (node && node[key]) return node[key].as<T>();
     return defaultVal;
 }
@@ -55,7 +76,7 @@ std::string datasetForPath(const std::string& p) {
         {"data/albedo_maps/",     "albedo-maps"},
         {"data/dem/validation/",  "validation-meshes"},
         {"data/dem/copernicus/",  "copernicus-dem"},
-        {"data/meshes/moon3d",    "moon3d-mesh"},
+        {"data/meshes/moon3d_cartesian_double", "moon3d-mesh"},
     };
     for (const auto& m : kMap)
         if (p.rfind(m.prefix, 0) == 0) return m.dataset;
@@ -135,7 +156,7 @@ std::string resolveDataPath(const std::string& value,
 }
 
 // ---------------------------------------------------------------------------
-// PTM-67: report, ONCE and in ONE line, every key under `thermophysical:` that
+// report, ONCE and in ONE line, every key under `thermophysical:` that
 // this parser does not read.
 //
 // Most of the block is decorative. `ks`, `kd`, `H`, `rhos`, `rhod`, `cp0`,
@@ -199,12 +220,12 @@ void warnUnreadThermophysicalKeys(const YAML::Node& thermo) {
         line << (i ? ", " : "") << dead[i];
     line << " -- editing them changes no result. Named properties are honored only under "
             "`generic_body.surface:`; on a built-in body use the `*_override` keys. "
-            "See docs/KNOWN_LIMITATIONS.md (PTM-67).";
+            "See docs/KNOWN_LIMITATIONS.md.";
     std::cerr << line.str() << std::endl;
 }
 
 // Same contract as warnUnreadThermophysicalKeys, for `generic_body:` and its
-// four subsections (BUGS.md PTM-663). Until 2026-09-24 two keys here --
+// four subsections. Until 2026-09-24 two keys here --
 // spin.prime_meridian_deg and orbit.epoch -- were parsed and then dropped, and
 // a DAMIT rotational phase had to be imposed by rotating the mesh. They are
 // wired now; this warner exists so the next dead key, or a typo such as
@@ -275,8 +296,8 @@ void warnUnreadGenericBodyKeys(const YAML::Node& gb) {
     std::cerr << line.str() << std::endl;
 }
 
-// Same contract as warnUnreadThermophysicalKeys, for `flux_cubes:`. PTM-67 is
-// the trap where a block's keys are read by nothing and the run prints one
+// Same contract as warnUnreadThermophysicalKeys, for `flux_cubes:`. The unread-config-key defect
+// is the trap where a block's keys are read by nothing and the run prints one
 // warning rather than honoring them; the flux-cube block is top-level to stay
 // out of that machinery, and this warner is the second guard.
 //
@@ -389,7 +410,7 @@ void warnUnreadShadowDepthKeys(const YAML::Node& sd) {
 // quoted form `map_depths_m: "0.05, 0.25"` is the same scalar and the same
 // silence. That is a forgotten pair of brackets producing a surface-only run
 // nobody is told about, so it is refused here instead -- a fatal config error
-// (ptm_thermal_sim.cpp, PTM-66), not a warning, because a warning on a run that
+// (ptm_thermal_sim.cpp), not a warning, because a warning on a run that
 // otherwise succeeds is what the operator will not see.
 //
 // A NULL node -- `map_depths_m:` with nothing after it, or an explicit `~` --
@@ -405,7 +426,7 @@ void warnUnreadShadowDepthKeys(const YAML::Node& sd) {
 //
 // ⛔ EVERY key the parser reads with `for (const auto& item : node)` or gates on
 // `.IsSequence()` needs this. Six do, and all six are guarded as of
-// 2026-09-06 (PTM-CONFIG-SEQUENCE-SCALAR-SILENT): output.map_depths_m,
+// 2026-09-06: output.map_depths_m,
 // output.map_depth_stats, thermal/illumination/radiation.gpu_device_ids and
 // generic_body.shape.semi_axes_km. If you add a seventh, guard it in the same
 // breath -- the failure is invisible by construction, so it will not be found
@@ -474,7 +495,7 @@ const char* const kDeviceIdsConsequence =
 } // namespace
 
 // ---------------------------------------------------------------------------
-// PTM-42: apply the config's `engine_env:` block to the process environment.
+// apply the config's `engine_env:` block to the process environment.
 //
 // Static-initialization audit (2026-08-04, before writing this): every
 // std::getenv() call under src/cpp/ (105 of them) sits inside a function body.
@@ -560,10 +581,74 @@ int ConfigParser::applyEngineEnv(const std::string& filename) {
     return applied;
 }
 
+
+namespace {
+// Keys the parser reads by direct subscript rather than through
+// getWithDefault (sequences, sub-maps, presence tests). Listed per section;
+// see the reads in loadFromYAML below.
+bool readDirectly(const std::string& section, const std::string& key) {
+    static const std::set<std::pair<std::string, std::string>> k = {
+        {"thermal", "eq_extrapolation"}, {"thermal", "gpu_device_ids"},
+        {"thermal", "gpu_batch_size"}, {"thermal", "state_restore_allow_mismatch"},
+        {"thermal", "seed_indirect"}, {"thermal", "ice_stability"},
+        {"illumination", "gpu_device_ids"},
+        {"output", "map_depths_m"}, {"output", "map_depth_stats"},
+        {"radiation", "beaming"}, {"radiation", "gpu_device_ids"},
+    };
+    return k.count({section, key}) > 0;
+}
+
+void collectUnread(const YAML::Node& map, const std::string& section,
+                   const std::string& path, std::vector<std::string>& out) {
+    if (!map || !map.IsMap()) return;
+    const YAML::Mark m = map.Mark();
+    for (const auto& kv : map) {
+        std::string key;
+        try { key = kv.first.as<std::string>(); } catch (...) { continue; }
+        const std::string dotted = path + "." + key;
+        const bool read = g_read_keys.count({m.line, m.column, key}) > 0 ||
+                          (path == section && readDirectly(section, key));
+        if (!read) { out.push_back(dotted); continue; }
+        if (kv.second.IsMap()) collectUnread(kv.second, section, dotted, out);
+    }
+}
+
+// Report every key in the file the parser never read. The thermophysical,
+// generic_body, flux_cubes and shadow_depth sections have their own, more
+// specific warners; engine_env is a free-form map of environment variables.
+void warnUnknownConfigKeys(const YAML::Node& root) {
+    g_unknown_key_count = 0;
+    if (!root || !root.IsMap()) return;
+    static const std::set<std::string> kSections = {
+        "simulation", "mesh", "thermal", "illumination", "radiation", "output",
+        "gpu", "advanced"};
+    static const std::set<std::string> kOwnWarner = {
+        "thermophysical", "generic_body", "flux_cubes", "shadow_depth", "engine_env"};
+    std::vector<std::string> unknown;
+    for (const auto& kv : root) {
+        std::string sec;
+        try { sec = kv.first.as<std::string>(); } catch (...) { continue; }
+        if (kOwnWarner.count(sec)) continue;
+        if (!kSections.count(sec)) { unknown.push_back(sec + " (whole section)"); continue; }
+        collectUnread(kv.second, sec, sec, unknown);
+    }
+    g_unknown_key_count = static_cast<int>(unknown.size());
+    if (unknown.empty()) return;
+    std::sort(unknown.begin(), unknown.end());
+    std::cerr << "[config] WARNING: " << unknown.size()
+              << " key(s) in this file are not read by the engine and have NO effect"
+                 " (a misspelling, or a key this version does not use):" << std::endl;
+    for (const auto& u : unknown) std::cerr << "[config]   unknown key: " << u << std::endl;
+}
+} // namespace
+
+int lastUnknownConfigKeyCount() { return g_unknown_key_count; }
+
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     SimulationConfig config;
     try {
         YAML::Node root = YAML::LoadFile(filename);
+        g_read_keys.clear();
 
         // Parse Time section
         if (root["simulation"]) {
@@ -675,7 +760,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // src/python/ptm/engine_config.py's extractor treats that exact
             // shape as a SECTION declaration and drops the key from the parity
             // table -- silently, still reporting "engine_defaults.py is
-            // current". See the ledger row PTM-ENGINECONFIG-ALIAS-DROPS-KEY.
+            // current".
             if (thermal["state_restore_allow_mismatch"]) {
                 config.thermal.state_restore_allow_mismatch.clear();
                 if (thermal["state_restore_allow_mismatch"].IsSequence()) {
@@ -706,7 +791,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // an aliased read matches ptm.engine_config's section-declaration
             // pattern, is classified as a section, is dropped from the parity
             // table, and the tool still reports "engine_defaults.py is current"
-            // (owed row PTM-ENGINECONFIG-ALIAS-DROPS-KEY).
+            // (still open).
             config.thermal.batch_checkpoint         = getWithDefault(thermal, "batch_checkpoint",         config.thermal.batch_checkpoint);
             config.thermal.batch_checkpoint_dir     = getWithDefault(thermal, "batch_checkpoint_dir",     config.thermal.batch_checkpoint_dir);
             config.thermal.batch_checkpoint_max_gib = getWithDefault(thermal, "batch_checkpoint_max_gib", config.thermal.batch_checkpoint_max_gib);
@@ -717,6 +802,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.eq_indirect_passes     = getWithDefault(thermal, "eq_indirect_passes",     config.thermal.eq_indirect_passes);
             config.thermal.spinup_seed            = getWithDefault(thermal, "spinup_seed",            config.thermal.spinup_seed);
             config.thermal.seed_anchor            = getWithDefault(thermal, "seed_anchor",            config.thermal.seed_anchor);
+            config.thermal.seed_indirect          = getWithDefault(thermal, "seed_indirect",          config.thermal.seed_indirect);
+            if (thermal["seed_indirect"]) config.thermal.seed_indirect_source = "config";
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
@@ -835,7 +922,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.output.skip_mesh = getWithDefault(output, "skip_mesh", config.output.skip_mesh);
         }
 
-        // Parse Flux Cubes section (TOP LEVEL -- see FluxCubeParams and PTM-67)
+        // Parse Flux Cubes section (TOP LEVEL -- see FluxCubeParams and the unread-key report)
         if (root["flux_cubes"]) {
             const auto& fc = root["flux_cubes"];
             config.flux_cubes.enabled = getWithDefault(fc, "enabled", config.flux_cubes.enabled);
@@ -849,7 +936,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // iterates a scalar as an EMPTY range, so `cache_files: layout.fcg`
             // would leave the list empty and the run would produce no cubes,
             // print nothing, and exit 0. Same guard, same reasons, as
-            // output.map_depths_m (PTM-CONFIG-SEQUENCE-SCALAR-SILENT).
+            // output.map_depths_m.
             if (fc["cache_files"]) {
                 requireYamlSequence(fc["cache_files"], "flux_cubes.cache_files",
                                     "geometry cache paths, one per cube height",
@@ -919,7 +1006,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         }
 
         // Parse the shadow-depth section. Same top-level placement, same
-        // PTM-67 reasoning, as flux_cubes.
+        // Unread-config-key reasoning, as flux_cubes.
         if (root["shadow_depth"]) {
             const auto& sd = root["shadow_depth"];
             config.shadow_depth.enabled = getWithDefault(sd, "enabled", config.shadow_depth.enabled);
@@ -1031,7 +1118,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         // Parse Generic Body section
         if (root["generic_body"]) {
             const auto& gb = root["generic_body"];
-            // BUGS.md PTM-663: name every key under generic_body that nothing
+            // name every key under generic_body that nothing
             // reads, BEFORE reading the ones that are.
             warnUnreadGenericBodyKeys(gb);
             config.generic_body.name = getWithDefault(gb, "name", config.generic_body.name);
@@ -1099,7 +1186,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 config.generic_body.prime_meridian_deg = getWithDefault(spin, "prime_meridian_deg", config.generic_body.prime_meridian_deg);
                 // Presence, not value: 0.0 is both the default and a legal
                 // angle, so the generic_body.config_file merge needs to know
-                // whether THIS file set it (BUGS.md PTM-663).
+                // whether THIS file set it.
                 if (spin["prime_meridian_deg"]) config.generic_body.prime_meridian_set = true;
                 config.generic_body.spin_epoch = getWithDefault(spin, "epoch", config.generic_body.spin_epoch);
             }
@@ -1123,7 +1210,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
         // Parse Thermophysical section (GUI-written overrides)
         if (root["thermophysical"]) {
             const auto& thermo = root["thermophysical"];
-            // PTM-67: say which of these keys are decorative BEFORE reading the
+            // say which of these keys are decorative BEFORE reading the
             // ones that are not. One line, whatever the count.
             warnUnreadThermophysicalKeys(thermo);
             bool use_default_albedo = getWithDefault(thermo, "use_default_albedo", true);
@@ -1167,10 +1254,10 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             // When this was written, ptm_thermal_sim.cpp caught every
             // loadFromYAML exception, printed "Warning: Failed to load config
             // file ... Continuing with default configuration", and ran the
-            // WHOLE simulation on built-in defaults with exit code 0
-            // (BUGS.md PTM-66). A throw here would have been downgraded to a
+            // WHOLE simulation on built-in defaults with exit code 0.
+            // A throw here would have been downgraded to a
             // warning and the run would have proceeded quietly on Hayne.
-            // PTM-66 is FIXED on fix/release-hygiene in this same release, so
+            // Malformed-config handling is FIXED on fix/release-hygiene in this same release, so
             // that is no longer true: a throw would now be fatal.
             //
             // The two-step is kept anyway, deliberately: the parser names the
@@ -1278,6 +1365,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 "generic_body.spice_metakernel");
         }
 
+        warnUnknownConfigKeys(root);
         std::cout << "Successfully loaded configuration from: " << filename << std::endl;
 
     } catch (const YAML::Exception& e) {
@@ -1347,6 +1435,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "equilibration_stop_on_certificate" << YAML::Value << config.thermal.equilibration_stop_on_certificate;
         out << YAML::Key << "spinup_seed" << YAML::Value << config.thermal.spinup_seed;
         out << YAML::Key << "seed_anchor" << YAML::Value << config.thermal.seed_anchor;
+        // ALWAYS written (the indirect-aware spin-up seed default change): an old run's config_used.yaml must
+        // say which seed produced it, and a re-run from it must pin the same one.
+        out << YAML::Key << "seed_indirect" << YAML::Value << config.thermal.seed_indirect;
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
         // (-1 = follow spinup_seed). Writing -1 into every template would make
@@ -1523,12 +1614,13 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
 #else
 
 // Fallback implementation without YAML support
+int lastUnknownConfigKeyCount() { return 0; }
 SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
     last_error_ = "YAML support not available. Please install yaml-cpp library.";
     throw std::runtime_error(last_error_);
 }
 
-// PTM-42 fallback. Without yaml-cpp we cannot read the block at all -- but a
+// engine_env fallback. Without yaml-cpp we cannot read the block at all -- but a
 // silently unapplied engine_env is the whole bug, so say so.
 int ConfigParser::applyEngineEnv(const std::string& filename) {
     std::cerr << "[engine_env] WARNING: this build has no YAML support, so any "
@@ -1700,7 +1792,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  body: \"Europa\"                      # Target body (Europa, Moon, Mercury, etc.)\n";
     out << "  spice_coverage_strict: false        # true = REFUSE when the loaded SPK does not span\n";
     out << "                                      # the run window (spin-up included); false = warn\n";
-    out << "                                      # and run on the Keplerian fallback (BUGS.md PTM-301)\n\n";
+    out << "                                      # and run on the Keplerian fallback\n\n";
     
     out << "# ========== Mesh Configuration ==========\n";
     out << "mesh:\n";
@@ -1855,6 +1947,12 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
                          "'legacy'; got '" << config.thermal.spinup_seed << "'"
                       << std::endl;
+            valid = false;
+        }
+        if (config.thermal.seed_indirect != "off" && config.thermal.seed_indirect != "series"
+                && config.thermal.seed_indirect != "mean") {
+            std::cerr << "Error: thermal.seed_indirect must be 'off', 'series' or "
+                         "'mean'; got '" << config.thermal.seed_indirect << "'" << std::endl;
             valid = false;
         }
         thermal::EqSeedAnchor dummy_anchor;

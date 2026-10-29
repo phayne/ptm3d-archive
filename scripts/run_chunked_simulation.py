@@ -187,7 +187,7 @@ def estimate_max_chunk_timesteps(n_faces: int, ram_gb: float,
 
 
 # --------------------------------------------------------------------------
-# GPU-wedge guardrails (see docs/gpu-wedge-guardrails.md)
+# GPU-wedge guardrails (see docs/dev/gpu-wedge-guardrails.md)
 #
 # Three defaults that used to live only in the campaign drivers, so a CLI or
 # GUI user got none of them:
@@ -1020,10 +1020,10 @@ def main():
                     except Exception as e:
                         print(f"[chunked] chunk {i:03d}: cleanup warning: {e}",
                               flush=True)
-                    # BUGS.md PTM-77: rmtree just deleted chunk_dir/config.yaml,
+                    # rmtree just deleted chunk_dir/config.yaml,
                     # which is the very file the retry passes to --config. Every
                     # retry after this branch was therefore guaranteed to fail —
-                    # and before the PTM-66 fix it failed INVISIBLY, because a
+                    # and before the malformed-config fix it failed INVISIBLY, because a
                     # missing config was downgraded to a warning and the binary
                     # ran a full simulation on built-in defaults into the default
                     # output/ directory. Regenerate it, and prove it is there.

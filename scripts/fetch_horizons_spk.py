@@ -22,6 +22,7 @@ Requirements:
     pip install spiceypy requests numpy
 """
 
+from pathlib import Path
 import argparse
 import sys
 import os
@@ -42,7 +43,7 @@ except ImportError:
 HORIZONS_API = "https://ssd.jpl.nasa.gov/api/horizons.api"
 
 # Default SPICE kernels path
-DEFAULT_KERNELS = "/Users/paha3326/software/cspice/data"
+DEFAULT_KERNELS = os.environ.get("CSPICE_DATA", str(Path(__file__).resolve().parents[1] / "data" / "kernels"))
 
 
 def fetch_horizons_vectors(command, center, start_time, stop_time, step_size):

@@ -27,7 +27,7 @@ and are distributed separately as an optional tier.)
 LDEM elevations sampled at each icosphere face center; stored as one
 single-precision value per face in mesh face order (same 4-byte-header binary
 layout as the output statistics files — see
-`docs/tutorials/06_interpreting_outputs.md`).
+`docs/tutorials/03_outputs.md`).
 
 ## License
 

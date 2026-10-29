@@ -20,7 +20,7 @@ Implementation is a 2-pass build:
      example file.
 
 Format reverse-engineered from
-``/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/moon/artemis/a3gt/
+``<campaign-root>/
  ptm3d/Malapert_PTM3D-site07/cog/{ice_depth,temperature_max}.tif``.
 """
 
@@ -587,7 +587,7 @@ def export_field(output_path, face_values, regridder, field_name,
             lost that way, but no unresolved one is ever answered, which is the
             safe direction. Bounding it needs a regridder that can drop a
             vertex from the triangulation; that is the open
-            ``PTM-REGRID-SENTINEL-UNSAFE``, not something this function can do.
+            regrid-sentinel issue, not something this function can do.
 
             ⚠️ Deliberately OPT-IN, not defaulted to ``~isfinite(face_values)``.
             Defaulting it would close the same hole for every NaN-carrying

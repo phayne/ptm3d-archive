@@ -232,8 +232,8 @@ AlbedoRegistrationReport checkAlbedoMapRegistration(
         std::cerr
             << "    The maria are the DARK terrain (Bond albedo ~0.07-0.09) and the highlands\n"
             << "    the BRIGHT terrain (~0.15-0.17). Reading that ordering inverted means the\n"
-            << "    map is rolled relative to IAU_MOON. Two known defects do this: PTM-34, a\n"
-            << "    180-degree longitude roll of the source FITS, and PTM-35, a latitude flip\n"
+            << "    map is rolled relative to IAU_MOON. Two known defects do this: a\n"
+            << "    180-degree longitude roll of the source FITS, and a latitude flip\n"
             << "    baked in by the map generator. These two statistics cannot tell them apart\n"
             << "    on their own -- run the verify script below, which scores the map against\n"
             << "    the source FITS under every candidate transform and names the axis.\n"

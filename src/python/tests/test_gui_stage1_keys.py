@@ -26,6 +26,7 @@ Run directly::
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -131,7 +132,7 @@ def test_the_default_conductivity_model_is_the_engine_s():
 
 
 def test_coupling_mode_is_writable_and_round_trips():
-    """PTM-102. The mode was unreachable while the field it gates was visible."""
+    """Coupling-mode control. The mode was unreachable while the field it gates was visible."""
     manager = _manager()
     assert manager.get_value("radiation.coupling_mode") == \
         ENGINE_DEFAULTS["radiation.coupling_mode"]
@@ -185,7 +186,7 @@ def test_the_initial_condition_group_is_writable():
 
 
 def test_spinup_seed_legacy_is_no_longer_defeated_by_the_injected_environment():
-    """The pair that makes `legacy` mean what it says (PTM-276).
+    """The pair that makes `legacy` mean what it says.
 
     `spinup_seed: legacy` exists to reproduce a pre-fix baseline
     digit-for-digit. On the GPU path with that seed, an injected
@@ -360,7 +361,7 @@ def test_a_quoted_rms_slope_does_not_break_the_load():
 
 
 def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
-    """PTM-161 is FIXED in this tree; the key is live on every body.
+    """Geothermal heat flow is FIXED in this tree; the key is live on every body.
 
     It was briefly disabled on built-in bodies on the strength of
     docs/KNOWN_LIMITATIONS.md section 4, which still described the pre-2e06a70
@@ -377,14 +378,24 @@ def test_the_basal_heat_flow_control_is_not_gated_on_the_body():
     source = (REPO_ROOT / "src" / "cpp" / "main" / "ptm_thermal_sim.cpp").read_text()
     assert "ovr_Qb" in source, (
         "the engine no longer forwards geothermal_heat_flow as ovr_Qb; if "
-        "PTM-161 has regressed, the GUI control and the docs both need to say "
+        "the geothermal heat-flow fix has regressed, the GUI control and the docs both need to say "
         "so again")
 
+    # The geothermal-floor item must present the key as a live setting. A stale
+    # "parsed but discarded" limitation is what disabled this control once already.
     limits = (REPO_ROOT / "docs" / "KNOWN_LIMITATIONS.md").read_text()
-    section = limits.split("## 4.", 1)[1].split("\n## ", 1)[0]
-    assert "FIXED" in section, (
-        "KNOWN_LIMITATIONS.md section 4 no longer records that PTM-161 is "
-        "fixed; a stale limitation is what disabled this control once already")
+    item = re.search(r"^\d+\. \*\*No temperature below the geothermal floor\.\*\*"
+                     r"(.*?)(?=^\d+\. \*\*|^## )", limits, re.M | re.S)
+    assert item, ("KNOWN_LIMITATIONS.md has no geothermal-floor item; it is where "
+                  "the docs say how Q_b is set")
+    text = " ".join(item.group(1).split())
+    assert "thermal.geothermal_heat_flow" in text, (
+        "the geothermal-floor item no longer names thermal.geothermal_heat_flow as "
+        "the way to set Q_b")
+    stale = [w for w in ("ignored", "discarded", "not applied", "no effect")
+             if w in text.lower()]
+    assert not stale, (f"the geothermal-floor item describes Q_b as {stale}, but the "
+                       "key is live on every body")
 
 
 def test_validate_never_raises_on_a_scalar_the_engine_accepts():

@@ -36,14 +36,14 @@ constexpr int kMaxNearFieldQuadPoints = kMaxNearFieldQuadOrder * kMaxNearFieldQu
 // Grazing / back-facing cut on the pair cosines, shared by every in-engine
 // view-factor kernel. A sample or a pair whose cos_i or cos_j falls below this
 // contributes ZERO; it is not removed from the integration domain (dividing by
-// the survivors would condition the estimate on detection -- FC-08's error).
+// the survivors would condition the estimate on detection -- the view-factor divisor defect's error).
 //
 // 1e-6 is the sparse builder's long-standing value and the one the shared
 // near-field quadrature uses. The H-matrix builder used 0.01 -- ten thousand
 // times larger -- in all four of its entry generators, as a candidate cull
 // before ray tracing, so the two builders disagreed about which pairs EXIST
 // before they could disagree about their values. Unified 2026-08-23; the
-// measured effect is in docs/design/vf-unification.md.
+// measured effect is in the view-factor unification design (docs/design/vf-unification.md in git history).
 constexpr double kGrazingCosCut = 1e-6;
 
 // Configuration for radiation exchange computation
@@ -51,7 +51,7 @@ struct RadiationConfig {
     // Master enable/disable
     bool enabled = false;
 
-    // ---- Radiation-exchange face set (PTM-98) --------------------------------
+    // ---- Radiation-exchange face set --------------------------------
     // Which faces keep the indirect flux the radiosity solve already computed
     // for them. RadiositySolver::solve() returns Q_indirect for ALL n faces
     // (radiation_exchange.cpp, "Compute absorbed indirect flux at each face");
@@ -64,7 +64,7 @@ struct RadiationConfig {
     //       zeroing part of its output is data loss, not an approximation.
     //   Shadow — legacy gate: keep only faces in shadow at least
     //       min_shadow_fraction of the time. WINDOW-DEPENDENT and therefore
-    //       chunk-decomposition dependent (PTM-98): the shadow fraction is
+    //       chunk-decomposition dependent: the shadow fraction is
     //       measured over the run's own illumination series, whose length is
     //       n_equilibration_steps + n_output_steps. A warm-started chunk has no
     //       equilibration samples, so a short chunk that happens to fall in
@@ -76,7 +76,7 @@ struct RadiationConfig {
     ExchangeSelection exchange_selection = ExchangeSelection::All;
 
     // Min fraction of time in shadow for a face to keep its indirect flux.
-    // Consulted ONLY when exchange_selection == Shadow. Before PTM-99 this was
+    // Consulted ONLY when exchange_selection == Shadow. Before the min_shadow_fraction plumbing this was
     // hard-coded here at 0.3 because the config key was parsed and then never
     // bridged into this struct; it is now plumbed through.
     double min_shadow_fraction = 0.3;
@@ -160,7 +160,7 @@ struct RadiationConfig {
     // still ran to 10, making GPU radiosity 1.74x slower than the CPU.
     int convergence_check_interval = 0;
 
-    // Band-separated (visible + thermal-IR) radiosity (PTM-07 fix). Production
+    // Band-separated (visible + thermal-IR) radiosity (the single gray-band radiosity bias fix). Production
     // DEFAULT ON (D2, 2026-07-12): the visible band scatters/absorbs the per-face
     // Bond albedo A_i (sourced from the surface albedo config) and the IR band
     // keeps 1-eps/eps; their two absorbed indirect fluxes are summed. Requires a

@@ -12,7 +12,7 @@
 // the root is unique; this program measures how far the iterate actually lands
 // from that root, against a float64 bisection solve of the SAME f.
 //
-// WHY IT EXISTS (PTM-116, the scalar twin of PTM-115)
+// WHY IT EXISTS (the scalar twin of the GPU radiation-off frame collapse)
 // ---------------------------------------------------
 // The pre-fix seed was `T_eq = (Qs/(eps*sigma))^0.25` whenever `Qs > 0`, and
 // `T1` only when Qs was EXACTLY zero. As Qs -> 0+ the seed -> 0 K, while the
@@ -25,7 +25,7 @@
 // depth-profile science products. The CPU MESH path (applySurfaceBCBatch)
 // warm-starts from the previous surface T and is immune.
 //
-// The fix (identical to PTM-115's in the GPU kernel) seeds at the UPPER end of
+// The fix (identical to the GPU radiation-off fix in the GPU kernel) seeds at the UPPER end of
 // the root bracket, max(T_eq, T1).
 //
 // HOW THE "BEFORE" COLUMN IS PRODUCED
@@ -84,7 +84,7 @@ double reference_root(double Qs, double k0, double dz0, double T1,
 
 // ---------------------------------------------------------------------------
 // Local re-implementation of the shipping Newton loop with a selectable seed.
-// `new_seed=false` reproduces the PTM-116 defect; `new_seed=true` reproduces
+// `new_seed=false` reproduces the scalar surface-Newton under-convergence defect; `new_seed=true` reproduces
 // the fix. Verified against the real surfTemp on every case (see gate below).
 // Keep this textually in step with thermal_model.cpp::surfTemp.
 // ---------------------------------------------------------------------------
@@ -248,9 +248,9 @@ struct Case {
 //   1.5e-4 K at max_iter = 20 and 1.0e-11 K at relaxation = 1.0, i.e. it is the
 //   pre-existing truncation of a 10-iteration, 0.8-relaxed loop that has to
 //   descend 4x from the seed. Neither max_iter nor the relaxation factor is
-//   touched by the PTM-116 fix. Set to 0.15 K: comfortably above the measured
+//   touched by the scalar surface-Newton under-convergence fix. Set to 0.15 K: comfortably above the measured
 //   worst, far below the 399 K the pre-fix seed produced on the same case.
-//   (Fermi's bit-faithful float32 emulation of the GPU twin gave <= 0.022 K on
+//   (the physics review's bit-faithful float32 emulation of the GPU twin gave <= 0.022 K on
 //   a narrower grid, with the same max_iter=12 -> 8.7e-4 K signature.)
 //
 // kGatePhysicalResidual_K -- the same worst residual restricted to T1 <= 150 K,
@@ -268,7 +268,7 @@ struct Case {
 // step. The shipping loop is now omega = 1.0 with the radiatively normalized
 // residual test, whose position error is bounded by tol_K/A <= tol_K = 1e-4 K
 // analytically. Both are therefore re-gated at 2e-4 K, twice the guaranteed
-// bound -- the same bar Fermi's 252-case derivation sweep passes at 1.790e-4 K
+// bound -- the same bar the physics review's 252-case derivation sweep passes at 1.790e-4 K
 // worst. The old 0.15 K corner (T1 = 400 K under 5 cm of k = 7.4e-4) is no
 // longer a corner: undamped Newton reaches it in 3 steps.
 constexpr double kGateMaxResidual_K      = 2e-4;
@@ -276,7 +276,7 @@ constexpr double kGatePhysicalResidual_K = 2e-4;
 constexpr double kGateMinDefectDemo_K    = 10.0;
 constexpr double kEmulationTol_K         = 1e-9;
 
-// Correction 1a (2026-08-11, Ada -- NEEDS SIGN-OFF). Sagan's replacement
+// Correction 1a (2026-08-11, NEEDS SIGN-OFF). The proposed replacement
 // threshold, 1e-10 K, was set from ONE measured column (grid A cold,
 // 2.684e-14 K) rather than from what the criterion guarantees, and it MISSES
 // on two of the three scored columns: grid B (ks x 8) 2.807e-07 K and the warm
@@ -306,7 +306,7 @@ constexpr double kEmulationTol_K         = 1e-9;
 constexpr double kGateNewtonResidual_K   = 1e-4;   // = tol_K, the guaranteed bound
 
 // G2: the derived 252-case sweep. The criterion's analytic position bound is
-// tol_K/A <= tol_K = 1e-4 K; Fermi's numpy reproduction measured 1.790e-4 K
+// tol_K/A <= tol_K = 1e-4 K; the physics review's numpy reproduction measured 1.790e-4 K
 // worst, the excess coming from the single unphysically soft G = 1e-3 column
 // that reaches the iteration cap. Gated at 2e-4 K = 2*tol_K.
 constexpr double kGateDerivationSweep_K  = 2e-4;
@@ -459,7 +459,7 @@ int main(int argc, char** argv)
     std::printf("    ... restricted to T1 <= 150 K        : %10.6f K\n", worst_ship_phys);
     std::printf("    ... cases with |dT| > 0.01 K         : %ld / %ld\n",
                 n_ship_bad_001K, n_cases);
-    std::printf("  PRE-FIX seed (emulated, PTM-116 defect):\n");
+    std::printf("  PRE-FIX seed (emulated, scalar surface-Newton defect):\n");
     std::printf("    worst |dT| vs root                   : %10.6f K\n", worst_old);
     std::printf("    ... restricted to 0 < Qs <= 1 W/m^2  : %10.6f K\n", worst_old_tiny);
     std::printf("    ... cases with |dT| > 1 K            : %ld / %ld\n",
@@ -541,7 +541,7 @@ int main(int argc, char** argv)
                     "                    the change, and why it is scored on more than\n"
                     "                    one grid and on a warm column.\n");
         std::printf("  OBSERVED, NOT GATED : the column offset vs (Qb/(eps*sigma))^0.25.\n"
-                    "                    That is the interior stencil (BUGS.md PTM-217),\n"
+                    "                    That is the interior stencil (a known issue),\n"
                     "                    it is grid-DEPENDENT, and it does not block\n"
                     "                    this change set. Reported per grid.\n");
         std::printf("  dt does NOT discriminate the two: a Crank-Nicolson steady state\n"
@@ -804,7 +804,7 @@ int main(int argc, char** argv)
     // =======================================================================
     // G2 -- the DERIVED 252-case sweep, run against the SHIPPED surfTemp.
     //
-    // This is Fermi's tol_K derivation grid reproduced against the real code
+    // This is the physics review's tol_K derivation grid reproduced against the real code
     // rather than in numpy: G = k0/dz0 over five decades (1e-3 .. 100
     // W/m^2/K, i.e. m*Gamma*sqrt(pi/P) from an unphysically soft column to a
     // fast high-inertia asteroid), Qs over four (0 .. 5444 W/m^2), T1 from
@@ -870,7 +870,7 @@ int main(int argc, char** argv)
     {
         struct Trans { const char* name; double Qprev, Qnew, T1; };
         // Q_prev is what set T0_prev; the batch path used to seed from it.
-        // The first six reproduce Fermi's M6 table (moon3d grid, T1 = 24 K for
+        // The first six reproduce the physics review's M6 table (moon3d grid, T1 = 24 K for
         // the sunrise rows -- a cold column taking a sudden flux, which is what
         // a terminator crossing at the A3GT 1440-step cadence looks like when
         // n_sub = 1 puts the whole crossing in one substep).
@@ -1002,21 +1002,21 @@ int main(int argc, char** argv)
     if (!(worst_old >= kGateMinDefectDemo_K)) {
         std::printf("[test_surface_newton] FAIL: the pre-fix seed no longer fails on this "
                     "grid (worst %.6f K < %.1f K expected). The parameter grid no longer "
-                    "covers the PTM-116 band, so the post-fix result below is vacuous.\n",
+                    "covers the collapse band, so the post-fix result below is vacuous.\n",
                     worst_old, kGateMinDefectDemo_K);
         return 1;
     }
     if (!(worst_ship <= kGateMaxResidual_K)) {
         std::printf("[test_surface_newton] FAIL: shipping surfTemp worst |dT| vs the "
                     "bisection root = %.6f K over the full grid, tolerance %.3f K "
-                    "(PTM-116).\n", worst_ship, kGateMaxResidual_K);
+                    "(scalar surface-Newton defect).\n", worst_ship, kGateMaxResidual_K);
         return 1;
     }
     if (!(worst_ship_phys <= kGatePhysicalResidual_K)) {
         std::printf("[test_surface_newton] FAIL: shipping surfTemp worst |dT| vs the "
                     "bisection root = %.6f K on the science-relevant T1 <= 150 K "
                     "subset, tolerance %.3f K (the Newton loop's own declared "
-                    "tolerance) (PTM-116).\n",
+                    "tolerance) (scalar surface-Newton defect).\n",
                     worst_ship_phys, kGatePhysicalResidual_K);
         return 1;
     }

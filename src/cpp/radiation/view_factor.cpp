@@ -518,7 +518,7 @@ static constexpr uint32_t SPARSE_VF_MAGIC = 0x5646464D;
 // a PHYSICS provenance stamp. A v1 file was written by the pre-2026-08-23
 // one-sided near-field (M2) estimator, whose edge/vertex-touching entries read
 // about -22% low. Loading one is legal -- refusing would force a rebuild of
-// multi-GB production matrices, which is the PTM-19 wedge trap -- but it is
+// multi-GB production matrices, which is the view-factor rebuild hazard wedge trap -- but it is
 // announced, because a v1 and a v2 matrix on the same mesh are DIFFERENT
 // physics and the outputs do not say so.
 static constexpr uint32_t SPARSE_VF_VERSION = 2;
@@ -600,7 +600,7 @@ bool ViewFactorMatrix::readBinary(const std::string& filename) {
     file.read(reinterpret_cast<char*>(&nnz), sizeof(uint64_t));
 
     if (version < SPARSE_VF_VERSION && nnz > 0) {
-        // Same bytes, different physics. Say so; do not refuse (PTM-19).
+        // Same bytes, different physics. Say so; do not refuse.
         // An empty stub (nnz == 0) carries no near-field entries, so it is not
         // announced -- the A3GT VF_REPLACE route deliberately loads one.
         std::cout << "\n  *** LOADED A v" << version << " SPARSE VIEW-FACTOR FILE: "
@@ -609,7 +609,7 @@ bool ViewFactorMatrix::readBinary(const std::string& filename) {
                      "-22% low on edge/vertex-touching pairs and\n      -3.9% "
                      "mass-weighted over the near field. This run reproduces THAT physics,"
                   << "\n      not the current estimator's. Rebuild the matrix to get the "
-                     "corrected near\n      field -- but check the size first: PTM-19 "
+                     "corrected near\n      field -- but check the size first: "
                      "forbids rebuilding a production\n      .vf by accident. ***\n"
                   << std::endl;
     }

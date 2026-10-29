@@ -8,7 +8,7 @@
 // moment at which all faces share the same output step, and a whole-mesh dump
 // taken mid-run banks un-solved faces. tools/config_parser.h says so at the key
 // `thermal.checkpoint_every_output_steps`, ptm_thermal_sim warns loudly if it is
-// set, and docs/PORTABILITY-AUDIT.md section 8 calls the partial dump "a resume
+// set, and the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history) section 8 calls the partial dump "a resume
 // hazard". Per-output-step checkpointing belongs to the CPU-first, time-outer
 // solver on the portability roadmap and is deliberately NOT implemented here.
 //
@@ -29,7 +29,7 @@
 //     about `n_faces` (losing the global face range, so nothing could place the
 //     columns back) or by laying down a full-width body that is mostly zeros --
 //     which is EXACTLY the "banks un-solved faces at 0 K" footgun the audit
-//     names and the PTM-78 zero-column runaway already cost this project once.
+//     names and the post-equilibration hand-off zero-column runaway already cost this project once.
 //   * A partial must carry far more than a column. A completed batch also owns
 //     its faces' whole SURFACE TIME SERIES (every statistic, every per-step
 //     product and every location export is a reduction of it) and its slice of

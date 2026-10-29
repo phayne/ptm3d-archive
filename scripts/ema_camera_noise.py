@@ -6,7 +6,7 @@ of frame_*.fits) and, for a dir, rebuilds a noisy PNG snapshot + MP4 using the
 EXISTING driver assembler helpers (make_mp4 / make_mp4_reflected / snapshot_png*)
 -- reused, not reinvented. STANDALONE: it imports ema_campaign_driver READ-ONLY
 (the module's __main__ guard means importing runs no campaign code, so it does not
-race Rocky's running driver) purely to reuse those helpers + the Planck constants.
+race the running campaign driver) purely to reuse those helpers + the Planck constants.
 
 NOISE MODELS
 ------------
@@ -19,14 +19,14 @@ IR (ECAM IR3S, THERMAL HDU = spectral radiance eps*B_lambda(T), W/m^2/sr/um @10.
       sigma_T(T) = sigma_L / (eps * dB_lambda/dT|_T)      (= 5 K exactly at 180 K)
   is smaller for hotter pixels and larger for colder ones -- the physically
   consistent behavior of a detector/background-noise-limited thermal imager.
-  ASSUMPTION for Fermi: constant radiance NEP (no explicit read-floor/photon term,
+  ASSUMPTION for the physics review: constant radiance NEP (no explicit read-floor/photon term,
   no per-band integration). Defensible first-order model; a fuller model would set
   sigma_L from the actual detector NEP at 10.5 um.
 
 Visible (CNAC, RADIANCE HDU = reflected radiance, W/m^2/sr):
   Spec: SNR = 10 at L_ref = 1 W/m^2/sr. Modeled as shot-noise-like, signal-dependent:
       sigma(L) = sqrt(L * L_ref) / SNR      (= L/SNR at L_ref, and sigma ~ sqrt(L))
-  the sqrt(L) scaling is the Poisson/photon-shot signature. ASSUMPTION for Fermi:
+  the sqrt(L) scaling is the Poisson/photon-shot signature. ASSUMPTION for the physics review:
   pure shot noise anchored at the spec point; no additive read-noise floor and no
   radiance->electrons conversion via the real CNAC QE/gain/integration time.
 
@@ -34,11 +34,12 @@ Deterministic + idempotent: per-frame RNG is seeded by (--seed, frame index) so 
 given (seed, frame) always yields the same realization; existing noisy outputs are
 skipped unless --overwrite.
 """
+from pathlib import Path
 import os, sys, glob, argparse, importlib.util
 import numpy as np
 from astropy.io import fits
 
-PTM = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm"
+PTM = str(Path(__file__).resolve().parents[1])
 
 # Reuse the driver's assembler/snapshot helpers + Planck constants, READ-ONLY.
 # ema_campaign_driver.py's top-level campaign block is now wrapped in an

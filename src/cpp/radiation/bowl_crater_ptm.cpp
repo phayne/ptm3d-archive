@@ -252,6 +252,28 @@ bool shadowed(RTCScene scene, const std::array<double, 3>& c,
 //                     then measures the near-field kernel alone.
 //   PTM_BOWL_RESULTS=<path.csv>                       : append one result row (default
 //                     output/bowl_conv/results.csv)
+// Moon3D R1 benchmark (C3) knobs -- unset = prior behavior, byte for byte:
+//   PTM_BOWL_WRITE_PLY=<prefix>  : write the mesh as <prefix>_dd<dd>.ply (binary, double
+//                     xyz, winding = the harness's inward/up normals so mc_ref_pp's
+//                     back-face cull sees front faces) + <prefix>_dd<dd>_mask.npy, then
+//                     SKIP the view factors and the solve for that d/D. The PLY is the
+//                     input for an offline mc_ref_pp sweep + assemble_vf_haworth.py.
+//   PTM_BOWL_VF_CSR=<path.csr>   : LOAD the view factors from an assembled CSR (the
+//                     production estimator) instead of building the exact dense
+//                     matrix. Exactly one d/D per run; the CSR must carry this mesh's
+//                     area hash (same check as PTM_HMATRIX_VF_REPLACE) and pass its
+//                     invariants (no row > 1, no negative entry), else FATAL.
+//   PTM_BOWL_ESTIMATOR=exact|sparse_production : `exact` (default) is the gate's dense
+//                     matrix (max_neighbors = nf). `sparse_production` builds with the
+//                     SHIPPED RadiationConfig defaults (20 / 500 / 95%, adaptive), i.e.
+//                     what a run with radiation enabled and no VF file would build.
+//                     PTM_BOWL_VISTHRESH / PTM_BOWL_WINDOW are not applied there.
+//   PTM_BOWL_WRITE_CSR=<path.csr>: after BUILDING F (exact or sparse_production), write it
+//                     in the assembler's CSR format (float32 values, area hash), so the
+//                     PTM_BOWL_VF_CSR load path can be round-trip tested against the gate.
+//   PTM_BOWL_DUMP=<prefix>       : with PTM_BOWL_RADIOSITY=1, write per-face <prefix>_T.npy,
+//                     _qind.npy (+ _qvis.npy/_qir.npy when two-band), _mask.npy and
+//                     _areas.npy at the converged state, for per-face accuracy metrics.
 const char* env_c(const char* k) { return std::getenv(k); }
 int    env_int(const char* k, int d)    { const char* v = env_c(k); return v ? std::atoi(v) : d; }
 double env_dbl(const char* k, double d) { const char* v = env_c(k); return v ? std::atof(v) : d; }
@@ -371,6 +393,116 @@ double vf_refined(const std::array<double, 3>& ni, const std::array<double, 3>& 
     return sum / Ai;
 }
 
+// ---- R1 benchmark helpers --------------------------------------------------
+// Same mesh-identity hash as PTM_HMATRIX_VF_REPLACE (radiation_exchange.cpp) and
+// assemble_vf_haworth.py's GEOMHASH.
+double area_hash(const std::vector<double>& areas) {
+    double h = 0.0;
+    for (size_t i = 0; i < areas.size(); ++i)
+        h += areas[i] + static_cast<double>(i + 1) * areas[i] * 1e-9;
+    return h;
+}
+
+// Load an assembled CSR (int32 n, float64 geomhash, int64 indptr[n+1], int64 nnz,
+// int32 cols[nnz], float32 data[nnz]) into F. FATAL on any mismatch: a bowl
+// accuracy number computed on a foreign or corrupt matrix must never be printed.
+void load_csr_or_die(const std::string& path, const std::vector<double>& areas,
+                     radiation::ViewFactorMatrix& F) {
+    std::ifstream f(path, std::ios::binary);
+    int32_t n = 0; double gh = 0.0;
+    if (f) { f.read(reinterpret_cast<char*>(&n), 4); f.read(reinterpret_cast<char*>(&gh), 8); }
+    if (!f) { std::cerr << "FATAL: PTM_BOWL_VF_CSR: cannot read " << path << "\n"; std::exit(3); }
+    if (static_cast<size_t>(n) != areas.size()) {
+        std::cerr << "FATAL: PTM_BOWL_VF_CSR: CSR has " << n << " faces, mesh " << areas.size()
+                  << " (wrong mesh or wrong PTM_BOWL_NRINGS/NAZ/NFLAT).\n";
+        std::exit(3);
+    }
+    const double mh = area_hash(areas);
+    if (std::fabs(gh - mh) > 1e-3 * std::fabs(mh) + 1e-9) {
+        std::cerr << "FATAL: PTM_BOWL_VF_CSR: geometry hash " << gh << " != mesh " << mh
+                  << ". The CSR was built for a different mesh.\n";
+        std::exit(3);
+    }
+    std::vector<int64_t> ip(static_cast<size_t>(n) + 1);
+    f.read(reinterpret_cast<char*>(ip.data()), static_cast<std::streamsize>(ip.size() * 8));
+    int64_t nnz = 0;
+    f.read(reinterpret_cast<char*>(&nnz), 8);
+    std::vector<int32_t> c32(static_cast<size_t>(nnz));
+    std::vector<float> v32(static_cast<size_t>(nnz));
+    f.read(reinterpret_cast<char*>(c32.data()), static_cast<std::streamsize>(nnz * 4));
+    f.read(reinterpret_cast<char*>(v32.data()), static_cast<std::streamsize>(nnz * 4));
+    if (!f || ip.back() != nnz) {
+        std::cerr << "FATAL: PTM_BOWL_VF_CSR: truncated or inconsistent CSR " << path << "\n";
+        std::exit(3);
+    }
+    size_t nover = 0; float vmin = 0.0f;
+    for (int32_t i = 0; i < n; ++i) {
+        double rs = 0.0;
+        for (int64_t k = ip[i]; k < ip[i + 1]; ++k) { rs += v32[k]; vmin = std::min(vmin, v32[k]); }
+        if (rs > 1.0 + 1e-6) ++nover;
+    }
+    if (nover > 0 || vmin < -1e-9f) {
+        std::cerr << "FATAL: PTM_BOWL_VF_CSR: invariants violated (rows>1=" << nover
+                  << ", min entry=" << vmin << ").\n";
+        std::exit(3);
+    }
+    std::vector<int> cols(c32.begin(), c32.end());
+    std::vector<double> vals(v32.begin(), v32.end());
+    F.setFromCSR(static_cast<size_t>(n), std::move(ip), std::move(cols), std::move(vals));
+    std::cout << "  [PTM_BOWL_VF_CSR] loaded " << path << ": N=" << n << " nnz=" << nnz
+              << ", mesh hash OK" << std::endl;
+}
+
+void write_csr_or_die(const std::string& path, const std::vector<double>& areas,
+                      const radiation::ViewFactorMatrix& F) {
+    std::ofstream f(path, std::ios::binary);
+    const int32_t n = static_cast<int32_t>(F.numRows());
+    const double gh = area_hash(areas);
+    const auto& ip = F.rowPointers();
+    const int64_t nnz = static_cast<int64_t>(F.numNonZeros());
+    std::vector<int32_t> c32(F.colIndices().begin(), F.colIndices().end());
+    std::vector<float> v32(F.values().begin(), F.values().end());
+    f.write(reinterpret_cast<const char*>(&n), 4);
+    f.write(reinterpret_cast<const char*>(&gh), 8);
+    f.write(reinterpret_cast<const char*>(ip.data()), static_cast<std::streamsize>(ip.size() * 8));
+    f.write(reinterpret_cast<const char*>(&nnz), 8);
+    f.write(reinterpret_cast<const char*>(c32.data()), static_cast<std::streamsize>(nnz * 4));
+    f.write(reinterpret_cast<const char*>(v32.data()), static_cast<std::streamsize>(nnz * 4));
+    if (!f) { std::cerr << "FATAL: cannot write " << path << "\n"; std::exit(3); }
+    std::cout << "  [PTM_BOWL_WRITE_CSR] wrote " << path << " (N=" << n << " nnz=" << nnz
+              << ", float32 values)" << std::endl;
+}
+
+// Binary PLY (double xyz, uchar+int32 faces). Each face is wound so that its
+// geometric normal agrees with the harness normal (inward on the bowl, +z on the
+// apron): mc_ref_pp uses the RAW winding normal and culls back-face hits.
+void write_bowl_ply(const std::string& path, const ptm::Mesh& m) {
+    std::ofstream f(path, std::ios::binary);
+    f << "ply\nformat binary_little_endian 1.0\nelement vertex " << m.vertices.size()
+      << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
+      << m.faces.size() << "\nproperty list uchar int vertex_indices\nend_header\n";
+    for (const auto& v : m.vertices) f.write(reinterpret_cast<const char*>(v.data()), 24);
+    size_t flipped = 0;
+    for (size_t i = 0; i < m.faces.size(); ++i) {
+        auto fc = m.faces[i];
+        const auto& a = m.vertices[fc[0]]; const auto& b = m.vertices[fc[1]];
+        const auto& c = m.vertices[fc[2]];
+        const double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        const double e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const double cr[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                              e1[0] * e2[1] - e1[1] * e2[0]};
+        const auto& nm = m.face_normals[i];
+        if (cr[0] * nm[0] + cr[1] * nm[1] + cr[2] * nm[2] < 0.0) { std::swap(fc[1], fc[2]); ++flipped; }
+        const unsigned char three = 3;
+        f.write(reinterpret_cast<const char*>(&three), 1);
+        const int32_t idx[3] = {fc[0], fc[1], fc[2]};
+        f.write(reinterpret_cast<const char*>(idx), 12);
+    }
+    if (!f) { std::cerr << "FATAL: cannot write " << path << "\n"; std::exit(3); }
+    std::cout << "  [PTM_BOWL_WRITE_PLY] wrote " << path << " (" << m.faces.size() << " faces, "
+              << flipped << " rewound to match the harness normals)" << std::endl;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -415,6 +547,41 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // R1 benchmark knobs (see the header). Validated up front so a typo FATALs
+    // before any work instead of silently running the default estimator.
+    const std::string write_ply = env_s("PTM_BOWL_WRITE_PLY", "");
+    const std::string vf_csr = env_s("PTM_BOWL_VF_CSR", "");
+    const std::string estimator = env_s("PTM_BOWL_ESTIMATOR", "exact");
+    const std::string dump_prefix = env_s("PTM_BOWL_DUMP", "");
+    const std::string write_csr = env_s("PTM_BOWL_WRITE_CSR", "");
+    if (!write_csr.empty() && (!vf_csr.empty() || !kprobe.empty() || dds.size() != 1)) {
+        std::cerr << "FATAL: PTM_BOWL_WRITE_CSR needs a BUILT matrix (no PTM_BOWL_VF_CSR / "
+                     "PTM_BOWL_KPROBE) and exactly one d/D." << std::endl;
+        return 1;
+    }
+    if (estimator != "exact" && estimator != "sparse_production") {
+        std::cerr << "FATAL: PTM_BOWL_ESTIMATOR=" << estimator
+                  << " (expected exact | sparse_production)." << std::endl;
+        return 1;
+    }
+    if (!vf_csr.empty() && (env_c("PTM_BOWL_ESTIMATOR") || !kprobe.empty())) {
+        std::cerr << "FATAL: PTM_BOWL_VF_CSR loads the matrix; it cannot be combined with "
+                     "PTM_BOWL_ESTIMATOR or PTM_BOWL_KPROBE." << std::endl;
+        return 1;
+    }
+    if (!vf_csr.empty() && dds.size() != 1) {
+        std::cerr << "FATAL: PTM_BOWL_VF_CSR is one mesh; pass exactly one d/D (got "
+                  << dds.size() << ")." << std::endl;
+        return 1;
+    }
+    if (estimator == "sparse_production" && (env_c("PTM_BOWL_VISTHRESH") || env_c("PTM_BOWL_WINDOW")))
+        std::cerr << "[bowl] WARNING: PTM_BOWL_ESTIMATOR=sparse_production uses the shipped "
+                     "RadiationConfig; PTM_BOWL_VISTHRESH / PTM_BOWL_WINDOW are NOT applied."
+                  << std::endl;
+    if (!dump_prefix.empty() && !env_flag("PTM_BOWL_RADIOSITY"))
+        std::cerr << "[bowl] WARNING: PTM_BOWL_DUMP is written only in PTM_BOWL_RADIOSITY=1 mode; "
+                     "nothing will be dumped." << std::endl;
+
     // CSV header (only if the file does not yet exist).
     {
         std::ifstream chk(results_path);
@@ -431,6 +598,17 @@ int main(int argc, char** argv) {
         Built b = build_mesh(dd, diameter, n_rings, n_az, flat_extent, n_flat_rings);
         size_t nf = b.mesh->faces.size();
         double mesh_eps = 1e-4 * b.r_rim;
+
+        if (!write_ply.empty()) {
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "_dd%.4g", dd);
+            write_bowl_ply(write_ply + tag + ".ply", *b.mesh);
+            write_npy(write_ply + tag + "_mask.npy", b.mask, {nf}, "<i4");
+            std::cout << "  faces=" << nf << "  (PTM_BOWL_WRITE_PLY: mesh only, no VF/solve)"
+                      << std::endl;
+            ++idx;
+            continue;
+        }
 
         RTCDevice dev = rtcNewDevice(nullptr);
         // The Ingersoll gate is exactly where someone checks a correctness or
@@ -451,7 +629,40 @@ int main(int argc, char** argv) {
         std::vector<double> rsums;
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        if (kprobe.empty()) {
+        if (kprobe.empty() && !vf_csr.empty()) {
+            // ---- R1: externally assembled CSR (the production MC estimator) ----
+            load_csr_or_die(vf_csr, b.areas, F);
+            rsums = F.rowSums();
+            std::vector<double> col_wsum;
+            if (recip) F.matvecTranspose(b.areas, col_wsum);
+            for (size_t i = 0; i < nf; ++i) {
+                if (b.mask[i] != 1) continue;
+                double rs = rsums[i];
+                if (recip) rs = 0.5 * rs + 0.5 * col_wsum[i] / std::max(b.areas[i], 1e-30);
+                fsky_face.push_back(1.0 - rs);
+                fsky_area.push_back(b.areas[i]);
+            }
+            kernel_label = "csr";
+        } else if (kprobe.empty() && estimator == "sparse_production") {
+            // ---- R1: the sparse point-kernel builder at SHIPPED defaults ----
+            radiation::RadiationConfig cfg;   // 20 / 500 / 95%, adaptive, as shipped
+            cfg.enabled = true;
+            cfg.verbose = false;
+            radiation::ViewFactorCalculator calc(b.mesh, dev, scene, cfg);
+            F = calc.computeAll();
+            rsums = F.rowSums();
+            std::vector<double> col_wsum;
+            if (recip) F.matvecTranspose(b.areas, col_wsum);
+            for (size_t i = 0; i < nf; ++i) {
+                if (b.mask[i] != 1) continue;
+                double rs = rsums[i];
+                if (recip) rs = 0.5 * rs + 0.5 * col_wsum[i] / std::max(b.areas[i], 1e-30);
+                fsky_face.push_back(1.0 - rs);
+                fsky_area.push_back(b.areas[i]);
+            }
+            kernel_label = "sparse_production";
+            if (!write_csr.empty()) write_csr_or_die(write_csr, b.areas, F);
+        } else if (kprobe.empty()) {
             // ---- production path: ViewFactorCalculator.computeAll() ----
             radiation::RadiationConfig cfg;
             cfg.enabled = true;
@@ -472,6 +683,7 @@ int main(int argc, char** argv) {
             radiation::ViewFactorCalculator calc(b.mesh, dev, scene, cfg);
             F = calc.computeAll();
             rsums = F.rowSums();
+            if (!write_csr.empty()) write_csr_or_die(write_csr, b.areas, F);
 
             std::vector<double> col_wsum;            // (F^T areas)_i = sum_j A_j F_ji
             if (recip) F.matvecTranspose(b.areas, col_wsum);
@@ -1071,6 +1283,22 @@ int main(int argc, char** argv) {
                   << leak_gray / std::max(P_inc, 1e-30) * 100.0 << ","
                   << leak_2band / std::max(P_inc, 1e-30) * 100.0 << ","
                   << q_vis_floor << "," << q_ir_floor << "," << P_ind_vis << "," << P_escaped << "\n";
+            }
+
+            if (!dump_prefix.empty()) {
+                // Per-face state at the converged T, for per-face accuracy metrics
+                // (Q_ind RMS vs a high-ray-budget reference at the same N). One
+                // extra solve AFTER every printed number, so nothing above moves.
+                std::vector<double> qind = solver.solve(T, solver_solar);
+                write_npy(dump_prefix + "_T.npy", T, {nf}, "<f8");
+                write_npy(dump_prefix + "_qind.npy", qind, {nf}, "<f8");
+                write_npy(dump_prefix + "_mask.npy", b.mask, {nf}, "<i4");
+                write_npy(dump_prefix + "_areas.npy", b.areas, {nf}, "<f8");
+                if (solver.isTwoBand()) {
+                    write_npy(dump_prefix + "_qvis.npy", solver.lastIndirectVisible(), {nf}, "<f8");
+                    write_npy(dump_prefix + "_qir.npy", solver.lastIndirectIR(), {nf}, "<f8");
+                }
+                std::cout << "  [PTM_BOWL_DUMP] wrote " << dump_prefix << "_*.npy" << std::endl;
             }
 
             rtcReleaseScene(scene);

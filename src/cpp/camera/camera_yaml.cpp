@@ -215,7 +215,7 @@ bool loadCameraYaml(const std::string& filepath, CameraSimConfig& config) {
             // Hapke parameters. w is the single-scattering albedo (calibrated to
             // the body's geometric albedo via the opposition-excluded disk
             // integral); B0/h/g/theta_bar are the phase-dependence structural
-            // params (Fermi's class-based provisional defaults — override here).
+            // params (the physics review's class-based provisional defaults — override here).
             config.photometric_params.hapke_w =
                 getOr(ph, "hapke_w", config.photometric_params.hapke_w);
             config.photometric_params.hapke_B0 =

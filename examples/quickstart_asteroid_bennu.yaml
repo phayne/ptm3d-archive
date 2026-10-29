@@ -86,7 +86,7 @@ thermal:
   crater_dd_ratio: 8.0
   geothermal_heat_flow: -1.0
 thermophysical:
-  # PTM-67 (docs/KNOWN_LIMITATIONS.md): for a generic body, only
+  # (docs/KNOWN_LIMITATIONS.md): for a generic body, only
   # generic_body.surface: below is read; the plain-named keys in this block
   # are inert except use_default_albedo, which IS read on every body type.
   use_default_albedo: false

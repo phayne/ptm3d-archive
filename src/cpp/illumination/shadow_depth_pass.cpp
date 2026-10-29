@@ -80,7 +80,7 @@ bool writeRawCount(const std::string& path, const std::vector<uint32_t>& v) {
     return static_cast<bool>(o);
 }
 
-// Same naming rule as every other per-step product (BUGS.md PTM-664): width
+// Same naming rule as every other per-step product: width
 // from the window's epoch count, minimum six digits.
 std::string frameIndex(int k, int n_steps) {
     return ptm::frameIndexString(k, n_steps);
@@ -120,7 +120,7 @@ bool runShadowDepthPass(const PassInputs& in, std::string& err) {
     }
     // The same invariant flux_cube_pass asserts, for the same reason: the output
     // epoch grid divides the COMBINED equilibration+output span, so re-deriving
-    // it is PTM-250/251. If these do not add up, the rows this pass writes do not
+    // it is the output-epoch drift defect. If these do not add up, the rows this pass writes do not
     // line up with time_steps.txt and nothing downstream would notice.
     //
     // ⛔ THE RELATION IS `<=`, NOT `==`, AND THAT IS NOT A LOOSENING.
@@ -316,13 +316,13 @@ bool runShadowDepthPass(const PassInputs& in, std::string& err) {
             err = std::string("shadow depth: cannot create ") + frames_dir + ": " + e.what();
             return false;
         }
-        // Frames of the other index width are a previous run's (BUGS.md PTM-664).
+        // Frames of the other index width are a previous run's.
         const long long stale = ptm::removeOtherWidthFrames(
             frames_dir, "shadow_depth", ptm::frameIndexWidth(n_steps));
         if (stale > 0) {
             std::cerr << "[shadow-depth] NOTE: removed " << stale << " stale shadow_depth_*.bin "
                          "frame(s) of a different index width from " << frames_dir
-                      << "/ (a previous run's; BUGS.md PTM-664)." << std::endl;
+                      << "/ (a previous run's; )." << std::endl;
         }
     }
 

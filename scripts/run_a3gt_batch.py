@@ -168,11 +168,11 @@ DEM    = None
 # is the binary this checkout built, and it is on local disk, so it cannot hit
 # OneDrive's on-demand fetch and the `execve` "operation canceled" (errno 89)
 # that motivated the /tmp copy. Both older paths remain as fallbacks, and the
-# choice is PRINTED rather than made silently. See BUGS.md PTM-04 and
+# choice is PRINTED rather than made silently. See
 # docs/dem-to-mesh-workflow.md.
 DTM_TOOL_REPO   = REPO / "build" / "bin" / "dtm_to_ply_delaunay"
 DTM_TOOL_LOCAL  = Path("/tmp/dtm_to_ply_delaunay")
-DTM_TOOL_REMOTE = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/dtm/dtm_to_ply_delaunay")
+DTM_TOOL_REMOTE = Path(os.environ.get("PTM_DTM_TOOL", "/nonexistent/dtm_to_ply_delaunay"))
 
 
 def _pick_dtm_tool():

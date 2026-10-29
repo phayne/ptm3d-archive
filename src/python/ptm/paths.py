@@ -348,13 +348,21 @@ def preflight(items=(), root=None, engine=None, start=None):
         else:
             path, what, remedy = item, None, None
         path = Path(path).expanduser()
+        rel = path.as_posix()
         if not path.is_absolute() and root is not None:
             path = root / path
+        # Same contract as the engine: a relative data/... path resolves under
+        # $PTM_DATA_ROOT first (it points AT the data directory), then <repo>/data.
         if what is None:
             try:
                 what = str(path.relative_to(root)) if root else str(path)
             except ValueError:
                 what = str(path)
+        data_root = os.environ.get("PTM_DATA_ROOT")
+        if data_root and rel.startswith("data/") and not path.exists():
+            candidate = Path(data_root).expanduser() / rel[len("data/"):]
+            if candidate.exists():
+                path = candidate
         if remedy is None:
             remedy = remedy_for(path, root)
         checks.append(Check(path=path, what=what, remedy=remedy,

@@ -92,7 +92,7 @@ public:
      * Siegler (2021) Eq. 10. It is INTENTIONALLY not defaulted: a defaulted
      * argument would let a new GPU entry point silently run Hayne while the
      * config asked for Martinez, which is precisely the failure mode of
-     * BUGS.md PTM-53. Make the compiler ask.
+     * the built-in-body property override. Make the compiler ask.
      */
     void setMaterialParams(
         float cp0,

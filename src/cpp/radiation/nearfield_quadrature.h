@@ -47,7 +47,7 @@ namespace radiation {
 // used the GEOMETRIC MEAN: Ns = r / (A_i A_j)^(1/4) <= adaptive_ns_threshold
 // (5). The geometric mean cannot see an area contrast. Measured M1 error
 // against the same quadrature run to convergence (m = 32, ~1.05e6 evaluations
-// per pair; ~/projects/ada_vfunify_2026-08-23/probe/window_curve.py):
+// per pair, with a standalone probe script):
 //
 //   A_j/A_i        at the OLD cut (Ns = 5)     at THIS cut (w = 4)
 //   1              Ns 5,      M1 +3.49%        Ns 8,      M1 +1.38%
@@ -439,7 +439,7 @@ inline double nearFieldPairIntegral(const std::array<double, 3>& a0,
     if (n_valid == 0) return 0.0;
 
     // Divide by the TOTAL sample-pair count, never by the survivors. Dividing by
-    // the survivors would condition the estimate on detection -- FC-08's error --
+    // the survivors would condition the estimate on detection -- the view-factor divisor defect's error --
     // and inflates the near field by +1.42 percent mass-weighted / +25 percent on
     // the worst pair, while the cut itself discards 0.00000 percent of the
     // coupling mass (measured 2026-08-23). This divisor is correct; do not "fix"

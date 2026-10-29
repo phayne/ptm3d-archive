@@ -73,21 +73,27 @@ def _skip(reason):
 def documented_recommended_on():
     """Parse the ``[recommended-ON]`` set out of docs/ENVIRONMENT.md.
 
-    The doc states it as one backtick-quoted, whitespace-separated run of
-    ``NAME=VALUE`` pairs after "The validated set is:". Parsing it rather than
+    The doc states it inside the ``[recommended-ON]`` status-tag bullet, as a
+    bold lead-in that starts "The validated set" followed by ONE backtick-quoted,
+    whitespace-separated run of ``NAME=VALUE`` pairs. The lead-in's exact wording
+    is free; the bundle's content is what is parsed. Parsing it rather than
     copying it is the point -- a copy would be one more table to drift.
     """
     text = ENVIRONMENT_DOC.read_text()
-    marker = "**The validated set is:**"
-    assert marker in text, (
-        f"{ENVIRONMENT_DOC} no longer contains {marker!r}; this test can no "
-        f"longer find the recommended-ON set and would silently pass")
-    tail = text.split(marker, 1)[1]
-    # The set is the run of `PTM_...=...` tokens up to the sentence that ends it.
-    body = tail.split("New science runs", 1)[0]
-    pairs = re.findall(r"(PTM_[A-Z0-9_]+)=([^\s`]+)", body)
-    assert pairs, f"no PTM_NAME=VALUE pairs found after {marker!r} in {ENVIRONMENT_DOC}"
+    m = re.search(r"\*\*The validated set[^*]*\*\*\s*`([^`]+)`", text)
+    assert m, (
+        f"{ENVIRONMENT_DOC} has no bold 'The validated set ...' lead-in followed "
+        f"by a backtick-quoted NAME=VALUE run; this test can no longer find the "
+        f"recommended-ON set and would silently pass")
+    pairs = re.findall(r"(PTM_[A-Z0-9_]+)=([^\s`]+)", m.group(1))
+    assert pairs, f"no PTM_NAME=VALUE pairs in the validated set of {ENVIRONMENT_DOC}"
     return dict(pairs)
+
+
+def documented_variables():
+    """Every variable docs/ENVIRONMENT.md documents with a table row."""
+    return set(re.findall(r"^\|\s*`(PTM_[A-Z0-9_]+)`\s*\|",
+                          ENVIRONMENT_DOC.read_text(), re.M))
 
 
 # --------------------------------------------------------------------------
@@ -117,10 +123,15 @@ def test_every_omission_is_on_the_record():
         "docs/ENVIRONMENT.md marks these [recommended-ON] and the GUI neither "
         f"injects them nor records why: {unexplained}. Add them to "
         "RECOMMENDED_ENGINE_ENV, or to DELIBERATELY_NOT_INJECTED with a reason.")
-    stale = sorted(set(DELIBERATELY_NOT_INJECTED) - omitted)
+    # An entry may also be a documented variable that has LEFT the validated
+    # set: the GUI still manages it (strips an inherited copy), so it stays on
+    # the record. What it may not be is undocumented, or injected anyway.
+    stale = sorted(set(DELIBERATELY_NOT_INJECTED) - omitted - documented_variables())
     assert not stale, (
-        "these entries in DELIBERATELY_NOT_INJECTED are no longer omitted "
-        f"documented variables and should be deleted: {stale}")
+        "these entries in DELIBERATELY_NOT_INJECTED are not documented in "
+        f"docs/ENVIRONMENT.md at all and should be deleted: {stale}")
+    both = sorted(set(DELIBERATELY_NOT_INJECTED) & set(RECOMMENDED_ENGINE_ENV))
+    assert not both, f"declared not-injected AND injected: {both}"
     for name, reason in DELIBERATELY_NOT_INJECTED.items():
         assert reason and len(reason) > 20, (
             f"DELIBERATELY_NOT_INJECTED[{name!r}] needs a real reason, not {reason!r}")
@@ -165,7 +176,7 @@ def test_a_config_can_decline_the_flags():
 
     # Declining has to survive a shell that already exports the variable.
     # Setting-only would leave the child running with it while this function
-    # reported an empty environment -- the PTM-276 hole, from the other side.
+    # reported an empty environment -- the injected-variable hole, from the other side.
     inherited = {"PTM_EQ_PERFACE_FLUX": "1", "PTM_ILLUM_RISE_EPS": "1",
                  "PATH": "/usr/bin"}
     env, applied = build_engine_env({"engine_env": {}}, base_env=inherited)
@@ -256,7 +267,7 @@ def test_loading_a_config_does_not_re_add_the_flags():
 
 
 def test_a_shell_export_cannot_re_enable_the_dropped_variable():
-    """PTM-276 from the other side, in the default (no engine_env:) case.
+    """The injected-variable hole from the other side, in the default (no engine_env:) case.
 
     The GUI stopped injecting PTM_EQ_PERFACE_FLUX. That is worth nothing if a
     user who once exported it in their shell still hands it to every GUI run,

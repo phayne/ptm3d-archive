@@ -3,7 +3,7 @@
 
 The GUI's "Check configuration" hands a config to the engine and reports the
 ENGINE's own text, so it stops maintaining a second, weaker copy of rules that
-then disagrees with the engine (docs/design/gui-update-plan.md item 2.4, DP-6).
+then disagrees with the engine (the GUI update plan (docs/design/gui-update-plan.md in git history) item 2.4, DP-6).
 That is only worth anything if the mode really is what it claims:
 
 * it accepts a configuration the engine would accept,
@@ -197,7 +197,7 @@ def test_engine_refusals_are_reproduced_verbatim():
 
 
 def test_malformed_yaml_is_refused_not_defaulted():
-    """PTM-66: a rejected config must never fall back to built-in defaults."""
+    """Malformed-config handling: a rejected config must never fall back to built-in defaults."""
     exe = _engine()
     with tempfile.TemporaryDirectory() as tmp:
         config = Path(tmp) / "broken.yaml"
@@ -249,7 +249,7 @@ def test_nothing_is_simulated_and_nothing_is_written():
 
 
 def test_unbacked_body_names_are_refused():
-    """BUGS.md ENG-BODY-UNBACKED-RUN, both polarities.
+    """Unknown-body fallback, both polarities.
 
     `simulation.body` used to accept any string: an unrecognized name resolved
     to EUROPA's properties in `PlanetaryData::getPropertiesByName`, so

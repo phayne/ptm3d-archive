@@ -45,8 +45,8 @@ Issues = "https://github.com/phayne/ptm3d/issues"
 
 [tool.setuptools]
 package-dir = { "" = "src/python" }
-# Listed explicitly: src/python also holds ~110 loose modules and two further
-# packages (ptm_ice, ojakangas_stevenson) that are not part of this
+# Listed explicitly: src/python also holds ~110 loose modules and one further
+# package (ptm_ice) that is not part of this
 # distribution.
 #
 # damit and horizons ARE, as of the tutorial-04 work: they are the small-body

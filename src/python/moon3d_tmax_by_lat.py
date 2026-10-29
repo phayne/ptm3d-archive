@@ -32,6 +32,7 @@ each LAT DIR (a directory holding mesh.ply + statistics/temperature_max.bin):
     --run -84.79 /path/native/coupled --run -80 /path/lat80/coupled ...
 """
 from __future__ import annotations
+import os
 import argparse
 from pathlib import Path
 import sys
@@ -51,7 +52,7 @@ from moon3d_temp_3d import read_ply_vertices_double, tri_faces
 from ptm_pubstyle import apply_style, DOUBLE_W
 import ptm_population as pop
 
-HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
+HEAT3D = Path(os.environ.get("PTM_HEAT3D_ROOT", str(Path(__file__).resolve().parents[3])))   # holds output/<run>
 
 # (run dir, latitude in deg). Native patch first so it renders upper-left, per
 # the manuscript Fig 16 ordering (upper-left to lower-right: -84.8, -80, ..., -60).

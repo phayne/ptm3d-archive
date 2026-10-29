@@ -5,13 +5,13 @@ Two defects found while verifying a 2026-09-02 lunar polar flux-cube product,
 both
 of which every structural check passed:
 
-* **PTM-460** -- ``scripts/ptm_flux_cubes_to_hdf5.py`` read ``statistics/*.bin``
+* **Flux-cube statistics header** -- ``scripts/ptm_flux_cubes_to_hdf5.py`` read ``statistics/*.bin``
   with a bare ``np.fromfile(dtype=float32)``, which takes the file's 4-byte
   uint32 face-count HEADER as if it were the first face's temperature and
-  shifts every face by one index. That is PTM-06's bug class, recurring in a
-  script written after PTM-06 had been fixed in ``ptm_qa.py``. It printed
+  shifts every face by one index. That is the statistics-header off-by-one bug class, recurring in a
+  script written after the statistics-header off-by-one had been fixed in ``ptm_qa.py``. It printed
   "2397891 faces" for a 2,397,890-face mesh and nobody read the number.
-* **PTM-461** -- the engine wrote the flux-cube provenance JSON's
+* **Flux-cube hash precision** -- the engine wrote the flux-cube provenance JSON's
   ``geomhash_core`` through a default-precision ``ostream``: six significant
   digits, so a hash of the form 31904726.165896364 was recorded as 31904700.0.
 
@@ -80,7 +80,7 @@ def write_stat_bin(path, values, declared_n=None):
     return path
 
 
-# --------------------------------------------------------------- PTM-460
+# --------------------------------------------------------------- the flux-cube statistics header
 def test_a_statistics_binary_is_read_past_its_face_count_header():
     """THE ARM. The values that come back are the values that went in.
 
@@ -149,7 +149,7 @@ def test_a_ply_face_count_is_read_from_the_header():
     assert m.ply_face_count(str(scratch() / "nope.ply")) is None
 
 
-# --------------------------------------------------------------- PTM-461
+# --------------------------------------------------------------- the flux-cube hash precision
 def _extract_geomhash_formatting():
     """The engine's own two lines that render `geomhash_core`, from the source.
 
@@ -163,7 +163,7 @@ def _extract_geomhash_formatting():
     if not lines:
         raise AssertionError(
             "no line in ptm_thermal_sim.cpp streams `geomhash_core` into a "
-            "string. PTM-461's fix has been removed or renamed.")
+            "string. The geometry-hash precision fix has been removed or renamed.")
     if len(lines) != 1:
         raise AssertionError(f"expected one such line, found {len(lines)}: {lines}")
     stream_line = lines[0]
@@ -268,7 +268,7 @@ def test_six_significant_digits_is_a_provenance_loss_not_a_gate_failure():
     rel = abs(CORE_GEOMHASH - six) / CORE_GEOMHASH
     assert rel < 1e-3, (
         f"relative loss {rel:.3g} is NOT inside the pass's 1e-3 match "
-        f"tolerance, so PTM-461 would have been a gate failure and the "
+        f"tolerance, so the hash-precision defect would have been a gate failure and the "
         f"'provenance-only' claim in the commit message is wrong")
     assert six != CORE_GEOMHASH, "no loss at all; this arm has no subject"
 
@@ -296,7 +296,7 @@ def test_the_packager_copies_the_provenance_number_at_full_precision():
             f"the packaged attribute is "
             f"{float(h.attrs['engine_geomhash_core'])!r}")
     assert hasattr(m, "read_face_stat_bin"), \
-        "the packager under test is not the one carrying the PTM-460 fix"
+        "the packager under test is not the one carrying the statistics-header fix"
 
 
 TESTS = [

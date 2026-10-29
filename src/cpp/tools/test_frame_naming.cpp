@@ -1,4 +1,4 @@
-// test_frame_naming -- per-step frame file names (BUGS.md PTM-664).
+// test_frame_naming -- per-step frame file names.
 //
 // Frames were zero-padded to FOUR digits, a MINIMUM width, so frame 10000 was
 // "10000" and an alphabetical listing of a >10,000-frame run came out

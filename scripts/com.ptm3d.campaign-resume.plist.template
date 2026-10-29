@@ -7,7 +7,7 @@
   this file and nothing depends on it. Read it, decide whether you want it,
   edit the two placeholders, and install it yourself. The rationale, the
   install and remove commands, and the reasons you might NOT want it are in
-  docs/gpu-wedge-guardrails.md, section "Unattended resume after a power
+  docs/dev/gpu-wedge-guardrails.md, section "Unattended resume after a power
   cycle".
 
   Short version: a wedged GPU can power-cycle the machine mid campaign, and
@@ -32,7 +32,7 @@
         <string>/bin/sh</string>
         <string>-lc</string>
         <!-- Replace with the ONE command that resumes your campaign; see
-             docs/gpu-wedge-guardrails.md for a worked example. -->
+             docs/dev/gpu-wedge-guardrails.md for a worked example. -->
         <string>__RESUME_COMMAND__</string>
     </array>
 

@@ -156,7 +156,7 @@ def verify_unpacked(tarball, target_dir):
     The `.unpacked` marker records only that an unpack once HAPPENED with a given
     archive checksum. It says nothing about the files afterwards, so a tree whose
     marker matches the manifest can still hold stale or hand-edited data. That is
-    not hypothetical: it is exactly how the PTM-34 lunar albedo misregistration
+    not hypothetical: it is exactly how the longitude-rolled lunar albedo misregistration
     survived a corrected archive for months -- the archive was right, the loader
     was right, and every check that existed passed while the bins on disk were the
     old 180-degree-rolled ones. Checking the archive alone cannot see that.

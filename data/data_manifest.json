@@ -8,7 +8,7 @@
     "moon-topo": {
       "description": "Moon global icosphere topography ico3-ico9 (LOLA-derived)",
       "tier": "core",
-      "attribution": "Derived from LRO LOLA LDEM (Smith et al. 2010); NASA PDS public domain",
+      "attribution": "Moon3D project testbed scan (Haddad et al. 2026)",
       "license": "CC-BY-4.0",
       "files": [
         {
@@ -81,9 +81,9 @@
       ]
     },
     "moon3d-mesh": {
-      "description": "Moon3D 500k-face global terrain mesh (LOLA-derived PLY)",
+      "description": "Moon3D testbed crater scan: Delaunay triangulation of an 849,283-point Moon3D instrument point cloud (1,698,304 faces, binary PLY), the undecimated source of the 509,337-face mesh used in the Moon3D paper",
       "tier": "core",
-      "attribution": "Derived from LRO LOLA LDEM (Smith et al. 2010); NASA PDS public domain",
+      "attribution": "Moon3D project testbed scan (Haddad et al. 2026)",
       "license": "CC-BY-4.0",
       "files": [
         {

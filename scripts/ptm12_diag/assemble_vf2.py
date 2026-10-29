@@ -5,11 +5,11 @@ Hardcoded to the moon3d 509,337-face mesh and its anchor files; assemble_vf_hawo
 is the general version and the one to prefer.
 The MIN-HIT filter was originally introduced to suppress single-ray survivors that the
 symmetrization stamped onto both rows. That was a mitigation, not a repair: the actual
-defect was the symmetrization divisor, fixed below (FC-08).
+defect was the symmetrization divisor, fixed below.
 Usage: assemble_vf2.py <MIN_HITS=5>   (hits = F*NRAYS, NRAYS=40000)
 CSR: int32 n, float64 geomhash, int64 indptr[n+1], int64 nnz, int32 cols[nnz], float32 data[nnz]."""
 import numpy as np, glob, time, sys, os
-DIAG="/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/scripts/ptm12_diag"
+DIAG=os.path.dirname(os.path.abspath(__file__))
 N=509337; NRAYS=int(sys.argv[2]) if len(sys.argv)>2 else 40000
 MIN_HITS=float(sys.argv[1]) if len(sys.argv)>1 else 5.0
 FTHR=MIN_HITS/NRAYS
@@ -35,7 +35,7 @@ key=lo*np.int64(N)+hi
 o=np.argsort(key,); key=key[o]; S=S[o]; lo=lo[o]; hi=hi[o]; del o
 bnd=np.concatenate(([0],np.nonzero(np.diff(key))[0]+1,[len(key)]))
 gs=bnd[:-1]; ge=bnd[1:]; csum=np.concatenate(([0.0],np.cumsum(S)))
-# FC-08 (2026-08-19): divide by the 2 ray directions TRIED, not by the number that
+# divide by the 2 ray directions TRIED, not by the number that
 # happened to hit. A direction with no hit is the measured zero it is (the sweep visits
 # every face in both roles); dividing by the hit count conditions on detection and
 # inflates far-field entries by up to 2x. See assemble_vf_haworth.py for the full note

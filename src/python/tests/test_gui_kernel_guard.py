@@ -16,7 +16,7 @@ WHAT WENT WRONG, on 2026-08-31, in one session of ordinary testing:
    regeneration needed no download at all: it happened on the CACHE-HIT path,
    where ``from_cache=True`` and the fetch is supposed to be a read.
 
-GUI-FETCH-CLOBBERS-COMMITTED-KERNELS. The arms below are the four properties
+The arms below are the four properties
 that make each of those impossible, plus the negative control that keeps the
 guard from costing anything on the ordinary path:
 

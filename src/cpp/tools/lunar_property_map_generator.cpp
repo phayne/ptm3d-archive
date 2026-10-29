@@ -4,7 +4,7 @@
 // onto icosphere face centers, compute exp(-z/zs)-weighted depth-averaged thermal
 // inertia at 273 K, and write per-face binary maps for use by ptm_thermal_sim.
 //
-// Raster format (from /Users/paha3326/.../moon/hpar/dataset/test-file-io.ipynb):
+// Raster format (from the source dataset's test-file-io notebook):
 //   dtype:           float32, little-endian, row-major
 //   pixels-per-deg:  128
 //   samples/line:    360 * 128 + 1     = 46081  (both 0 and 360 endpoints)

@@ -1,4 +1,4 @@
-// Standalone gate for the lunar albedo-map registration tripwire (PTM-34/PTM-35).
+// Standalone gate for the lunar albedo-map registration tripwire.
 //
 // The tripwire's job is to catch a mis-registered albedo map at load time. Its
 // two failure modes are equally serious:
@@ -94,10 +94,10 @@ std::vector<double> bakeAlbedo(const std::vector<double>& lat,
             case Transform::kCorrect:
                 a[i] = synthAlbedo(lat[i], lon[i]);
                 break;
-            case Transform::kLonRoll180:  // PTM-34
+            case Transform::kLonRoll180:  // the albedo-map longitude-roll
                 a[i] = synthAlbedo(lat[i], lon[i] + 180.0);
                 break;
-            case Transform::kLatFlip:  // PTM-35
+            case Transform::kLatFlip:  // the albedo generator latitude flip
                 a[i] = synthAlbedo(-lat[i], lon[i]);
                 break;
         }
@@ -124,20 +124,20 @@ int main() {
         check(r.ns_contrast > 0.0, "correct map: north/south contrast is positive");
     }
 
-    // 2. PTM-34, a 180-degree longitude roll, must be caught.
+    // 2. A 180-degree longitude roll must be caught.
     {
         const auto a = bakeAlbedo(glat, glon, Transform::kLonRoll180);
         const auto r = ptm::checkAlbedoMapRegistration("Moon", glat, glon, a, "synthetic lon+180");
-        check(r.applicable && r.suspect, "PTM-34 longitude roll: FLAGGED");
+        check(r.applicable && r.suspect, "longitude roll: FLAGGED");
     }
 
-    // 3. PTM-35, a latitude flip, must be caught. This is the one the bright-dark
+    // 3. A latitude flip must be caught. This is the one the bright-dark
     //    contrast alone barely sees, which is why the north/south test exists.
     {
         const auto a = bakeAlbedo(glat, glon, Transform::kLatFlip);
         const auto r = ptm::checkAlbedoMapRegistration("Moon", glat, glon, a, "synthetic -lat");
-        check(r.applicable && r.suspect, "PTM-35 latitude flip: FLAGGED");
-        check(r.ns_contrast < 0.0, "PTM-35 latitude flip: north/south contrast goes negative");
+        check(r.applicable && r.suspect, "latitude flip: FLAGGED");
+        check(r.ns_contrast < 0.0, "latitude flip: north/south contrast goes negative");
     }
 
     // 4. Non-lunar bodies must never be touched. Europa's FITS registers correctly

@@ -32,7 +32,7 @@ sections, instead of trusting whatever it happens to find.
 One textual ambiguity is resolved rather than assumed away.
 ``const auto& X = Y["Z"];`` is written for both a section and a single key, and
 reading every one of them as a section dropped the keys bound that way while
-still reporting the table current (PTM-ENGINECONFIG-ALIAS-DROPS-KEY). See
+still reporting the table current. See
 :func:`_section_aliases`: an alias is a section only if the parser goes on to
 read keys OUT of it.
 """
@@ -287,7 +287,7 @@ def _section_aliases(body):
         const auto& d = output["map_depths_m"];     a KEY -- Z is the key, and
                                                     the alias is the value
 
-    Reading both as the first was PTM-ENGINECONFIG-ALIAS-DROPS-KEY: the second
+    Reading both as the first was the second
     form put ``output.map_depths_m`` in the SECTIONS set, and sections are
     excluded from the defaults table, so the key was dropped -- while
     ``python3 -m ptm.engine_config`` still printed "engine_defaults.py is

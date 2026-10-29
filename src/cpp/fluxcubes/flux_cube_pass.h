@@ -14,7 +14,7 @@
 //     A blended B is not the B of any state.
 //  3. The loop has TWO dispatch sites (single-timestep and multi-GPU pool).
 //     Evaluating there means two insertion points that must agree forever --
-//     the PTM-106c "two spellings of one formula" defect class. After the loop
+//     the "two spellings of one formula" defect class. After the loop
 //     both routes have written the same blended series, and that confluence is
 //     what makes this pass route-blind.
 //
@@ -62,7 +62,7 @@ struct PassInputs {
     // --- time axis -------------------------------------------------------
     // MUST be the same (times, time_strings) pair that was handed to
     // writeTimeStepsFile for this run. Re-deriving the grid from
-    // start_time + i*dt is exactly the PTM-250/251 defect (the output epoch
+    // start_time + i*dt is exactly the output-epoch drift defect (the output epoch
     // grid divides the COMBINED equilibration+output span, and the stride
     // export path filters). The pass asserts its row count against these.
     const std::vector<double>* times = nullptr;
@@ -107,8 +107,8 @@ struct PassInputs {
     // The engine's own solarConstForStep(t, S) with S already bound.
     std::function<double(int)> solar_const;
     // The engine's own applyIncidenceAlbedo(base_A, direct_flux, S) with the
-    // PTM-106 coefficients already bound. Null => the source albedo falls back
-    // to the Bond value, which is the legacy (pre-PTM-106) behavior and is
+    // two-band source-albedo coefficients already bound. Null => the source albedo falls back
+    // to the Bond value, which is the legacy (pre-fix) behavior and is
     // recorded in the header rather than assumed.
     std::function<double(double, double, double)> source_albedo;
     // The engine's own primary-body physics, taking mean_cos (not a normal).

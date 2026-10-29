@@ -2,8 +2,8 @@
 //
 // ONE implementation, shared by every solver path. Before this file the reader
 // and the writer lived inline in the GPU persistent solver and were duplicated
-// a third time by the PTM-57 post-coupling rewrite; the CPU paths had no copy
-// at all, which is BUGS.md PTM-76.
+// a third time by the coupled checkpoint hand-off post-coupling rewrite; the CPU paths had no copy
+// at all, which the CPU checkpoint support fixed.
 //
 // ---------------------------------------------------------------------------
 // FORMAT (v1 -- unchanged; every banked state on disk is this layout)
@@ -30,9 +30,9 @@
 //     uint32   version       = 2
 //     uint32   trailer_bytes             total, including magic and crc32
 //     uint32   n_layers                  must equal the v1 header's n_layers
-//     float64  z[n_layers]               THE DEPTH GRID (closes PTM-STATE-GRID-BLIND)
+//     float64  z[n_layers]               THE DEPTH GRID (closes the unchecked checkpoint grid)
 //     float64  et_seconds                SPICE ET this column is valid at
-//                                        (closes PTM-STATE-NO-EPOCH)
+//                                        (closes the unrecorded checkpoint epoch)
 //     float64  output_cadence_s          the writing run's output cadence
 //     float64  refgrid_H
 //     int32    grid_m, grid_n, grid_b, reserved0
@@ -65,8 +65,8 @@
 // properties that set the skin depth, and not the EPOCH. Two runs whose grids
 // differ but whose LAYER COUNT happens to agree will load each other's
 // checkpoints without complaint, and the restored column is silently
-// reinterpreted onto the wrong depths. Those are BUGS.md PTM-STATE-GRID-BLIND
-// and PTM-STATE-NO-EPOCH.
+// reinterpreted onto the wrong depths. Those are the unchecked checkpoint grid
+// and the unrecorded checkpoint epoch.
 //
 // The v2 trailer closes both FOR FILES THAT CARRY IT. For a v1 file the gap is
 // unchanged and is made AUDIBLE instead: gridFingerprint() prints the live grid
@@ -100,7 +100,7 @@
 // tolerance.
 //
 // ---------------------------------------------------------------------------
-// THE WRITE IS ATOMIC (BUGS.md PTM-STATE-ATOMIC)
+// THE WRITE IS ATOMIC
 // ---------------------------------------------------------------------------
 // write() never truncates the destination. It creates `<path>.tmp-<pid>` in the
 // SAME DIRECTORY (therefore the same filesystem), writes the whole file there,
@@ -111,7 +111,7 @@
 // Before this, write() opened the destination with ios::trunc: the destination
 // was destroyed the moment the write began, and a kill, a full disk or a crash
 // mid-stream left a truncated file. read() refuses such a file (good) -- but
-// the checkpoint it refuses is the one that was already there. The PTM-57
+// the checkpoint it refuses is the one that was already there. The coupled checkpoint hand-off
 // post-coupling re-archive (ptm_thermal_sim.cpp) is the sharp case: it is a
 // read-modify-write IN PLACE, so it destroyed a VALID checkpoint in order to
 // write a better one. It reads the whole file into memory before calling
@@ -181,7 +181,7 @@ constexpr std::size_t kBodyNameBytes = 32;
 constexpr std::size_t kGitShaBytes   = 48;
 
 namespace flag {
-// bit0 -- the state is the POST-radiation-coupling column (BUGS.md PTM-57).
+// bit0 -- the state is the POST-radiation-coupling column.
 //         Clear means it is iter-0's un-coupled column, which the next chunk
 //         would resume radiation-fed faces from.
 constexpr std::uint32_t kPostCouplingComplete = 1u << 0;
@@ -191,7 +191,7 @@ constexpr std::uint32_t kPostCouplingComplete = 1u << 0;
 constexpr std::uint32_t kAllFacesPatched = 1u << 1;
 // bit2 -- the writing run had thermal coupling_select_dt > 0, so the
 //         re-thermal selector could freeze a face that had nonzero indirect
-//         flux (Fermi F4). A warm start must refuse such a state.
+//         flux. A warm start must refuse such a state.
 constexpr std::uint32_t kCouplingSelectDtPositive = 1u << 2;
 // bit3 -- RESERVED for batch-completion partials (plan phase 1D'). Nothing
 //         writes it today; a reader REFUSES it, so the bit can never be
@@ -457,7 +457,7 @@ inline std::vector<unsigned char> serializeTrailerPrefix(const Trailer& t) {
 // function produced before v2 existed -- 12-byte header then the float32 body,
 // nothing added. The argument is mandatory rather than defaulted on purpose:
 // every call site has to decide whether the state it is banking can describe
-// itself, and a site that quietly downgraded a v2 file to v1 (the PTM-57
+// itself, and a site that quietly downgraded a v2 file to v1 (the coupled checkpoint hand-off
 // re-archive is a read-modify-WRITE and would have) is exactly the silent loss
 // this signature makes impossible to write by accident.
 inline bool write(const std::string& path,
@@ -876,7 +876,7 @@ inline bool named(const std::vector<std::string>& allow, const char* key) {
 // "grid_n", "grid_b", "refgrid_H", "epoch" -- and deliberately NOT a blanket
 // force: a `--force` that turns off every guard at once is the "warn instead of
 // refuse" policy wearing a hat, and warning instead of refusing is what made
-// PTM-76 possible.
+// the missing CPU checkpoint possible.
 //
 // `flag::kBatchCompletionPartial` is the one refusal `allow_mismatch` cannot
 // reach. A partial state is not a whole-mesh state that happens to disagree
@@ -903,18 +903,18 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
     if (status == TrailerStatus::Absent || t == nullptr) {
         v.unverified.push_back(
             "depth grid z[]      -- a restore onto a DIFFERENT grid with the "
-            "same layer count is accepted in silence (PTM-STATE-GRID-BLIND)");
+            "same layer count is accepted in silence");
         v.unverified.push_back(
             "epoch               -- the epoch this column belongs to is not in "
             "the file, so a cross-window or cross-season restore cannot be "
-            "detected (PTM-STATE-NO-EPOCH)");
+            "detected");
         v.unverified.push_back(
             "body + properties   -- the physics the column was integrated with");
         v.unverified.push_back(
             "mesh identity       -- whether these faces are this mesh's faces");
         v.unverified.push_back(
             "radiation coupling  -- whether the column is pre- or "
-            "post-coupling (PTM-57)");
+            "post-coupling ");
         return;
     }
 
@@ -1004,7 +1004,7 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
     // config key at all. These messages named the field, so a user acting on
     // one went looking for a key that does not exist -- and had they added it,
     // the engine would have ignored it in silence
-    // (PTM-STATEIO-REFUSAL-NAMES-A-NONEXISTENT-KEY, the same defect fixed in
+    // (the same defect fixed in
     // depth_map_plan.h). The clause name stays; the message names the key.
     if (t->grid_m >= 0 && run.grid_m >= 0 && t->grid_m != run.grid_m)
         fail("grid_m", "thermal.thermal_m: " + std::to_string(t->grid_m) +
@@ -1113,14 +1113,14 @@ inline void checkRestore(const Trailer* t, TrailerStatus status,
         v.warnings.push_back(
             "the writing run had a positive radiation coupling_select_dt, so "
             "its re-thermal selector could leave a face with nonzero indirect "
-            "flux frozen at its iter-0 column (BUGS.md PTM-89). Treat this "
+            "flux frozen at its iter-0 column . Treat this "
             "checkpoint as provisional.");
     }
     if (run.coupled_run && !(t->flags & flag::kPostCouplingComplete)) {
         v.warnings.push_back(
             "this checkpoint is the PRE-coupling (iter-0) column and this run "
             "couples radiation: the faces radiation feeds resume from an "
-            "un-coupled state. That is BUGS.md PTM-57.");
+            "un-coupled state. That is a known limitation.");
     } else if ((t->flags & flag::kPostCouplingComplete) &&
                !(t->flags & flag::kAllFacesPatched)) {
         v.warnings.push_back(

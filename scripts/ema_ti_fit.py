@@ -5,7 +5,7 @@ Recovers thermal inertia (TI) -- with visible albedo as a free-but-constrained
 confounder -- from a NOISY IR diurnal temperature curve T(local-time), by fitting
 against the 15-point Chimaera TI x albedo sweep grid (interpolated). STANDALONE:
 imports ema_campaign_driver and ema_camera_noise READ-ONLY (their __main__ guards
-mean no campaign/CLI code runs on import), so it does not race Rocky's driver.
+mean no campaign/CLI code runs on import), so it does not race the running campaign driver.
 
 OBSERVABLE (forward model AND observation, extracted the SAME way so definitions
 cancel): surface T vs local solar time. Per facet, local time is set by
@@ -33,23 +33,24 @@ Subcommands:
   selftest  -- build a synthetic analytic grid, inject noise, fit, verify recovery
                (unit-tests the interpolation + chi^2 + uncertainty machinery).
   extract   -- extract T(local-time) from one real thermal output dir (smoke test).
-  fit       -- run the real campaign fit once Rocky's 15-point sweep + cameras exist.
+  fit       -- run the real campaign fit once the 15-point sweep + cameras exist.
 """
+from pathlib import Path
 import os, sys, re, glob, json, argparse, importlib.util
 import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-PTM = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm"
-TROOT = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal"
+PTM = str(Path(__file__).resolve().parents[1])
+TROOT = os.environ.get("PTM_EMA_ROOT", PTM + "/output/ema") + "/thermal"
 
 def _load(mod, path):
     s = importlib.util.spec_from_file_location(mod, path); m = importlib.util.module_from_spec(s)
     s.loader.exec_module(m); return m
 
-# EMA-01 (RESOLVED 2026-07-09): `alb_point` and `disk_p_from_w` were Hapke
+# `alb_point` and `disk_p_from_w` were Hapke
 # disk-integrated photometry helpers that lived ONLY in the deleted scratch module
-# /tmp/ema_sweep_driver.py, which left the `fit` path dead on import. Fermi's formula
+# /tmp/ema_sweep_driver.py, which left the `fit` path dead on import. The physics review's formula
 # survived in a comment at ema_campaign_driver.py:45-48 and is now transcribed
 # verbatim into the tracked, pure module scripts/ema_hapke.py (with its provenance
 # and opposition-convention caveats). We import the recovered helpers from there.
@@ -63,7 +64,7 @@ import ema_hapke
 
 class _Drv:
     """Tracked driver symbols (thermal_done, HAPKE_DEFAULTS) plus the recovered
-    Hapke photometry helpers from ema_hapke (EMA-01, resolved 2026-07-09)."""
+    Hapke photometry helpers from ema_hapke (resolved 2026-07-09)."""
     thermal_done   = staticmethod(_driver.thermal_done)
     HAPKE_DEFAULTS = _driver.HAPKE_DEFAULTS
     alb_point      = staticmethod(ema_hapke.alb_point)
@@ -78,7 +79,7 @@ def _body_num_from_sweep_root(sweep_root):
     """Derive the body number ('623', '23871', ...) from a sweep-root path such as
     '.../thermal/623chimaera/sweep' -> '623', by matching the '<num><name>'
     directory component. Returns None if no such component is present. Mirrors the
-    dynamic pattern at ema_ousha_extra_offgrid.py:148 and fixes EMA-02: the `fit`
+    sweep-root naming pattern and fixes the `fit`
     path must NOT silently reuse Chimaera's albedo for every body."""
     for part in reversed(os.path.normpath(sweep_root).split(os.sep)):
         m = re.match(r"(\d+)[a-z]", part)
@@ -195,12 +196,12 @@ def load_sweep_grid(sweep_root, lat_band=25.0, nbins=24, epoch='ca'):
         cur = extract_local_time_curve(d, lat_band, nbins, epoch)
         pts.append((float(meta['ti']), float(meta['geom_albedo']), cur['T']))
     if not pts:
-        raise SystemExit(f"no complete sweep points under {sweep_root} (Rocky's sweep not done yet?)")
+        raise SystemExit(f"no complete sweep points under {sweep_root} (sweep not done yet?)")
     tis = sorted(set(round(p[0], 6) for p in pts)); albs = sorted(set(round(p[1], 6) for p in pts))
     if len(tis) < 2 or len(albs) < 2:
         raise SystemExit(f"incomplete grid under {sweep_root}: found {len(pts)} point(s) spanning "
                          f"{len(tis)} TI x {len(albs)} albedo; need >=2 x >=2 for interpolation "
-                         f"(Rocky's 15-point sweep not done yet).")
+                         f"(15-point sweep not done yet).")
     lst = extract_local_time_curve(glob.glob(sweep_root+"/ti*_alb*")[0], lat_band, nbins, epoch)['lst']
     cube = np.full((len(tis), len(albs), nbins), np.nan)
     for ti, alb, T in pts:
@@ -271,7 +272,7 @@ def selftest(seed=1, outdir="/tmp/ema_ti_fit_selftest"):
     os.makedirs(outdir, exist_ok=True)
     rng = np.random.default_rng(seed)
     tis = [10.0, 32.0, 100.0, 316.0, 1000.0]
-    # EMA-02 note: selftest is a SYNTHETIC machinery test (analytic toy grid, no real
+    # Note: selftest is a SYNTHETIC machinery test (analytic toy grid, no real
     # sweep dir). There is no sweep_root / body number in scope here, so w is a fixed
     # Chimaera anchor (w_nom=0.143) BY CONSTRUCTION -- not the silent-default bug. The
     # per-body fix lives in the `fit` path, which derives the body from --sweep-root.
@@ -368,14 +369,14 @@ def main(argv=None):
         os.makedirs(a.out, exist_ok=True)
         grid = load_sweep_grid(a.sweep_root, a.lat_band, a.nbins, a.epoch)
         rng = np.random.default_rng(a.seed)
-        # EMA-02: derive the body from --sweep-root; never default to Chimaera's albedo.
+        # derive the body from --sweep-root; never default to Chimaera's albedo.
         num = _body_num_from_sweep_root(a.sweep_root)
         if num is None or num not in _drv.HAPKE_DEFAULTS:
             raise SystemExit(
                 f"ema_ti_fit fit: cannot resolve a body number from --sweep-root "
                 f"{a.sweep_root!r} (expected a '<num><name>' component such as "
                 f"'623chimaera' with an entry in HAPKE_DEFAULTS). Refusing to guess "
-                f"the albedo -- see EMA-02 in the project issue ledger.")
+                f"the albedo; a wrong body would silently fit with another body's albedo.")
         p_nom = _drv.disk_p_from_w(_drv.HAPKE_DEFAULTS[num]['w'])
         results = []
         for ti_true in a.truth_ti:

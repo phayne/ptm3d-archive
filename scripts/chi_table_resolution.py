@@ -25,17 +25,17 @@ INPUT: --pairs is an .npy of shape (N, >=6) with columns
   3 = cos(incidence on the emitting wall),
   4 = cos(emission angle from the wall toward the receiver),
   5 = cos(phase angle) = d . s_hat,
-produced by Fermi's calc10_geom.py from a run's own view-factor matrix and
+produced by the physics review's calc10_geom.py from a run's own view-factor matrix and
 temperature field.  It is a multi-hundred-MB measurement, NOT in the repo; the
 default path is where the 2026-08-24 review left it.
 """
+import os
 import argparse
 from pathlib import Path
 import numpy as np
 from scipy.special import erfc
 
-DEFAULT_PAIRS = Path("/Users/paha3326/projects/fermi_beaming_review_2026-08-24/"
-                     "calc10_pairs.npy")
+DEFAULT_PAIRS = Path(os.environ.get("PTM_CHI_PAIRS", "calc10_pairs.npy"))
 PAIRS = DEFAULT_PAIRS
 W_DEG = 32.5
 NQ = 33
@@ -275,7 +275,7 @@ def _cli():
     if not a.pairs.exists():
         raise SystemExit(f"FATAL: pair distribution not found: {a.pairs}\n"
                          "It is a measurement, not a repo artifact -- regenerate it with "
-                         "Fermi's calc10_geom.py against the run you want to characterize, "
+                         "a pair-geometry script (calc10_geom.py) against the run you want to characterize, "
                          "or point --pairs at an existing copy. Refusing to invent one.")
     PAIRS = a.pairs
     main(a.samples)

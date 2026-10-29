@@ -278,7 +278,7 @@ def long_run_advisory(config_dict, chunked=False):
         f"record.",
         "[gpu-guardrails] to use it:  python3 scripts/run_chunked_simulation.py "
         "--config <this config> --total-days <days> --output-dir <dir>   "
-        "(see docs/gpu-wedge-guardrails.md). Note it produces merged "
+        "(see docs/dev/gpu-wedge-guardrails.md). Note it produces merged "
         "statistics and no per-step series.",
     ]
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Verify per-face lunar Bond-albedo bins are correctly longitude/latitude
-registered against IAU_MOON (PTM-34, formerly mislabeled PTM-30).
+registered against IAU_MOON.
 
 Discriminating tests (a mis-registered bin FAILS these; a correct one PASSES):
 
@@ -27,7 +27,7 @@ Discriminating tests (a mis-registered bin FAILS these; a correct one PASSES):
           Procellarum/Imbrium longitude band (-60..-15 E).
         - named mare boxes must read mare-dark and farside highlands bright.
         - the Apollo 15 and 17 landing sites (both mare) must read mare-dark.
-      This is the detector quoted in the PTM-34 acceptance report; it is
+      This is the detector quoted in the albedo-map longitude-roll acceptance report; it is
       deliberately independent of the FITS the bins were generated from, so it
       cannot be fooled by a FITS that is itself mis-registered.
 
@@ -328,14 +328,14 @@ def main(argv=None):
         # gate. This is the attribution the engine's load-time guard defers to.
         transforms = {
             "true (+lat, lon)": (flat, flon),
-            "lon+180 (PTM-34)": (flat, flon + 180.0),
-            "-lat (PTM-35)": (-flat, flon),
+            "lon+180 (longitude roll)": (flat, flon + 180.0),
+            "-lat (latitude flip)": (-flat, flon),
             "-lat & lon+180": (-flat, flon + 180.0),
         }
         rms = {k: float(np.sqrt(np.mean((alb - fits_sample(data, la, lo)) ** 2)))
                for k, (la, lo) in transforms.items()}
         rms_true = rms["true (+lat, lon)"]
-        rms_flip = rms["lon+180 (PTM-34)"]
+        rms_flip = rms["lon+180 (longitude roll)"]
         best = min(rms, key=rms.get)
 
         verdict = "PASS" if (contrast > 0.02 and rms_true < 0.02 and rms_true < rms_flip) else "FAIL"

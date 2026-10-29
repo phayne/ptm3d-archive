@@ -1,6 +1,6 @@
 // test_two_band_rownorm.cpp
 // ---------------------------------------------------------------------------
-// Decisive severity test for BUGS.md PTM-08 (vf_row_norm_ applied in the Jacobi
+// Decisive severity test for the Gauss-Seidel row-norm omission (vf_row_norm_ applied in the Jacobi
 // radiosity iteration but NOT in Gauss-Seidel), in the two-band VISIBLE regime
 // where it bites (Bond albedo A up to ~0.5 Europa / ~0.9 frost).
 //
@@ -295,7 +295,7 @@ int runB1() {
 //     flux would be low by 1/s ~ 33% here -- far outside the 1e-3 float32 band.
 //   * If the row norm were NOT applied on the device at all, the GPU visible
 //     band would iterate gain A·s = 0.75 instead of A·min(s,1) = 0.5 and
-//     over-couple to a different fixed point (the PTM-08 error, ~2x on the floor).
+//     over-couple to a different fixed point (the Gauss-Seidel row-norm omission error, ~2x on the floor).
 // Only "applied exactly once, inside the iteration" passes.
 //
 // Returns 0 on PASS or on a genuine no-GPU SKIP, 1 on mismatch or non-engagement.
@@ -996,13 +996,13 @@ int runB1g() {
 }
 
 // ---------------------------------------------------------------------------
-// B1b (BUGS.md PTM-11): the single-GPU two-band gate is ORDERING-SENSITIVE.
+// B1b: the single-GPU two-band gate is ORDERING-SENSITIVE.
 // two_band_gpu_ok_ is set inside initGPU() ONLY if two_band_ is already true at that
 // moment (radiation_exchange.cpp:359-360). So the per-face Bond albedo + enableTwoBand()
 // MUST be sourced BEFORE initGPU() — which is exactly what RadiationExchangeManager::
 // prepare() sequences (setSolarAlbedo -> enableTwoBand -> initGPU), and what the
 // ptm_thermal_sim caller now does by sourcing the albedo BEFORE prepare(). If they are
-// sourced AFTER initGPU() (the PTM-11 bug), the gate never engages and solve() falls to
+// sourced AFTER initGPU() (the two-band GPU init ordering bug), the gate never engages and solve() falls to
 // the CPU two-band path (isGPUTwoBand() == false; enableTwoBand() warns).
 //
 // DISCRIMINATING test for the fix's mechanism: the SAME solver, SAME small Σ_j F_ij ≤ 1
@@ -1022,7 +1022,7 @@ int runB1b() {
     std::vector<double> areas(N, 1.0), emiss(N, EPS), A_vec(N, A);
     ViewFactorMatrix F = buildOpenEnclosure(N, s);
 
-    std::printf("=== B1b: PTM-11 init-ordering gate discrimination (N=%d, s=%.2f, A=%.2f) ===\n",
+    std::printf("=== B1b: two-band init-ordering gate discrimination (N=%d, s=%.2f, A=%.2f) ===\n",
                 N, s, A);
 
     auto make_cfg = []() {
@@ -1055,7 +1055,7 @@ int runB1b() {
     }
 
     try {
-        // BUGGY order (PTM-11): initGPU -> setSolarAlbedo -> enableTwoBand.
+        // BUGGY order: initGPU -> setSolarAlbedo -> enableTwoBand.
         RadiositySolver solver(F, emiss, areas);
         RadiationConfig cfg = make_cfg();
         solver.setConfig(cfg);
@@ -1111,11 +1111,11 @@ int main() {
            "jac_converged,jac_iters,jac_qvis_floor,jac_qvismax,"
            "rel_diff_qvis,verdict\n";
 
-    std::printf("\n=== A0: two-band visible-band GS-vs-Jacobi on Σ_j F_ij > 1 (PTM-08) ===\n");
+    std::printf("\n=== A0: two-band visible-band GS-vs-Jacobi on Σ_j F_ij > 1 (Gauss-Seidel row norm) ===\n");
     std::printf("  N=%d  eps=%.3f  S=%.1f  (face 0 = shadowed floor, Q_solar=0)\n\n", N, EPS, S);
 
     int n_fail = 0;
-    // BUGS.md PTM-102: jac_ok was computed, printed as "JACOBI FAILED (unexpected)"
+    // jac_ok was computed, printed as "JACOBI FAILED (unexpected)"
     // and then dropped on the floor -- the exit code was n_fail + a2 + b1 + b1b and
     // never saw it, so a run in which the protected Jacobi reference failed on all
     // 4 configs still exited 0. Count it separately (so the GS!=JAC summary keeps
@@ -1167,7 +1167,7 @@ int main() {
     }
     out.close();
 
-    std::printf("=== SUMMARY: %d/%zu configs where GS != Jacobi (0 == PTM-08 fixed) ===\n",
+    std::printf("=== SUMMARY: %d/%zu configs where GS != Jacobi (0 == row norm fixed) ===\n",
                 n_fail, cfgs.size());
     std::printf("    JACOBI reference failures: %d/%zu (must be 0 -- Jacobi is the "
                 "protected reference)\n", n_jac_fail, cfgs.size());

@@ -154,17 +154,17 @@ ALLOW = [
     # Code identifiers. Renaming these breaks callers or saved data, so the
     # British spelling stays until someone does a deliberate API change.
     ("src/cpp/gpu/bvh_gpu_pool.cpp", "honourPause",
-     "function identifier (PTM-198)"),
+     "function identifier; never renamed"),
     ("gui/gui_core/data_exporter.py", "self._cancelled",
-     "attribute identifier (PTM-198)"),
+     "attribute identifier; never renamed"),
     ("gui/gui_panels/visualization_panel.py", "was_cancelled",
-     "local identifier (PTM-198)"),
+     "local identifier; never renamed"),
     ("src/python/radiation_exchange_schematic.py", "centre_window",
-     "local identifier (PTM-198)"),
+     "local identifier; never renamed"),
     ("src/python/tests/test_results_api.py", "test_same_geometry_in_metres",
-     "test function identifier (PTM-198)"),
+     "test function identifier; never renamed"),
     ("src/python/tests/test_results_api.py", "test_forced_mesh_units_are_honoured",
-     "test function identifier (PTM-198)"),
+     "test function identifier; never renamed"),
 ]
 
 INLINE_ALLOW = "american-english: allow"

@@ -30,7 +30,7 @@ except ImportError:
 
 
 def default_cspice_kernels_dir():
-    """Resolve a portable default SPICE kernels directory (GUI-CAM-1).
+    """Resolve a portable default SPICE kernels directory.
 
     Search order: the ``$CSPICE_DATA`` environment variable, then the
     project's ``data/kernels`` directory, else blank. A blank result means

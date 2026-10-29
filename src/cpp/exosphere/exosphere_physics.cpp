@@ -8,7 +8,12 @@
 #include <numeric>
 #include <chrono>
 #include <omp.h>
+// x86 only: clang's <immintrin.h> is an #error on any other target (arm64 /
+// Apple Silicon). Every use below is behind __AVX512F__ / __AVX2__, which are
+// never defined off x86, so non-x86 builds take the scalar branches.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>  // For AVX2 intrinsics
+#endif
 
 // Check for AVX support at compile time
 #ifdef __AVX512F__
@@ -2838,7 +2843,7 @@ void BallisticTransport::computeTransportProduct(
     // The persistent index keeps the query radius of its FIRST build. A later
     // call with hotter sources would have its kernel silently truncated at that
     // radius. Opt-in callers get a call-local index instead; everyone else is
-    // warned (PTM-643; the sublimation path's behavior is unchanged here).
+    // warned (the sublimation path's behavior is unchanged here).
     const SphericalSpatialIndex* index = &spatial_index_;
     SphericalSpatialIndex local_index;
     if (theta_max_global > spatial_index_query_radius_ * (1.0 + 1e-12)) {
@@ -2848,7 +2853,7 @@ void BallisticTransport::computeTransportProduct(
             local_index.build(face_centers, cell_size_deg, theta_max_global * 1.1);
             index = &local_index;
         } else {
-            std::cerr << "WARNING [PTM-643]: transport kernel cutoff " << std::fixed << std::setprecision(1)
+            std::cerr << "WARNING: transport kernel cutoff " << std::fixed << std::setprecision(1)
                       << (theta_max_global * 180.0 / M_PI) << " deg (T_max " << T_max
                       << " K) exceeds the spatial index query radius "
                       << (spatial_index_query_radius_ * 180.0 / M_PI)
@@ -3067,7 +3072,7 @@ void BallisticTransport::computeTransportProduct(
             totals->jeans_escaped = jeans_escaped_total;
             totals->unscattered = unscattered_total;
         }
-        return;  // raw sums only (PTM-657); no log line (called many times)
+        return;  // raw sums only; no log line (called many times)
     }
 
     // Pre-correction mass conservation
@@ -3195,7 +3200,7 @@ double BallisticTransport::finalizeTransport(const std::vector<double>& face_are
                                              const std::vector<double>& raw,
                                              const std::vector<double>& calibration,
                                              std::vector<double>& deposition) {
-    // Must match the correction in computeTransportProduct exactly (PTM-657).
+    // Must match the correction in computeTransportProduct exactly.
     if (spatialSmoothingRadiusRad() > 0.0) {
         throw std::invalid_argument("finalizeTransport: the face-local refresh does not support "
                                     "EXO_DEP_SMOOTH_DEG spatial smoothing");
@@ -3241,7 +3246,7 @@ void ExosphereModel::computeTransportProduct(
 }
 
 // ---------------------------------------------------------------------------
-// PTM-671: fixed-temperature transport operator (see exosphere_physics.h).
+// fixed-temperature transport operator (see exosphere_physics.h).
 // The kernel, self-cap and escape formulas below are copies of the ones in
 // BallisticTransport::computeTransportProduct, kept separate on purpose: that
 // function is the legacy (--no-sputter-operator-cache) path and must keep its
@@ -3507,7 +3512,7 @@ const FixedKernelTransportOperator& ExosphereModel::fixedKernelOperator(double t
     if (!fixed_op_) fixed_op_ = std::make_unique<FixedKernelTransportOperator>();
     if (!fixed_op_->matches(face_centers_.size(), temperature_K, apply_jeans_escape)) {
         if (fixed_op_->built()) {
-            std::cerr << "WARNING [PTM-671]: fixed-temperature transport operator rebuilt: it was built for "
+            std::cerr << "WARNING: fixed-temperature transport operator rebuilt: it was built for "
                       << fixed_op_->temperatureK() << " K and is now requested at " << temperature_K
                       << " K (or EXO_XI_CUTOFF / the Jeans option changed)" << std::endl;
         }

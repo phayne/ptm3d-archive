@@ -98,7 +98,7 @@ def main():
     # Apply the DEM's elevation scale/offset. LOLA polar PDS .IMG store elevation
     # as scaled integers (SCALING_FACTOR, e.g. 0.5 m/DN); GDAL's ReadAsArray
     # returns raw DN UNSCALED. Using raw DN as meters silently DOUBLED a ring
-    # once (PTM-21, sunlit_ring_50_200). The projected Float32 .tif stores
+    # once (sunlit_ring_50_200). The projected Float32 .tif stores
     # physical meters directly (no scale metadata) and stays byte-identical.
     _int_types = (gdal.GDT_Byte, gdal.GDT_Int16, gdal.GDT_UInt16,
                   gdal.GDT_Int32, gdal.GDT_UInt32)

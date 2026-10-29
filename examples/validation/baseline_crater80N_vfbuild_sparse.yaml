@@ -1,6 +1,6 @@
 # PTM3D validation baseline arm: the SPARSE view-factor builder, built FRESH.
 #
-# Part of the byte-identity regression suite (docs/validation-baselines.md).
+# Part of the byte-identity regression suite (docs/dev/validation-baselines.md).
 # This arm exists because, before 2026-08-23, the whole portable suite was
 # STRUCTURALLY INERT to any change in the view-factor estimator:
 #

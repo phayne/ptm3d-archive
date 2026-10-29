@@ -366,7 +366,7 @@ class ThermalAnalysisPanel(QWidget):
             return
 
         # Find all temperature files
-        # Numeric order, either naming generation (BUGS.md PTM-664).
+        # Numeric order, either naming generation.
         from gui_core._ptm_bootstrap import ensure_ptm_importable
         ensure_ptm_importable()
         from ptm.readers import sorted_frame_files

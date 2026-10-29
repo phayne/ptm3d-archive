@@ -8,7 +8,7 @@
 // WHY THIS HASHES THE RESOLVED OBJECTS AND NOT THE CONFIG FILE
 // ---------------------------------------------------------------------------
 // On a built-in body (Moon / Europa / Mercury) the whole `thermophysical:` YAML
-// block is DECORATIVE -- BUGS.md PTM-67. `ks`, `kd`, `H`, `rhos`, `rhod`,
+// block is DECORATIVE (the unread-config-key defect). `ks`, `kd`, `H`, `rhos`, `rhod`,
 // `cp0`, `Qb`, `chi`, `albedo` and `emissivity` under that block are read by
 // nothing; only the `*_override` keys are live. Hashing the FILE would
 // therefore do exactly the wrong thing twice over: two runs whose configs
@@ -27,7 +27,7 @@
 // identityFields() is the single list. hashOf() folds it and text() prints it;
 // neither has its own idea of what a property is. A property added to the list
 // is therefore automatically covered by the guard AND named in the mismatch
-// report -- which is the failure mode PTM-53's `thermoOverrideRequested()`
+// report -- which is the failure mode the built-in-body property override's `thermoOverrideRequested()`
 // exists to prevent for the override forwarding, and this copies that stance
 // deliberately.
 //

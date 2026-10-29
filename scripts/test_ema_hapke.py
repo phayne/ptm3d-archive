@@ -7,7 +7,7 @@ Exits 0 if every assertion passes, 1 (with a printed FAIL summary) otherwise.
 The numeric expectations here are NOT invented -- the 4-dp alb_point values ARE
 the actual `ti<TI>_alb<p>` sweep directory names on disk, and the six-anchor `p`
 values are the literature geometric albedos the campaign calibrated to. This test
-is what pins ema_hapke.py to the outputs that already exist (see BUGS.md EMA-01).
+is what pins ema_hapke.py to the outputs that already exist.
 """
 import os
 import sys

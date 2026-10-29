@@ -22,7 +22,7 @@ ones.
 
 Justitia's committed kernel was verified against fourteen real Justitia
 configurations on 2026-08-31 (the `examples/justitia_*.yaml` set, which is local
-to one machine and **not yet tracked** — see PTM-300/PTM-446): all fourteen
+to one machine and **not yet tracked**): all fourteen
 resolve every metakernel member, and the committed SPK
 (**2033-12-14T23:58:51 → 2036-05-31T23:58:51 UTC, 899.0 days for body
 20000269**, one interval) contains every run window *including its
@@ -50,7 +50,7 @@ truncation workaround), so regenerating one bakes in a single machine's layout
 and the file stops resolving anywhere else. The committed metakernels are
 hand-written relative on purpose; each says so in its own header. This is not
 hypothetical — it is how the fourteen Justitia configurations came to name a
-directory that does not exist (PTM-446), and a stray regeneration was found
+directory that does not exist, and a stray regeneration was found
 sitting in the working tree on 2026-08-31.
 
 ## Shape-model policy
@@ -61,7 +61,7 @@ it is tracked.** Concretely, every such file has all four of:
 1. **The file itself, tracked in git.**
 2. **A named `!` exception in `.gitignore`**, by exact filename. `.gitignore`'s
    `*.obj` is a C/C++ object-file rule that also swallows every Wavefront shape
-   model in the tree (PTM-303). The exception is written out rather than the file
+   model in the tree. The exception is written out rather than the file
    force-added, because a force-add is invisible to the next person and silently
    stops applying the day someone re-adds the file without `-f`.
 3. **A machine-readable provenance sidecar** next to it, `<stem>_provenance.json`
@@ -76,7 +76,7 @@ The tracked set, as of 2026-08-31:
 | body | file | what it is |
 |---|---|---|
 | (269) Justitia | `shape.obj` | DAMIT model 2858, the original |
-| (269) Justitia | `shape_reconstructed_20260704.obj` | the superseded 2026-07-04 hand reconstruction (PTM-303), geometrically identical to the original — max vertex deviation 0.000000000 km |
+| (269) Justitia | `shape_reconstructed_20260704.obj` | the superseded 2026-07-04 hand reconstruction, geometrically identical to the original — max vertex deviation 0.000000000 km |
 | (623) Chimaera | `shape.obj` | DAMIT model 9110, the original (byte-identical to a 2026-08-31 re-download) |
 | (623) Chimaera | `shape_refined.obj` | 2-pass Loop subdivision of the above; **this** is what `body_config.yaml` loads, and its generator is not in this repository |
 | (101955) Bennu | `g_06370mm_alt_obj_0000n00000_v021.obj` | OSIRIS-REx OLA v21 global model |

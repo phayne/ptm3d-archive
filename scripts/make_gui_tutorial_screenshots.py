@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the figures for docs/tutorials/07_gui_walkthrough.md — offscreen.
+"""Render the figures for docs/tutorials/04_gui.md — offscreen.
 
 Everything here drives the REAL GUI object model (`gui/gui_panels/*`,
 `gui/gui_core/*`) under `QT_QPA_PLATFORM=offscreen` and saves `QWidget.grab()`

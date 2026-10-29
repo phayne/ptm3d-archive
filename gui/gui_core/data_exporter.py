@@ -46,7 +46,7 @@ from ptm.results import FIELD_INFO as _FIELD_INFO_ASCII            # noqa: E402
 from ptm.results import STATISTICS_FIELDS as _STATS_FIELDS_ASCII   # noqa: E402
 from ptm.results import detect_available_statistics as _detect_stats_in_dir  # noqa: E402
 from ptm.results import field_info as _results_field_info           # noqa: E402
-# Either per-step naming generation (BUGS.md PTM-664).
+# Either per-step naming generation.
 from ptm.readers import frame_path as _frame_path                   # noqa: E402
 
 try:

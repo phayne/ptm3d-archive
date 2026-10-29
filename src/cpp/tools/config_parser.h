@@ -34,7 +34,7 @@ struct SimulationConfig {
         double duration_days = 3.55;
         int timesteps = 72;
         std::string body = "Europa";
-        // BUGS.md PTM-301. When the loaded SPK does not span the run window
+        // Per-epoch Keplerian fallback. When the loaded SPK does not span the run window
         // (equilibration spin-up included), the engine falls back to Keplerian
         // two-body propagation per epoch. false (default) = warn, naming both
         // spans, and run anyway; true = refuse. Default false because it is a
@@ -70,7 +70,7 @@ struct SimulationConfig {
         // scalar, CPU SIMD and GPU persistent paths. equilibration_cycles
         // below changes only HOW the total is reached, never the total.
         // ⚠️ Before 2026-08-11 this was the BLOCK length and the GPU
-        // integrated 2x it (BUGS.md PTM-146); shipped GPU configs were
+        // integrated 2x it; shipped GPU configs were
         // rewritten to state the integrated number they always ran.
         // ⚠️ The CPU paths additionally run a fixed analytic clear-sky
         // pre-conditioner of NYEARSEQ * round(year/day) cycles (Moon 24,
@@ -248,7 +248,7 @@ struct SimulationConfig {
         //   depth_grid  mesh  config  body  grid_m  grid_n  grid_b
         //   refgrid_H   epoch
         // There is deliberately no blanket "force": switching every guard off
-        // at once is the warn-instead-of-refuse policy that made PTM-76
+        // at once is the warn-instead-of-refuse policy that made the missing CPU checkpoint
         // possible, wearing a different name. The batch-completion-partial
         // refusal cannot be reached from here at all.
         //
@@ -285,7 +285,7 @@ struct SimulationConfig {
         // Phase R (R4): mid-run thermal-state checkpoint cadence, in OUTPUT
         // steps. 0 (default) = off = checkpoint only at chunk boundaries (the
         // status quo). NOTE (architectural, documented in
-        // docs/PORTABILITY-AUDIT.md): true per-output-step full-mesh
+        // the July 2026 portability audit (docs/PORTABILITY-AUDIT.md in git history)): true per-output-step full-mesh
         // checkpointing is INCOMPATIBLE with the current GPU persistent
         // solver, which is batch-outer/time-inner (each face-batch runs ALL
         // timesteps before the next batch starts), so no single wall-clock
@@ -429,6 +429,39 @@ struct SimulationConfig {
         //     identical to the pre-2026-08-12 seed.
         std::string seed_anchor = "lumped";
 
+        // INDIRECT-AWARE spin-up seed for radiation-coupled runs.
+        // DEFAULT "series" since the seed was confirmed (decisive control +
+        // physics review sign-off); "off" is the supported LEGACY value and reproduces every
+        // earlier result byte-for-byte. Also settable as --seed-indirect <mode>. The seed is built from the face's absorbed DIRECT forcing
+        // only, so a never-lit column (indirect is its only heat) starts on
+        // the geothermal floor (25.28 K on Moon3D) and two equilibration
+        // lunations leave it ~50 K too cold at depth. Acts ONLY in the
+        // eq-indirect re-solve (thermal.eq_indirect_source != off), the first
+        // point at which an indirect estimate exists.
+        //   "off" -- LEGACY: byte-identical to every run before the default changed.
+        //   "series" -- seed each face from its absorbed flux PLUS the
+        //     iteration-0 (or converged-loop) time-varying indirect flux over
+        //     the OUTPUT window (uniform cadence, the span the sweep solved),
+        //     with the lumped anchor allowed to run on that composite series.
+        //     The window is cut to WHOLE cycles and must hold at least one
+        //     (FATAL otherwise: a sub-cycle seed is the cold seed again). The
+        //     EQUILIBRATION forcing of that re-solve also carries the indirect
+        //     time-varying: each eq step takes the box average of the output
+        //     samples that fall in its interval, folded by phase (physics review;
+        //     a series seed under constant-<q> equilibration overshoots warm).
+        //     DEFAULT: anchors the column near the cycle-mean <T>.
+        //   "mean" -- add the per-face time-mean <q_ind> to every forcing
+        //     sample; the anchor still stands down (radiation-coupled), so the
+        //     surface is the WARM bracket T_rad(<F>+<q_ind>) -- by Jensen above
+        //     <T> on faces whose indirect swings (24.8 K median on Moon3D
+        //     never-lit faces). Kept for A/B attribution, not recommended.
+        std::string seed_indirect = "series";
+        // Where seed_indirect came from: "default" | "config" | "cli". A DEFAULT
+        // that cannot act (no eq-indirect pass, a warm-started chunk, the CPU scalar
+        // solver) quietly reverts to the legacy seed and says so in one line; an
+        // EXPLICIT setting that cannot act is FATAL. Recorded in provenance.txt.
+        std::string seed_indirect_source = "default";
+
         // What a TWO-TIMESCALE face does. The anchor's closure picks ONE
         // conductance G from a variance match, and with diurnal AND seasonal
         // power in the same series that single G is being asked to cover two
@@ -569,7 +602,7 @@ struct SimulationConfig {
     //
     // TOP LEVEL, deliberately: nested under `output:` it would be reachable by
     // the body-defaults machinery that makes `thermophysical:` decorative on a
-    // built-in body (PTM-67). See docs/flux-cubes.md.
+    // built-in body. See docs/flux-cubes.md.
     struct FluxCubeParams {
         bool enabled = false;
         // Geometry cache from ptm_flux_cube_geom. REQUIRED when enabled; a
@@ -588,7 +621,7 @@ struct SimulationConfig {
         // EMPTY range, so `cache_files: layout.fcg` would clear the vector and
         // never fill it: a run with no cubes, no message and exit 0. Guarded in
         // config_parser.cpp with requireYamlSequence, same as the six keys
-        // PTM-CONFIG-SEQUENCE-SCALAR-SILENT covered on 2026-09-06.
+        // Scalar-for-list config check covered on 2026-09-06.
         //
         // Empty (the default) => the single-cache `cache_file` path, whose
         // outputs keep their historical names. Setting BOTH is refused rather
@@ -627,7 +660,7 @@ struct SimulationConfig {
     //
     // TOP LEVEL for the same reason flux_cubes is: nested under `output:` it
     // would be reachable by the body-defaults machinery that makes
-    // `thermophysical:` decorative on a built-in body (PTM-67).
+    // `thermophysical:` decorative on a built-in body.
     //
     // `enabled: false` (the default) must be byte-neutral to every other
     // output, and `true` must be too -- the pass reads arrays and writes its
@@ -661,7 +694,7 @@ struct SimulationConfig {
     // Radiation Exchange
     struct RadiationParams {
         bool enabled = false;
-        // PTM-98 — which faces keep the indirect flux the radiosity solve already
+        // which faces keep the indirect flux the radiosity solve already
         // computed for them. The solve always covers ALL faces; this set is only
         // a post-solve copy mask.
         //
@@ -680,7 +713,7 @@ struct SimulationConfig {
         // Override without editing a config: PTM_EXCHANGE_SELECTION=all|shadow
         // or --rad-exchange-selection <mode>.
         std::string exchange_selection = "all";
-        // Consulted ONLY when exchange_selection == "shadow". Before PTM-99 this
+        // Consulted ONLY when exchange_selection == "shadow". Before the min_shadow_fraction plumbing this
         // key parsed but was never bridged into radiation::RadiationConfig, so the
         // hard-coded 0.3 always won silently.
         double min_shadow_fraction = 0.3;
@@ -715,7 +748,7 @@ struct SimulationConfig {
         // threshold by this factor (default 0.5) errs on the side of inclusion.
         // NOTE: only consulted when coupling_mode == "legacy" (see below).
         double coupling_select_safety = 0.5;
-        // PTM-89 — decomposition (chunking) independence of the Picard coupling.
+        // decomposition (chunking) independence of the Picard coupling.
         //
         // Every input to the shipped face-selection and exit decisions is a
         // max OVER THE WINDOW, so a 30-step window and a 60-step window select
@@ -735,7 +768,7 @@ struct SimulationConfig {
         //       coupling_temp_threshold is disabled too, so every window runs
         //       exactly max_coupling_iterations sweeps. This is the only
         //       stopping rule that cannot depend on the window by construction.
-        //   "legacy":  pre-PTM-89 behavior, bit-for-bit. Threshold is
+        //   "legacy":  pre-fix behavior, bit-for-bit. Threshold is
         //       coupling_temp_threshold·coupling_select_safety and the
         //       face-fraction OR-exit is live. Provided to REPRODUCE published
         //       runs; it re-introduces the defect.
@@ -745,7 +778,7 @@ struct SimulationConfig {
         std::string coupling_mode = "bounded";
         // Absolute predicted-ΔT selection threshold [K], "bounded"/"fixed" only.
         // 0 = select every face with any indirect flux (decomposition-independent).
-        // >0 trades accuracy for speed and RE-INTRODUCES PTM-89 at that magnitude;
+        // >0 trades accuracy for speed and RE-INTRODUCES chunking dependence at that magnitude;
         // the run warns when it is set.
         double coupling_select_dt = 0.0;
         bool use_hmatrix = false;
@@ -842,7 +875,7 @@ struct SimulationConfig {
         double arg_perihelion_deg = -1.0;
         double mean_anomaly_deg = -1.0;
         // Epoch of the osculating elements above (TDB; orbital/epoch_parse.h).
-        // Wired BUGS.md PTM-663: mean_anomaly_deg is M0 AT this epoch. Before
+        // Wired mean_anomaly_deg is M0 AT this epoch. Before
         // that it was parsed and dropped, and M0 was applied at J2000.
         std::string orbital_epoch = "";
 
@@ -855,7 +888,7 @@ struct SimulationConfig {
         // J2000 ecliptic +x (the vernal equinox) projected onto the body's
         // equatorial plane, or ecliptic +y if the pole is within 25.8 deg of +x.
         // W(t) =
-        // W0 + 360 deg * (t - epoch) / period. Wired BUGS.md PTM-663; before
+        // W0 + 360 deg * (t - epoch) / period. Wired by the generic-body epoch fix; before
         // that it was parsed and dropped.
         double prime_meridian_deg = 0.0;
         bool prime_meridian_set = false;  // the key was present in this file
@@ -938,7 +971,7 @@ struct SimulationConfig {
         // stderr but does not throw; ptm_thermal_sim.cpp validates this string
         // right after config load and exits 1, so an unknown law can never be
         // silently replaced by Hayne. (The original reason for not throwing was
-        // that a throw was swallowed -- BUGS.md PTM-66. That is fixed in this
+        // that a throw was swallowed (the malformed-config defect). That is fixed in this
         // release; the two-step is kept for the better message. See
         // config_parser.cpp.)
         // NOTE selecting martinez2021 makes ks/kd INERT for conduction (Eq. 10
@@ -961,7 +994,7 @@ struct SimulationConfig {
     // may use; the per-solver gpu_devices / gpu_device_ids / gpu_batch_size
     // keys decide how a rung that is allowed then runs. They came out of the
     // 2026-08-20/21 wedge forensics: see src/cpp/gpu/gpu_guardrails.h for the
-    // mechanism and docs/gpu-wedge-guardrails.md for the platform-gating table
+    // mechanism and docs/dev/gpu-wedge-guardrails.md for the platform-gating table
     // and the cost of each guardrail.
     struct GpuParams {
         // Floor on the per-device VRAM headroom a resident radiosity CSR
@@ -987,7 +1020,7 @@ struct SimulationConfig {
         // by a lot in price on a large-matrix site. Measured on A3GT lunar polar site B,
         // the CPU radiosity rung cost 108.9 min/window against 31.4 min on the
         // GPU pool (+77.5 measured), while separation costs a derived
-        // +7-10 min. See docs/gpu-wedge-guardrails.md.
+        // +7-10 min. See docs/dev/gpu-wedge-guardrails.md.
         std::string thin_margin_policy = "separate";
         // The floor below which even `separate` refuses [GiB].
         double hard_min_vram_margin_gib = 0.25;
@@ -1024,14 +1057,14 @@ public:
     SimulationConfig loadFromYAML(const std::string& filename);
 
     /**
-     * @brief Apply a config's `engine_env:` block to the process environment (PTM-42).
+     * @brief Apply a config's `engine_env:` block to the process environment.
      *
      * PTM3D configs may carry an `engine_env:` mapping recording the environment
      * variables a run needs (`PTM_ILLUM_TRUE_NORMALS`, `PTM_EQ_PERFACE_FLUX`, ...).
      * Until 2026-08-04 nothing in the engine read that block: it was documentation
      * applied only if a human remembered to export it, and a regression pair could
      * silently end up with two different illumination configurations while looking
-     * identical on paper (BUGS.md PTM-42, which absorbs PTM-52).
+     * identical on paper (which absorbs an earlier duplicate).
      *
      * Contract:
      *  - The PROCESS environment always WINS. A variable already set to a different
@@ -1101,6 +1134,10 @@ private:
     void parseRadiationSection(SimulationConfig::RadiationParams& params, const void* node);
     void parseAdvancedSection(SimulationConfig::AdvancedParams& params, const void* node);
 };
+
+/// Number of keys in the last YAML file loaded by ConfigParser::loadFromYAML that
+/// the engine does not read (each was printed as a WARNING). 0 when none.
+int lastUnknownConfigKeyCount();
 
 } // namespace ptm
 

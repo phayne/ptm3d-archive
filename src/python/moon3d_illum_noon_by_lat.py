@@ -30,6 +30,7 @@ byte-identical direct-solar frames.
         --out docs/figures/moon3d_500k/illum_noon_by_lat.png
 """
 from __future__ import annotations
+import os
 import argparse
 from pathlib import Path
 import sys
@@ -48,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from moon3d_temp_3d import read_ply_vertices_double, tri_faces
 from ptm_pubstyle import apply_style, DOUBLE_W, savefig_pinned
 
-HEAT3D = Path("/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d")
+HEAT3D = Path(os.environ.get("PTM_HEAT3D_ROOT", str(Path(__file__).resolve().parents[3])))   # holds output/<run>
 # (run dir, latitude label in deg S). Last entry is the native patch.
 RUNS = [
     (HEAT3D / "output/moon3d_lat_final/lat60_coupled", 60.0),

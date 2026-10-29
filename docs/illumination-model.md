@@ -87,15 +87,15 @@ A two-tier adaptive strategy balances computational cost and penumbral accuracy:
 - **Initial pass**: A minimum of $N_0 = \max(8, N_\mathrm{base})$ samples are evaluated, where $N_\mathrm{base}$ is the user-specified sample count (default 9).
 - **Penumbra upsampling**: If the initial pass detects partial terrain occlusion --- i.e., at least one sample is blocked and at least one is visible --- the face is automatically resampled with $N_\mathrm{heavy} = \max(64, 4 N_\mathrm{base})$ samples to resolve the penumbra boundary more accurately.
 
-### Shadow Flux (Permanently Shadowed Regions)
+### Sub-grid crater shadow flux (optional, off by default)
 
-For faces in permanent shadow where $F_{\mathrm{direct},i} = 0$, an optional shadow flux model based on Ingersoll et al. (1992) provides a residual heating estimate from multiply-scattered sunlight within craters. The crater geometry is parameterized by $D$, the diameter-to-depth ratio. For shallow craters ($D > 10$):
-
-$$F_\mathrm{shadow} = E_\odot \sin(e_0) \cdot \frac{1 - A}{D^2/4} \left[1 + \frac{A(1-f)}{\varepsilon}\right]$$
-
-where $e_0$ is the solar elevation angle, $A$ is the surface Bond albedo, $\varepsilon$ is the surface emissivity, and $f = 1/(1 + D^2/4)$. For deeper craters ($D \leq 10$), the full multiple-scattering expression is used:
-
-$$F_\mathrm{shadow} = E_\odot \sin(e_0) \cdot \frac{(1 - A) f}{1 - Af} \cdot \left(1 + \frac{Af}{1 - Af}\right)$$
+`thermal.enable_shadow_flux` adds a parameterized estimate, after Ingersoll et al. (1992), of the
+scattered and re-emitted flux reaching shadowed floors of craters smaller than a mesh face. It is
+off in every shipped configuration, and it should stay off on meshes that resolve the terrain,
+where the radiation-exchange module computes this flux directly. Its implementation has known
+errors: it omits the emissivity factor that Ingersoll's Eq. 8 carries (the absorbed shadow flux
+should be $E_\odot \sin e_0\thinspace(1-A) f/(1-Af)\thinspace[\varepsilon + A(1-f)]$), and it adds the
+result to the direct-solar channel.
 
 ## Primary Body Thermal Infrared Flux
 
@@ -103,51 +103,50 @@ For satellites orbiting a giant planet or other body with significant thermal em
 
 $$\Omega_\mathrm{p} = 2\pi\left(1 - \cos\alpha_\mathrm{p}\right), \qquad \alpha_\mathrm{p} = \arcsin\negthinspace\left(\frac{R_\mathrm{p}}{d_\mathrm{p}}\right)$$
 
-The view factor from a planar face to a spherical primary, assuming Lambertian emission, is
+The irradiance view factor from a planar face to a sphere of angular radius $\alpha_\mathrm{p}$, for a face that sees the whole disk, is
 
-$$\mathcal{F}_i = \frac{\Omega_\mathrm{p}}{4\pi}\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right)$$
+$$\mathcal{F}_i = \sin^2\alpha_\mathrm{p}\thinspace\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right) \approx \frac{\Omega_\mathrm{p}}{\pi}\left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right),$$
 
-where $\hat{\mathbf{p}}_i$ is the unit vector from face $i$ toward the primary center. Faces oriented away from the primary ($\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i \leq 0$) receive zero flux. The thermal IR flux is then
+where $\hat{\mathbf{p}}_i$ is the unit vector from face $i$ toward the primary center. Faces oriented away from the primary ($\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i \leq 0$) receive zero flux. The incident thermal infrared flux is
 
-$$F_{\mathrm{IR},i} = F_\mathrm{IR,p} \cdot \mathcal{F}_i$$
+$$F_{\mathrm{IR},i} = M_\mathrm{p}\thinspace\mathcal{F}_i,$$
 
-where $F_\mathrm{IR,p}$ is the total thermal infrared flux emitted by the primary (e.g., $F_\mathrm{IR,Jupiter} = 13.8\thickspace\text{W m}^{-2}$ at Europa's orbit). Terrain visibility is verified via ray tracing before assigning the flux.
+where $M_\mathrm{p} = \sigma T_\mathrm{p}^4$ is the flux emitted at the primary's surface (13.8 W m⁻² for Jupiter, $T_\mathrm{p} = 124.9$ K). Terrain visibility is checked by ray tracing, and the face absorbs $\varepsilon F_{\mathrm{IR},i}$.
 
 ## Primary Body Reflected Sunlight
 
-Sunlight reflected by the primary body toward the satellite surface is modeled assuming Lambertian scattering with a phase-dependent correction. The phase angle $\varphi$ between the Sun and the target body as seen from the primary is
-
-$$\varphi = \arccos\negthinspace\left(-\hat{\mathbf{s}}_\mathrm{p} \cdot \hat{\mathbf{p}}_i\right)$$
-
-where $\hat{\mathbf{s}}_\mathrm{p}$ is the unit vector from the primary to the Sun, and $\hat{\mathbf{p}}_i$ points from the face toward the primary. A Lambert-sphere phase function modulates the reflected intensity:
-
-$$\Phi(\varphi) = \frac{1 + \cos\varphi}{2}$$
-
-The reflected solar flux incident on face $i$ is
-
-$$F_{\mathrm{refl},i} = \frac{E_{\odot,\mathrm{p}} \cdot A_\mathrm{p} \cdot \Phi(\varphi) \cdot \Omega_\mathrm{p}}{4\pi} \left(\hat{\mathbf{n}}_i \cdot \hat{\mathbf{p}}_i\right)$$
-
-where $E_{\odot,\mathrm{p}} = S_0 / (d_{\odot,\mathrm{p}} / 1\thickspace\text{AU})^2$ is the solar irradiance at the primary's heliocentric distance and $A_\mathrm{p}$ is the primary's Bond albedo (e.g., $A_\mathrm{Jupiter} = 0.343$). Terrain visibility is again verified by ray tracing.
+Sunlight reflected by the primary toward the surface is computed as the irradiance from a
+Lambertian sphere of Bond albedo $A_\mathrm{p}$ (e.g., 0.343 for Jupiter) illuminated by the Sun,
+integrated over the sunlit part of the disk visible from the face, as a function of the phase
+angle at the primary and the face orientation. The derivation and the validation against direct
+numerical integration are in [primary-reflected-flux-derivation.md](primary-reflected-flux-derivation.md).
+Terrain visibility is checked by ray tracing.
 
 ## Total Absorbed Flux
 
 The total radiative flux absorbed by face $i$ at time $t$ is the sum of the three components:
 
-$$F_{\mathrm{abs},i}(t) = (1 - A)\thinspaceF_{\mathrm{direct},i}(t) + F_{\mathrm{IR},i}(t) + (1 - A)\thinspaceF_{\mathrm{refl},i}(t)$$
+$$F_{\mathrm{abs},i}(t) = (1 - A)\thinspaceF_{\mathrm{direct},i}(t) + \varepsilon\thinspaceF_{\mathrm{IR},i}(t) + (1 - A)\thinspaceF_{\mathrm{refl},i}(t)$$
 
-where $A$ is the surface Bond albedo. For heliocentric bodies without a parent planet (e.g., asteroids), the primary IR and reflected terms vanish and only the direct solar term contributes.
+where $A$ is the surface Bond albedo, which depends on the incidence angle (Hayne et al. 2017 by default, or the Hapke directional-hemispheric albedo), and $\varepsilon$ is the infrared emissivity. In radiation-coupled runs the indirect flux of [radiation-exchange.md](radiation-exchange.md) is added. For heliocentric bodies without a parent planet (e.g., asteroids), the primary IR and reflected terms vanish and only the direct solar term contributes.
 
 ## Ray Origin Offset
 
-To prevent self-intersection artifacts in ray tracing, each ray origin is offset from the face center along both the face normal and the ray direction. The offset magnitude is scale-aware:
+To avoid self-intersection, each shadow ray starts offset from the face center along the face
+normal and along the ray direction, by multiples of
 
-$$\epsilon = \max\negthinspace\left(16\thinspace\epsilon_\mathrm{mach}\thinspacer,\thickspace \max\negthinspace\left(10^{-6}\thinspacer,\thickspace 0.01\thickspace\text{m}\right)\right)$$
+$$\epsilon = \max\negthinspace\left(16\thinspace\mathrm{ulp}(r),\ \max\negthinspace\left(10^{-6}\thinspace r,\ 0.01\ \text{m}\right)\right),$$
 
-where $r = \lVert\mathbf{r}_i\rVert$ is the radial distance of the face center from the body origin and $\epsilon_\mathrm{mach}$ is the machine epsilon for double-precision arithmetic. The ray origin for face $i$ with sun direction $\hat{\mathbf{s}}$ is then
+where $r$ is the distance of the face center from the scene origin (the scene is recentered on
+the mesh before tracing). The origin is $\mathbf{r}_i + 2\epsilon\thinspace\hat{\mathbf{n}}_i + k\epsilon\thinspace\hat{\mathbf{s}}$ with
+$k = 1$ on the single-face path and $k = 8$ on the batched path used in production.
 
-$$\mathbf{o}_i = \mathbf{r}_i + 2\epsilon\thinspace\hat{\mathbf{n}}_i + 12\epsilon\thinspace\hat{\mathbf{s}}$$
-
-This ensures robust behavior across scales ranging from meter-scale DEM patches to planetary-radius global meshes.
+The 1 cm minimum is much larger than the relief of millimeter-scale terrain: on such meshes a
+shadow ray can step over a small rim and light a face that should be in shadow. The default also
+flips face normals radially outward, which turns overhangs into false sunlit faces. The opt-in
+settings `PTM_ILLUM_TRUE_NORMALS`, `PTM_ILLUM_RISE_EPS` with `PTM_ILLUM_RISE_HABS=0`, and
+`PTM_ILLUM_SEAL_HOLES` correct both; use them together on fine polar meshes
+([ENVIRONMENT.md](ENVIRONMENT.md)).
 
 ## References
 

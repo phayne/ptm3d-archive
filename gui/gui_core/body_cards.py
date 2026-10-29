@@ -12,8 +12,7 @@ Three rules govern the tables below, and each of them was paid for:
    from :data:`ptm.body_table.IMPLEMENTED_BODIES`, which is generated from
    ``planetary_properties.h``. It is not retyped here. The GUI used to offer
    seven built-in bodies against the engine's three, and the four extras ran to
-   completion with Europa's radius and zero absorbed flux on every face
-   (``BUGS.md`` ENG-BODY-UNBACKED-RUN). A body added or removed in C++ now
+   completion with Europa's radius and zero absorbed flux on every face. A body added or removed in C++ now
    changes this surface through a generated table and a parity test, not
    through somebody remembering.
 
@@ -152,8 +151,7 @@ BODY_PRESENTATION = {
         modes=("global",),
         # The two defects that held this button back -- a solar day recorded as
         # the 58.646 d SIDEREAL rotation, and a 500 K ceiling written for icy
-        # bodies -- were fixed in the engine on 2026-08-26 (BUGS.md
-        # ENG-MERCURY-SOLAR-DAY, ENG-MERCURY-TEMP-CEILING). What remains is
+        # bodies -- were fixed in the engine on 2026-08-26. What remains is
         # thin DATA, and the Mercury CARD says so in a banner at the top,
         # beside the controls it constrains. It used to say so twice, once as a
         # two-word badge on the button; the badge is gone and the banner is the
@@ -1071,7 +1069,7 @@ def card_preset(route, mode):
 
 
 # ---------------------------------------------------------------------------
-# 7. The generic-body round-trip floor (PTM-201)
+# 7. The generic-body round-trip floor
 # ---------------------------------------------------------------------------
 
 #: Below this, a `generic_body.surface` number does not survive the trip into
@@ -1081,7 +1079,7 @@ def card_preset(route, mode):
 #: solver silently keeps the EUROPA placeholder property, because a generic
 #: body's name resolves to Europa by design. Measured: ks = kd = 4e-7 and
 #: ks = 0.0096, kd = 0.05 produce byte-identical statistics -- a 24000-fold
-#: conductivity error, with nothing said (BUGS.md PTM-201).
+#: conductivity error, with nothing said.
 SURFACE_ROUND_TRIP_FLOOR = 5e-7
 
 #: The shape types the ENGINE branches on, in its own spelling.
@@ -1298,7 +1296,7 @@ def _resolve_kernel_path(value, project_root=None, env=None):
     file is meant, or it reports on a file the run will not open:
 
     * ABSOLUTE -- used exactly as given. Prepending the kernel directory to an
-      absolute path is PTM-145, and it is why every EMA asteroid configuration
+      absolute path is the generic-body metakernel defect, and it is why every EMA asteroid configuration
       missed its metakernel.
     * relative ``data/...`` -- the ``$PTM_DATA_ROOT`` contract shared with
       ``mesh.import_file``. This is what the seven cached ``body_config.yaml``
@@ -1388,7 +1386,7 @@ _KERNEL_POOL_ASSIGNMENT = re.compile(
 #: to the one after it, with the marker dropped. `SPKGenerator` emits every
 #: long path this way (`spk_generator.py:_continued_string_lines`) because a
 #: single pool string longer than about 99 characters is TRUNCATED rather than
-#: refused -- which is PTM-145, and which is why a parser that ignored this
+#: refused -- the generic-body metakernel defect, and the reason a parser that ignored this
 #: would resolve a deep OneDrive path to a shorter one that does not exist.
 _POOL_CONTINUATION = "+"
 

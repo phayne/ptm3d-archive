@@ -13,7 +13,7 @@
 //  (e) optional, given <mesh.ply> <Europa_Albedo_res6.bin> (FITS beside the .bin):
 //      map-fill faces are seeded from the map value the thermal run used, so on
 //      every in-range fill face the t = 0 composition albedo, the temperature
-//      reference and the thermal albedo agree (PTM-637); --fill-ice-fraction=uniform
+//      reference and the thermal albedo agree; --fill-ice-fraction=uniform
 //      (the old seed) is shown to disagree there.
 //
 // The legacy rule (compare to the previous pass, skip faces below the threshold)

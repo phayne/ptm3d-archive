@@ -21,7 +21,7 @@ rule is the GUI's, it is stated where it is computed, and the card shows it
 with its reasoning. See :func:`gui_core.body_cards.auto_equilibration_cycles`.
 
 **3. The built-in bodies' surface properties use the keys the engine READS.**
-This is PTM-67, and it is the one that would go wrong silently: on the Moon,
+This is the unread-config-key defect, and it is the one that would go wrong silently: on the Moon,
 Europa or Mercury the engine reads ``thermophysical.albedo_override`` and
 ignores ``thermophysical.albedo``. A card offering the unsuffixed name would
 write a value the run reads and then discards. The check below re-derives the
@@ -689,7 +689,7 @@ def test_a_unit_with_no_period_is_refused_not_approximated():
 
 
 def test_showing_a_duration_in_another_unit_does_not_rewrite_it():
-    """GUI-DURATION-DISPLAY-UNITS-STORED, closed. This one CORRUPTED files.
+    """Stored duration in display units, closed. This one CORRUPTED files.
 
     ``BaseConfigTab.set_numeric`` writes the coerced number back to the
     configuration on purpose -- it is how a YAML string like ``5e3`` stops
@@ -725,7 +725,7 @@ def test_showing_a_duration_in_another_unit_does_not_rewrite_it():
 
 
 def test_every_duration_control_shows_the_same_precision():
-    """GUI-DURATION-DECIMALS-4-VS-6, closed.
+    """Duration shown at four decimals vs six, closed.
 
     ``simulation.duration_days`` was shown at four decimals by the Simulation
     tab and six by the body cards, so the same configuration read differently
@@ -833,7 +833,7 @@ def _engine_thermophysical_keys():
 
 
 def test_the_card_overrides_are_exactly_the_keys_the_engine_reads():
-    """PTM-67, held by re-derivation rather than by memory.
+    """Unread-config-key defect, held by re-derivation rather than by memory.
 
     On a built-in body the engine reads ``*_override`` and ignores the
     unsuffixed names; anything else under ``thermophysical:`` draws a "read by
@@ -849,13 +849,13 @@ def test_the_card_overrides_are_exactly_the_keys_the_engine_reads():
     assert not unread, (
         f"the card offers {sorted(unread)} under thermophysical:, which the "
         f"parser's own read-list does not contain -- editing them would "
-        f"change no result (PTM-67)")
+        f"change no result (unread-config-key defect)")
     # ...and every *_override the engine reads is offered, so a property the
     # engine gained does not sit unreachable.
     missing = {k for k in engine if k.endswith("_override")} - offered
     assert not missing, (
         f"the engine reads {sorted(missing)} but no card control offers them")
-    print(f"    [PTM-67] {len(offered)} overrides offered, all in the "
+    print(f"    [unread keys] {len(offered)} overrides offered, all in the "
           f"parser's read-list: {sorted(offered)}")
 
 

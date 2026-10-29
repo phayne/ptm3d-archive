@@ -166,7 +166,7 @@ def scatter_flux_vs_temp(outdir: Path, temp: np.ndarray, arrays: dict, colors: d
     temperature (linear x), BOTH bands overlaid as rasterized low-alpha point
     clouds (~509k faces/band). The scatter layer is rasterized so the vector
     PDF stays small; ALL faces are shown (no over-count masking) so the known
-    PTM-12 VF over-count population appears honestly as high-T outliers."""
+    the VF over-count population appears honestly as high-T outliers."""
     from matplotlib.lines import Line2D
     figs, ax = plt.subplots(1, 1, figsize=(0.80 * DOUBLE_W, 0.52 * DOUBLE_W))
     ymax = 0.0

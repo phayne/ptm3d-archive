@@ -13,7 +13,7 @@
 //                                               T_avg = T_ss/sqrt(2): flux-blind
 //                                               AND latitude-blind
 //     CPU SIMD batch (the default)   66.246 K   per-face radiative balance
-//                                               (PTM-46) -- correct -- then
+//                                               -- correct -- then
 //                                               destroyed by the pre-conditioner
 //     GPU persistent (default)       71.028 K   10-step mean flux, then
 //                                               `if (T_eq < 40) T_eq = 100`
@@ -108,7 +108,7 @@
 // average albedo -- before the real forcing, and the GPU had no analog. An
 // initial condition is free: a correct solver forgets it. A FORCING is not. It
 // destroyed the correct per-face IC the same code path had just computed
-// (Fermi measured 24.043 K -> 64.375 K surface, +60 K at 1 m on a face that
+// (the physics review measured 24.043 K -> 64.375 K surface, +60 K at 1 m on a face that
 // never sees the Sun). It is OFF by default now, and reported when on.
 // See analyticSeedCycles() below.
 
@@ -467,7 +467,7 @@ double eqSeedGammaEff(const EqSeedInput& in, const EqSeedForcing& fc,
 // exceeds twice its year, and Mercury is exactly that body once its day is the
 // true 175.938-day SOLAR day rather than the 58.646-day sidereal rotation
 // (2 Mercury years = 1 Mercury solar day, so year/day = 0.5). Without the
-// floor, fixing ENG-MERCURY-SOLAR-DAY would have silently turned the legacy
+// floor, fixing the Mercury solar day would have silently turned the legacy
 // analytic pre-conditioner OFF for Mercury -- a spin-up of zero cycles
 // reported as a spin-up. Inert for every other body and every shipped config:
 // Moon, Europa and every generic body already return >= 1.

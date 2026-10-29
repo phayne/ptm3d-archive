@@ -12,13 +12,13 @@
 //   output:                     the run COMPLETED, exit 0, wrote no subsurface
 //     map_depths_m: 0.05        maps, and said NOTHING -- a forgotten pair of
 //                               brackets is a silent surface-only run
-//                               (PTM-DEPTHMAP-SCALAR-SILENT-OFF)
+//                               
 //
 //   output:                     the run STOPPED, exit 1, reporting
 //     map_depth_stats: avg      "output.map_depth_stats is empty" -- for a file
 //                               that plainly named a statistic. Right verdict,
 //                               wrong diagnosis, and the wrong fix to try
-//                               (PTM-DEPTHMAP-STATS-SCALAR-MISDIAGNOSED)
+//                               
 //
 // The arms below pin BOTH directions: the malformed forms are refused and the
 // message names the list form, and every legal spelling -- a list, an empty

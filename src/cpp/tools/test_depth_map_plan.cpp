@@ -405,8 +405,8 @@ int main() {
         // `thermal_b` (config_parser.cpp: getWithDefault(thermal, "thermal_b",
         // config.thermal.grid_b)). The refusal shipped naming the field, so it
         // told the reader to increase a key that does not exist and that the
-        // engine would silently ignore if they added it
-        // (PTM-DEPTHMAP-REFUSAL-NAMES-A-NONEXISTENT-KEY). Both directions are
+        // engine would silently ignore if they added it.
+        // Both directions are
         // asserted: the old spelling is not a substring of the new one, so the
         // negative arm is what fails if it ever comes back.
         checkRefused(baseRequest({1.5}, true), z, "thermal.thermal_b",

@@ -659,7 +659,7 @@ def test_the_curated_shape_comes_with_its_provenance_and_its_git_status():
     """A shape that ships is a different statement from a shape that does not.
 
     ``.gitignore`` line 14 (``*.obj``, written for C object files) matches
-    every asteroid shape model here -- PTM-303, and why a Justitia shape once
+    every asteroid shape model here, which is why a Justitia shape once
     went missing. Bennu's is force-added and TRACKED. Saying "untracked, back
     it up" over a file the repository carries would be wrong; saying "tracked"
     over one it does not would be worse. The registry records which, and the

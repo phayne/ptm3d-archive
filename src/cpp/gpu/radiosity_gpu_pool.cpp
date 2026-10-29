@@ -119,7 +119,7 @@ bool RadiosityGPUDevicePool::uploadStaticDataCommon(
         DeviceSlot* slot = slots_[i].get();
         if (!slot->healthy || !slot->solver) continue;
 
-        // uploadViewFactors can throw (chunk/VRAM fail-loud, PTM-25). Every
+        // uploadViewFactors can throw (chunk/VRAM fail-loud). Every
         // device holds the full CSR replica, so a failure on any device means
         // the pool cannot serve this matrix -- fail loud rather than run a
         // partially-loaded pool.

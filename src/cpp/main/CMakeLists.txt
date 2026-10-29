@@ -40,7 +40,7 @@ set_target_properties(ptm_thermal_sim
 # ============================================================================
 # VTK Reader Support
 # ============================================================================
-option(PTM_USE_VTK_READER "Use VTK C++ reader for mesh import (replicates PyVista)" ON)
+# PTM_USE_VTK_READER is declared in the top-level CMakeLists.txt (src/cpp/mesh reads it first).
 
 if(PTM_USE_VTK_READER)
   find_package(VTK COMPONENTS

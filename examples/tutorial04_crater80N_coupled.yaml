@@ -1,10 +1,21 @@
 # Tutorial 04: lunar 80N bowl crater WITH inter-face radiation exchange
 # (radiosity). Compare against tutorial04_crater80N_radoff.yaml — radiation
-# warms the shadowed crater floor (docs/tutorials/04_crater_radiosity.md).
+# warms the shadowed crater floor (docs/tutorials/02_crater_radiosity.md).
 # Run from the repo root after `python3 scripts/fetch_kernels.py`.
 #
 # The first run builds an H-matrix view-factor set for the 12,800-face mesh
 # and SAVES it to radiation.view_factor_file; later runs reload it.
+
+# The validated fine-mesh illumination settings (opt-in, default OFF). They
+# are used together, never PTM_ILLUM_RISE_EPS on its own; on this 29 m-facet
+# crater they change few faces, but this is the recipe for polar terrain.
+# See docs/ENVIRONMENT.md.
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_KEPS: '0.2'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
 
 simulation:
   start_time: '2026-04-05T00:00:00'
@@ -12,14 +23,14 @@ simulation:
   timesteps: 118                 # ~6 h cadence over one lunation
   body: Moon
 mesh:
-  resolution: 3
   import_file: data/meshes/lunar_crater_80N.ply   # 12,800 faces, shipped with the repo
   scale_factor: 1.0
   use_topographic: false
 thermal:
   run_thermal_mesh: true
   threads: 0
-  equilibration_orbits: 1.0
+  equilibration_orbits: 8.0     # integrated diurnal cycles of spin-up
+  equilibration_samples_per_diurnal_cycle: 48
   equilibration_steps_per_day: -1.0
   use_gpu: false
   compute_statistics: true
@@ -51,6 +62,5 @@ illumination:
 output:
   directory: output/tutorial04_crater80N_coupled
   format: binary
-  vtk_mode: thermal
 advanced:
   verbose: false

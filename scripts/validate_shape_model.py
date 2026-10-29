@@ -57,7 +57,7 @@ import sys
 import numpy as np
 
 # The engine's kilometers-vs-meters discriminator on the median |face center|
-# (ptm_thermal_sim.cpp, the PTM-37 guard). Repeated here ONLY to predict what
+# (ptm_thermal_sim.cpp, the mesh length-unit guard). Repeated here ONLY to predict what
 # the run will print; the engine remains the authority, and this tool says
 # "predicts" rather than "is" for exactly that reason.
 UNIT_DISCRIMINATOR = 10000.0
@@ -219,7 +219,7 @@ def geometry(vertices, faces):
 
 
 def predict_units(face_center_median, body_radius_km):
-    """What the engine's PTM-37 guard will print for this mesh, and why.
+    """What the engine's mesh length-unit guard will print for this mesh, and why.
 
     Reported as a prediction rather than a fact: the guard is in the engine and
     a second copy of a rule is a rule that drifts. Run the engine to confirm.

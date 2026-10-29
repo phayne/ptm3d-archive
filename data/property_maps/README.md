@@ -26,7 +26,7 @@ python3 scripts/fetch_data.py --dataset moon-property-maps   # ~60 MB
 
 Diviner-derived global maps sampled at each icosphere face center; one
 single-precision value per face in mesh face order (4-byte-header binary
-layout, see `docs/tutorials/06_interpreting_outputs.md`).
+layout, see `docs/tutorials/03_outputs.md`).
 
 ## License
 

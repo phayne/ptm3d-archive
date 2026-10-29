@@ -538,8 +538,7 @@ def test_an_unparseable_device_list_blocks_the_launch_and_stays_fixable():
     engine, not here. It used to assert that unticking the box UNBLOCKED the
     launch, on the stated grounds that this was "a key the run would never
     read". That premise is now false: `config_parser.cpp` refuses a non-list
-    `gpu_device_ids` at CONFIG LOAD, before it looks at `use_gpu` at all
-    (PTM-CONFIG-SEQUENCE-SCALAR-SILENT). Letting the launch through would start
+    `gpu_device_ids` at CONFIG LOAD, before it looks at `use_gpu` at all. Letting the launch through would start
     a run that dies in its first second -- and this application really can write
     such a file: a scalar passes straight through `save_to_yaml` to disk,
     measured.

@@ -56,7 +56,7 @@ __all__ = [
 # --- per-step frame names ----------------------------------------------------
 #
 # A per-step product is <run>/<field>/<field>_<index>.bin. Engines before
-# BUGS.md PTM-664 zero-padded <index> to FOUR digits -- a minimum, so frame
+# the frame-name fix zero-padded <index> to FOUR digits -- a minimum, so frame
 # 10000 was "10000" -- and an alphabetical sort of a run with more than 10,000
 # frames came out 0000 ... 1000, 10000, 10001, ..., 1001. That scrambled a
 # Justitia TWG Case 4 reduction. Current engines pad to
@@ -140,13 +140,11 @@ TimeAxis = namedtuple("TimeAxis", "et elapsed_s utc")
 def read_time_steps(path):
     """Read ``time_steps.txt`` into a :class:`TimeAxis`.
 
-    Column 1 is **seconds past the J2000 epoch** -- SPICE ET -- even though the
-    file's own header comment says "Time elapsed from start (seconds)". The
-    header is wrong and has been wrong for every run in the tree;
-    ``docs/tutorials/06_interpreting_outputs.md`` documents the trap. Eleven
-    separate parsers in the repo re-discover it, several of them by plotting a
-    time axis that starts at 8.3e8. ``elapsed_s`` is the rebased column, so a
-    caller that wants elapsed time never has to know.
+    Column 1 is **seconds past the J2000 epoch** (SPICE ET). Files written
+    before release/r1-engine carry a header comment calling it "Time elapsed
+    from start (seconds)"; that label was wrong, the numbers were always ET.
+    ``elapsed_s`` is the rebased column, so a caller that wants elapsed time
+    never has to know.
     """
     path = Path(path)
     et, utc = [], []
@@ -425,7 +423,7 @@ def infer_mesh_length_unit(face_centers, vertices=None, body_radius_km=None):
     topographic run and kilometers for a plain icosphere -- on the same body,
     with the same header. Every consumer in the tree re-derives the unit from
     ``|face_center| > 10000``, and getting it backwards is a 1000x error in
-    every length (that was PTM-36: Jupiter's shadow shrank 1000x and every
+    every length (that was Jupiter's shadow shrank 1000x and every
     Europa eclipse vanished).
 
     This is a port of ``inspectMeshLengthUnit`` in
@@ -452,7 +450,7 @@ def infer_mesh_length_unit(face_centers, vertices=None, body_radius_km=None):
 
     # 0. Face centers are vertex averages, so their magnitudes cannot
     #    legitimately differ by a unit scale. When they do, something rescaled
-    #    one array and not the other (PTM-65, mesh.scale_factor).
+    #    one array and not the other (mesh.scale_factor).
     if vertices is not None and len(vertices) and median > 0:
         vmedian = float(np.median(np.linalg.norm(
             np.asarray(vertices, dtype=np.float64), axis=1)))
@@ -509,7 +507,7 @@ def infer_mesh_length_unit(face_centers, vertices=None, body_radius_km=None):
             f"{'KILOMETERS' if says_km else 'METERS'}, but the "
             f"|face_center| > {_DISCRIMINATOR:g} rule every consumer uses says "
             f"{'METERS' if meters else 'KILOMETERS'}. Running on this would "
-            f"scale every SPICE-derived length by 1000x the wrong way (PTM-36)")
+            f"scale every SPICE-derived length by 1000x the wrong way")
 
     in_band = (_DISCRIMINATOR / _AMBIGUOUS_FACTOR < median
                < _DISCRIMINATOR * _AMBIGUOUS_FACTOR)

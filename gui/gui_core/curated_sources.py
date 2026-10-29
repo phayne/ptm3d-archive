@@ -72,7 +72,7 @@ and they are kept in separate modules for that reason.
 Adding a body
 -------------
 
-See ``docs/gui-curated-body-sources.md``. In short: add the kernel set to
+See ``docs/dev/gui-curated-body-sources.md``. In short: add the kernel set to
 ``BODY_KERNELS`` in ``scripts/fetch_kernels.py`` with its pinned sha256, ship
 the metakernel in ``data/kernels/``, add a ``CuratedBody`` below, and let
 ``src/python/tests/test_gui_curated_sources.py`` check that every path,
@@ -174,7 +174,7 @@ class CuratedShape:
 
     ``tracked`` records whether the file is in git. It matters and it is not
     obvious: ``.gitignore`` carries ``*.obj``, a rule written for C object
-    files that matches every asteroid shape model here (PTM-303). The curated
+    files that matches every asteroid shape model here. The curated
     body cache is excepted from it by name
     (``!data/horizons_cache/bodies/**/*.obj``), so Bennu's shape ships by RULE
     rather than by the ``git add -f`` it originally needed -- a force-add is
@@ -300,7 +300,7 @@ CURATED_BODIES = (
             # Mean |vertex| over the 24,578 REFERENCED vertices, 0.243722 km.
             # Not decoration: `BodyShape::meanRadiusKm` returns this verbatim
             # for a CUSTOM_MESH (`src/cpp/orbital/body_shape.h:41`), so it is
-            # the R_body the engine's PTM-37 unit guard cross-checks the mesh
+            # the R_body the engine's mesh length-unit guard cross-checks the mesh
             # against and the radius `setBodyRadius` receives.
             radius_km=0.2437,
             mesh_scale=1.0,

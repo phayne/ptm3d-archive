@@ -8,11 +8,11 @@ polar stereographic when |lat| > 70 everywhere; equirectangular otherwise.
 
 Example:
 
-    /Users/paha3326/anaconda3/envs/europa_viz/bin/python \\
+    python3 \\
         scripts/ptm3d_stats_to_cog.py \\
-        --mesh   /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/<SITE>/mesh.ply \\
-        --stats  /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/<SITE>/statistics \\
-        --output /Users/paha3326/Research/moon/artemis/a3gt/sites_v2_3km_rad/<SITE>/cog
+        --mesh   <RUN_DIR>/mesh.ply \\
+        --stats  <RUN_DIR>/statistics \\
+        --output <RUN_DIR>/cog
 
 Default resolution is auto-estimated from face spacing. For A3GT v2 1 m/px
 meshes pass ``--resolution-m 1`` to force 1 m pixels (matches the colleague's
@@ -35,7 +35,7 @@ try:
 except ImportError:
     sys.stderr.write(
         "ERROR: rasterio not importable. Run with the europa_viz Python:\n"
-        "       /Users/paha3326/anaconda3/envs/europa_viz/bin/python "
+        "       python3 "
         f"{sys.argv[0]} ...\n"
     )
     sys.exit(2)

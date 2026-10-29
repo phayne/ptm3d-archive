@@ -158,7 +158,7 @@ _md5 = run_mod.file_md5
 #
 # The two config-key parameters below were checked against the engine on a
 # GENERIC body as well as a built-in one, because generic_body.surface.* is
-# normally the only place a generic body's properties are read (PTM-67) and a
+# normally the only place a generic body's properties are read and a
 # body-class-dependent mapping would have been the obvious guess. Measured on
 # quickstart_asteroid_diurnal, binary f0f66a09:
 #   * thermophysical.albedo_override 0.30 and generic_body.surface.albedo 0.30

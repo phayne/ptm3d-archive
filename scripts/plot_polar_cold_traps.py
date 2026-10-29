@@ -686,7 +686,7 @@ def plot_combined_panel(all_meshes, all_T_max, dem_labels, dem_keys,
 # DEM configurations
 # ──────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEM_DIR = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/DEM/sutton_WorkMORE"
+DEM_DIR = os.environ.get("PTM_EUROPA_DEM_DIR", os.path.join(BASE_DIR, "data", "external", "sutton_WorkMORE"))
 
 DEM_BASES = {
     "rhad":   {"mesh": os.path.join(DEM_DIR, "Rhadamanthys_DEM_450m_SOCET.ply"),

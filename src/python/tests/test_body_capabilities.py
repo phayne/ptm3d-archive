@@ -3,8 +3,7 @@
 
 ``src/cpp/thermal/planetary_properties.h`` implements three bodies. The GUI
 offered seven, and the four with no properties resolved to Europa's and ran to
-completion with zero absorbed flux and exit 0 (``BUGS.md``
-ENG-BODY-UNBACKED-RUN). The engine now refuses those names at config parse;
+completion with zero absorbed flux and exit 0. The engine now refuses those names at config parse;
 this file is the drift guard that stops the two sides diverging again -- the
 same job ``test_config_parity.py`` does for configuration keys.
 
@@ -65,7 +64,7 @@ REQUIRED_FIELDS = (
 
 #: Bodies the GUI's built-in dropdown offers that the engine does NOT implement.
 #: Every one of these is a config the engine refuses at parse
-#: (ENG-BODY-UNBACKED-RUN); they are pinned so a NEW unbacked body cannot be
+#: they are pinned so a NEW unbacked body cannot be
 #: added to the dropdown unnoticed, and so that removing them from the GUI
 #: (Phase B of the body-first work) fails this test until the pin is updated
 #: too. Do not add to this list to make the test pass.

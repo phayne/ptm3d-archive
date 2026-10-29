@@ -123,7 +123,7 @@ def collect(paths):
 
 
 def main(argv):
-    paths = argv[1:] or ["docs", "README.md", "INSTALL.md", "TUTORIAL.md"]
+    paths = argv[1:] or ["docs", "README.md", "INSTALL.md", "CHANGELOG.md"]
     files = collect([p for p in paths if os.path.exists(p)])
     total = 0
     for f in files:

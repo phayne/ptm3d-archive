@@ -223,7 +223,7 @@ inline void waveBias(double zeta1, double zeta2, double zeta_q, double w,
 // config_parser.cpp reads `getWithDefault(thermal, "thermal_b",
 // config.thermal.grid_b)`. A refusal that names the field tells the reader to
 // edit a key that does not exist -- the defect class that already shipped twice
-// (PTM-DEPTHMAP-REFUSAL-NAMES-A-NONEXISTENT-KEY, and the state-io refusal fixed
+// (and the state-io refusal fixed
 // in `fix/sequence-scalar-guards`).
 //
 // `product` names the thing being refused, so the message reads correctly for

@@ -6,7 +6,7 @@ state from one chunk to the next through ``thermal.final_state_file`` /
 ``thermal.initial_state_file`` with ``thermal.checkpoint_lookahead_steps: 1``,
 so chunk k+1 starts at exactly the epoch where chunk k stopped exporting. The
 contract is that the concatenated frames are the single-shot frames. Before
-BUGS.md PTM-662 the first frame of every restored chunk was not: the solver
+the warm-start seam fix the first frame of every restored chunk was not: the solver
 filed the restored column's raw surface node under output index 0 instead of
 re-solving the massless surface at that frame's own epoch, the way it does for
 every other frame (fix/frame-forcing-epoch). Measured 0.31 K on Justitia.
@@ -33,7 +33,7 @@ Solver paths exercised: CPU SIMD batch (the default) and CPU scalar
 (``--no-simd-batch``). The CPU streamed driver shares the scalar per-face
 integrator (runThermalModelWithMatchedTimes -> Model::run) but is selected by a
 memory threshold, so it is NOT separately exercised here. The GPU persistent
-solver is not exercised either (see BUGS.md PTM-662 for its status).
+solver is not exercised either (see the warm-start seam fix for its status).
 
 Usage
 -----

@@ -1,7 +1,7 @@
 #ifndef PTM_FILEIO_FRAME_NAMING_H
 #define PTM_FILEIO_FRAME_NAMING_H
 
-// Per-step frame file names: <dir>/<prefix>_<index>.bin (BUGS.md PTM-664).
+// Per-step frame file names: <dir>/<prefix>_<index>.bin.
 //
 // The index used to be zero-padded to FOUR digits. std::setw is a MINIMUM
 // width, so frame 10000 was written "10000" and an alphabetical sort of a run
@@ -30,7 +30,7 @@ namespace ptm {
 
 // Minimum index width for newly written frames.
 constexpr int kFrameIndexMinWidth = 6;
-// Width every run before BUGS.md PTM-664 wrote (a minimum, not a maximum).
+// Width every run before the frame-name fix wrote (a minimum, not a maximum).
 constexpr int kFrameIndexLegacyWidth = 4;
 
 // Number of digits the writer pads to for a run exporting `n_frames` frames
@@ -80,7 +80,7 @@ inline std::string resolveFrameFile(const std::string& dir,
 // left in a directory this run is about to fill. Returns the number removed
 // (0 when the directory does not exist yet).
 //
-// Why: before BUGS.md PTM-664 a re-run into the same output directory wrote
+// Why: before the frame-name fix a re-run into the same output directory wrote
 // the same names and overwrote the old frames. With the new width it would
 // leave the old 4-digit set beside the new one, and every reader that lists
 // frames numerically would then load both (duplicate indices) or refuse the

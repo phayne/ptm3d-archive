@@ -1,10 +1,9 @@
-# Paths below are REPOSITORY-ROOT-RELATIVE (PTM-145 convention). The engine
+# Paths below are REPOSITORY-ROOT-RELATIVE. The engine
 # resolves a `data/...` value against the repository root, which it finds by
 # walking up from THIS FILE's directory to the one holding
 # data/data_manifest.json (src/cpp/tools/config_parser.cpp, findRepoRootForData
 # / resolveDataPath), so these resolve from any working directory and honor
-# $PTM_DATA_ROOT. They previously named an absolute OneDrive path that does not
-# exist on every machine (PTM-446). Do not re-absolutize them.
+# $PTM_DATA_ROOT. Do not make them absolute.
 #
 # ONE EXCEPTION, and it is a real one: the paths INSIDE
 # data/horizons_cache/bodies/269_Justitia_(A887_SA)/metakernel.tm are resolved
@@ -80,7 +79,7 @@ illumination:
   albedo_maps_directory: ''
   positions_file: ''
 output:
-  directory: /Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/EMA/science/thermal/269justitia/ice_depth_study/homog_ctrl
+  directory: output/justitia/ice_depth_study/homog_ctrl
   format: binary
   vtk_mode: none
   include_primary_ir: false

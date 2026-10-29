@@ -520,7 +520,7 @@ Examples:
         print(f"\nCreating PVD file: {pvd_file}")
 
         time_values = read_time_steps_txt(input_dir)
-        # time_steps.txt lists one time per snapshot, in label order (PTM-636), so
+        # time_steps.txt lists one time per snapshot, in label order, so
         # the k-th entry belongs to the k-th AVAILABLE label -- not to the label
         # whose value happens to equal k (with labels 0, 2, 4, ... a label lookup
         # gave label 2 the time of the third snapshot).
@@ -529,7 +529,7 @@ Examples:
             by_label = {t: time_values[k] for k, t in enumerate(available_timesteps)}
         elif time_values:
             print(f"  WARNING: time_steps.txt has {len(time_values)} entries for "
-                  f"{len(available_timesteps)} snapshots (written by a build before PTM-636, "
+                  f"{len(available_timesteps)} snapshots (written by a build before the snapshot-time fix, "
                   f"which omitted the final snapshot and held nominal times); PVD times are "
                   f"approximate")
 

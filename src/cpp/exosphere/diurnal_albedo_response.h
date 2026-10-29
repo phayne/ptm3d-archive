@@ -32,7 +32,7 @@
  * the radiative-equilibrium limit (g1 = 1/4, g2 = 0) is reproduced EXACTLY for any
  * r. The legacy rescale is therefore the special case g1 = 1/4, g2 = 0.
  *
- * TRUST REGION (PTM-675). The expansion is about the thermal run's own state and
+ * TRUST REGION. The expansion is about the thermal run's own state and
  * was validated to |ln r| ~ 0.4; production reaches r ~ 3 (|ln r| 1.1), where it runs
  * +0.5 K / +15% HK warm. The engine therefore treats it as an expansion about an
  * ANCHOR (r_a, T_a, g1, g2): once |ln(r / r_a)| exceeds the trust radius (0.35), the
@@ -515,7 +515,7 @@ struct DiurnalAnchorInfo {
 };
 
 /**
- * RE-ANCHORING (large r; PTM-675). The second-order law is an expansion about the thermal
+ * RE-ANCHORING (large r). The second-order law is an expansion about the thermal
  * run's own state and degrades as |ln r| grows (validated to |ln r| ~ 0.4). This
  * solves the periodic problem EXACTLY at the absorbed-solar ratio r, on the same
  * column, and returns the new base curve with the log coefficients about it; the

@@ -12,7 +12,7 @@ Makefile
 # Compiled object files
 *.o
 # `*.obj` is a C/C++ object-file rule that also matches every Wavefront OBJ
-# shape model in the tree (PTM-303). The curated body cache ships shape models
+# shape model in the tree. The curated body cache ships shape models
 # there, so they are excepted BY NAME rather than force-added: a force-add is
 # invisible to the next person, and the day someone re-adds one without -f it
 # would silently stop being tracked -- leaving a curated card that offers a
@@ -31,13 +31,13 @@ Makefile
 # here, and it carries a provenance sidecar next to it (source, version, URL,
 # md5, date) plus a PROVENANCE.md in its body directory. The exception is by
 # EXACT FILENAME so that removing a shape and leaving the rule behind is
-# visible. See data/horizons_cache/README.md, "Shape-model policy", and PTM-303.
+# visible. See data/horizons_cache/README.md, "Shape-model policy".
 *.obj
 # (101955) Bennu -- OSIRIS-REx OLA v21 global model, and the superseded Nolan
 # 2013 radar model kept because a shipped notebook reads it by name.
 !data/horizons_cache/bodies/**/bennu_radar_shape.obj
 !data/horizons_cache/bodies/**/g_06370mm_alt_obj_0000n00000_v021.obj
-# (269) Justitia -- DAMIT model 2858, the original (PTM-303), plus the
+# (269) Justitia -- DAMIT model 2858, the original, plus the
 # 2026-07-04 hand reconstruction it replaced. The reconstruction is retained for
 # the same reason Bennu's radar model is: it is the shape behind every Justitia
 # product made before 2026-08-31. The two are geometrically identical (max

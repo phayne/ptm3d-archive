@@ -18,7 +18,7 @@ def find_converter():
     from src/cpp/tools/ by this repository's CMake, so that is the binary
     matching this checkout. The legacy standalone ``dtm/`` locations stay as
     fallbacks for machines that have not rebuilt yet -- those binaries predate
-    the port and may target a different CPU architecture. See BUGS.md PTM-04.
+    the port and may target a different CPU architecture.
     """
     repo_root = Path(__file__).resolve().parents[2]
     candidates = [

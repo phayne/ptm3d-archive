@@ -8,7 +8,7 @@
  * These are the campaign-script guardrails from the 2026-08-20/21 GPU wedges
  * (SMC -128 and -108 on the A3GT gen-2 run) folded into the engine, so a CLI
  * user, a GUI user and a colleague's machine get them without copying a
- * driver script. See docs/gpu-wedge-guardrails.md for the full rationale,
+ * driver script. See docs/dev/gpu-wedge-guardrails.md for the full rationale,
  * the platform-gating table and the cost of each guardrail.
  *
  * PLATFORM GATING is the design rule here. The wedge is a macOS + AMD
@@ -141,7 +141,7 @@ struct Policy {
     /// refusal costs a MEASURED +77.5 min/window (A3GT lunar polar site B: 108.9 min on
     /// the CPU radiosity rung against 31.4 on the GPU pool, 8 windows each)
     /// while the separation costs a derived +7-10 min. See
-    /// docs/gpu-wedge-guardrails.md "Two ways to treat a thin margin".
+    /// docs/dev/gpu-wedge-guardrails.md "Two ways to treat a thin margin".
     std::string thin_margin_policy = "separate";
     /// The floor below which even "separate" refuses, in GiB.
     double hard_min_vram_margin_gib = 0.25;
@@ -329,7 +329,7 @@ inline std::vector<int> resolveDeviceIds(int devices,
  * co-residency is the one condition common to both events. Splitting the dies
  * removes it, and costs ~+7-10 min on a ~30 min A3GT window (derived from the
  * N=4 -> N=2 scaling of the radiosity sweep and the thermal phases; NOT
- * measured end to end -- see docs/gpu-wedge-guardrails.md).
+ * measured end to end -- see docs/dev/gpu-wedge-guardrails.md).
  *
  * @param rad_ids        device ids the radiosity pool would use
  * @param n_enumerated   number of enumerated (available) GPUs
@@ -644,7 +644,7 @@ inline bool powerSettingsAdvisory(bool gpu_requested) {
                      "  Revert after the campaign:\n"
                      "      sudo pmset -a disablesleep 0 displaysleep 30\n"
                      "  See the GPU checklist in INSTALL.md and "
-                     "docs/gpu-wedge-guardrails.md.\n\n";
+                     "docs/dev/gpu-wedge-guardrails.md.\n\n";
         return true;
     }
     if (disablesleep != 1) {

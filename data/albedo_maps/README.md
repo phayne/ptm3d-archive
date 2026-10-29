@@ -28,12 +28,12 @@ runtime sampler (`ptm_thermal_sim.cpp`, `thermal_model.cpp`, `albedo_manager.cpp
 the DEM sampler) and the photo-validated Moon camera bin. Each per-face binary is
 an 8-byte little-endian face count followed by one float64 (Bond albedo) per face.
 
-## Lunar map registration (PTM-34 longitude, PTM-35 latitude — corrected)
+## Lunar map registration (longitude, latitude — corrected)
 
 Two registration defects in the earlier lunar maps are corrected in this
 revision:
 
-- **PTM-34 — source FITS longitude (+180°).** The original `Moon-BondAlbedo.fits`
+- **Source FITS longitude (+180°).** The original `Moon-BondAlbedo.fits`
   was mislabeled by 180° in longitude: its WCS declared `CRVAL1=0` (column 0 =
   IAU_MOON lon 0, east, 0..360) but the raster was a −180..180-centered map
   (IAU lon 0 at the center column), so the dark nearside maria landed on the
@@ -47,7 +47,7 @@ revision:
   `astropy`** (`python3 -m pip install -r scripts/requirements.txt`); neither is
   a build or runtime dependency of the engine.
 
-- **PTM-35 — per-face generator latitude.** `albedo_map_generator` previously
+- **Per-face generator latitude.** `albedo_map_generator` previously
   sampled each face at −latitude, flipping the baked `Moon_Albedo_res*.bin`
   hemispheres relative to the FITS-direct runtime path. It now samples +latitude
   (see Processing). Moon bins regenerated from the corrected FITS match the
@@ -68,7 +68,7 @@ fixed generator reproduces them); the Europa maps are unchanged.
 The distributed `albedo_maps.tar.gz` in this revision carries the corrected Moon
 FITS + regenerated Moon bins (Europa untouched); `data_manifest.json`'s sha256 and
 size are updated to match. If you have a local copy fetched before this revision,
-re-fetch. See `docs/KNOWN_LIMITATIONS.md` (PTM-34 / PTM-35).
+re-fetch. See `docs/KNOWN_LIMITATIONS.md`.
 
 ### Load-time registration guard
 
@@ -123,7 +123,7 @@ python3 scripts/verify_moon_albedo_registration.py \
 That second half matters: the `.unpacked` marker records only that an unpack once
 happened, so before this check a tree whose marker matched the manifest could
 still hold the old 180°-rolled bins and pass verification cleanly. That is
-precisely how PTM-34 survived a corrected archive — the archive was right, the
+precisely how survived a corrected archive — the archive was right, the
 loader was right, and nothing compared them to the bytes on disk.
 
 The `--geographic` mode of the verify script needs no FITS and is the cheapest

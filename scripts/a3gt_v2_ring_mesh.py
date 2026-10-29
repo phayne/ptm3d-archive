@@ -51,9 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from a3gt_v2_crop_core import _load_ply, _write_ply, geodesic_km  # noqa: E402,F401
 import ring_registration as rreg  # noqa: E402
 
-DTM_TOOL_DEFAULT = Path(
-    "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/"
-    "europa/heat3d/dtm/dtm_to_ply_delaunay")
+DTM_TOOL_DEFAULT = Path(__file__).resolve().parents[1] / "build" / "bin" / "dtm_to_ply_delaunay"
 RING_MAX_POINTS_DEFAULT = 80_000   # ~1e5 ring tris @ R_ext=20 km ≈ LOLA 80-160 m
 
 

@@ -4,7 +4,7 @@
 
 The PTM3D thermal model solves the one-dimensional vertical heat conduction equation independently at every triangular mesh face, using temperature- and depth-dependent material properties and a nonlinear radiative surface boundary condition. The solver is fully decoupled from the [illumination model](illumination-model.md) and the [radiation exchange module](radiation-exchange.md) through a single prescribed time series of absorbed surface flux $Q_s(t)$ per face: the illumination module supplies direct solar, primary-body reflected, and primary-body thermal IR fluxes; the radiation exchange module adds the indirect (multi-bounce) flux when enabled. Lateral conduction between faces, phase change, and advective transport are not represented — face-to-face energy exchange happens entirely through the radiation exchange module, not through the thermal solver.
 
-The model was originally developed for the lunar regolith (Hayne et al., 2017) and extended to icy bodies. Numerical implementation choices are guided by the unconditional stability of the Crank–Nicolson scheme on the implicit pentadiagonal system that arises from non-uniform vertical grids.
+The model was originally developed for the lunar regolith (Hayne et al., 2017) and extended to icy bodies. Numerical implementation choices are guided by the unconditional stability of the Crank–Nicolson scheme on the implicit tridiagonal system that arises from non-uniform vertical grids.
 
 ## 2. Governing Equation
 
@@ -14,7 +14,7 @@ $$\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t}  =  \frac{\pa
 
 where $\rho$ is bulk density (kg m⁻³), $c_p$ is specific heat capacity (J kg⁻¹ K⁻¹), $k$ is bulk thermal conductivity (W m⁻¹ K⁻¹), $z$ is depth below the surface (m, positive downward), and $t$ is time (s). The PDE is parabolic and quasi-linear: nonlinearity enters only through the temperature dependence of $c_p$ and $k$. There is no internal volumetric source term; all heat input is supplied through the boundary conditions (§5).
 
-The 1D-vertical assumption is justified because the diurnal thermal skin depth (§4.1) is small compared with the lateral scale of mesh faces in every application reported here ($\delta_1 \lesssim 10$ cm on the Moon and $\lesssim 5$ cm on Europa, vs. face edges $\gtrsim 1$ km on global meshes and $\gtrsim 1$ m on regional topographic meshes), so horizontal gradients of $T$ within a single face are negligible. Sublimation- and sputtering-driven mass flux is treated separately by the exosphere model and feeds back into the thermal model only through albedo and thermal-property updates between epochs.
+The 1D-vertical assumption is justified when the diurnal thermal skin depth (§4.1, $\delta_1 \lesssim 10$ cm on the Moon) is small compared with the lateral size of mesh faces: face edges of a kilometer or more on global meshes and a meter or more on regional site meshes. It does **not** hold on millimeter- to centimeter-scale meshes such as the Moon3D testbed scan (509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across): there, small cold traps are warmed by lateral conduction from their surroundings, which the model omits (see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 1).
 
 ## 3. Thermophysical Properties
 
@@ -32,7 +32,7 @@ Heat capacity is evaluated as a polynomial in temperature,
 
 $$c_p(T)  =  c_0  +  \sum_{j=1}^{N_c} c_j\thinspace T^j \tag{B3}$$
 
-stored as a constant term $c_0$ plus an ordered coefficient list $\lbracec_j\rbrace$ in the body's `ThermophysicalProperties` record (`planetary_properties.h`). The polynomial is evaluated by Horner's method to reduce $2N_c$ multiplications to $N_c$ per call; in the inner thermal loop this is vectorized with AVX-512 or AVX2 fused multiply-add instructions where available, with a scalar fallback (`thermal_model.cpp:74–170`). For the Moon we use the four-term polynomial of Hayne et al. (2017), Table A1; for water-ice surfaces we use the linear approximation $c_p(T) \approx 7.49\thinspace T$ (J kg⁻¹ K⁻¹) derived from the heat-capacity data of Giauque & Stout (1936), valid below $\sim$270 K.
+stored as a constant term $c_0$ plus an ordered coefficient list $\lbracec_j\rbrace$ in the body's `ThermophysicalProperties` record (`planetary_properties.h`). The polynomial is evaluated by Horner's method to reduce $2N_c$ multiplications to $N_c$ per call; in the inner thermal loop this is vectorized with AVX-512 or AVX2 fused multiply-add instructions where available, with a scalar fallback (`thermal_model.cpp`). For the Moon we use the four-term polynomial of Hayne et al. (2017), Table A1; for water-ice surfaces we use the linear approximation $c_p(T) \approx 7.49\thinspace T$ (J kg⁻¹ K⁻¹) derived from the heat-capacity data of Giauque & Stout (1936), valid below $\sim$270 K.
 
 ### 3.3 Density and Contact-Conductivity Stratification
 
@@ -65,7 +65,7 @@ The defaults adopted in this work are listed below. Moon values reproduce Hayne 
 | $A$ | Bond albedo | 0.12 | 0.50 | – | Hayne et al. (2017); model default |
 | $Q_b$ | Internal heat flux | 0.018 | 0.030 | W m⁻² | Langseth et al. (1976); model default |
 
-The Moon entry additionally carries an incidence-angle-dependent albedo correction $A(\theta) = A_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$ with $\lbracea, b\rbrace = \lbrace0.06, 0.25\rbrace$ (Hayne et al., 2017). For Europa we use a constant Bond albedo, optionally overridden per face by a high-resolution albedo map (see [illumination-model.md](illumination-model.md)).
+The Moon entry additionally carries an incidence-angle-dependent albedo correction $A(\theta) = A_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$ with $\lbracea, b\rbrace = \lbrace0.06, 0.25\rbrace$ (Hayne et al., 2017); this is the default (`thermophysical.albedo_model`). The Moon3D paper used the Hapke directional-hemispheric albedo instead (single-scattering albedo $w = 0.4964$, which gives $A = 0.12$ at normal incidence; `thermophysical.incidence_angle_albedo: true` or `albedo_model: hapke`). For Europa we use a constant Bond albedo, optionally overridden per face by a high-resolution albedo map (see [illumination-model.md](illumination-model.md)).
 
 ## 4. Spatial Discretization
 
@@ -75,7 +75,7 @@ The diurnal thermal skin depth is
 
 $$\delta_1  =  \sqrt{\thinspace\kappa\thinspace P / \pi\thinspace} \tag{B6}$$
 
-where $\kappa = k / (\rho c_p)$ is the thermal diffusivity and $P$ is the diurnal period. $\delta_1$ is the depth at which the diurnal temperature oscillation has decayed by a factor of $e$. In practice $\delta_1$ is evaluated at the surface using $k_s$, $\rho_s$, and a representative $c_p(200~\text{K})$ to set grid scales (`thermal_model.cpp:647–658`).
+where $\kappa = k / (\rho c_p)$ is the thermal diffusivity and $P$ is the diurnal period. $\delta_1$ is the depth at which the diurnal temperature oscillation has decayed by a factor of $e$. In practice $\delta_1$ is evaluated at the surface using $k_s$, $\rho_s$, and a representative $c_p(200~\text{K})$ to set grid scales (`thermal_model.cpp`).
 
 ### 4.2 Geometric Depth Grid
 
@@ -83,7 +83,7 @@ The default depth grid is geometrically stretched: the uppermost layer thickness
 
 $$\Delta z_0 = \delta_1 / m, \qquad \Delta z_{i+1} = \Delta z_i\thinspace(1 + 1/n), \qquad z_{\max} = b\thinspace \delta_1 \tag{B7}$$
 
-The defaults $m = 4$, $n = 10$, $b = 5$ were selected by sensitivity analysis against Diviner observations (Hayne et al., 2017), giving an RMS surface-temperature error below 4 K with a systematic offset of $+2.65$ K relative to a much finer reference grid.
+The defaults are $m = 10$ layers per skin depth and $b = 15$ skin depths to the bottom (`thermal_model.h`; `thermal.thermal_m`, `thermal.thermal_b`). The growth parameter $n$ belongs to a legacy fixed grid that no configuration selects; the default grid is the adaptive one of §4.3.
 
 ### 4.3 Adaptive Depth Grid
 
@@ -103,7 +103,7 @@ with grid coupling coefficients
 
 $$g_{1,i}  =  \frac{2\thinspace\Delta z_{i+1}}{D_i}, \qquad g_{2,i}  =  \frac{2\thinspace\Delta z_i}{D_i}, \qquad D_i  =  \Delta z_i\thinspace \Delta z_{i+1}\thinspace (\Delta z_i + \Delta z_{i+1}). \tag{B9}$$
 
-For uniform spacing this reduces to the familiar $1/\Delta z^2$ stencil; for stretched grids the asymmetric weighting in (B9) preserves second-order accuracy. The coefficients $g_1$, $g_2$, and $D \equiv d_{3z}$ are pre-computed once during `Profile` construction (`thermal_model.cpp:687–689`) and reused on every timestep. Cell-centered conductivities $k_{i-1}$ (lower interface) and $k_i$ (upper interface) are used directly without arithmetic or harmonic averaging, consistent with the cell-centered finite-difference convention.
+For uniform spacing this reduces to the familiar $1/\Delta z^2$ stencil; for stretched grids the asymmetric weighting in (B9) preserves second-order accuracy. The coefficients $g_1$, $g_2$, and $D \equiv d_{3z}$ are pre-computed once during `Profile` construction (`thermal_model.cpp`) and reused on every timestep. Cell-centered conductivities $k_{i-1}$ (lower interface) and $k_i$ (upper interface) are used directly without arithmetic or harmonic averaging, consistent with the cell-centered finite-difference convention.
 
 ## 5. Boundary Conditions
 
@@ -113,7 +113,7 @@ At $z = 0$, the surface temperature $T_0$ satisfies the energy balance
 
 $$Q_s  +  k_0\thinspace \frac{T_1 - T_0}{\Delta z_0}  =  \varepsilon\thinspace \sigma\thinspace T_0^{\thinspace4} \tag{B10}$$
 
-where $\sigma = 5.670\times 10^{-8}$ W m⁻² K⁻⁴ is the Stefan–Boltzmann constant, $\varepsilon$ is the broadband IR emissivity, $k_0$ and $\Delta z_0$ are the surface-layer conductivity and thickness, and $T_1$ is the temperature of the first subsurface node. The absorbed surface flux $Q_s(t)$ is composed by the upstream modules,
+where $\sigma = 5.670374419\times 10^{-8}$ W m⁻² K⁻⁴ is the Stefan–Boltzmann constant, $\varepsilon$ is the broadband IR emissivity, $k_0$ and $\Delta z_0$ are the surface-layer conductivity and thickness, and $T_1$ is the temperature of the first subsurface node. The absorbed surface flux $Q_s(t)$ is composed by the upstream modules,
 
 $$Q_s  =  (1 - A)\thinspace\bigl[\thinspaceQ_{\text{solar}} + Q_{\text{refl}}\thinspace\bigr]  +  \varepsilon\thinspace Q_{\text{IR}}  +  Q_{\text{indirect}}, \tag{B11}$$
 
@@ -121,11 +121,11 @@ with $Q_{\text{solar}}$, $Q_{\text{refl}}$, $Q_{\text{IR}}$ from [illumination-m
 
 ### 5.2 Newton–Raphson Surface Solver
 
-Equation (B10) is nonlinear in $T_0$ through the $T_0^4$ term and is solved at each timestep by damped Newton–Raphson iteration (`thermal_model.cpp:1250–1296`). Defining the residual
+Equation (B10) is nonlinear in $T_0$ through the $T_0^4$ term and is solved at each timestep by Newton iteration (`thermal_model.cpp`). Defining the residual
 
 $$f(T_0)  =  Q_s + k_0\thinspace(T_1 - T_0)/\Delta z_0  -  \varepsilon\thinspace \sigma\thinspace T_0^{\thinspace4}, \tag{B12}$$
 
-with derivative $f'(T_0) = -k_0/\Delta z_0 - 4\thinspace\varepsilon\thinspace\sigma\thinspace T_0^{\thinspace3}$, the iterate is updated by $T_0^{(k+1)} = T_0^{(k)} - \omega\thinspace f / f'$ with relaxation factor $\omega = 0.8$. The initial guess is the radiative-equilibrium estimate $T_0^{(0)} = (Q_s/\varepsilon\sigma)^{1/4}$ when $Q_s > 0$ and $T_0^{(0)} = T_1$ otherwise; iteration stops when $|\Delta T_0| < 0.001$ K, with a hard cap of 10 iterations (typical convergence is reached in 2–4). The solution is clamped to the physical range $[3, 500]$ K.
+with derivative $f'(T_0) = -k_0/\Delta z_0 - 4\thinspace\varepsilon\thinspace\sigma\thinspace T_0^{\thinspace3}$, the iterate is updated by full Newton steps with a step limiter, from a bracketed initial guess. Iteration stops when the residual, converted to temperature, is below $10^{-4}$ K (or at floating-point resolution), with a cap of 10 iterations; typical convergence takes 2 to 3 iterations. The same routine serves the CPU scalar, CPU SIMD and GPU solvers, and every run reports the worst residual it accepted ("surface-BC certificate").
 
 ### 5.3 Bottom Boundary
 
@@ -133,17 +133,17 @@ A prescribed conductive heat flux $Q_b$ is imposed at the deepest node, giving t
 
 $$T_n  =  T_{n-1}  +  Q_b\thinspace \frac{\Delta z_{n-1}}{k_n} \tag{B13}$$
 
-(`thermal_model.cpp:1298–1305`). Body-specific values are listed in §3.5.
+(`thermal_model.cpp`). Body-specific values are listed in §3.5.
 
 ### 5.4 Numerical Safety Bounds
 
-After the implicit interior solve (§6), each $T_i$ is clamped to $[2.7, 500]$ K, with non-finite values rolled back to the previous timestep's value (`thermal_model.cpp:1241–1247`). These guards do not activate in any of the production runs reported here; they exist to keep transient violations during eclipse ingress or strong shadowing from corrupting subsequent timesteps.
+Non-finite values are rolled back to the previous step's value. There is no upper temperature bound. The lower bound is the geothermal floor $T_{\text{geo}} = (Q_b/\varepsilon\sigma)^{1/4}$, applied to every layer at every step (24.04 K on the Moon at the default $Q_b$): it fires routinely on never-lit faces, because the discrete bottom boundary (B13) uses the conductivity of the last node while the last interior row uses the one above it, so a never-lit surface settles a few millikelvin below $T_{\text{geo}}$ and is held at the floor. The effect on reported statistics is at most a few millikelvin; a value at the floor is the bound, not a solution ([KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 6).
 
 ## 6. Temporal Discretization
 
 ### 6.1 Crank–Nicolson on the Non-Uniform Grid
 
-Time integration uses the implicit, second-order Crank–Nicolson scheme. Substituting (B8) into (B1) and centering the spatial operator at the midpoint $t^{n+1/2}$ yields, for each interior node $i$ and timestep $\Delta t$,
+Time integration of the interior uses the implicit Crank–Nicolson scheme. The column as a whole is **first order in time**: the massless surface node (§5.2) is solved from the previous step's $T_1$, and $k$ and $c_p$ are evaluated at $T^n$ (lagged, not iterated), so the error falls linearly with the substep. At the default substep the bias in time-mean temperature is at most about 0.1 K. Substituting (B8) into (B1) and centering the spatial operator at the midpoint $t^{n+1/2}$ yields, for each interior node $i$ and timestep $\Delta t$,
 
 $$T_i^{n+1}  -  T_i^n  =  \frac{\Delta t}{2\thinspace\rho_i\thinspace c_{p,i}} \Bigl[\thinspace \mathcal{L}\thinspace T^{n+1}  +  \mathcal{L}\thinspace T^n \thinspace\Bigr], \tag{B14}$$
 
@@ -153,39 +153,45 @@ $$a_i = -\nu\thinspace\alpha, \quad b_i = 1 + \nu\thinspace(\alpha + \beta), \qu
 
 $$d_i = T_i^n + \nu\bigl[\thinspace\alpha\thinspace T_{i-1}^n - (\alpha + \beta)\thinspace T_i^n + \beta\thinspace T_{i+1}^n\thinspace\bigr]. \tag{B16}$$
 
-The surface and bottom boundary values $T_0^{n+1}$ and $T_n^{n+1}$ (computed via §5.2 and §5.3) are folded into the right-hand side at the first and last interior rows, after which the corresponding off-diagonal entries are zeroed. Material properties $k(T)$, $c_p(T)$, and $\rho c_p$ are updated using $T^n$ before assembling (B15)–(B16), giving an effectively semi-implicit treatment of the nonlinearity (Picard linearization).
+The surface and bottom boundary values $T_0^{n+1}$ and $T_n^{n+1}$ (computed via §5.2 and §5.3) are folded into the right-hand side at the first and last interior rows, after which the corresponding off-diagonal entries are zeroed. Material properties $k(T)$, $c_p(T)$, and $\rho c_p$ are updated using $T^n$ before assembling (B15)–(B16), giving an effectively semi-implicit treatment of the nonlinearity (lagged-coefficient (semi-implicit) linearization).
 
 ### 6.2 Thomas Algorithm
 
-The tridiagonal system is inverted in $O(N_z)$ operations with the Thomas algorithm (`thermal_model.cpp:267–290`). The CN matrix is strictly diagonally dominant for $\nu > 0$, since $|b_i| = 1 + \nu(\alpha + \beta) > \nu(\alpha + \beta) = |a_i| + |c_i|$, so the algorithm is stable without pivoting. Solver buffers are held in thread-local memory pools to avoid allocation in the inner loop, and the implicit path is taken for all profiles by default (`IMPLICIT_ALL = true`, `THOMAS_LIMIT = 4096`). On modern CPUs the assembly stage of (B15)–(B16) is vectorized using AVX-512 or AVX2 fused multiply-add instructions for the temperature-dependent $k$ and $c_p$ updates; per-face profiles are dispatched in parallel across faces with OpenMP, and the entire integrator can optionally be offloaded to OpenCL on AMD or Apple GPUs (`gpu/thermal_opencl.cpp`), validated against the CPU path to within numerical precision.
+The tridiagonal system is inverted in $O(N_z)$ operations with the Thomas algorithm (`thermal_model.cpp`). The CN matrix is strictly diagonally dominant for $\nu > 0$, since $|b_i| = 1 + \nu(\alpha + \beta) > \nu(\alpha + \beta) = |a_i| + |c_i|$, so the algorithm is stable without pivoting. Solver buffers are held in thread-local memory pools to avoid allocation in the inner loop, and the implicit path is taken for all profiles by default (`IMPLICIT_ALL = true`, `THOMAS_LIMIT = 4096`). On modern CPUs the assembly stage of (B15)–(B16) is vectorized using AVX-512 or AVX2 fused multiply-add instructions for the temperature-dependent $k$ and $c_p$ updates; per-face profiles are dispatched in parallel across faces with OpenMP, and the entire integrator can optionally be offloaded to OpenCL on AMD or Apple GPUs (`gpu/thermal_opencl.cpp`), validated against the CPU path to within numerical precision.
 
 ### 6.3 Adaptive Time Step
 
-The base timestep is set to $\Delta t = P / N_{\text{day}}$ with $N_{\text{day}} = $ `MAIN_LOOP_STEPS_PER_DAY` (default 768; ~11 s on the Moon, ~6 s on Europa). When `MULTIRATE_ADAPTIVE_STEP = true` (default), $\Delta t$ is scaled by a multiplier $s \in [0.1,\thinspace 8]$ that grows by a factor `DT_GROW = 1.0` (no growth) or shrinks by `DT_SHRINK = 0.1` based on the magnitude of the surface-temperature change in the previous step relative to `SURF_DMAX = 0.1` K (`thermal_model.cpp:1907–1925`). The unconditional stability of CN means that aggressive shrinking is preferred to growth: errors from oversized steps appear as low-order oscillations in the surface temperature, and the multirate controller reins them in within one or two steps.
+Within each output interval the CPU solvers take $n_{\text{sub}} = \lceil \Delta t_{\text{out}} / (P/768) \rceil$ substeps (about 55 minutes on the Moon) and interpolate the absorbed flux linearly to each substep. The GPU solver chooses $n_{\text{sub}} = \lceil \Delta t_{\text{out}}\thinspace\kappa_{\max} / (0.49\thinspace\Delta z_0^2) \rceil$, capped at 200, and holds the flux of the interval's start constant across its substeps; this is why the two backends differ in peak temperatures at coarse output cadence ([KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 5). The Moon3D revision used the CPU solver.
 
 ### 6.4 Event-Aware Refinement
 
-Sharp flux discontinuities — most importantly Jupiter eclipses on Europa, which can drop the absorbed flux by an order of magnitude in $\sim$1 minute — are handled by the event-aware controller (`thermal_model.cpp:1515–1546`). When `EVENT_AWARE_DT = true`, the timestep is additionally limited so that the linearly extrapolated change in $Q_s$ across the step satisfies $|\Delta Q_s| \le$ `FLUX_DQ_TARGET` ($= 0.1$ W m⁻²), with a floor of `MIN_EVENT_DT` ($= 0.25$ s). Refinement is triggered when the local flux derivative exceeds `FLUX_DERIV_THRESH` ($= 5\times 10^{-4}$ W m⁻² s⁻¹). For known flux knots (e.g., eclipse ingress and egress times tagged in the precomputed flux series) the controller additionally aligns one timestep boundary to each knot, so the discontinuity is sampled exactly rather than smeared across a CN step.
+Sharp flux discontinuities — most importantly Jupiter eclipses on Europa, which can drop the absorbed flux by an order of magnitude in $\sim$1 minute — are handled by the event-aware controller (`thermal_model.cpp`). When `EVENT_AWARE_DT = true`, the timestep is additionally limited so that the linearly extrapolated change in $Q_s$ across the step satisfies $|\Delta Q_s| \le$ `FLUX_DQ_TARGET` ($= 0.1$ W m⁻²), with a floor of `MIN_EVENT_DT` ($= 0.25$ s). Refinement is triggered when the local flux derivative exceeds `FLUX_DERIV_THRESH` ($= 5\times 10^{-4}$ W m⁻² s⁻¹). For known flux knots (e.g., eclipse ingress and egress times tagged in the precomputed flux series) the controller additionally aligns one timestep boundary to each knot, so the discontinuity is sampled exactly rather than smeared across a CN step.
 
 ## 7. Equilibration
 
 ### 7.1 Strategy
 
-Before the science integration window, the thermal model is spun up to a quasi-periodic diurnal steady state from a depth-dependent initial profile. The initial condition uses an exponential blend toward radiative equilibrium,
+Before the output window the thermal model is spun up for `thermal.equilibration_orbits` diurnal cycles of the run's own forcing (illumination, shadowing, primary-body flux and, in coupled runs, indirect flux). The same number is integrated on every solver path.
+
+**Initial condition** (`thermal.spinup_seed: physical`, the default). Each face starts from its own conductive steady profile: the surface value is anchored at the cycle-mean temperature implied by the face's absorbed flux, and the profile below follows $T(z) = T_0 + Q_b\int_0^z dz'/k(z')$. A permanently shadowed face therefore starts at the geothermal floor rather than at a clear-sky temperature. In radiation-coupled runs the seed of the second whole-mesh pass also includes the time-varying indirect flux of the first radiation solution, folded over whole diurnal cycles (`thermal.seed_indirect: series`, the default; see [radiation-exchange.md](radiation-exchange.md) §7.8).
+
+**Legacy initial condition** (`spinup_seed: legacy`, for reproducing runs made before 2026-08-11): an exponential blend toward radiative equilibrium,
 
 $$T(z,\thinspace t = 0)  =  T_{\text{deep}} + (T_{\text{avg}} - T_{\text{deep}})\thinspace \exp(-z / \delta_1), \tag{B17}$$
 
-with $T_{\text{max}} = ((1-A)\thinspaceS/(\varepsilon\sigma))^{1/4}$, $T_{\text{avg}} = T_{\text{max}}/\sqrt{2}$, and $T_{\text{deep}} = T_{\text{avg}} + \min(Q_b\thinspace z/k,\thinspace 50\thickspace\text{K})$ (`thermal_model.cpp:718–778`). The model is then advanced through `NYEARSEQ` orbits (default 1, equivalent to 29.5 lunar diurnal cycles) of clear-sky diurnal forcing using the `fastEquilibrate` routine.
+with $T_{\text{max}} = ((1-A)\thinspace S/(\varepsilon\sigma))^{1/4}$, $T_{\text{avg}} = T_{\text{max}}/\sqrt{2}$ and $T_{\text{deep}} = T_{\text{avg}} + \min(Q_b\thinspace z/k,\thinspace 50\thickspace\text{K})$, followed on the CPU paths by an analytic clear-sky pre-conditioner (24 cycles on the Moon, 2 on Europa, 4 on Mercury) with no topography or shadowing.
+
+**How long.** Surface temperatures converge in a few cycles; the deep column relaxes with an e-folding time of roughly 15 to 23 lunations on the Moon at the default grid. Each run prints an estimate of the cycles needed to reach `thermal.equilibration_target_K` (default 0.1 K) and warns when the configured value is shorter; see [configuration.md](configuration.md#equilibration-length-what-the-number-means).
 
 ### 7.2 Decoupled Equilibration Cadence
 
-Because Crank–Nicolson is unconditionally stable, the equilibration cadence can be much coarser than the science-window cadence without compromising the spin-up. PTM3D supports three equilibration cadence policies, in priority order (`ptm_thermal_sim.cpp:7796–7830`):
+Because Crank–Nicolson is unconditionally stable, the equilibration cadence can be much coarser than the science-window cadence without compromising the spin-up. PTM3D supports three equilibration cadence policies, in priority order (`ptm_thermal_sim.cpp`):
 
 1. **Explicit override.** `EQUILIBRATION_STEPS_PER_DAY` (CLI `--equilibration-steps-per-day`, YAML `thermal.equilibration_steps_per_day`) directly sets $\Delta t_{\text{eq}} = P / N_{\text{eq}}$.
 2. **Accuracy target.** `EQUILIBRATION_SAMPLES_PER_DIURNAL_CYCLE` (CLI `--equilibration-samples-per-diurnal`) requests a body-independent number of samples per diurnal cycle. Calibration on Moon ico3 vs. a Fourier-stable reference gives maximum surface-temperature errors of ~7 K at 30 samples cycle⁻¹, ~4 K at 120 samples cycle⁻¹ (the GUI default), and ~3 K at 240 samples cycle⁻¹.
 3. **Legacy fallback.** Match the science-window output cadence.
 
-The default `EQUILIBRATION_STEPS_PER_DAY = 192` was chosen as a balance between cost and accuracy: a sensitivity study on the Moon (`tools/test_equilibration_dt.cpp`) reports a worst-case surface-T error below 1 K relative to a Fourier-stable reference (~5000 steps day⁻¹) after 24 lunar diurnal cycles, while running ~26× faster. Decoupling the equilibration cadence from the (typically much finer) output cadence is essential for camera-simulation runs: on a 4.8 M-face lunar mesh with 1-minute output, setting `equilibration_steps_per_day: 24` reduces the equilibration phase from 85,048 to 1,417 steps and the peak memory footprint from 227 GB to 13 GB, with <2 K accuracy impact at the first output timestep.
+At 192 steps per day a sensitivity study on the Moon (`tools/test_equilibration_dt.cpp`) reports a worst-case surface-T error below 1 K relative to a Fourier-stable reference (~5000 steps day⁻¹) after 24 lunar diurnal cycles, while running ~26× faster. Decoupling the equilibration cadence from the (typically much finer) output cadence is essential for camera-simulation runs: on a 4.8 M-face lunar mesh with 1-minute output, setting `equilibration_steps_per_day: 24` reduces the equilibration phase from 85,048 to 1,417 steps and the peak memory footprint from 227 GB to 13 GB, with <2 K accuracy impact at the first output timestep.
 
 ## 8. Validation
 
@@ -205,13 +211,13 @@ The shape and depth dependence of the diurnal thermal wave provide a second inte
 
 ### 8.3 Equilibration Convergence
 
-The equilibration cadence accuracy is documented by the `tools/test_equilibration_dt` test program, which runs `fastEquilibrate` over 24 lunar diurnal cycles at four latitudes (0°, 30°, 60°, 85°) and reports the maximum and mean per-layer temperature differences against a Fourier-stable reference solution. Figure B.3 visualizes the resulting convergence: at the production cadence `EQUILIBRATION_STEPS_PER_DAY = 192`, the worst-case error across all latitudes and depth nodes is 0.99 K (latitude 85°), just below the 1 K production target. Coarsening to 96 steps day⁻¹ raises the worst-case error to 2.2 K, and to 24 steps day⁻¹ to 11.9 K; refining to 768 steps day⁻¹ reduces the error to 0.21 K. The error scales as $\Delta t^2$, consistent with the second-order accuracy of Crank–Nicolson.
+The equilibration cadence accuracy is documented by the `tools/test_equilibration_dt` test program, which runs `fastEquilibrate` over 24 lunar diurnal cycles at four latitudes (0°, 30°, 60°, 85°) and reports the maximum and mean per-layer temperature differences against a Fourier-stable reference solution. At the production cadence `EQUILIBRATION_STEPS_PER_DAY = 192` the worst case on this release is 0.55 K (latitude 85°), within the 1 K tolerance. The error falls roughly linearly with the step, as expected for a first-order scheme (§6.1); Figure B.3 shows the sweep from an earlier build.
 
 ![Figure B.3: Equilibration cadence convergence](figures/v2/equilibration_convergence.png)
 
 ### 8.4 Surface Energy Conservation
 
-Figure B.4 quantifies the closure of the surface energy balance over a fully integrated synodic month on the ico7 topographic mesh (327,680 faces) after six equilibration orbits. For an equilibrated diurnal cycle the per-face energy budget should satisfy $\langle Q_{\mathrm{abs}}\rangle_t = \langle\varepsilon\sigma T^4\rangle_t - Q_b$. Both the simulation and the post-hoc accounting in this figure apply the Hayne et al. (2017) angular albedo correction $A(\theta)$ on top of the per-face base albedo $A_0$, so any residual reflects an actual closure error rather than a parameter mismatch. The bulk-mean fractional residual is 3.7 %, with a global imbalance of 2.0 % between absorbed and emitted radiation integrated over the synodic month (panel c). The remaining residual reflects a combination of (i) finite-time-of-flight thermal lag between absorbed solar input and re-radiated thermal emission and (ii) the difference between $\langle T \rangle^4$ and $\langle T^4 \rangle$ that Jensen's inequality introduces when applying $\sigma T^4$ to time-averaged temperatures.
+Figure B.4 quantifies the closure of the surface energy balance over a fully integrated synodic month on the ico7 topographic mesh (327,680 faces) after six equilibration orbits. For an equilibrated diurnal cycle the per-face energy budget should satisfy $\langle Q_{\mathrm{abs}}\rangle_t = \langle\varepsilon\sigma T^4\rangle_t - Q_b$. Both the simulation and the post-hoc accounting in this figure apply the Hayne et al. (2017) angular albedo correction $A(\theta)$ on top of the per-face base albedo $A_0$, so any residual reflects an actual closure error rather than a parameter mismatch. The bulk-mean fractional residual is 3.7 %, with a global imbalance of 2.0 % between absorbed and emitted radiation integrated over the synodic month (panel c). For a column in periodic steady state this balance holds exactly whatever the thermal lag, and Jensen's inequality enters only if σ⟨T⟩⁴ is used in place of σ⟨T⁴⟩. A residual of this size after six equilibration orbits most likely reflects heat still going into storage in the deep column, which relaxes over 15 to 23 lunations; this has not been tested.
 
 ![Figure B.4: Surface energy-balance closure](figures/v2/energy_conservation.png)
 
@@ -225,24 +231,22 @@ The post-illumination phase (thermal solver plus statistics export and binary ou
 
 ### 8.6 Europa Validation
 
-Validation of PTM3D against Europa-specific observations (Galileo PPR diurnal curves and depth-resolved millimeter brightness temperatures) is presented in the main text Section 3 and is not repeated here. The 1D thermal solver is identical for the Moon and Europa runs; only the input parameters of §3.5 and the orbital/illumination geometry change.
+Comparisons with Europa observations are not part of this release's validation set. The 1D thermal solver is identical for the Moon and Europa; only the input parameters of §3.5 and the orbital and illumination geometry change.
 
 ## 9. Configuration Reference
 
-The key user-facing parameters of the thermal solver are summarized below; a complete list lives in the `Config` class (`thermal_model.h:179–294`).
+The key user-facing parameters of the thermal solver are summarized below; a complete list lives in the `Config` class (`thermal_model.h`).
 
 | Parameter | Default | Description |
 |---|---|---|
 | `chi` | 2.7 | Radiative conductivity parameter $\chi$ (eq. B2) |
-| `m` | 4 | Layers in the upper skin depth (eq. B7) |
-| `n` | 10 | Layer growth factor (eq. B7) |
-| `b` | 5 | Skin depths to the bottom layer (eq. B7) |
+| `m` (`thermal_m`) | 10 | Layers in the upper skin depth (eq. B7) |
+| `b` (`thermal_b`) | 15 | Skin depths to the bottom layer (eq. B7) |
 | `ADAPTIVE_GRID` | true | Use per-profile adaptive grid (§4.3) |
 | `RES_DECAY_SKINS` | 3.0 | e-folding scale for resolution decay with depth |
 | `MIN_LAYERS_DEEP_PER_SKIN` | 0.5 | Floor on layers per skin depth in the deep (§4.3) |
 | `MIN_TOTAL_LAYERS_FOR_DEEP_COARSENING` | 20 | Below this layer count the deep floor is not applied (§4.3) |
 | `R_MAX` | 2.0 | Per-step layer-thickness growth cap |
-| `NYEARSEQ` | 1 | Equilibration duration (orbits) |
 | `EQUILIBRATION_STEPS_PER_DAY` | 192 | Equilibration cadence (§7.2) |
 | `MAIN_LOOP_STEPS_PER_DAY` | 768 | Science-window cadence (§6.3) |
 | `IMPLICIT_ALL` | true | Force CN+Thomas for all profiles |

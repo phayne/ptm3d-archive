@@ -63,7 +63,7 @@
 //
 // At the shipped near-surface resolution m = 10 (h = d/10) the prediction is
 // 8.33e-4 relative amplitude and 8.33e-4 rad PER SKIN DEPTH -- reproduced as
-// an explicit self-check below, because Fermi derived the same two numbers
+// an explicit self-check below, because the physics review derived the same two numbers
 // independently (3.06e-4*A absolute at one skin depth = e^-1 * 8.33e-4, and
 // 8.35e-4 rad). Two derivations agreeing is what makes this a floor and not a
 // guess. A gate tighter than that FAILS CORRECT CODE.
@@ -302,7 +302,7 @@ int main() {
     std::printf("Analytic gate for the CONDUCTION solution below the surface,\n"
                 "and the U2 / D8 max-min interpolation measurement.\n\n");
 
-    // ---- 0. the derivation, self-checked against Fermi's independent one --
+    // ---- 0. the derivation, self-checked against the physics review's independent one --
     {
         // At m = 10 the cell is h = delta/10 and the temporal term is
         // negligible, so lam_h*h should be 0.100083 + 0.099917i: a relative
@@ -317,7 +317,7 @@ int main() {
         std::printf("  [derivation] m=10: mis-decay %.4e / skin depth, "
                     "mis-phase %.4e rad / skin depth\n", mis_decay, mis_phase);
         std::printf("               absolute amplitude error at 1 skin depth = "
-                    "%.3e * A   (Fermi, independently: 3.06e-4 * A)\n",
+                    "%.3e * A   (physics review, independently: 3.06e-4 * A)\n",
                     std::exp(-1.0) * mis_decay);
         check(std::fabs(mis_decay - 8.33e-4) < 0.02 * 8.33e-4 &&
               std::fabs(mis_phase + 8.33e-4) < 0.02 * 8.33e-4,

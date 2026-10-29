@@ -4,6 +4,7 @@
  * Uses actual mesh and temperature data from europa_high_res simulation
  */
 
+#include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -267,8 +268,10 @@ int main(int argc, char* argv[]) {
     std::cout << "========================================" << std::endl;
 
     // Default paths
-    std::string mesh_file = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/build/output/europa_high_res/mesh.ply";
-    std::string output_dir = "/Users/paha3326/Library/CloudStorage/OneDrive-UCB-O365/europa/heat3d/ptm/build/output/europa_high_res/";
+    const char* dir_env = std::getenv("PTM_TEST_EUROPA_RUN");
+    std::string output_dir = (argc > 1) ? argv[1] : (dir_env ? dir_env : "output/europa_high_res/");
+    if (!output_dir.empty() && output_dir.back() != '/') output_dir += '/';
+    std::string mesh_file = output_dir + "mesh.ply";
 
     if (argc > 1) {
         mesh_file = argv[1];

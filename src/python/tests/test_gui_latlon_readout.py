@@ -33,7 +33,7 @@ calls ``_reinit_plotter``, which replaces the plotter with one carrying a
 DIFFERENT VTK interactor. The observers stayed bound to the retired one while
 ``picking_active``, ``picking_enabled`` and the "Select Face Mode" button all
 still read as on, so face selection silently stopped working
-(PTM-GUI-PICKING-DEAD-AFTER-EXPORT, found 2026-09-15, fixed here). A readout
+(found 2026-09-15, fixed here). A readout
 bound the same way would inherit that defect on the first export.
 
 Section 1 is ``ast`` over the panel source: no PyQt6, no VTK, no display, and it
@@ -189,7 +189,7 @@ def check_every_plotter_rebind_repoints_the_pointer_observers():
         f"these PyVistaWidget methods rebind self.plotter without re-pointing "
         f"the pointer observers: {sorted(offenders)}. The coordinate readout "
         f"freezes and face selection stops working, with nothing in the UI "
-        f"saying so (PTM-GUI-PICKING-DEAD-AFTER-EXPORT).")
+        f"saying so (picking dead after export).")
     rebinders = sorted(n for n, f in _methods(cls).items()
                        if n not in ("__init__", "init_ui")
                        and _assigns_self_attr(f, "plotter"))
@@ -818,7 +818,7 @@ def check_the_readout_survives_an_animation_export(tmp):
     after = _move_pointer(widget, *_center_of_canvas(widget))
     assert READOUT_RE.search(after), (
         f"the coordinate readout is dead after an animation export: {after!r} "
-        f"(PTM-GUI-PICKING-DEAD-AFTER-EXPORT)")
+        f"(picking dead after export)")
     widget.select_face_btn.setChecked(True)
     widget.toggle_face_selection(True)
     assert widget.picking_active, (

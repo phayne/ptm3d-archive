@@ -21,7 +21,7 @@
  * Key approximations:
  * - Transport matrix is fixed (computed once at start)
  * - Deposition is constant within a step at the global scale (per source group) whose
- *   deposition equals what the kernel retains from the step's own emission (PTM-644)
+ *   deposition equals what the kernel retains from the step's own emission
  *
  * References:
  * - Operator splitting: Strang (1968), LeVeque (2002)
@@ -212,7 +212,7 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
 
 /**
  * One step of the lag-barrier face model (IceLayerModel::enableLagBarrier), with
- * deposition B held constant over the step (PTM-644 solves for B).
+ * deposition B held constant over the step (the super-step deposition solve handles B).
  *
  * Inputs [SI]: Js, Jp = pure-ice potential sublimation and gross sputter fluxes,
  * B = deposition [kg/(m² s)]; d0 [m], mf0 (frost veneer), M0 (substrate ice) [kg/m²];
@@ -226,7 +226,7 @@ inline ExposedAreaStep solveExposedAreaStep(double phi0, double A, double B,
  *     With q = p - B, g0 = a + q u0, eps = q/g0, s = u - u0 this separates to
  *       t(s) = l / (beta g0) [u0 L(s) + M(s)],  L = int_0^s dx/(1+eps x), M = int_0^s x dx/(1+eps x),
  *     and the sublimation emitted is int a/u dt = l a / (beta g0) L(s). For B = p = 0 this
- *     is d + d^2/(2l) = beta a t. The equilibrium u* = a/(B - p) (Fermi's
+ *     is d + d^2/(2l) = beta a t. The equilibrium u* = a/(B - p) (the physics review's
  *     d* = l (Js f / B - 1) for p = 0) is approached, never crossed.
  *  sliding (m_f = 0, E_S < B < Js + Jp): frost that lands sublimates again as fast as
  *     it arrives (Filippov: the face is frost-free a fraction lambda = (Jv - B)/(Jv - E_S)
@@ -368,8 +368,8 @@ inline LagFaceStep solveLagFaceStep(double Js, double Jp, double B, double d0, d
 }
 
 /**
- * Garden mode (PTM-669): one step of the lag face model with the sputter split and
- * micrometeoroid gardening, deposition B held constant (Fermi's formulation,
+ * Garden mode: one step of the lag face model with the sputter split and
+ * micrometeoroid gardening, deposition B held constant (the physics review's formulation,
  * Paul's rulings 2026-09-24).
  *
  * Inputs: Js sublimation, Jw H2O-ejection, Jr radiolytic (O2 + H2, = 36/32 x O2)
@@ -383,7 +383,7 @@ inline LagFaceStep solveLagFaceStep(double Js, double Jp, double B, double d0, d
  *  V   (m_f > 0): emission Js + Jw + Jr, dm_f/dt = B - Jv - gv; the gardened frost
  *      (gv) goes into the box ice; the lag under the veneer is untouched.
  *  S   (m_f = 0, B <= E_S): dd/dt = beta [(a + pw)/u + pr - B] - v_m 1(d > 0), the
- *      box loses E_S - B. This is the PTM-659 closed form with a -> a + pw and
+ *      box loses E_S - B. This is the lag layer and diffusion barrier closed form with a -> a + pw and
  *      p -> pr - v_m/beta. d = 0 is absorbing when beta (a + pw + pr - B) <= v_m
  *      (Spencer criterion): the box then loses ice with no lag and its c rises.
  *  sliding (m_f = 0, E_S < B < Jv + gv): the face is frost-free a fraction
@@ -573,7 +573,7 @@ inline GardenFaceStep solveGardenFaceStep(double Js, double Jw, double Jr, doubl
 }
 
 /**
- * PTM-676: one garden face over dt in nsub substeps (see
+ * one garden face over dt in nsub substeps (see
  * MultiTimescaleConfig::garden_subcycle_kappa). Each substep is one
  * solveGardenFaceStep() call; between substeps the gardening entrainment of the box
  * growth ((1 - c0) rho dh of ice, c0 dh of non-ice) is added and the box composition
@@ -611,7 +611,7 @@ inline GardenFaceStep solveGardenFaceSubcycled(const IceLayerModel& m, double Js
 }
 
 /**
- * PTM-676: substeps a frost-free face with box ice M needs over dt. Subcycling applies
+ * substeps a frost-free face with box ice M needs over dt. Subcycling applies
  * only where the single call is step-size dependent: the box gardening entrains more
  * than kappa x M of ice within the step (S dt > kappa M, S = entrainment rate), which
  * the single call books after the step while the loss runs through it. Such a face gets
@@ -710,7 +710,7 @@ struct MultiTimescaleConfig {
     // Converges when |sublimation + sputtering - deposition| / (sublimation + sputtering) < threshold
     double flux_convergence_threshold = timescale_constants::FLUX_CONVERGENCE_THRESHOLD;
 
-    // PTM-644: deposition over a step follows the emission produced over that step
+    // deposition over a step follows the emission produced over that step
     // (see MultiTimescaleEvolution::evolveEpoch). false reproduces the pre-fix
     // operator splitting: deposition held at its start-of-step value while the
     // sources follow the ice availability, and (linear availability mode) the
@@ -721,13 +721,13 @@ struct MultiTimescaleConfig {
     // refinement checks; the physical bound is computeSafeEpochCount().
     int max_superstep_epochs = 0;
 
-    // PTM-676: garden-step subcycling. A frost-free face whose box gardening entrains
+    // garden-step subcycling. A frost-free face whose box gardening entrains
     // more than kappa of its box ice within the step is integrated in substeps of at
     // most kappa x its turnover time (tau = M / max(|E_S - B|, entrainment rate)), with
     // the entrainment and the box composition (c, f, beta) updated between substeps.
     // Without it the equilibrium of such a face depends on the super-step length (the
     // entrainment is booked after the step while the loss runs through it).
-    // 0 = off (the pre-PTM-676 single call).
+    // 0 = off (the pre-fix single call).
     double garden_subcycle_kappa = 0.1;
     int garden_subcycle_cap = 1024;
 
@@ -752,8 +752,8 @@ struct MultiTimescaleConfig {
         std::cout << "  Flux convergence threshold: " << (flux_convergence_threshold * 100.0) << "%" << std::endl;
         std::cout << "  Step deposition: "
                   << (superstep_consistent_deposition
-                      ? "consistent with the step's emission (PTM-644)"
-                      : "LEGACY start-of-step value (PTM-644 not applied; not mass-conserving)")
+                      ? "consistent with the step's emission"
+                      : "LEGACY start-of-step value (not applied; not mass-conserving)")
                   << std::endl;
         if (max_superstep_epochs > 0) {
             std::cout << "  Max super-step: " << max_superstep_epochs << " epochs" << std::endl;
@@ -817,7 +817,7 @@ struct DiurnalAverages {
     // Total emission at cache time (for scaling deposition)
     double total_base_emission = 0.0;  // [kg/s] (summed over all faces)
 
-    // PTM-642 sputter mass accounting. When sputter_transport is set,
+    // sputter mass accounting. When sputter_transport is set,
     // avg_sputtering_flux / base_sputtering_flux are the GROSS sputter removal,
     // a fraction sputter_transport_share of it (the non-escaping H2O) enters the
     // ballistic transport, and deposition is kept as two parts, each rescaled by
@@ -835,7 +835,7 @@ struct DiurnalAverages {
     double total_base_sublimation = 0.0;  // [kg/s] sublimation source at cache time
     double total_base_sputter = 0.0;      // [kg/s] GROSS sputter removal at cache time
 
-    // PTM-649. Per-face fate fractions of the gross sputter flux (diurnal means),
+    // Sputtering parameters. Per-face fate fractions of the gross sputter flux (diurnal means),
     // set when the composition varies with temperature (current parameter set:
     // tau(T) on the radiolytic part only). Empty = the global shares above.
     std::vector<double> sputter_face_transport_frac;
@@ -853,7 +853,7 @@ struct DiurnalAverages {
         return perFaceSputter() ? sputter_face_reservoir_frac[i] : sputter_reservoir_share;
     }
 
-    // PTM-644. Deposition = base deposition x a global scale per source group
+    // Super-step deposition consistency. Deposition = base deposition x a global scale per source group
     // (one group, total emission, without sputter transport; sublimation and
     // sputter with it). The scales below are the CURRENT (start-of-step) values
     // set by cacheBaseFluxesUnscaled() (1) and applyScaledFluxes(); evolveEpoch()
@@ -994,13 +994,13 @@ struct DiurnalAverages {
         size_t n = avg_sublimation_flux.size();
 
         if (sputter_transport) {
-            // PTM-642 (c): each deposition part follows the source that produced
+            // each deposition part follows the source that produced
             // it. The old single (sublimation + sputtering) ratio let deposition
             // exceed sublimation whenever the two sources lost ice availability
             // at different rates (sublimation is equatorial, sputtering trailing).
             // Face-order (deterministic) sums: an OpenMP reduction here made the
             // deposition scale, and so every face's state, vary by an ulp with the
-            // thread count and run to run (PTM-645; flaked the PTM-644 equilibrium test).
+            // thread count and run to run (flaked the super-step deposition equilibrium test).
             #pragma omp parallel for
             for (size_t i = 0; i < n; ++i) {
                 avg_sublimation_flux[i] = base_sublimation_flux[i] * ice_availability[i];
@@ -1041,7 +1041,7 @@ struct DiurnalAverages {
             avg_sublimation_flux[i] = base_sublimation_flux[i] * ice_availability[i];
             avg_sputtering_flux[i] = base_sputtering_flux[i] * ice_availability[i];
         }
-        for (size_t i = 0; i < n; ++i) {  // face order: deterministic (PTM-645)
+        for (size_t i = 0; i < n; ++i) {  // face order: deterministic
             total_current_emission += (avg_sublimation_flux[i] + avg_sputtering_flux[i]) * face_areas[i];
         }
 
@@ -1067,7 +1067,7 @@ struct DiurnalAverages {
     std::vector<double> cached_sub_availability;   // lag only: availabilities at cache time
     std::vector<double> cached_sput_availability;
 
-    // Garden mode (PTM-669): per-face composition of the gross sputter potential.
+    // Garden mode: per-face composition of the gross sputter potential.
     // w = H2O-ejection share; tw, ew = transported / escaping share of the H2O part;
     // er = escaping share of the radiolytic part (the rest is atmospheric loss).
     // Set by the integration from the diurnal fate accumulation (empty otherwise).
@@ -1231,7 +1231,7 @@ struct EvolutionStatistics {
     double net_mass_loss_rate = 0.0;        // [kg/s] net loss (sublim + sput - depos)
     double flux_imbalance_fraction = 0.0;   // |net| / (sublim + sput), dimensionless
 
-    // PTM-642 sputter fates (set only when the new accounting is active; then
+    // Sputter mass accounting: sputter fates (set only when the new accounting is active; then
     // sputtering_rate is the GROSS removal). Rates are per step [kg/s]; the
     // redeposited rate is the start-of-step deposition the step used, while
     // sputtering_rate is averaged over the step's ice availability, so the two
@@ -1249,11 +1249,11 @@ struct EvolutionStatistics {
     //   + sublimation Jeans escape - super-step lag.
     // The lag is deposition in excess of the step-mean sources: a super-step
     // holds deposition at its start-of-step value while sublimation and
-    // sputtering follow the step-mean ice availability (PTM-644).
+    // sputtering follow the step-mean ice availability.
     double total_sublimation_jeans_mass = 0.0;    // [kg]
     double total_superstep_lag_mass = 0.0;        // [kg]
 
-    // PTM-644 step conservation audit (all multiscale modes; it throws only in
+    // Super-step deposition: step conservation audit (all multiscale modes; it throws only in
     // the consistent mode). Per step: deposited = retained emission, where each
     // source group retains rho_k = kernel deposition / kernel source at cache time.
     // Cumulative identity: sublimated + sputtered - deposited
@@ -1272,7 +1272,7 @@ struct EvolutionStatistics {
     long long steps_evolved = 0;
     long long step_solver_evaluations = 0;
     int step_solver_max_iterations = 0;
-    // PTM-640 albedo step limiter (predictions do not change the state).
+    // albedo step limiter (predictions do not change the state).
     long long step_solver_slope_fallbacks = 0;  // FD slope outside [-1, 0): used -1
     long long step_solver_loose = 0;            // accepted at |residual| <= 1e-8 after stagnation
     long long predictions = 0;
@@ -1289,11 +1289,11 @@ struct EvolutionStatistics {
     double lag_max_thickness = 0.0;            // [m]
     size_t lag_faces_over_warn = 0;            // faces with d above the warning thickness
     size_t lag_regime_count[4] = {0, 0, 0, 0}; // last step: S, sliding, veneer, none
-    // Garden mode (PTM-669): ice brought in by the growing box; the audit becomes
+    // Garden mode: ice brought in by the growing box; the audit becomes
     //   inventory_now - inventory_0 = entrained - (sublimated + sputtered - deposited).
     double garden_entrained_mass = 0.0;        // [kg]
     size_t garden_absorbing_faces = 0;         // last step: Spencer-absorbing d = 0 faces
-    // PTM-676 subcycling (commits only; the evaluate/predict passes repeat it)
+    // Garden-step subcycling (commits only; the evaluate/predict passes repeat it)
     long long garden_subcycled_face_steps = 0; // face-steps integrated in substeps
     int garden_subcycle_max = 0;               // most substeps in one face-step
     long long garden_subcycle_capped = 0;      // face-steps that hit the substep cap
@@ -1346,7 +1346,7 @@ struct EvolutionStatistics {
                 std::cout << "      sputter escaped:     " << total_sputter_escaped_mass << " kg" << std::endl;
                 std::cout << "      sputter reservoir:   " << total_sputter_reservoir_mass << " kg" << std::endl;
                 std::cout << "    Sublimation Jeans escape: " << total_sublimation_jeans_mass << " kg" << std::endl;
-                std::cout << "    Super-step lag (deposition in excess of step-mean sources; PTM-644): "
+                std::cout << "    Super-step lag (deposition in excess of step-mean sources): "
                           << total_superstep_lag_mass << " kg" << std::endl;
                 std::cout << "    (sublimated + sputtered - deposited = sputter escaped + reservoir + "
                           << "Jeans - lag)" << std::endl;
@@ -1356,7 +1356,7 @@ struct EvolutionStatistics {
                 const double net = total_sublimated_mass + total_sputtered_mass - total_deposited_mass;
                 double resid = (lag_inventory_mass - lag_inventory_initial_mass) + net;
                 // Garden mode: the entrained supply, in a separate non-inlined function so that
-                // -ffast-math cannot fuse it into the PTM-659 expression above (measured: a fused
+                // -ffast-math cannot fuse it into the lag layer and diffusion barrier expression above (measured: a fused
                 // "- 0.0" moved the gardening-off audit line by an ulp).
                 if (garden_entrained_mass > 0.0) {
                     resid = gardenAuditResidual(lag_inventory_mass, lag_inventory_initial_mass, net,
@@ -1379,8 +1379,8 @@ struct EvolutionStatistics {
                           << std::endl;
             }
             if (step_audit_count > 0) {
-                std::cout << "  Step conservation (PTM-644" << (superstep_consistent ? "" : "; LEGACY, not enforced")
-                          << "): not redeposited " << total_not_redeposited_mass << " kg, residual "
+                std::cout << "  Step conservation" << (superstep_consistent ? "" : " (LEGACY, not enforced)")
+                          << ": not redeposited " << total_not_redeposited_mass << " kg, residual "
                           << total_step_residual_mass << " kg (max step " << max_step_residual_rel
                           << " rel), layer overflow " << total_layer_overflow_mass << " kg" << std::endl;
             }
@@ -1421,7 +1421,7 @@ private:
     // Reusable buffer for ice availability queries (avoids per-epoch allocation)
     mutable std::vector<double> ice_availability_buf_;
 
-    // Per-face scratch for evolveEpoch()'s face-order sums (PTM-644).
+    // Per-face scratch for evolveEpoch()'s face-order sums.
     struct StepBuffers {
         std::vector<double> emit_sub, emit_sput, dep_sub, dep_sput, deposition, overflow, inventory_err;
         std::vector<double> sput_transport, sput_escape, sput_reservoir;
@@ -1663,7 +1663,7 @@ public:
      * Lag barrier: how far the emission PATTERN has moved since the transport was
      * cached, as the total-variation distance between the normalized current and
      * cached per-face emission (max over sublimation and sputtering; 0..1). A uniform
-     * decay is not a pattern change (the PTM-644 scale absorbs it); a change here is,
+     * decay is not a pattern change (the super-step deposition scale absorbs it); a change here is,
      * and the cached deposition pattern no longer matches its sources.
      */
     double lagSourcePatternDrift(const IceLayerModel& ice_model, const IceLayerState& ice_state,
@@ -1842,7 +1842,7 @@ public:
      * face's sublimation; (b) the substrate running out; (c) a veneer vanishing,
      * weighted by (an upper bound on) the emission jump. As in computeSafeEpochCount, the step ends when
      * the events passed carry 10% of the current emission. The per-face step is
-     * exact; this bounds the within-step change of the emission the PTM-644
+     * exact; this bounds the within-step change of the emission the super-step deposition
      * deposition solve averages over, and of the pattern the cached transport holds.
      */
     int computeSafeEpochCountLag(const IceLayerModel& ice_model, const IceLayerState& st,
@@ -1904,7 +1904,7 @@ public:
     }
 
     /**
-     * Garden mode (PTM-669) super-step bound, the same 10%-of-emission rule as
+     * Garden mode super-step bound, the same 10%-of-emission rule as
      * computeSafeEpochCountLag with the garden ODE's rates: a 10% change of the
      * barrier factor (growing or gardened lag), the lag gardened away, the box of an
      * absorbing d = 0 face losing 10% of its ice (its c and albedo move), substrate
@@ -1994,7 +1994,7 @@ public:
     }
 
     /**
-     * One face over one step with deposition held at B (PTM-644 helper).
+     * One face over one step with deposition held at B (super-step deposition helper).
      * conc_before: non-ice concentration at the start; A, B [1/s] as in
      * evolveEpoch(). mean_avail is the step-mean ice availability, so that
      * base_emission * mean_avail is the step-mean emission.
@@ -2018,7 +2018,7 @@ public:
             return out;
         }
         if (exact_linear_mean) {
-            // Well-conditioned closed form (PTM-644). With f = 1 - nonice, y = A t and
+            // Well-conditioned closed form. With f = 1 - nonice, y = A t and
             // rate0 = B - A f0 (df/dt at the start):
             //   f(t) - f0 = rate0 t phi1(y),               phi1(y) = (1 - e^-y) / y
             //   int_0^t f = t [f0 + rate0 t psi(y)],       psi(y) = (y - 1 + e^-y) / y^2
@@ -2051,7 +2051,7 @@ public:
                 // Exact equilibrium: f is constant; the trapezoid of the end points keeps
                 // such faces bit-identical to the legacy step. (An absolute |df| < 1e-8
                 // switch here made the step mean discontinuous in B on nearly depleted
-                // faces, f ~ 1e-6, and stalled the deposition solve; PTM-640 work.)
+                // faces, f ~ 1e-6, and stalled the deposition solve; the albedo step-limit work.)
                 out.mean_avail = 0.5 * (f0 + f_end);
                 return out;
             }
@@ -2094,7 +2094,7 @@ public:
      * Each face approaches equilibrium nonice_eq = 1 - B/A, where
      * sublimation (reduced by ice fraction) balances deposition.
      *
-     * Deposition over the step (PTM-644). Deposition is the transport kernel's
+     * Deposition over the step. Deposition is the transport kernel's
      * output at cache time times a global scale per source group (s_sub, s_sput;
      * one group without sputter transport), because the kernel is linear in its
      * source and the pattern is fixed until the next full diurnal. Pre-fix, the
@@ -2111,7 +2111,7 @@ public:
      * its mean, so the pattern error is O(the step's change in emission), which
      * computeSafeEpochCount() bounds, and it vanishes under step refinement
      * (--max-superstep-epochs). (Temperatures and the albedo-coupling refresh are
-     * still evaluated only at step boundaries; that lag is PTM-640, not this.)
+     * still evaluated only at step boundaries; that lag is what the albedo step limit handles, not this.)
      * The mass balance is exact for every step:
      *     deposited_k = rho_k * emitted_k,  rho_k = D_k,base / S_k,base
      * (sublimation: 1 - Jeans - unscattered; sputter: non-escaping H2O share).
@@ -2134,7 +2134,7 @@ public:
     }
 
     /**
-     * PTM-640: the non-ice concentrations evolveEpoch() WOULD produce over
+     * the non-ice concentrations evolveEpoch() WOULD produce over
      * epoch_duration from the current state (same deposition solve and closed
      * form), without changing the state or the statistics.
      */
@@ -2145,7 +2145,7 @@ public:
                                std::vector<double>& nonice_out,
                                bool solve_deposition = true,
                                std::vector<double>* lag_thickness_out = nullptr) {
-        // solve_deposition = false (PTM-657): hold deposition at its start-of-step
+        // solve_deposition = false: hold deposition at its start-of-step
         // scale instead of solving the step-consistent scale; ~7x cheaper, and
         // adequate for the albedo step limiter, which only needs where the albedo
         // is heading (the step itself is still solved).
@@ -2163,7 +2163,7 @@ public:
     }
 
 private:
-    // ---- Garden mode (PTM-669) step pieces, kept out of evolveEpochImpl (see there). ----
+    // ---- Garden mode step pieces, kept out of evolveEpochImpl (see there). ----
     GardenFaceStep gardenStepAt(const IceLayerModel& m, const IceLayerState& st, size_t i, double B,
                                 double dt) const {
         const DiurnalAverages& d = *diurnal_avg_;
@@ -2175,7 +2175,7 @@ private:
                                    st.lag_exposed_fraction[i], st.lag_beta[i], m.getLagBarrierLength(),
                                    lc.gardening ? lc.gardening_rate : 0.0, gardenVeneerRate(m), dt, lc.sputter_shield);
     }
-    // ---- PTM-676: garden-step subcycling --------------------------------------
+    // ---- garden-step subcycling --------------------------------------
     // Number of substeps face i needs over dt (1 = the plain single call).
     int gardenSubcycleCount(const IceLayerModel& m, const IceLayerState& st, size_t i, double B,
                             double dt, bool* capped = nullptr) const {
@@ -2240,7 +2240,7 @@ private:
             const int ns = gardenSubcycleCount(ice_model, ice_state, i, B, epoch_duration);
             if (ns > 1) {
                 // The subcycled face's predicted c includes the step's entrainment: that is
-                // its actual step (PTM-676). The single call below leaves it out as before;
+                // its actual step. The single call below leaves it out as before;
                 // for those faces the entrainment is < kappa of their box ice.
                 double Nx, Mx;
                 const GardenFaceStep sx = gardenStepSubcycled(ice_model, ice_state, i, B, epoch_duration, ns, Nx, Mx);
@@ -2286,7 +2286,7 @@ private:
                 const double avail_before = ice_model.getSublimationAvailability(ice_state, i);
                 const double inv_before = ice_state.substrate_ice[i] + ice_state.frost_veneer[i];
                 const double d_before = ice_state.lag_thickness[i];
-                // PTM-676: a face whose box turns over within the step is integrated in substeps
+                // a face whose box turns over within the step is integrated in substeps
                 // (entrainment and box composition inside the step); every other face takes the
                 // single call exactly as before.
                 bool capped = false;
@@ -2378,9 +2378,9 @@ private:
         const bool lag = lagOn(ice_model, ice_state);
         const double ell = lag ? ice_model.getLagBarrierLength() : 0.0;
         if (lag && !config_.superstep_consistent_deposition) {
-            throw std::logic_error("evolveEpoch: the lag barrier requires the step-consistent deposition (PTM-644)");
+            throw std::logic_error("evolveEpoch: the lag barrier requires the step-consistent deposition");
         }
-        // Garden mode (PTM-669): solveGardenFaceStep, the sputter split and the box.
+        // Garden mode: solveGardenFaceStep, the sputter split and the box.
         const bool garden = lag && ice_model.usesGardenMode();
         if (garden && d.sputter_transport && !d.perFaceSputter()) {
             throw std::logic_error("evolveEpoch: garden mode needs the per-face sputter composition "
@@ -2401,7 +2401,7 @@ private:
 
         // Source groups: 0 = sublimation (+ sputtering when it is not transported), 1 = sputter.
         // Group 1 is the sputter transport source: the gross, or (per-face composition,
-        // PTM-649) the per-face transported share of it.
+        // sputtering parameters) the per-face transported share of it.
         const bool per_face = two && d.perFaceSputter();
         const double S_base[2] = {two ? d.total_base_sublimation : d.total_base_emission,
                                   two ? (per_face ? d.total_base_sputter_transport : d.total_base_sputter) : 0.0};
@@ -2462,7 +2462,7 @@ private:
             for (int k = 0; k < 2; ++k) {
                 if (active[k] && D_base[k] > S_base[k] * rho_max[k] * (1.0 + 1e-6)) {
                     std::ostringstream m;
-                    m << std::scientific << std::setprecision(6) << "evolveEpoch (PTM-644): cached deposition "
+                    m << std::scientific << std::setprecision(6) << "evolveEpoch: cached deposition "
                       << D_base[k] << " kg/s exceeds its source's retainable share " << S_base[k] * rho_max[k]
                       << " kg/s (group " << k << ")";
                     throw std::runtime_error(m.str());
@@ -2485,7 +2485,7 @@ private:
                 if (++iterations > 40) {
                     std::ostringstream m;
                     m << std::scientific << std::setprecision(6)
-                      << "evolveEpoch (PTM-644): step deposition scale did not converge in 40 Newton iterations"
+                      << "evolveEpoch: step deposition scale did not converge in 40 Newton iterations"
                       << " (s = " << s[0] << ", " << s[1] << "; residual " << g[0] << ", " << g[1] << ")";
                     throw std::runtime_error(m.str());
                 }
@@ -2513,7 +2513,7 @@ private:
                 }
                 const double det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
                 if (!(std::abs(det) > 0.0) || !std::isfinite(det)) {
-                    throw std::runtime_error("evolveEpoch (PTM-644): singular Jacobian in the step deposition solve");
+                    throw std::runtime_error("evolveEpoch: singular Jacobian in the step deposition solve");
                 }
                 const double dx0 = (-g[0] * J[1][1] + g[1] * J[0][1]) / det;
                 const double dx1 = (-g[1] * J[0][0] + g[0] * J[1][0]) / det;
@@ -2560,7 +2560,7 @@ private:
 
         if (garden) {
             // Separate, non-inlined function: keeps the codegen (and so the -ffast-math
-            // rounding) of the PTM-659 lag branch below identical to 254bb03.
+            // rounding) of the lag layer and diffusion barrier lag branch below identical to 254bb03.
             gardenApplyStep(ice_model, ice_state, face_areas, epoch_duration, s, two, per_face, max_change);
         } else if (lag) {
             if (lag_regime_.size() != num_faces_) lag_regime_.assign(num_faces_, 0);
@@ -2677,7 +2677,7 @@ private:
             double change = std::abs(ice_state.nonice_concentration[i] - conc_before);
             max_change = std::max(max_change, change);
 
-            // PTM-644 audit terms, summed in face order below.
+            // Super-step deposition audit terms, summed in face order below.
             step_buffers_.deposition[i] = deposition;
             step_buffers_.emit_sub[i] = eff_sublimation * face_areas[i];
             step_buffers_.emit_sput[i] = eff_sputtering * face_areas[i];
@@ -2704,7 +2704,7 @@ private:
         // Face-order (reproducible) sums of the step.
         // Gs, Gp, Ds, Dp [kg/s]; over, inv_err [kg] over the step.
         double Gs = 0.0, Gp = 0.0, Ds = 0.0, Dp = 0.0, over = 0.0, inv_err = 0.0;
-        double Gc = 0.0, Ge = 0.0, Gr = 0.0;  // per-face sputter fates [kg/s] (PTM-649)
+        double Gc = 0.0, Ge = 0.0, Gr = 0.0;  // per-face sputter fates [kg/s]
         if (per_face) {
             for (size_t i = 0; i < num_faces_; ++i) {
                 Gc += step_buffers_.sput_transport[i];
@@ -2722,13 +2722,13 @@ private:
         }
         if (consistent) {   // (the lag barrier requires it; see the top of this function)
             // Stats from the reproducible sums (the OpenMP reductions above vary at
-            // ~1e-16 run to run; PTM-645).
+            // ~1e-16 run to run).
             epoch_sublimated = Gs;
             epoch_sputtered = Gp;
             epoch_deposited = Ds + Dp;
         }
 
-        // Step conservation audit (PTM-644): deposited = retained share of what
+        // Step conservation audit: deposited = retained share of what
         // the step emitted, per group.
         const double rho0 = active[0] ? D_base[0] / S_base[0] : 0.0;
         const double rho1 = active[1] ? D_base[1] / S_base[1] : 0.0;
@@ -2740,7 +2740,7 @@ private:
         const double external = ((!active[0] && D_base[0] > 0.0) ? Ds : 0.0) +
                                 ((!active[1] && D_base[1] > 0.0) ? Dp : 0.0);
         if (external > 0.0 && stats_.total_external_deposition_mass == 0.0) {
-            std::cerr << "WARNING [PTM-644]: deposition with no cached source (external supply, "
+            std::cerr << "WARNING: deposition with no cached source (external supply, "
                       << std::scientific << std::setprecision(3) << external
                       << " kg/s); it is excluded from the step conservation audit and reported as "
                       << "external deposition" << std::fixed << std::endl;
@@ -2765,7 +2765,7 @@ private:
         if (consistent && !(std::abs(step_rel) <= 1e-6)) {
             std::ostringstream m;
             m << std::scientific << std::setprecision(6)
-              << "evolveEpoch (PTM-644): step conservation audit failed: deposited " << deposited
+              << "evolveEpoch: step conservation audit failed: deposited " << deposited
               << " kg/s vs retained emission " << retained << " kg/s (emitted " << emitted
               << "), residual " << step_rel << " relative (limit 1e-6)";
             throw std::runtime_error(m.str());
@@ -2777,7 +2777,7 @@ private:
         stats_.total_deposited_mass += epoch_deposited * epoch_duration;
         stats_.total_sputtered_mass += epoch_sputtered * epoch_duration;
 
-        // Net surface mass loss = sublimation + sputtering - deposition. With the PTM-642
+        // Net surface mass loss = sublimation + sputtering - deposition. With the sputter mass accounting
         // accounting this is escape + atmospheric reservoir (+ Jeans), minus the super-step lag.
         double epoch_net_loss = epoch_sublimated + epoch_sputtered - epoch_deposited;
         stats_.total_escaped_mass += std::max(0.0, epoch_net_loss) * epoch_duration;
@@ -2806,7 +2806,7 @@ private:
             stats_.total_sputter_escaped_mass += stats_.sputter_escaped_rate * epoch_duration;
             stats_.total_sputter_reservoir_mass += stats_.sputter_reservoir_rate * epoch_duration;
         } else if (d.sputter_transport) {
-            // Legacy (pre-PTM-644) diagnostics, unchanged. Separate pass so the reductions above are untouched.
+            // Legacy (pre-fix) diagnostics, unchanged. Separate pass so the reductions above are untouched.
             double dep_sput = 0.0, dep_sub = 0.0, s0 = 0.0;
             for (size_t i = 0; i < num_faces_; ++i) {
                 dep_sput += d.avg_deposition_sputter_flux[i] * face_areas[i];
@@ -2890,7 +2890,7 @@ public:
     DiurnalAverages& getMutableDiurnalAverages() { return *diurnal_avg_; }
 
     /**
-     * Activate the PTM-642 sputter mass accounting (call before the first
+     * Activate the sputter mass accounting (call before the first
      * epoch). Shares are fractions of the gross sputtered mass and must sum to 1.
      */
     void setSputterPartition(double transport_share, double escape_share, double reservoir_share) {
@@ -2911,7 +2911,7 @@ public:
      * Global sputter mass audit of the CURRENT flux state [kg/s].
      * gross = redeposited + escaped + reservoir must close to 1e-6 (the caller throws);
      * redeposited is MEASURED from the deposition field (the kernel output after
-     * rescaling), not assumed. Also checks the PTM-642 (c) regression:
+     * rescaling), not assumed. Also checks the sputter mass accounting (c) regression:
      * deposition <= sublimation + sputter transport source.
      */
     struct SputterAudit {
