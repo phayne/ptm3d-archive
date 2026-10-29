@@ -6296,7 +6296,7 @@ bool runThermalModelsForAllFaces(
 }
 
 // Phase R / per-face mean-flux equilibration seed.
-// The legacy Moon/Europa/A3GT seed derives T(z,0) from the INSTANTANEOUS
+// The legacy Moon/Europa/polar-site seed derives T(z,0) from the INSTANTANEOUS
 // absorbed flux over the first 10 equilibration steps with a hard 100 K
 // nightside floor — so a PSR floor (which never sees the sun) is stamped at
 // ~100 K and, with no radiation to drain it, its deep column holds ~50 K across
@@ -9898,7 +9898,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // The same thermal::EqSpinupCensus the CPU SIMD-batch driver prints, on the
     // path production actually runs. It shipped wired into
     // runThermalModelsForAllFacesBatchSoA ONLY, so every GPU window -- every
-    // A3GT window -- integrated its spin-up and said nothing about whether that
+    // polar-site window -- integrated its spin-up and said nothing about whether that
     // spin-up was long enough.
     //
     // Report-only: it reads the seed column, kc/rho and Qb, and writes only
@@ -10686,7 +10686,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // smooth seed removes it at the source and matches the CPU path.
         //
         // Gated on "using_generic_body" (mirrors applyConfiguredThermo / 710db0f):
-        // built-in Moon/Europa/A3GT runs keep the legacy seed and stay
+        // built-in Moon/Europa/polar-site runs keep the legacy seed and stay
         // byte-identical to their established baselines.
         std::vector<float> T_initial(batch_n * n_layers);
         if (config.spinup_seed == thermal::EqSeedMode::Physical) {
@@ -11572,7 +11572,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         // THE SINGLE-DEVICE (thermal.gpu_devices == 1) BATCH LOOP. This body is
         // a duplicate of the `run_batch_on_solver` lambda the multi-GPU pool
         // uses, so the estimate has to be scored in BOTH or it is missing on
-        // the default configuration -- which is the configuration every A3GT
+        // the default configuration -- which is the configuration every polar landing-site
         // production window runs. Same call, same helper, no second copy of the
         // arithmetic.
         scoreSpinupCensusGpuBatch(
@@ -14052,7 +14052,7 @@ struct MeshUnitReport {
 //                                        1.96 mm moon3d 509k mesh is refused
 //                                        with margin)
 //     0.05 m .. 1 m              LOUD WARNING
-//     >= 1 m                     allow   (the 3.46 m A3GT core passes cleanly)
+//     >= 1 m                     allow   (the 3.46 m polar-site core passes cleanly)
 //
 // THE GATE IS THE FINE END, NOT THE MEAN, for the reason facet_scale.py gives:
 // sqrt(mean area) is dominated by the LARGEST facets, so a mesh that is 99%
@@ -14060,8 +14060,8 @@ struct MeshUnitReport {
 // rule written to refuse millimeter facets. Beaming double-counts on the facets
 // that already resolve the roughness, so what matters is whether a meaningful
 // fraction of the mesh sits at that scale. Measured, sqrt(mean) vs
-// sqrt(5th percentile): sunlit_radcore_r50 234 m / 169 m; A3GT lunar polar site A core
-// 3.47 m / 0.708 m; A3GT ring 146 m / 25.1 m.
+// sqrt(5th percentile): sunlit_radcore_r50 234 m / 169 m; lunar polar site A core
+// 3.47 m / 0.708 m; polar-site ring 146 m / 25.1 m.
 //
 // UNITS come from inspectMeshLengthUnit's verdict, not from an assumption --
 // asteroid .obj are in kilometers and lunar/Europa DEM meshes in meters, and a
@@ -14076,7 +14076,7 @@ struct FacetScaleReport {
 };
 
 // Above this face count, sample rather than sum every triangle. Same numbers as
-// facet_scale.py: summing all 2,397,890 faces of the A3GT core took 9.9 s in
+// facet_scale.py: summing all 2,397,890 faces of the polar-site core took 9.9 s in
 // the GUI's Python reader, and 5,000 evenly spaced faces reproduce its
 // documented 3.46 m. Here it is C++ and one pass, but the sampling is kept so
 // the two implementations answer identically on the same mesh.
@@ -20927,7 +20927,7 @@ int main(int argc, char** argv) {
         // ~line 8548); the GPU thermal solver rebuilds its OWN Planet from
         // config properties and would otherwise never see the gate. Only set
         // these when the gate is on → thermal_config stays byte-identical for
-        // every non-Hapke run (default OFF path unchanged for Moon3D/A3GT/
+        // every non-Hapke run (default OFF path unchanged for Moon3D/polar-site/
         // Europa/gate-off EMA).
         if (planet.use_hapke_albedo && planet.hapke_albedo_w >= 0.0) {
             thermal_config.setProperty("use_hapke_albedo", true);

@@ -794,9 +794,9 @@ def request_key(request):
     passes on the command line, so the key is keyed on the number the TOOL
     receives and 25 and 25.0 are one request rather than two.
 
-    The mesh's face count is in the key as well as its path: an A3GT core mesh
+    The mesh's face count is in the key as well as its path: a polar-site core mesh
     has been regenerated under its own name after the artifacts built against
-    it (project map, "A3GT DEM meshes can be silently regenerated"), and a key
+    it (project map, "polar-site DEM meshes can be silently regenerated"), and a key
     made of the path alone would hand that run the old layout. The engine also
     refuses on the geometry hash, but by then the whole solve has run.
     """

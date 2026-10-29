@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""A3GT v2 — DEM catalog builder.
+"""Polar landing-site campaign (v2): DEM catalog builder.
 
-Scans a tree of regional lunar DEMs (default the A3GT Shape-from-Shading set
-under ``moon/DEM/a3gt/<region>/``) and emits a machine catalog
+Scans a tree of regional lunar DEMs (default the polar-site Shape-from-Shading set
+under ``<DEM root>/<region>/``) and emits a machine catalog
 (``dem_catalog.json``) plus a human spreadsheet (``dem_catalog.csv``). The
 catalog is consumed by ``a3gt_v2_site_filter.py`` (catalog/association mode)
 to pick the best DEM(s) per landing site and build per-site VRT mosaics.
@@ -39,7 +39,7 @@ extension ring is limited to SfS coverage.
 Example
 -------
     python3 scripts/dem_catalog.py \\
-        --dem-root /Users/.../moon/DEM/a3gt \\
+        --dem-root /path/to/polar_sfs_dems \\
         --lola-base data/dem/a3gt_v2/_lola_base_spstereo.tif \\
         --out-json output/a3gt_v2/dem_catalog.json \\
         --out-csv  output/a3gt_v2/dem_catalog.csv
@@ -67,7 +67,7 @@ from a3gt_v2_site_filter import gdal_extent  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_DEM_ROOT = Path(os.environ.get("PTM_DEM_ROOT", str(REPO / "data" / "dem")))
 
-# Canonical lunar south-polar-stereographic frame shared by every A3GT SfS DEM
+# Canonical lunar south-polar-stereographic frame shared by every polar-site SfS DEM
 # and required for the per-site VRT mosaic (the C++ mesh tool converts the ROI
 # center via the dataset's own polar-stereo params, so a mixed-CRS VRT breaks).
 CANON = {"proj": "stere", "lat_0": -90.0, "lon_0": 0.0, "R": 1737400.0}

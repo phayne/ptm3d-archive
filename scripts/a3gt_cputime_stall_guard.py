@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CPU-time stall guard for the AGT unattended campaign (kill-on-soft-hang).
+"""CPU-time stall guard for the unattended polar landing-site campaign (kill-on-soft-hang).
 
 The June campaign stalled ~38 h with the orchestrator and its GPU sim child
-BOTH alive but not computing (a soft GPU wedge). `a3gt_rad_corering_watchdog.py`
-keys its stall detection on WINDOW-COMPLETION progress and leaves that
-"alive-but-frozen" case (WEDGE_SUSPECT) notify-only -- it never killed anything,
+BOTH alive but not computing (a soft GPU wedge). The earlier campaign watchdog
+(not in this repository) keyed its stall detection on WINDOW-COMPLETION
+progress and left that "alive-but-frozen" case (WEDGE_SUSPECT) notify-only -- it never killed anything,
 so the resume-by-default machinery never got a chance to fire. This guard adds
 the missing action: it watches a process's *CPU time* -- the one signal that
 keeps rising while the process actually computes and FREEZES the instant it

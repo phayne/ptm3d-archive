@@ -76,7 +76,7 @@ const char* eqSeedAnchorStatusName(EqSeedAnchorStatus s) {
 //
 // A generic length is not optional here: a forcing series is however many
 // samples the run happens to have (118 = 2*59 on the shipped lunar crater,
-// 1440 on A3GT). Radix-2 when n is a power of two; Bluestein (chirp-z) over
+// 1440 on polar sites). Radix-2 when n is a power of two; Bluestein (chirp-z) over
 // the next power of two >= 2n-1 otherwise, so the cost is O(n log n) for every
 // n including primes. Plans are cached per thread, keyed on n, because every
 // face in a mesh shares the same n.

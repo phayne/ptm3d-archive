@@ -1428,7 +1428,7 @@ class MeshTab(BaseConfigTab):
         place_layout = QGridLayout()
         place_layout.setColumnStretch(1, 1)
 
-        # The core-plus-ring architecture was CLI-only: every A3GT-class site
+        # The core-plus-ring architecture was CLI-only: every polar landing site
         # run needs an occluder, and the GUI had no field for it.
         self.add_file_field(place_layout, 0, "Occluder File:", "mesh.occluder_file",
                             "Mesh Files (*.ply *.obj *.vtk);;All Files (*)")

@@ -49,7 +49,7 @@ validated on load, ptm_thermal_sim.cpp:3316-3356) serialize/deserialize the
 IDENTICAL T(z) array -- there is no approximation or interpolation in the
 handoff, just a disk round-trip of the same floats. This is the same
 checkpoint format scripts/run_chunked_simulation.py already relies on for
-production A3GT chunked+radiation-coupled runs.
+production polar landing-site chunked+radiation-coupled runs.
 
 TWO STAGES (chunk numbering continues run_chunked_simulation.py's
 `chunk_NNN` convention for downstream-tool compatibility):

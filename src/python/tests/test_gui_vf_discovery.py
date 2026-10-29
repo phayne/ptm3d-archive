@@ -90,7 +90,7 @@ def _hmat(path, rows, nnz, version=2, blocks=0):
 
     ``hmatrix_view_factor.cpp:5217``. With zero root blocks the two run
     together and the file is exactly 80 bytes -- which is what
-    ``make_empty_vf`` writes and what the A3GT base stubs are.
+    ``make_empty_vf`` writes and what the polar-site base stubs are.
     """
     body = struct.pack("<IIQQQ", 0x484D4154, version, rows, rows, blocks)
     stats = struct.pack("<6Q", 0, 0, 0, 0, 0, nnz)
@@ -351,8 +351,8 @@ def test_a_file_that_is_not_a_view_factor_matrix_is_refused_by_name():
 def test_the_format_is_read_from_the_magic_number_and_not_the_extension():
     """In this project the two disagree, and it is not a corner case.
 
-    ``~/projects/a3gt/campaign/base_vf/*.hmat`` are SPARSE version-1 files
-    with zero nonzeros -- twenty-five of them, banked for the A3GT catalog --
+    ``<campaign dir>/base_vf/*.hmat`` are SPARSE version-1 files
+    with zero nonzeros -- twenty-five of them, banked for the polar-site catalog --
     while the current empty stubs are H-matrix version 2 and are named ``.vf``.
     Both spellings are wrong for what the file contains, and a search that
     trusted the extension would describe every one of them backwards.
@@ -387,9 +387,9 @@ def test_the_format_is_read_from_the_magic_number_and_not_the_extension():
 def test_an_identical_mesh_copy_elsewhere_still_counts_as_this_mesh():
     """Otherwise rung 1 refuses every genuine match this project has.
 
-    Every real A3GT provenance sidecar records the mesh under the repository's
+    Every real polar-site provenance sidecar records the mesh under the repository's
     ``data/dem/a3gt_v2/``; every production configuration loads it from
-    ``~/projects/a3gt/meshes/``. Measured 2026-08-31, those two copies are
+    ``<campaign dir>/meshes/``. Measured 2026-08-31, those two copies are
     byte-identical. Matching on device and inode alone would therefore have
     demoted the one case the provenance tier was built for -- and it did,
     which is how this rung came to exist.

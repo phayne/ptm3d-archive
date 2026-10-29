@@ -201,7 +201,7 @@ constexpr double PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021;
 // PRIMARY_DISK_SAMPLES above is ONE number for every face on every body. It was
 // fixed by the single hardest face in the fleet -- the coldest lunar PSR floor,
 // where the whole primary flux is worth 13 K -- and then charged to all
-// 2,397,890 faces of an A3GT production mesh. Measured on the lunar polar site A window,
+// 2,397,890 faces of a polar-site production mesh. Measured on the lunar polar site A window,
 // current main: 571,917 faces per epoch escalate to 128 rays, 82.8 M
 // primary-disk rays per epoch = 34.5x the entire direct-solar shadow-ray budget,
 // ~900 s of a 2,772 s window. The flux those rays resolve peaks at 0.087 W/m^2.
@@ -252,7 +252,7 @@ constexpr double PRIMARY_DISK_WORST_VISIBILITY_ERROR = 0.021;
 //     lower bound on the face temperature (every term dropped is non-negative),
 //     it is one scalar, it is a pure function of the body, and it is the same
 //     number the engine's own PSR floor already is: T_geo = (Qb/(eps sigma))^0.25
-//     = 24.0428 K on the Moon at Qb = 0.018, which is precisely where the A3GT
+//     = 24.0428 K on the Moon at Qb = 0.018, which is precisely where the polar landing-site
 //     temperature field floors.
 // Costed: the strict V = 0 bound is at most one ladder rung more expensive than
 // the self-consistent T_eq(Q_floor + V F_full) it replaces, because Q_floor

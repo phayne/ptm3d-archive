@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""A3GT v2 — site × window orchestrator for the sparse 18-yr lunar workflow.
+"""Polar landing-site campaign (v2): site × window orchestrator for the sparse 18-yr lunar workflow.
 
 Drives the per-site mesh generation and per-window simulation runs for the
-A3GT v2 batch. Wraps:
+polar landing-site batch (v2). Wraps:
   - dtm_to_ply_delaunay (CPU mesh builder) for Phase 1.
   - scripts/run_chunked_simulation.py for per-window thermal+illumination runs.
 
@@ -45,7 +45,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-# AGT campaign portability (Phase R): REPO now defaults to wherever THIS file
+# polar landing-site campaign portability (Phase R): REPO now defaults to wherever THIS file
 # lives (self-relative) instead of a hardcoded OneDrive path, so a checkout
 # such as ~/Projects/ptm runs fully off its own tree (scripts, templates,
 # meshes) with zero OneDrive dependency in the hot path -- a OneDrive outage
@@ -103,7 +103,7 @@ def _pick_dtm_tool():
 
 DTM_TOOL = _pick_dtm_tool()
 # PTM_A3GT_MESH_DIR: point mesh/VRT lookup at a local, pre-verified copy
-# (e.g. ~/projects/a3gt/meshes/) instead of REPO/data/dem/a3gt_v2 -- kills the
+# (e.g. a campaign-wide mesh directory) instead of REPO/data/dem/a3gt_v2 -- kills the
 # OneDrive-eviction hazard for the one artifact class (multi-GB core+ring
 # meshes) that's actually big enough to matter. Unset => old REPO-relative
 # behavior, unchanged.
@@ -558,7 +558,7 @@ def write_window_yaml(site: dict, window: dict, mesh: Path,
 # this heartbeat-based stall watchdog was built and validated but NEVER
 # reached ~/Projects/ptm (the tree carrying the corrected-VF / illum / eq-seed
 # physics fixes and the pinned campaign binary) -- a real gap: the two trees'
-# orchestrator.py had diverged, so the "AGT campaign has the #1 fix" premise
+# orchestrator.py had diverged, so the "polar landing-site campaign has the #1 fix" premise
 # was false for the tree actually used to launch it. Ports faithfully rather
 # than re-deriving, since this exact design already closed the 2026-06-27
 # 38-hour silent-stall failure mode (chunk runner SIGKILLed a hung sim but
@@ -1045,7 +1045,7 @@ def order_sites(sites: list[dict], order_file: Path | None) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# Rolling-VF safety hooks (AGT corrected-VF re-run, 2026-07-23).
+# Rolling-VF safety hooks (polar landing-site corrected-VF re-run, 2026-07-23).
 #
 # Two artifacts per site, staged OUTSIDE the sim's own output tree so a
 # post-composite cleanup can delete them without touching statistics/:

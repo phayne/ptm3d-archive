@@ -14,7 +14,7 @@ Example:
         --stats  <RUN_DIR>/statistics \\
         --output <RUN_DIR>/cog
 
-Default resolution is auto-estimated from face spacing. For A3GT v2 1 m/px
+Default resolution is auto-estimated from face spacing. For the polar landing-site 1 m/px
 meshes pass ``--resolution-m 1`` to force 1 m pixels (matches the colleague's
 example COGs).
 """

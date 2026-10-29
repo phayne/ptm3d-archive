@@ -6,7 +6,7 @@
  *        power settings.
  *
  * These are the campaign-script guardrails from the 2026-08-20/21 GPU wedges
- * (SMC -128 and -108 on the A3GT gen-2 run) folded into the engine, so a CLI
+ * (SMC -128 and -108 on the polar-site gen-2 run) folded into the engine, so a CLI
  * user, a GUI user and a colleague's machine get them without copying a
  * driver script. See docs/dev/gpu-wedge-guardrails.md for the full rationale,
  * the platform-gating table and the cost of each guardrail.
@@ -138,7 +138,7 @@ struct Policy {
     ///   "refuse"   -- give up the GPU rung (radiosity runs on the CPU)
     /// Default is "separate" (Paul's ruling, 2026-08-22): both orderings remove
     /// the co-residency the wedges died in, but on a large-matrix site the
-    /// refusal costs a MEASURED +77.5 min/window (A3GT lunar polar site B: 108.9 min on
+    /// refusal costs a MEASURED +77.5 min/window (lunar polar site B: 108.9 min on
     /// the CPU radiosity rung against 31.4 on the GPU pool, 8 windows each)
     /// while the separation costs a derived +7-10 min. See
     /// docs/dev/gpu-wedge-guardrails.md "Two ways to treat a thin margin".
@@ -209,7 +209,7 @@ enum class MarginVerdict {
  *   "refuse"   (default, and what shipped on 2026-08-22) -- below
  *              gpu.min_vram_margin_gib the GPU rung is given up and radiosity
  *              falls to the CPU. Simple and safe, and on a large-matrix site
- *              very expensive: measured on A3GT lunar polar site B, the CPU radiosity
+ *              very expensive: measured on lunar polar site B, the CPU radiosity
  *              rung cost 108.9 min/window against 31.4 min on the GPU pool
  *              (8 windows each, gen-1 vs gen-2) -- about +78 min/window.
  *
@@ -327,7 +327,7 @@ inline std::vector<int> resolveDeviceIds(int devices,
  * Why it exists: both 2026-08 wedges died inside a GPU *thermal* dispatch
  * while a multi-GB radiosity CSR replica was resident on all four dies. That
  * co-residency is the one condition common to both events. Splitting the dies
- * removes it, and costs ~+7-10 min on a ~30 min A3GT window (derived from the
+ * removes it, and costs ~+7-10 min on a ~30 min polar-site window (derived from the
  * N=4 -> N=2 scaling of the radiosity sweep and the thermal phases; NOT
  * measured end to end -- see docs/dev/gpu-wedge-guardrails.md).
  *

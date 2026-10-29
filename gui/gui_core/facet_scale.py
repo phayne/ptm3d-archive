@@ -52,7 +52,7 @@ FACET_SCALE_WARN_BELOW_M = 1.0
 BEAMING_BODIES = ("Moon",)
 #: Above this face count, sample rather than sum every triangle. The plan
 #: (section 4.4) proposed 5,000,000; measurement moved it down. Summing all
-#: 2,397,890 faces of the A3GT lunar polar site A core took 9.9 s in this reader, which is
+#: 2,397,890 faces of the lunar polar site A core took 9.9 s in this reader, which is
 #: not something to do on the GUI thread every time a field changes. Sampling
 #: 5,000 evenly spaced faces of the same mesh reproduces the documented 3.46 m.
 _AREA_SAMPLE_ABOVE = 200_000
@@ -82,7 +82,7 @@ class FacetScale:
 
     The mean alone fails open on a MULTI-RESOLUTION mesh, which is not a
     contrived case: `scripts/a3gt_v2_extended_mesh.py` builds the production
-    A3GT v2 mesh as one PLY whose resolution falls off from the center, and
+    polar landing-site (v2) mesh as one PLY whose resolution falls off from the center, and
     measured on the real lunar polar site A 3 km core the mean is 3.47 m while the 5th
     percentile is 0.71 m -- a factor of 4.9. Construct the extreme and the mean
     hides it completely: 99% of facets at 1 mm plus 1% at 1 m reports 70.7 cm,
@@ -262,7 +262,7 @@ def _obj_face_areas(path):
     RESERVOIR sampling, not "sum the first N then stride". OBJ has no header
     face count, so a stride cannot be chosen up front -- and taking the first
     200,000 faces exhaustively is a BIASED sample of a mesh whose resolution
-    varies with position, which every A3GT-class mesh's does. Measured on
+    varies with position, which every polar landing-site mesh's does. Measured on
     byte-identical geometry written to both formats (245,000 faces at 1 mm then
     5,000 at 1 m): the prefix-then-stride reader reported 2.49 cm and REFUSED
     while the PLY path reported 14.1 cm and allowed -- a 5.7x disagreement that
@@ -685,10 +685,10 @@ def beaming_policy(config, project_root=None):
     #
     # Measured on the real meshes, sqrt(mean) vs sqrt(5th percentile):
     #   sunlit_radcore_r50   234 m  /  169 m   (ratio 1.4, near-uniform)
-    #   A3GT lunar polar site A core  3.47 m  / 0.708 m  (ratio 4.9, multi-resolution)
-    #   A3GT ring            146 m  / 25.1 m   (ratio 5.8, by construction)
+    #   lunar polar site A core  3.47 m  / 0.708 m  (ratio 4.9, multi-resolution)
+    #   polar-site ring            146 m  / 25.1 m   (ratio 5.8, by construction)
     # None has a millimeter-scale subpopulation, so no validated mesh is newly
-    # refused; the A3GT core moves from allow to the acknowledgment tier, which
+    # refused; the polar-site core moves from allow to the acknowledgment tier, which
     # is the honest reading of 5% of its facets being sub-meter.
     fine = scale.fine_meters if scale.fine_meters is not None else scale.meters
 

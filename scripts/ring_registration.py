@@ -3,7 +3,7 @@
 
 Background
 ----------
-A3GT/CP-22 sites use the core+ring architecture (`docs/extended-occluder-
+The polar landing-site and CP-22 sites use the core+ring architecture (`docs/extended-occluder-
 architecture.md`): a high-resolution thermally solved core PLY plus a coarse
 LOLA occluder ring that is added to the shadow-ray BVH only. The two meshes
 are built independently, and both ring builders used to punch the ring's

@@ -385,7 +385,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
         // CONSTRUCTOR; setConfig() has not happened yet, so config_ still holds
         // RadiationConfig's defaults and config_.use_gpu is false no matter what
         // the YAML says. A route chosen from it here reads a value that is never
-        // the user's -- measured 2026-08-16 on the real A3GT matrix, where a
+        // the user's -- measured 2026-08-16 on the real polar-site matrix, where a
         // config with `radiation.use_gpu: true` and no environment override took
         // the CPU branch and announced "ROUTE = CPU (radiation.use_gpu in the
         // config)". That is worse than the env-var-only reachability it replaced,
@@ -413,7 +413,7 @@ void RadiositySolver::initCommon(const std::vector<double>& emissivity,
             // constructor's ViewFactorMatrix and this replacement does NOT
             // repoint it, so if the solver was built by the SPARSE constructor
             // (a real .vf base rather than the H-matrix/empty-stub base every
-            // A3GT config uses) two different matrices are now live at once:
+            // polar-site config uses) two different matrices are now live at once:
             // F_op_ holds the corrected CSR, F_ptr_ still points at the
             // uncorrected loaded one. Gauss-Seidel reads F_ptr_ ONLY, so the
             // CPU route would silently solve the uncorrected matrix while the
@@ -884,7 +884,7 @@ void RadiositySolver::initGPU() {
     // the GPU thermal pool, which allocates its own per-device working set
     // (~0.77 GiB at gpu_batch_size=100000, n_layers=23, 961 steps) on the very
     // dies that hold the CSR replica, while the replica stays resident for the
-    // whole window. Nothing in either path knows about the other. A3GT lunar polar site B
+    // whole window. Nothing in either path knows about the other. lunar polar site B
     // passed this check with 0.63 GiB of nominal margin -- less than the thermal
     // solver's own ask -- and that promotion happened by accident: the view-factor
     // divisor fix shrank the matrix 8.4% and carried it across the threshold
@@ -1015,7 +1015,7 @@ void RadiositySolver::initGPU() {
     // Advisory, always on: the margin this check leaves is NOT free space, it is
     // the budget every other consumer of the same die draws on. The one we can
     // size is the GPU thermal pool, which allocates on these same dies while the
-    // replica stays resident: ~0.77 GiB/device at the A3GT production settings
+    // replica stays resident: ~0.77 GiB/device at the polar-site production settings
     // (gpu_batch_size=100000, n_layers=23, 961 steps -- thermal_opencl.cpp
     // buf_flux_all + buf_output_temps dominate at n_faces*n_steps*4 B each).
     // Below the placement threshold (gpu.placement_margin_gib, default 4 GiB)
@@ -4047,7 +4047,7 @@ bool RadiationExchangeManager::auditBeamEnergy(
     // The histogram is per-thread (8192 doubles = 64 KiB each) so the percentiles
     // stay deterministic. D_j is NOT: it is one shared n-face array written with
     // `omp atomic`, because per-thread copies of it would be nthreads x n x 8 B --
-    // 0.9 GB on a 2.4 M-face A3GT site at 48 threads, i.e. this audit would have
+    // 0.9 GB on a 2.4 M-face polar landing site at 48 threads, i.e. this audit would have
     // swapped one multi-GB transient for another. The cost of D_j's summation
     // order not being fixed is last-bit noise on a diagnostic printed to six
     // significant figures.

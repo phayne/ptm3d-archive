@@ -1333,7 +1333,7 @@ def test_a_layout_built_for_another_mesh_is_refused_on_its_header():
         request = _request(spacing_m=100.0, radius_m=300.0,
                            n_faces_core=header.n_faces_core)
         assert fc.cache_satisfies(header, request)[0]
-        # The A3GT trap: a core mesh regenerated under its own name. Same path,
+        # The polar-site trap: a core mesh regenerated under its own name. Same path,
         # different face count -- and this is caught before the solve rather
         # than by the engine's geometry hash after it.
         stale = _request(spacing_m=100.0, radius_m=300.0,

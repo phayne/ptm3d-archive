@@ -146,7 +146,7 @@ def stat(run_dir, name):
     The naive `np.fromfile(p, dtype="<f4")` recipe -- which is what `ptm-analyze`'s
     SKILL.md prescribed -- reads that 4-byte header as a *temperature* and shifts every
     face by one index. Confirmed on 5/5 runs across both the generic-body and planetary
-    paths (Chimaera, Justitia, Ousha, A3GT, Moon3D). The header value equals the mesh
+    paths (Chimaera, Justitia, Ousha, polar landing sites, Moon3D). The header value equals the mesh
     face count exactly, which is how the format was identified.
     """
     p = os.path.join(run_dir, "statistics", name)
@@ -1248,7 +1248,7 @@ def cmd_selftest(args):
           "--derived", f"{E}/camera/623chimaera/flyby/anim",
           "--ext", "TEMP_K", "--max-frames", "3", "--out", "/tmp/_qa_noop.json"], 1),
     ]
-    # The cross-body A3GT run is a real production output, and its path names a
+    # The cross-body polar landing-site run is a real production output, and its path names a
     # site this project does not publish -- so it is REGISTERED locally rather
     # than written here (src/python/tests/local_fixtures.py). Dropping it is
     # PRINTED: a selftest that quietly ran one case fewer is a selftest whose
