@@ -91,30 +91,29 @@ Read in this order:
 | [gui/README.md](gui/README.md) | The desktop GUI |
 | [CHANGELOG.md](CHANGELOG.md) | Changes between releases |
 
-## What it does
+## Capabilities
 
-- **Bodies:** the Moon, Mercury and Europa with built-in properties; any other body through
-  orbital elements, SPICE kernels or JPL Horizons.
-- **Illumination:** ray-traced shadows with a finite solar disk, eclipses, and light and
-  thermal emission from a primary body (Earthshine, Jupiter-shine).
-- **Heat conduction:** Crank-Nicolson columns with temperature-dependent conductivity and heat
-  capacity and depth-dependent density.
-- **Radiation exchange:** face-to-face view factors (sparse or hierarchically compressed),
-  two-band (visible and infrared) radiosity coupled to the thermal solution, and optional
-  sub-facet roughness (beaming).
-- **Products:** per-face temperature and flux statistics, per-step frames, subsurface depth
-  maps, ice-stability depth; a Python package and a desktop GUI read them.
+PTM3D has built-in properties for the Moon, Mercury and Europa, and handles any other body
+through orbital elements, SPICE kernels or JPL Horizons. Illumination is ray traced, with a
+finite solar disk, eclipses, and reflected light and thermal emission from a primary body
+(Earthshine, Jupiter-shine). Heat conduction is solved in Crank-Nicolson columns with
+temperature-dependent conductivity and heat capacity and depth-dependent density. Radiation
+exchange uses face-to-face view factors (sparse or hierarchically compressed) and two-band
+(visible and infrared) radiosity coupled to the thermal solution, with optional sub-facet
+roughness (beaming). The products are per-face temperature and flux statistics, per-step
+frames, subsurface depth maps and the ice-stability depth; a Python package and a desktop GUI
+read them.
 
-## Validation at a glance
+## Validation summary
 
-Details and figures: [docs/VALIDATION.md](docs/VALIDATION.md).
+Details and figures are in [docs/VALIDATION.md](docs/VALIDATION.md).
 
-- **Bowl crater (Ingersoll et al. 1992):** shadowed-floor temperature within 0.1 K (≤0.26%) of
-  the analytic solution and shadow flux within 1.2%, at 15,840 faces.
-- **Diviner equatorial diurnal cycle and Apollo 15/17 heat-flow probes:** every reference point
+- Bowl crater (Ingersoll et al. 1992): the shadowed-floor temperature is within 0.1 K (≤0.26%)
+  of the analytic solution and the shadow flux within 1.2%, at 15,840 faces.
+- Diviner equatorial diurnal cycle and Apollo 15/17 heat-flow probes: every reference point
   that carries an uncertainty lies within its ±5 K bar (largest residual 4.91 K). The reference
   values come from the Hayne et al. (2017) compilation, which shares an author with PTM3D.
-- **Diviner seasonal temperatures at a Haworth cold-trap site (240 m cells):** on the cold-trap
+- Diviner seasonal temperatures at a Haworth cold-trap site (240 m cells): on the cold-trap
   floor (n = 2,970) the median summer-maximum bias is −0.80 K (IQR 11.19 K) with sub-facet
   roughness, and −10.30 K (IQR 10.38 K) without it.
 
