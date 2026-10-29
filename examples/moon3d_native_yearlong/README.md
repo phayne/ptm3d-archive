@@ -9,7 +9,7 @@ the 509,337-face Moon3D testbed crater scan placed at the IM-2 landing site (84.
 | `moon3d_native_yearlong_coupled.yaml` | on (two-band radiosity) | the science run |
 | `moon3d_native_yearlong_radoff.yaml` | off | the comparison run; otherwise identical |
 
-Settings worth knowing: an 8-cycle spin-up with the default indirect-aware seed, the CPU solver
+The main settings are an 8-cycle spin-up with the default indirect-aware seed, the CPU solver
 (`thermal.use_gpu: false`), `thermal_b: 32` (a deeper grid for the annual wave), a basal heat
 flow of 0.022 W/m² (the engine's lunar default is 0.018 W/m²), the Hapke incidence-dependent
 albedo, no sub-facet roughness (this mesh, 509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across, already resolves it), and the validated
@@ -19,17 +19,17 @@ fine-mesh illumination settings in an `engine_env:` block.
 
 Neither input is in the repository or in the Zenodo data archive.
 
-1. **The mesh**, `data/meshes/moon3d_c_cartesian_NEW_500k_clean_native.ply` (509,337 faces,
+1. The mesh, `data/meshes/moon3d_c_cartesian_NEW_500k_clean_native.ply` (509,337 faces,
    about 23 MB). It is resolved against `$PTM_DATA_ROOT/meshes/`, then `<repo>/data/meshes/`.
    The fetchable dataset `moon3d-mesh` is the undecimated 1.7 M-face scan, not this file.
-2. **The view-factor matrix.** The revision's runs replaced the engine's view factors with a
+2. The view-factor matrix. The revision's runs replaced the engine's view factors with a
    precomputed sky-side matrix from the offline Monte Carlo referee, loaded through the
    environment variable `PTM_HMATRIX_VF_REPLACE=/path/to/matrix.csr` (see
    [docs/ENVIRONMENT.md](../../docs/ENVIRONMENT.md)). The engine refuses a matrix that does not
    match the mesh or that was traced on the other side of the surface. The config's
    `view_factor_file` (resolved against this directory) names the placeholder the engine loads
-   before the replacement. **If neither file is present the engine builds the view factors
-   itself**, which on this mesh takes hours and a very large amount of memory; confirm that the
+   before the replacement. If neither file is present the engine builds the view factors
+   itself, which on this mesh takes hours and a very large amount of memory; confirm that the
    log says `Loaded view factors from:` before leaving the run.
 
 ## Running

@@ -9,10 +9,10 @@ facets), shipped with the repository.
 **Cost:** about 35 s (control) and 110 s (coupled, including the view-factor build) on four cores;
 under 1 GB of memory. The view-factor file is 36,341,754 bytes.
 
-## The question
+## The effect being measured
 
-A crater floor that never sees the Sun is not at zero flux: it receives sunlight **scattered** by
-the sunlit walls and **thermal infrared** emitted by the warm rim. PTM3D computes this with a
+A crater floor that never sees the Sun is not at zero flux: it receives sunlight scattered by
+the sunlit walls and thermal infrared emitted by the warm rim. PTM3D computes this with a
 radiosity solve over face-to-face view factors, coupled to the thermal model. This tutorial
 measures the effect by differencing two otherwise identical runs.
 
@@ -63,7 +63,7 @@ iterations are the expected signs. A second coupled run loads the saved file
 the spin-up of coupled runs now includes the indirect flux; `thermal.seed_indirect: off`
 restores the earlier behavior.
 
-**Spin-up.** These configs integrate 8 diurnal cycles, and the run prints a spin-up WARNING
+Spin-up: these configs integrate 8 diurnal cycles, and the run prints a spin-up WARNING
 (estimated requirement about 62 cycles for 0.1 K; see [Tutorial 1](01_quickstart.md)). On this
 crater an 8-cycle spin-up is within a few tenths of a kelvin (median) of a 40-cycle reference,
 which takes about 12 minutes on four cores. Raise `equilibration_orbits` for production work.
@@ -93,7 +93,7 @@ for name in ('temperature_min', 'temperature_avg', 'temperature_max'):
 EOF
 ```
 
-Expected (CPU build of this release). **Shadowed set: 1,423 of 12,800 faces.**
+Expected (CPU build of this release). Shadowed set: 1,423 of 12,800 faces.
 
 | Quantity (1,423 shadowed faces) | radiation off | radiation on | change |
 |---|---:|---:|---:|
