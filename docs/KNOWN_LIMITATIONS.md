@@ -10,7 +10,7 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
    are warmed by their neighbors in reality but not in the model; for a pit with
    depth-to-diameter 0.1 at 85°S, the 110 K cold trap disappears below about 5 cm diameter.
 
-2. **Spin-up length is your choice.** `thermal.equilibration_orbits` (default 1) sets how many
+2. **Spin-up length is set by the user.** `thermal.equilibration_orbits` (default 1) sets how many
    diurnal cycles are integrated before the output window. Surface temperatures settle in a few
    cycles; the deep column relaxes over roughly 15 to 23 lunations on the Moon and about 10
    orbits on Europa. The run prints the number of cycles it estimates you need and warns when
@@ -24,7 +24,7 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
    alike. Where this seed cannot act (a warm-started chunk, the CPU scalar solver, an output
    window shorter than one diurnal cycle) the run says so and uses the previous seed, and
    absolute temperatures are uncertain by about 1 to 2 K. The difference between coupled and
-   uncoupled runs is more robust than either absolute value.
+   uncoupled runs is better constrained than either absolute value.
 
 4. **The column solver is first order in time.** The surface temperature is solved from the
    previous substep's subsurface state, so the error falls linearly with the substep. At the
@@ -66,19 +66,19 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
 
 ## Configuration
 
-- **Very small generic-body properties are lost.** A `generic_body.surface` value below 5e-7 is
+- Very small generic-body properties are lost. A `generic_body.surface` value below 5e-7 is
   rounded to zero and replaced by a placeholder without warning. Keep such values at or above
   5e-7, or set them with the `*_override` keys, which keep full precision.
-- **Plain property keys are ignored on the Moon, Mercury and Europa** (the run warns); use the
+- Plain property keys are ignored on the Moon, Mercury and Europa (the run warns); use the
   `thermophysical.*_override` keys. A per-face albedo map overrides `albedo_override` for
   absorbed sunlight.
-- **Unknown keys and command-line flags are reported but do not stop the run.** Check the
+- Unknown keys and command-line flags are reported but do not stop the run. Check the
   warnings, or run `ptm_thermal_sim --config FILE --validate-config` first.
-- **`mesh.scale_factor` does not work**; the engine refuses such a mesh. Rescale the mesh file.
+- `mesh.scale_factor` does not work; the engine refuses such a mesh. Rescale the mesh file.
 
 ## Platforms
 
-- **GPU:** only OpenCL on macOS with AMD GPUs has been exercised; the HIP and CUDA backends are
-  untested. Long GPU runs on macOS with AMD hardware can hang the machine; see
+- Of the GPU backends, only OpenCL on macOS with AMD GPUs has been exercised; the HIP and CUDA
+  backends are untested. Long GPU runs on macOS with AMD hardware can hang the machine; see
   [dev/gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md).
-- **Windows:** use WSL2 and the Linux instructions.
+- On Windows, use WSL2 and the Linux instructions.
