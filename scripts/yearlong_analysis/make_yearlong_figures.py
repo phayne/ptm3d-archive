@@ -599,7 +599,7 @@ def main():
                     first_lunation=stats_block(radoff, "first_lunation", "radoff/")),
         deep_cold_trap_floor_population=floor_block,
         known_artifact=dict(
-            description="Coupled-run-only hot-face population (radiative-coupling artifact; ABSENT in radoff): "
+            description="Coupled-run-only hot-face population (radiative-coupling artifact; absent in the radiation-off run): "
                         "max Tmax 458.5 K (annual) / 451.0 K (first lunation) vs radoff's clean subsolar cap "
                         "383.5-385.5 K. NOT masked per standing instruction for this deliverable.",
             n_faces_gt_400K_annual=int(np.count_nonzero(

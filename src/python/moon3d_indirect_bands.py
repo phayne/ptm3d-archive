@@ -218,8 +218,7 @@ def main() -> int:
                          "default), 'all'=every figure. The scatter/ratio options "
                          "are additive so existing figures stay untouched.")
     ap.add_argument("--pubclean", action="store_true",
-                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
-                         "manuscript v4 review, 2026-07-22): suppress the upper "
+                    help="Publication-clean variant (no on-figure notes): suppress the upper "
                          "suptitle on the map/hist/hist_ratio figures. Colorbars/axis "
                          "labels/legends unaffected. Additive, default OFF.")
     ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",

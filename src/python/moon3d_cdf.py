@@ -82,7 +82,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--coupled", required=True, help="coupled run dir (direct_solar/, statistics/)")
-    ap.add_argument("--radoff", required=True, help="radoff baseline run dir (statistics/)")
+    ap.add_argument("--radoff", required=True, help="radiation-off baseline run directory (statistics/)")
     ap.add_argument("--qind", required=True, help="PTM_DUMP_QIND_SERIES .qidt for the coupled run")
     ap.add_argument("--out", default="docs/figures/moon3d_500k/illum_temp_cdf.png")
     ap.add_argument("--mask-tmax", type=float, default=0.0,

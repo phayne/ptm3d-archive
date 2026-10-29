@@ -270,7 +270,7 @@ def _cli():
     ap.add_argument("--pairs", type=Path, default=DEFAULT_PAIRS,
                     help="measured flux-weighted pair distribution (.npy); see module docstring")
     ap.add_argument("--samples", type=int, default=4000,
-                    help="flux-weighted draws (the exact arm is O(samples) integrals)")
+                    help="flux-weighted draws (the exact method is O(samples) integrals)")
     a = ap.parse_args()
     if not a.pairs.exists():
         raise SystemExit(f"FATAL: pair distribution not found: {a.pairs}\n"

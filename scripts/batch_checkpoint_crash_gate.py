@@ -360,7 +360,7 @@ def main():
     ap.add_argument("--log-dir", required=True)
     ap.add_argument("--max-attempts", type=int, default=12)
     ap.add_argument("--refusal-probes", action="store_true",
-                    help="run the engine-level refusal arms against the "
+                    help="run the engine-level refusal checks against the "
                          "partial set the crash gate left behind, instead of "
                          "the crash gate itself")
     args = ap.parse_args()

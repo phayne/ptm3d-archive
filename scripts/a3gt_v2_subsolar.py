@@ -154,7 +154,7 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--start", default="2034-10-30T00:00:00",
                    help="Start time of the 18-yr window (ISO; default matches "
-                        "the previous A3GT batch).")
+                        "the previous campaign batch).")
     p.add_argument("--total-days", type=float, default=6798.5,
                    help="Total span over which to compute subsolar-lat samples "
                         "(default: 6798.5 = lunar 18.6-yr nodal cycle).")

@@ -229,7 +229,7 @@ def main():
     ap.add_argument("--workdir", required=True,
                     help="scratch directory for the runs (not /tmp if you intend to keep them)")
     ap.add_argument("--steps", type=int, default=STEPS_PER_ROT,
-                    help="frames per arm (default: one rotation)")
+                    help="frames per run (default: one rotation)")
     ap.add_argument("--tol", type=float, default=1e-4,
                     help="kelvin; float32 checkpoint + frame quantization is ~1e-5 K")
     ap.add_argument("--paths", default="simd,scalar")

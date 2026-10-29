@@ -180,8 +180,7 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--pubclean", action="store_true",
-                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
-                         "checklist P2.8, 2026-07-22): suppress the suptitle and the "
+                    help="Publication-clean variant (no on-figure notes): suppress the suptitle and the "
                          "4 panel titles. Axis labels are unaffected. Writes "
                          "*_pubclean.{png,pdf} instead of the default filenames.")
     ap.add_argument("--pubclean-canvas-px", default=None, metavar="WxH",
@@ -197,8 +196,7 @@ def main():
                          "unchanged. Writes *_logd.{png,pdf} (or *_logd_pubclean with "
                          "--pubclean) instead of the default filenames.")
     ap.add_argument("--panel-labels", action="store_true",
-                    help="Additive, default OFF (2026-07-22, Paul's explicit ask on "
-                         "manuscript v4 review): add an in-panel text label (top-left "
+                    help="Additive, default OFF: add an in-panel text label (top-left "
                          "corner, axes-fraction placement, plain text, no box) naming "
                          "each panel's quantity ('Summer max', 'Summer mean', 'Winter "
                          "max', 'Winter mean'). Distinct from an on-figure title/stat "
