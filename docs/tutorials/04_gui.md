@@ -61,9 +61,8 @@ python run_gui.py --results /path/to/output_dir/     # open a finished run
 separate multi-module launcher that bundles the DEM/mesh tools and receives
 less testing.
 
-On the first launch only, the app asks which target body you want
-(`gui/ptm3d_gui.py:163-191`). You can change it any time on the Simulation
-tab; the prompt does not appear again.
+The window opens on the body-first landing screen, which is where you choose
+the target body. You can change it any time on the Simulation page.
 
 
 ---
@@ -231,15 +230,15 @@ Under Advanced thermal (collapsed by default, expanded in the figure):
 
 ## 4. Your first run
 
-This is [tutorial 02](01_quickstart.md)'s lunar diurnal run, done
-through the GUI.
+This is [tutorial 01](01_quickstart.md)'s lunar diurnal run, done
+through the GUI, at 144 time steps rather than the quickstart config's 240.
 
 1. Body: Moon (the default). Duration stays at one synodic day.
 2. Mesh > Resolution: `3` (1,280 faces).
 3. Simulation > Time Steps: `144`.
 4. Thermal: leave GPU off; Compute Statistics on.
 5. Output > Output Directory: `output/gui_tutorial_moon_quickstart`.
-6. Optional: `Ctrl+T` (Simulation > Validate Configuration) for a quick
+6. Optional: `Ctrl+T` (Simulation > Check Configuration) for a quick
    check on ranges and required fields.
 7. Press **Run** (or `F5`).
 
@@ -339,8 +338,11 @@ auto-load.
 Exit code 0 alone does not confirm a healthy run. Check the tail of the log:
 face count, time steps, `Statistics export completed successfully`, and a flux
 summary that is not all zeros. The run above reported 1,280 faces, 144 time
-steps, and a maximum total flux of 1,413.9 W/m^2, about right for the Moon at
-1 AU.
+steps, and a maximum total flux of 1,413.9 W/m^2. That is the largest
+incident (not absorbed) flux on any face at any step: direct sunlight plus
+Earth's reflected light and thermal emission. It is above the 1,361 W/m^2
+solar constant because the default start date, 2025-01-01, is two days before
+Earth's perihelion, when the Moon is a little closer to the Sun than 1 AU.
 
 ---
 
@@ -612,7 +614,7 @@ reached the run:
    `Loaded view factors from: ...`, `Face count: ...`) and warns when a set
    value is ignored. If a setting is never mentioned, check the YAML.
 4. Compare the outputs. For anything that should change temperatures, run
-   both arms and difference them, as [tutorial 04](02_crater_radiosity.md)
+   both arms and difference them, as [tutorial 02](02_crater_radiosity.md)
    does.
 
 ---

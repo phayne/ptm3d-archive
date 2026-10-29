@@ -219,10 +219,14 @@ pip install -r requirements.txt
 
 ### Required packages:
 - `PyQt6` - GUI framework
-- `pyvista` + `pyvistaqt` - 3D visualization
-- `matplotlib` - 2D plotting
 - `numpy` - Numerical operations
 - `PyYAML` - Configuration file handling
+- `ruamel.yaml` - Saving a project without losing its comments or layout
+  (without it the GUI warns and falls back to a lossy save)
+
+### Recommended packages (in `requirements.txt`; the GUI starts without them, with that view disabled):
+- `pyvista` + `pyvistaqt` - 3D visualization
+- `matplotlib` - 2D plotting
 
 ### Optional packages (for enhanced features):
 - `pyopencl` - GPU detection
@@ -258,8 +262,9 @@ python run_gui.py --results /path/to/output/
 ### Quick Start
 
 1. Configure Simulation
-   - Select the "Configuration" tab
-   - Set simulation parameters (body, duration, timesteps)
+   - On the "Configuration" tab, pick a body on the landing screen, then a
+     run type; the card that opens holds the settings below
+   - Set simulation parameters (duration, timesteps)
    - Configure mesh resolution
    - Set thermal and illumination options
    - Choose output directory
