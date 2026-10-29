@@ -5,7 +5,7 @@ spatially resolved spectral maps in *Cartwright et al. (2025), PSJ 6, 125*.
 
 ## Hypotheses
 
-- **H1 (headline)** — equilibrium crystalline ice fraction tracks $T_{\max}$ via
+- **H1 (primary)** — equilibrium crystalline ice fraction tracks $T_{\max}$ via
   the Mitchell+Nordheim balance with hemisphere-asymmetric threshold near
   $T^* \approx 125$ K.
 - **H2** — 2.0 μm $H_2O$ band center shifts linearly with $T_{\max}$
@@ -63,7 +63,7 @@ python scripts/jwst/plot_phi_C_map.py \
 | `ingest_cartwright2025.py`          | Digitized-CSV → unified NPZ ingestion              |
 | `compare_jwst_ptm3d.py`             | End-to-end comparison metrics + 4-panel figure     |
 | `plot_sigmoid_theory.py`            | Theory slide: φ_eq(T) sigmoids                     |
-| `plot_phi_C_map.py`                 | Headline equirectangular φ_C + T_max maps          |
+| `plot_phi_C_map.py`                 | Main equirectangular φ_C + T_max maps              |
 
 ## Digitizing Cartwright (2025) maps
 

@@ -734,7 +734,7 @@ All constants are defined in the source headers and used consistently throughout
 
 ## Quantitative Estimates and Validation
 
-The following estimates are computed analytically from the model equations using the constants defined in the code. They serve as sanity checks for simulation output.
+The following estimates are computed analytically from the model equations using the constants defined in the code. They serve as consistency checks for simulation output.
 
 ### Vapor Pressure
 

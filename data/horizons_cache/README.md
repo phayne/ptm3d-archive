@@ -44,7 +44,7 @@ Two things a fresh clone still has to supply:
 absolute paths from the machine that generated it, and it has no tracked shape.
 Treat it as provenance only.
 
-⛔ **Do not regenerate a committed `metakernel.tm`.** `SPKGenerator.create_metakernel()`
+**Do not regenerate a committed `metakernel.tm`.** `SPKGenerator.create_metakernel()`
 emits absolute paths by design (the deep-OneDrive-path and SPICE 78-character
 truncation workaround), so regenerating one bakes in a single machine's layout
 and the file stops resolving anywhere else. The committed metakernels are
@@ -152,7 +152,7 @@ rewrite, is idempotent, and leaves a file that already says `albedo_type: bond`
 alone. A file with **no** `albedo_type` predates the change and holds p_V; the
 GUI converts it on read and says it did.
 
-⚠️ **One consumer wants the other convention.** `scripts/ema_campaign_driver.py`
+**One consumer wants the other convention.** `scripts/ema_campaign_driver.py`
 reads this same field (`albedo=float(gb['surface']['albedo'])`) and uses it as the
 **geometric** albedo p — deliberately: its Hapke single-scattering albedos `w` are
 calibrated to reproduce those p values, and the absorbed-flux albedo it sets is
