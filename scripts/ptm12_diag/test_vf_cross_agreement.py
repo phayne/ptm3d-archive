@@ -263,25 +263,25 @@ def main():
     p.add_argument("--work", default="")
     p.add_argument("--jobs", type=int, default=4)
     p.add_argument("--nrays", type=int, default=200000,
-                   help="referee ray budget for the LOW arm; the noise arm doubles it. "
+                   help="referee ray budget for the LOW-budget comparison; the noise check doubles it. "
                         "Sized from the measured lambda distribution, not chosen: on the "
                         "default cap the largest F_ij is 8.7e-4, so at 40k rays NOT ONE "
-                        "entry reaches lambda = 50 and the per-entry arm would be vacuous")
+                        "entry reaches lambda = 50 and the per-entry check would be vacuous")
     p.add_argument("--cap-rings", type=int, default=14)
     p.add_argument("--cap-az", type=int, default=24)
     p.add_argument("--keps", type=float, default=0.01,
                    help="mc_ref_pp rise-march self-relief threshold for the COMPARISON "
-                        "sweeps. Not the 0.2 every other caller passes -- see arm [X5]")
+                        "sweeps. Not the 0.2 every other caller passes; see check [X5]")
     p.add_argument("--keps-production", type=float, default=0.2,
-                   help="the value production sweeps use; scored by arm [X5]")
+                   help="the value production sweeps use; scored by check [X5]")
     p.add_argument("--keps-deficit-max-pct", type=float, default=8.0)
     p.add_argument("--min-significant", type=int, default=1000,
-                   help="fewest lambda-resolved entries the per-entry arm will accept "
+                   help="fewest lambda-resolved entries the per-entry check will accept "
                         "before declaring itself vacuous and FAILING")
     p.add_argument("--quad-order", type=int, default=0,
                    help="override radiation.nearfield_quadrature_order in the ENGINE "
                         "side only. DIAGNOSTIC, NOT A NEGATIVE CONTROL -- see the NOT "
-                        "COVERED banner: this gate cannot referee the near field and "
+                        "COVERED banner: this test cannot referee the near field and "
                         "--quad-order 1 is expected to stay GREEN")
     p.add_argument("--noise-factor", type=float, default=3.0,
                    help="PER-ENTRY engine-vs-referee difference may be this many times "
@@ -293,16 +293,16 @@ def main():
                    help="minimum NRAYS*F for an entry to enter the per-entry statistic")
     p.add_argument("--closed-form-tol-pct", type=float, default=2.0)
     p.add_argument("--nrays-fc08", type=int, default=2000,
-                   help="ray budget for arm [X6]. Small ON PURPOSE: lambda = NRAYS*F "
+                   help="ray budget for check [X6]. Small ON PURPOSE: lambda = NRAYS*F "
                         "must be of order 1 for the divisor defect to exist at all")
     p.add_argument("--fc08-tol-pct", type=float, default=15.0,
-                   help="arm [X6] row-sum agreement. Loose by design: it separates a "
+                   help="check [X6] row-sum agreement. Loose by design: it separates a "
                         "1x from a 2x, and 2,000 rays is genuinely noisy")
     p.add_argument("--referee-divisor", choices=("tried", "hits"), default="tried",
                    help="NEGATIVE CONTROL ONLY. 'hits' restores the pre-2026-08-19 "
                         "assembler divisor defect (divide the symmetrized pair by the "
                         "number of ray directions that HIT, not by 2), which inflates "
-                        "the far field by up to 2x. The gate must go RED.")
+                        "the far field by up to 2x. The test must go RED.")
     p.add_argument("--mc-ref-pp", default="")
     p.add_argument("--vf-dump-sparse", default="")
     p.add_argument("--keep", action="store_true")

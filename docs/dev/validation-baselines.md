@@ -3,9 +3,12 @@
 Byte-identical regression is the contract for any change that claims "no behavior
 change": a solver, GPU, BVH, radiosity, or mesh-pipeline refactor must reproduce
 a known-good result bit for bit. This document defines the known-good result
-(which commit, which configs, which arms, which output files, and which
-toolchain) so that a byte comparison is answering the question the operator
-thinks it is answering.
+(which commit, which configs, which validation cases, which output files, and
+which toolchain) so that a byte comparison is answering the question the operator
+thinks it is answering. Each validation case is one config, plus at most a
+few command-line overrides, run once and compared file by file; the validation
+tool calls each such case an arm (its command-line option and its arm list
+use that word), and this document uses the term throughout.
 
 It also records how the previous baselines became unusable, and the one command
 that detects the same failure early next time.
@@ -67,7 +70,7 @@ Never delete this directory without the maintainer's approval. Its predecessor
 (`postmerge-baseline-2026-08-24`, at `<workdir>/postmerge_2026-08-24/`)
 was removed in a routine disk cleanup on 2026-09-03 because nothing on disk
 said it was needed, taking the corrected `crater80N_sparse.vf` with it and
-leaving the project with no executable regression gate at all. Two things now
+leaving the project with no executable regression test at all. Two things now
 stand against a repeat: the `DO-NOT-DELETE.md` above, and
 `ptm_validate_baseline.py`, which refuses to write anywhere beneath a
 directory carrying that marker.
@@ -84,7 +87,7 @@ pull request #171). It blesses the same fifteen arms as its predecessor
 | Build | the canonical `./rebuild.sh` configuration: `PTM_ENABLE_GPU=ON`, `GPU_BACKEND=OPENCL`, `PTM_ARCH_NATIVE=ON`, `BUILD_SHARED_LIBS=ON`, `CMAKE_BUILD_TYPE=Release` |
 | Embree | `~/opt/embree-4.3.3-avx512`, md5 `7e229da52bb90938741bba6d8666f3c7`, max ISA AVX512 |
 | Threads | `OMP_NUM_THREADS=48`, recorded per arm |
-| Bowl-crater gate at this commit | `PASS: 16 of 16 verdicts (0 skipped, 4 latitudes)`; analytic `F_sky` error 0.492713% against a 1% tolerance, the same value recorded at `ecf635a` |
+| Bowl-crater test at this commit | `PASS: 16 of 16 verdicts (0 skipped, 4 latitudes)`; analytic `F_sky` error 0.492713% against a 1% tolerance, the same value recorded at `ecf635a` |
 
 This bank is not byte-comparable to the 2026-08-15 or 2026-08-24 banks on
 any lunar arm, and the reason is the toolchain, not the physics. Those were
@@ -151,8 +154,8 @@ still have.
 | `verify` with no `--arm` and no `--rerun` | exit 2, no verdict printed at all (section 5) |
 | `verify --arm <name>=<the banked directory>` | exit 2, refused as a self-comparison |
 
-The one-flipped-bit arm is the essential one. A gate that has never been
-observed to fail is not known to be a gate.
+The one-flipped-bit row is the essential one. A check that has never been
+observed to fail is not known to be a check.
 
 The predecessor bank, `postmerge-baseline-2026-08-24` at `51bf168`, is gone
 from disk (the whole `<workdir>/postmerge_2026-08-24/` directory,
@@ -239,7 +242,7 @@ magnitude on the radiation-off arm is 11 of 16 files, up to 573 of 12,800 faces,
 maximum 0.02846 K on `temperature_max`, confined to the illumination,
 primary-infrared and primary-reflected channels.
 
-This supersedes the earlier working note that the drift was "pre-existing,
+This supersedes the earlier note that the drift was "pre-existing,
 `ecf635a` to `cb1e55d`, cause unidentified". It was pre-existing; the cause is
 now identified.
 
@@ -297,7 +300,7 @@ phayne/perf/rad-defaults-and-rho-advisory`), which is `origin/main` as of
 | Tag | Blesses | Reproducible from a clean clone? |
 |---|---|---|
 | `validate-baseline-2026-08-15` | The thirteen portable arms: lunar crater (CPU coupled, radiation off, GPU thermal pool at N=1/2/4, GPU radiosity pool at N=1/2/4, gray radiosity at N=1/4), Bennu, Keplerian asteroid, Europa | Yes: repository configs plus data shipped in `data/` |
-| `validate-baseline-flagship-2026-08-15` | The two site-local flagship arms: 509,337-face lunar mesh, N=2 and N=4 GPU thermal | No: needs the moon3d mesh and corrected view-factor CSR, which live outside the repository on this machine |
+| `validate-baseline-flagship-2026-08-15` | The two site-local flagship arms: 509,337-face lunar mesh, N=2 and N=4 GPU thermal | No: needs the flagship mesh and corrected view-factor CSR, which live outside the repository on this machine |
 
 The split is not cosmetic. A colleague with a fresh checkout can run the first
 suite and cannot run the second; a suite that pretends otherwise sends them
@@ -337,10 +340,10 @@ another's coverage costs wall-clock time and buys nothing.
 | `europa_diurnal_cpu` | `examples/quickstart_europa_diurnal.yaml` | Europa built-in body, primary-body infrared and reflected light, a full eclipse inside the output window |
 | `moon509k_gputhermal_n{2,4}` | site-local (see the flagship manifest) | Production scale: 509,337 faces, corrected CSR view factors, 600 equilibration steps |
 
-The generic-body arms are not optional. A passing lunar gate says nothing
-about a change gated to the generic-body path; for such a change "Moon
-byte-identical" is a tautology, because the gate excluded the Moon by
-construction. Commit `5bfbdbe` scrambled the asteroid diurnal field while
+The generic-body arms are not optional. A passing lunar comparison says
+nothing about a change gated to the generic-body path; for such a change
+"Moon byte-identical" is a tautology, because the change's own gate excluded
+the Moon by construction. Commit `5bfbdbe` scrambled the asteroid diurnal field while
 passing the bowl-crater test, lunar byte-identity, and the seam check.
 
 ### View-factor builder arms
@@ -614,7 +617,7 @@ banked radiation-off arm 16/16 byte-identical; rebuilding the same commit with
 `OFF` does not. The physical size of the `ON`-versus-`OFF` difference at `ecf635a`
 is one face, maximum 3.2e-20: a single denormal in six flux files, no
 temperature file touched. That is the whole difference, enough to break byte-identity,
-far too small to mean anything, and exactly the kind of difference a byte gate is
+far too small to mean anything, and exactly the kind of difference a byte comparison is
 supposed to surface rather than absorb.
 
 On `51bf168` the flag is inert on all five portable CPU arms (`OFF` == `ON`,
@@ -736,7 +739,7 @@ two-band is affected, because two-band clears `warm_start` on both paths.
 
 ## 8. What this suite does not cover
 
-The value of a gate is bounded by what it touches. The suite does not cover the following.
+The value of a regression test is bounded by what it touches. The suite does not cover the following.
 
 - Scientific accuracy. Byte-identity is a *refactor* contract. It says the
   numbers did not move; it says nothing about whether they were right. Diviner
@@ -754,8 +757,8 @@ The value of a gate is bounded by what it touches. The suite does not cover the 
   `validate-baseline-flagship-2026-08-15` stands unre-baselined and its own
   view factors are unaudited by this work. Production scale (509,337 faces, and
   a view-factor spectral radius of 0.776 against the crater's 0.134) is
-  therefore ungated on current `main`.
-- `test_bowl_crater` is a smaller gate on a CPU build than on a GPU build, and
+  therefore not covered by any current baseline on `main`.
+- `test_bowl_crater` is a smaller test on a CPU build than on a GPU build, and
   it does not say so. It reports `PASS: 12 of 12 verdicts (0 skipped)` when
   built with `PTM_ENABLE_GPU=OFF` and `PASS: 16 of 16 verdicts (0 skipped)` with
   `ON`; the four missing verdicts are the GPU-against-CPU radiosity comparison,
@@ -779,7 +782,7 @@ Measured on the 509,337-face lunar mesh with the corrected view-factor CSR
 loaded (nnz 495,163,704; never rebuilt), 600 equilibration steps and
 20 output steps, `gpu_batch_size: 4000`, `PTM_MAX_TIMESTEPS_PER_DISPATCH=50`.
 
-| Arm | Wall clock | GPU kernel device-time | Kernel dispatches |
+| Device count | Wall clock | GPU kernel device-time | Kernel dispatches |
 |---|---|---|---|
 | N=1 | 1834 s | 1588.6 s | 687 |
 | N=2 | 1112 s | 1586.2 s | 687 |
@@ -820,7 +823,7 @@ parallel fraction of 0.850), with residuals of −0.8%, +3.9% and −4.4%.
 Therefore the 1.711× for N=4 over N=2 is measured; a thermal-phase-only
 speedup near 2× is model output, not a measurement. Quote the first, and if
 you quote the second, say it is derived and name the residuals. Had this been
-stopped at two arms, the report would have carried `C` = 1848 s as a fact.
+stopped at two device counts, the report would have carried `C` = 1848 s as a fact.
 
 Contention is the dominant error source in any of these numbers. The same
 N=2 arm measured 1297 s while an unrelated job held the GPU and 1112 s alone: a
