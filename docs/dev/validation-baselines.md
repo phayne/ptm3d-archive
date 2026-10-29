@@ -114,7 +114,7 @@ python3 scripts/ptm_validate_baseline.py bank --repo . --binary build/bin/ptm_th
     --out baseline_manifest_portable.json --arm <name>=<rundir> ...
 ```
 
-Prerequisite: the SPICE kernels. Three arms (`asteroid_bennu_spice_cpu`,
+Prerequisite: the SPICE kernels. Three kinds of arm (`asteroid_bennu_spice_cpu`,
 `europa_diurnal_cpu`, and every lunar arm) need `data/kernels/{lsk,pck,spk,fk}`,
 which is gitignored, 1.2 GB, and therefore absent from every fresh worktree.
 Without it each arm dies on `FATAL: SPICE initialization failed for body
@@ -387,8 +387,9 @@ are not comparable to it. They are new configs, and they run physics that
 changed on purpose: the near-field estimator was one-sided until 2026-08-23 and
 read −21.7 percent on edge/vertex-touching pairs. Their baselines are banked
 separately, at the branch and commit named in their own manifest, with the
-attribution in `notes`; currently `postmerge-baseline-2026-08-24` at `51bf168`
-(section 2.1), which supersedes `vfunify-stage2-2026-08-23` at `fc57d58`. Do not
+attribution in `notes`; currently `postmerge-baseline-2026-09-05` at `c137564`
+(section 2.1). Before that they were banked in `postmerge-baseline-2026-08-24` at
+`51bf168` (deleted 2026-09-03), which superseded `vfunify-stage2-2026-08-23` at `fc57d58`. Do not
 merge them into the 2026-08-15 manifest and do not retag it.
 
 Both arms are byte-identical between `fc57d58` and `51bf168`, 32/32 each, at 48
@@ -558,7 +559,7 @@ bytes, kernels SSE2 SSE4.2 AVX AVX2 AVX512). Selecting it with
 2026-08-15, 75 of 260 files differ on a lunar site run, worst face-frame
 difference 0.00907 K. Europa and Bennu are byte-identical across the swap.
 
-A comparison run under a different Embree is therefore not a section 1 comparison.
+A comparison run under a different Embree is therefore not a byte-identity comparison against these baselines.
 Either build both arms against the same Embree, or state the ISA and treat
 lunar differences at the 0.01 K scale as toolchain, not regression. Every run
 records `embree_library` and `embree_max_isa` in its `provenance.txt`, and the
@@ -635,12 +636,14 @@ and `0b41b3b` fired its occlusion rays in the mesh frame into a scene
 ever rejected as blocked. On the 12,800-face crater that is 0 of 1,307,376
 pairs and up to −6.52 K on `temperature_max`.
 
-`validate-baseline-2026-08-15`'s six GPU arms load exactly such a matrix, which is
+`validate-baseline-2026-08-15`'s five radiosity arms (`radgpu_n{1,2,4}` and
+`radgpu_gray_n{1,4}`) load exactly such a matrix, which is
 why they cannot simply be re-verified: their input was wrong, so their bytes bless
 the wrong physics. The seven copies of it are quarantined, not deleted, at
 `~/projects/quarantine_zero-occlusion-vf_2026-08-24/` with a reversal manifest,
-and a corrected replacement sits at
-`<workdir>/postmerge_2026-08-24/crater80N_sparse.vf`.
+and a corrected replacement was banked at
+`<workdir>/postmerge_2026-08-24/crater80N_sparse.vf` until that directory was deleted
+on 2026-09-03 (section 2.1). The current bank carries its own sparse matrix under `inputs/`.
 
 A missing `.vf` is not a hazard here: `ptm_thermal_sim` announces
 `Early View Factor Computation`, builds the matrix, prints its occlusion counts,
@@ -731,6 +734,45 @@ two-band is affected, because two-band clears `warm_start` on both paths.
 
 ---
 
+## 8. What this suite does not cover
+
+The value of a gate is bounded by what it touches. The suite does not cover the following.
+
+- Scientific accuracy. Byte-identity is a *refactor* contract. It says the
+  numbers did not move; it says nothing about whether they were right. Diviner
+  cross-validation (`scripts/divval_orchestrate.py`) is the data-anchored
+  check, and the Ingersoll bowl-crater test is the analytic one.
+  Concretely: the flagship arms use a deliberately short shape (600
+  equilibration steps, 20 output steps) built for cost and equivalence probing,
+  and `scripts/ptm_qa.py thermal` fails its never-lit-face coherence check
+  on them, both on this baseline's run (standard deviation of the minimum
+  temperature, 21.65 K against a 3.0 K threshold) *and* on the earlier
+  independent run of the same recipe at `d279eca` (13.95 K). The failure is a
+  property of the recipe, not of the baseline. Never quote a flagship arm as a
+  converged thermal field.
+- The two site-local flagship arms. They were not re-run at `51bf168`, so
+  `validate-baseline-flagship-2026-08-15` stands unre-baselined and its own
+  view factors are unaudited by this work. Production scale (509,337 faces, and
+  a view-factor spectral radius of 0.776 against the crater's 0.134) is
+  therefore ungated on current `main`.
+- `test_bowl_crater` is a smaller gate on a CPU build than on a GPU build, and
+  it does not say so. It reports `PASS: 12 of 12 verdicts (0 skipped)` when
+  built with `PTM_ENABLE_GPU=OFF` and `PASS: 16 of 16 verdicts (0 skipped)` with
+  `ON`; the four missing verdicts are the GPU-against-CPU radiosity comparison,
+  which is compiled out rather than skipped. `0 skipped` reads as full coverage
+  in both cases. Quote the build configuration alongside the verdict.
+- The exosphere, camera, and merge-chunks binaries. Only `ptm_thermal_sim`
+  is exercised here.
+- Illumination on the GPU. Every arm traces shadow rays on the CPU with
+  Embree. `--use-gpu-illumination` is untested by this suite.
+- Chunked runs and warm start. The `initial_state_file` /
+  `final_state_file` path and `ptm_merge_chunks` have their own equivalence
+  requirement and no arm here.
+- Cross-machine reproducibility, as above.
+- Gray-mode radiosity at production spectral radius, as above.
+- Any Europa or asteroid GPU path. The generic-body and Europa arms are all
+  CPU; a GPU change gated to those bodies would pass this suite untested.
+
 ## 9. Flagship scale: the N=1/2/4 ladder
 
 Measured on the 509,337-face lunar mesh with the corrected view-factor CSR
@@ -784,42 +826,3 @@ Contention is the dominant error source in any of these numbers. The same
 N=2 arm measured 1297 s while an unrelated job held the GPU and 1112 s alone: a
 14% penalty, consistent with the 18.5% previously documented on this host for
 identical code paths. Never quote a speedup taken beside another job.
-
-## 8. What this suite does not cover
-
-The value of a gate is bounded by what it touches. The suite does not cover the following.
-
-- Scientific accuracy. Byte-identity is a *refactor* contract. It says the
-  numbers did not move; it says nothing about whether they were right. Diviner
-  cross-validation (`scripts/divval_orchestrate.py`) is the data-anchored
-  check, and the Ingersoll bowl-crater test is the analytic one.
-  Concretely: the flagship arms use a deliberately short shape (600
-  equilibration steps, 20 output steps) built for cost and equivalence probing,
-  and `scripts/ptm_qa.py thermal` fails its never-lit-face coherence check
-  on them, both on this baseline's run (standard deviation of the minimum
-  temperature, 21.65 K against a 3.0 K threshold) *and* on the earlier
-  independent run of the same recipe at `d279eca` (13.95 K). The failure is a
-  property of the recipe, not of the baseline. Never quote a flagship arm as a
-  converged thermal field.
-- The two site-local flagship arms. They were not re-run at `51bf168`, so
-  `validate-baseline-flagship-2026-08-15` stands unre-baselined and its own
-  view factors are unaudited by this work. Production scale (509,337 faces, and
-  a view-factor spectral radius of 0.776 against the crater's 0.134) is
-  therefore ungated on current `main`.
-- `test_bowl_crater` is a smaller gate on a CPU build than on a GPU build, and
-  it does not say so. It reports `PASS: 12 of 12 verdicts (0 skipped)` when
-  built with `PTM_ENABLE_GPU=OFF` and `PASS: 16 of 16 verdicts (0 skipped)` with
-  `ON`; the four missing verdicts are the GPU-against-CPU radiosity comparison,
-  which is compiled out rather than skipped. `0 skipped` reads as full coverage
-  in both cases. Quote the build configuration alongside the verdict.
-- The exosphere, camera, and merge-chunks binaries. Only `ptm_thermal_sim`
-  is exercised here.
-- Illumination on the GPU. Every arm traces shadow rays on the CPU with
-  Embree. `--use-gpu-illumination` is untested by this suite.
-- Chunked runs and warm start. The `initial_state_file` /
-  `final_state_file` path and `ptm_merge_chunks` have their own equivalence
-  requirement and no arm here.
-- Cross-machine reproducibility, as above.
-- Gray-mode radiosity at production spectral radius, as above.
-- Any Europa or asteroid GPU path. The generic-body and Europa arms are all
-  CPU; a GPU change gated to those bodies would pass this suite untested.

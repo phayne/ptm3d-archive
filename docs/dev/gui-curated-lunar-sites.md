@@ -41,7 +41,7 @@ From this project's own A3GT campaign, all measured:
   27.3108 km one and the offline matrix sweep used the 81.6712 km one (two
   different jobs), and the bigger ring is not the better answer to the first;
 * one accidental rebuild of a multi-gigabyte matrix, which hard-wedged the
-  graphics cards and needed a reboot. That is what exists to prevent, and
+  graphics cards and needed a reboot. That is what the never-rebuild rule exists to prevent, and
   a wrong or missing cache path is how it happens by accident.
 
 None of that is visible in a file picker.
@@ -174,7 +174,7 @@ Refused outright, each with its reason and both numbers where there are two:
 a row count that disagrees with the mesh; a cloud placeholder (refused on the
 `stat`, before anything reads it and blocks); a truncated or unidentifiable
 file; a radiance-pruned matrix whose receipt records a failure; and the five
-A3GT matrices records as defective, which are loadable, correctly
+A3GT matrices that `DEFECTIVE_VIEW_FACTORS` records as defective, which are loadable, correctly
 dimensioned, and known to be wrong.
 
 Three things the ranking deliberately does not claim:
@@ -196,7 +196,7 @@ Three things the ranking deliberately does not claim:
   routinely: `~/projects/a3gt/campaign/base_vf/*.hmat` are sparse version-1
   files with zero nonzeros, and the current empty stubs are H-matrix version 2
   named `.vf`. Everything is identified by its magic number. (`MFFV`, which
-  calls "the old format", is not a third magic: it is `VFFM`'s four bytes
+  the stale-format fallback calls "the old format", is not a third magic: it is `VFFM`'s four bytes
   as they sit on disk, little-endian.)
 
 A `.csr` chosen this way is wired to `engine_env.PTM_HMATRIX_VF_REPLACE` and the

@@ -122,10 +122,11 @@ configuration for the same body.
    `+` continuation.
 3. Ship the shape, with a `PROVENANCE.md` beside it naming the archive
    (a PDS LID, a DAMIT model id), the vertex and facet counts, the units, and
-   what it supersedes. `.gitignore` line 14 is `*.obj` (a rule written for C
+   what it supersedes. `.gitignore` carries `*.obj` (a rule written for C
    object files that matches every asteroid shape model here), so a
-   shape that is meant to ship must be added with `git add -f`, and the
-   registry's `tracked` field must say so. The test compares that field
+   shape that is meant to ship needs its own `!data/horizons_cache/bodies/...`
+   exception line there, by exact filename, and the registry's `tracked`
+   field must say so. The test compares that field
    against `git ls-files`.
 4. Add the `CuratedBody` to `CURATED_BODIES` in
    `gui/gui_core/curated_sources.py`:
