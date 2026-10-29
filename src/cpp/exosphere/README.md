@@ -456,8 +456,8 @@ initial composition relates to the albedo map that drove the thermal run:
   `--fill-ice-fraction=uniform` (the earlier behavior, which warns), get
   $f = 1 - f_{\mathrm{dust}}$. The run reports the fill faces' share of the final-state
   sublimation rate separately, with their count and area. Defaults: ice $A_B = 0.80$ (the base
-  case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (Paul,
-  2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
+  case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (default
+  since 2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
   $g = 0$ for both; $r = 10$.
   Requires `--multiscale`.
 
@@ -483,7 +483,7 @@ per net ice loss $\Delta M$. Sublimation crosses the lag by Knudsen diffusion
 (Schorghofer 2008, eq. 3), $J = J_0 f(x_n) / (1 + d/\ell)$ with
 $\ell = 1.128\thinspace [\phi_{\mathrm{lag}}/(1-\phi_{\mathrm{lag}})]\thinspace r/\tau$ = 4.23 µm at the
 defaults ($r$ = 5 µm, $\phi_{\mathrm{lag}}$ = 0.6, $\tau$ = 2). **Sputtering is not
-barriered** (energetic ions reach cm depths; Paul, 2026-09-24). Deposition offsets a
+barriered** (energetic ions reach cm depths; default since 2026-09-24). Deposition offsets a
 face's net loss (the lag then tends to $d^* = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$,
 where the face stops being a net source); deposition above the free-frost loss builds an
 unbarriered frost veneer, which replaces the legacy off-book layer overflow; in between
@@ -619,7 +619,7 @@ $$\phi_{\mathrm{eq}} = \frac{k_{\mathrm{cryst}}}{k_{\mathrm{cryst}} + k_{\mathrm
 | 120 | $1.6 \times 10^{-7}$ | $7.67 \times 10^{-7}$ | 0.17 |
 | 130 | $1.9 \times 10^{-5}$ | $7.67 \times 10^{-7}$ | 0.96 |
 
-This predicts a sharp transition from amorphous to crystalline ice between 120-130 K, consistent with the JWST detection of crystalline ice predominantly at the sub-solar point and warm latitudes (Cartwright et al. 2025).
+The model therefore has a sharp transition from amorphous to crystalline ice between 120 and 130 K.
 
 **Depositional amorphization:** Freshly deposited ice at Europa's surface temperatures is amorphous. When new ice of mass $\Delta m_{\mathrm{dep}}$ is deposited on a face with existing ice mass $m_{\mathrm{old}}$, the crystalline fraction is diluted:
 
@@ -846,7 +846,7 @@ At the trailing equator (maximum radiation dose, $k_{\mathrm{amorph}} = 7.67 \ti
 - $T \sim 120$ K: $\phi_{\mathrm{eq}} \sim 0.17$ (competition)
 - $T > 130$ K: $\phi_{\mathrm{eq}} > 0.96$ (crystallization wins)
 
-On the leading hemisphere (dose rate ~$`5\times`$ lower), the transition shifts to lower temperatures. This is consistent with JWST observations showing crystalline ice at warm, leading-hemisphere locations (Cartwright et al. 2025).
+On the leading hemisphere (dose rate ~$`5\times`$ lower), the transition shifts to lower temperatures.
 
 The amorphization timescale at the trailing equator is $\tau_{\mathrm{amorph}} = 1/k_{\mathrm{amorph}} = 15.1$ days, matching the Cartwright et al. (2025) constraint.
 
