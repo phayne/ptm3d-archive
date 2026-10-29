@@ -180,9 +180,9 @@ the far field, so an over-wide window costs time and never accuracy.
 | 8.0 | 904,357 | 0.0046926 | 60.065 | — |
 
 Build time is 0.3 s at every setting; the near-field kernel is not what this mesh's VF build costs.
-End to end through the coupled thermal arm `baseline_crater80N_vfbuild_sparse`, the old rule to the
+End to end through the coupled thermal validation case `baseline_crater80N_vfbuild_sparse`, the old rule to the
 new one moves 2,562 of 12,800 faces, median $-1.5 \times 10^{-4}$ K and worst $0.019$ K on
-`temperature_max`; the change is a cooling, as the sign of the M1 bias requires. The H-matrix arm is unchanged:
+`temperature_max`; the change is a cooling, as the sign of the M1 bias requires. The H-matrix case is unchanged:
 $w = 4$ is the constant it already used.
 
 **One kernel, two builders.** Since 2026-08-23 the M2 integral above lives in exactly one place,
@@ -215,7 +215,7 @@ Richardson $m = 8/16$ double-area reference on `lunar_crater_80N.ply` (60 faces,
 | $\max(3, \text{adaptive})$, shipped | $+0.729$ percent | $+7.10$ percent | 191 |
 
 The two builders share the near/far switch above but still differ in their grazing-angle
-culls and in neighbor selection; arm `[H4]` of `test_vf_production` bounds what these cost.
+culls and in neighbor selection; case `[H4]` of `test_vf_production` bounds what these cost.
 
 **Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
 cosine-weighted hemispherical rays and count first hits, giving $`F_{ij} \approx \text{hits}_j/N`$.
@@ -291,15 +291,15 @@ applies a reciprocity-preserving $\Sigma F \le 1$ congruence, and writes the v2 
 
 **Orientation.** The referee launches rays from the side of each face that the engine
 illuminates, using the same rule as the engine (`src/cpp/mesh/face_orientation.h`), and refuses a
-mesh it would have to reverse on more than 1% of faces unless told to expect it. Before the
-Moon3D revision it used the raw triangle winding; on a mesh wound into the body that silently
+mesh it would have to reverse on more than 1% of faces unless told to expect it. Before the runs for the
+Moon3D paper (Hayne et al., in revision) it used the raw triangle winding; on a mesh wound into the body that silently
 produced the view factors of the surface's underside, while reciprocity, row sums and nonzero
 counts all looked normal. The engine refuses a loaded matrix whose recorded orientation differs
 from its own.
 
 **Near-field rise filter.** The referee's sixth argument, `keps` (default 0.2), drops hits whose
 rise above the source face is below `keps` times the face edge, to reject self-relief. It also
-drops some real near partners: the Moon3D revision's matrices were built with `keps = 0.01`. This
+drops some real near partners: the matrices for the Moon3D paper were built with `keps = 0.01`. This
 is a referee setting, distinct from the engine's `PTM_ILLUM_RISE_KEPS`.
 
 **The symmetrization estimator.** Every undirected pair $\lbrace i,j\rbrace$ is measured twice, once from
@@ -316,7 +316,7 @@ per unit area,
 
 $$G_{ij} = \frac{h_{ij} + h_{ji}}{n_i/A_i + n_j/A_j},$$
 
-which is reciprocal by construction and has lower variance. The Moon3D revision's crater matrix
+which is reciprocal by construction and has lower variance. The Moon3D paper's crater matrix
 used pooled; its Haworth matrix used tried, where the two agree (median ratio 1.0004, 95th
 percentile 1.011).
 
@@ -564,7 +564,7 @@ is read, and it is *not* the Jacobi iteration count: every solve also pays one f
 matvec to turn the converged radiosity into absorbed flux, and the band-separated GPU
 route used to pay it twice per timestep. `PTM_RAD_COST_REPORT` counts dispatches.
 
-| route | A3GT lunar polar site A (2.485e9 nnz) | moon3d 509k (4.95e8 nnz) |
+| route | lunar polar site A (2.485e9 nnz) | Moon3D testbed mesh, 509k (4.95e8 nnz) |
 |---|---|---|
 | CPU (fused width-2 Jacobi) | 2.000 traversals/solve | 2.792 |
 | GPU, unfused + absolute criterion | 7.000 | 9.927 |
@@ -572,16 +572,16 @@ route used to pay it twice per timestep. `PTM_RAD_COST_REPORT` counts dispatches
 | GPU, relative criterion only | 6.000 | — |
 | GPU, fused + relative (current) | **3.500** | **4.375** |
 
-So the GPU's traversal excess over the CPU falls from 3.50x to 1.75x at A3GT and
-from 3.56x to 1.57x at moon3d. The two changes are close to multiplicative
+So the GPU's traversal excess over the CPU falls from 3.50x to 1.75x on lunar polar site A and
+from 3.56x to 1.57x on the Moon3D testbed mesh. The two changes are close to multiplicative
 (1.75 x 1.17 = 2.04 against the 2.00 measured together).
 
 **Sweep wall clock.** Bracketed from the engine's own structural markers
 (`--- Radiation Iteration N ---` to `Computing indirect flux ... 100%`), which is
 uniform across routes; the progress bar is not, because the multi-GPU pool emits a
-single frame per sweep. Four sweeps per arm; the spread is the standard deviation.
+single frame per sweep. Four sweeps per variant; the spread is the standard deviation.
 
-| arm | A3GT sweep (s) | g = CPU/arm | moon3d sweep (s) | g |
+| variant | site A sweep (s) | g = CPU/variant | Moon3D sweep (s) | g |
 |---|---|---|---|---|
 | CPU | 134.62 ± 0.88 | 1.000 | 7.11 ± 0.30 | 1.000 |
 | GPU N=1, unfused + absolute | 82.23 ± 1.47 | 1.637 | 5.20 ± 0.10 | 1.367 |
@@ -592,11 +592,11 @@ single frame per sweep. Four sweeps per arm; the spread is the standard deviatio
 | GPU N=4 pool, fused + relative | **26.74 ± 0.57** | **5.034** | — | — |
 
 **The traversal ratio overstates the time saving by a wide margin.** Traversals fell
-2.00x at A3GT but the sweep only 1.24x (1.10x at N=4); at moon3d, 2.27x against
+2.00x on the polar site but the sweep only 1.24x (1.10x at N=4); on the Moon3D mesh, 2.27x against
 1.47x. The reason is that a width-2 traversal is *not* the cost of one single-band
 traversal: it shares the CSR value and column reads (8 bytes per stored entry) but
 doubles the gather from the radiosity vector, the arithmetic and the output writes.
-Measured on the fusion-only arm, one fused traversal costs 1.60x a single-band
+Measured on the fusion-only variant, one fused traversal costs 1.60x a single-band
 one (time ratio 0.916 against a traversal ratio of 0.571), so fusing two traversals
 into one buys 1.09x, not 1.75x. The criterion change, which removes whole
 single-band traversals at unchanged unit cost, converts almost exactly (1.14x of
@@ -611,7 +611,7 @@ count.
 lunar polar site A window profile (99.19-min CPU window, radiosity 67.4 %, per-window GPU
 setup penalty +46.3 s at N=4) over 472 windows:
 
-| arm | window (min) | campaign (days) |
+| variant | window (min) | campaign (days) |
 |---|---|---|
 | GPU N=4, unfused + absolute | 47.8 | 15.7 |
 | GPU N=4, fused + relative | 46.4 | **15.2** |
@@ -622,12 +622,12 @@ radiosity is already only ~31 % of the window, and because of the gather-bound
 result above.
 
 **Equivalence.** Against the same run's CPU route, worst temperature max\|Δ\|:
-0.0066 K at A3GT (weak coupling, max Σ_j F_ij = 0.2) and 0.271 K at moon3d
+0.0066 K on lunar polar site A (weak coupling, max Σ_j F_ij = 0.2) and 0.271 K on the Moon3D testbed mesh
 (strong coupling); 14 of 22 statistics products byte-identical in both cases (the 8
 that differ are exactly the radiosity-derived ones), sign census 92–96 % one-sided
-at A3GT and 99.6–99.9 % at moon3d. The relative criterion moved the moon3d delta
+on the polar site and 99.6–99.9 % on the Moon3D mesh. The relative criterion moved the Moon3D delta
 only slightly (0.279 K to 0.271 K): at these scales the CPU/GPU difference is
-dominated by float32-vs-float64, not by where the iteration stops. The A3GT
+dominated by float32-vs-float64, not by where the iteration stops. The polar-site
 millikelvin figure does not transfer to a strongly coupled mesh.
 
 ## 7. Thermal-radiation coupling
@@ -977,7 +977,7 @@ direct forcing, and in a coupled run its surface anchor stands down (status
 `fallback-radiation-coupled`, because the forcing depends on neighbors it cannot see). A face
 whose only heat is indirect therefore starts on the geothermal floor (25.28 K on Moon3D). Two
 equilibration lunations are far shorter than the deep column's response time, so it ends
-about 50 K too cold at depth. In the Moon3D revision's runs, seeding with the indirect flux raised the
+about 50 K too cold at depth. In the runs for the Moon3D paper, seeding with the indirect flux raised the
 spun-up cold-trap mean temperature by 2.0 to 2.2 K (median). The last line of §7.7, "correct at leading order", does not hold for this population.
 
 `thermal.seed_indirect` acts in the eq-indirect re-solve, the first point at which an indirect
@@ -1001,7 +1001,7 @@ off, no internal eq-indirect pass (`eq_indirect_source: off`, an `eq_indirect_fl
 equilibration span), the CPU scalar solver, a warm-started chunk (its column comes from the
 checkpoint), a measured $\langle q_{\text{ind}}\rangle = 0$, or an output window shorter than one diurnal cycle. An explicit `series`/`mean`
 that cannot act is fatal instead. Those runs are byte-identical to `off` by construction, and the
-validation suite checks it (`scripts/ptm_validate_baseline.py`, default arm with `--expect-differ-if-log`).
+validation suite checks it (`scripts/ptm_validate_baseline.py`, its default validation case, which the script calls an arm, run with `--expect-differ-if-log`).
 
 With `off`, the equilibration forcing uses the constant $\langle q_{\text{ind}}\rangle$ of §7.7.
 
@@ -1093,7 +1093,7 @@ mesh (or from its view-factor provenance sidecar's `total_area_m2 / n_faces`), n
 |---|---|---|---|---|
 | `sunlit_radcore_r50` (50 km core) | 140,091 | 7845 km² | **237 m** | **ON** (5 orders above the roughness scale) |
 | `haworth_radcore_r32c` (32 km core) | 99,665 | 3279 km² | **181 m** | **ON** |
-| A3GT lunar polar site A 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
+| lunar polar site A 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
 | `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** (the mesh *is* at the roughness scale) |
 
 The 509k `moon3d` mesh is a laboratory scan of a testbed crater about 1.2 m across (scanned domain 1.34 × 1.35 m) with a mean facet edge of about 2.5 mm. It
@@ -1173,10 +1173,10 @@ what every pre-2026-08-25 beaming run actually paid.)
 Every number below is a measurement. The engine prints its own `[beam-cost]` block at the
 end of any run with beaming on, so this is re-measurable on any mesh without differencing two runs.
 
-**Production wall time.** `sunlit_radcore_r50` arms, 140,091 faces, 573.0 M-nonzero referee CSR,
+**Production wall time.** `sunlit_radcore_r50` runs, 140,091 faces, 573.0 M-nonzero referee CSR,
 2 chunks each, same driver / CSR / environment / batch size throughout:
 
-| Arm pair (identical except beaming) | off | on | delta |
+| Run pair (identical except beaming) | off | on | delta |
 |---|---|---|---|
 | `max_coupling_iterations: 5` (2026-08-24) | 1743.9 s | 2128.0 s | +384.0 s (**+22.0%**) |
 | `max_coupling_iterations: 16` (2026-08-24) | 1738.9 s | 2125.9 s | +387.1 s (**+22.3%**) |
@@ -1184,7 +1184,7 @@ end of any run with beaming on, so this is re-measurable on any mesh without dif
 | `max_coupling_iterations: 5`, **after** (2026-08-25) | 1746 s | **1930 s** | **+184 s (+10.5%)** |
 
 The last two rows are the same recipe on the same machine minutes apart, so they are directly
-comparable: 210 s of the 394 s beaming overhead was recovered (53%), and the two beaming arms
+comparable: 210 s of the 394 s beaming overhead was recovered (53%), and the two beaming runs
 produce byte-identical output (2642 of 2642 files) across both chunks. Engine-reported
 `[beam-cost]` accounts for 390.0 s of the 394 s "before" overhead (99.0%) and 176.9 s of the 184 s
 "after" overhead (96.2%), so the table below is not missing a term.
@@ -1230,8 +1230,8 @@ Three things changed, and none of them changes a number:
    to 5 × 10⁻⁶ on the p05.
 
 The pair build and the Gate-2 audit are one shot per *chunk*; the per-timestep pass runs once per
-beamed timestep (1115 across both chunks of the 2026-08-25 production arms in the per-term
-table above; the first version of this section, written against the 2026-08-24 arms, gave 1380
+beamed timestep (1115 across both chunks of the 2026-08-25 production runs in the per-term
+table above; the first version of this section, written against the 2026-08-24 runs, gave 1380
 for one chunk), so on a long run the per-timestep
 term is what matters and on a short one the setup is.
 
@@ -1243,18 +1243,18 @@ one shared $D_j$ array rather than a copy of every active pair:
 |---|---|---|---|---|---|
 | `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **4.33–5.53 GiB** | ~4 MB |
 | `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 4.3–5.5 GiB (est.) | ~4 MB |
-| A3GT 3 km polar site A | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **18.8–23.9 GiB (est.)** | ~22 MB |
+| lunar polar site A 3 km core | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **18.8–23.9 GiB (est.)** | ~22 MB |
 
 (For comparison, the 2026-08-24 code needed 5.05–6.45 GiB and 21.9–27.9 GiB in the pair-list
 column, and a ~2.4 GB / ~8 GB Gate-2 transient on top.) The estimates apply the measured r50
 retention band (33.8–43.2% of the CSR's nonzeros survive the receiver/emitter/geometry filters)
 to each mesh's own nonzero count. They are estimates, not measurements: the retention depends on
 the shadow topology of the specific site and window, and the receiver set is itself window-scoped
-(§8.8). The absolute ceiling is 100% retention, i.e. 24 B × nnz: 55.6 GiB for the A3GT site.
+(§8.8). The absolute ceiling is 100% retention, i.e. 24 B × nnz: 55.6 GiB for lunar polar site A.
 
 The pair build also no longer grows an unreserved vector by repeated realloc-and-copy: it counts
 first, allocates exactly, and fills in parallel, which removes a transient peak of roughly half the
-pair list again (~2.5 GiB at r50, ~10 GiB at A3GT scale) on top of the list itself.
+pair list again (~2.5 GiB at r50, ~10 GiB at polar-site scale) on top of the list itself.
 
 **Remaining cost and declined optimizations.** The remaining per-timestep cost is dominated by the
 $\chi$ trilinear lookup itself. Three further reductions were implemented and measured on the real
@@ -1285,7 +1285,7 @@ The 509k `moon3d` mesh is deliberately absent from this table: beaming does not 
 (§8.4), so its cost is not a planning number.
 
 **Beaming on a multi-million-face site has a substantial cost.** Extrapolating the measured
-per-pair rate, an A3GT-class site would add of order 0.6 s per beamed timestep and hold ~19–24 GiB
+per-pair rate, a site of that size would add of order 0.6 s per beamed timestep and hold ~19–24 GiB
 of resident host memory. It should be measured on the target mesh (with a short run and the `[beam-cost]`
 line) before committing a campaign to it. The efficiency work moved the wall-time term
 substantially and the memory term only 14%; memory remains the constraint that decides whether
@@ -1299,7 +1299,7 @@ though the radiation-exchange set no longer is. Measured on r50: 126,787 receive
 247.4 M pairs in chunk 000 against 128,794 / 242.5 M in chunk 001. The run warns. Remedy: run
 beaming single-shot, or state the chunk decomposition with the result.
 
-**`test_bowl_crater` does not cover it.** The Ingersoll gate constructs `RadiositySolver`
+**`test_bowl_crater` does not cover it.** The Ingersoll test constructs `RadiositySolver`
 directly and never touches `RadiationExchangeManager`, so `buildBeamPairs` / `addBeamedFlux` are
 architecturally unreachable from it. A passing result there is not evidence about beaming.
 
@@ -1410,7 +1410,7 @@ and GPU-to-CPU agreement of 0.0001% relative error.
 
 ![Figure C.1: Bowl-crater radiation exchange validation](figures/v2/bowl_crater_ingersoll.png)
 
-This test is the acceptance gate for any change to the radiation path.
+This test is the acceptance test for any change to the radiation path.
 
 ## 11. Radiance-weighted view-factor pruning (optional, default off)
 

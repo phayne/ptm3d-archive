@@ -15,13 +15,13 @@ the identical Embree 4.3.3 source rebuilt multi-ISA:
 | | SSE2-only (Homebrew) | multi-ISA (`AVX512`) |
 |---|---|---|
 | `rtcOccluded1`, traversal micro-benchmark | 1.00x | 1.22–1.45x |
-| illumination phase, `calib120` arm, end to end | 13.12 s | **12.20 s (−7.0%)** |
+| illumination phase, `calib120` run, end to end | 13.12 s | **12.20 s (−7.0%)** |
 
 The end-to-end figure is 18 paired interleaved repeats across two sessions (18/18 favoring
 multi-ISA; t = 6.0 and 13.8). It is quoted with its limits: the thermal phase, which casts no
 rays and therefore cannot be affected, was measured alongside as a negative control and came out
 null (t = −0.8 and −1.0), which is what makes the illumination difference believable. A longer
-709-step arm on the same machine could not resolve the difference at all (n = 6, sd 45 s);
+709-step run on the same machine could not resolve the difference at all (n = 6, sd 45 s);
 the control was equally contaminated there, so that is machine contention, not evidence against
 the effect. Expect a few percent off the illumination phase, not a large speedup; the
 traversal micro-benchmark ratio is not an end-to-end ratio.

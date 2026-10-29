@@ -272,7 +272,7 @@ The epoch clause is the one that separates a hand-off from a warm start.
   hand-off would make an overlap worse.
 
 That last case is not a formality. A cross-season warm start measured on one
-A3GT site moved `temperature_min` by 5.75 K rms and 49.9 K maximum, and shifted
+lunar south-polar site moved `temperature_min` by 5.75 K rms and 49.9 K maximum, and shifted
 the ice-stability depth product by 19.3 percentage points, and no check in the
 QA battery detected it. Chaining is admissible only where the states tile the
 timeline, which is what `scripts/run_chunked_simulation.py` does within a
@@ -365,7 +365,7 @@ does not validate, the resume refuses; if it is merely behind the files on disk
 is reported. A partial can never be loaded as `thermal.initial_state_file`; it
 is a different format and fails at the magic.
 
-The crash-resume gate is `scripts/batch_checkpoint_crash_gate.py`, which
+The crash-resume test is `scripts/batch_checkpoint_crash_gate.py`, which
 SIGKILLs the engine at several points, resumes, and requires the finished
 outputs to be byte-identical to an uninterrupted control.
 
@@ -647,7 +647,7 @@ validated on lunar polar-crater geometry.
 
 The cost is about +22% wall time and 5–6.5 GiB of host RAM on a 140k-face lunar polar mesh
 (measured). The memory term scales with the view-factor matrix's nonzero count and reaches an
-estimated 22–28 GiB on a 2.4 M-face A3GT site; measure before enabling it on a large mesh. Every
+estimated 22–28 GiB on a 2.4 M-face polar site; measure before enabling it on a large mesh. Every
 run with beaming on prints its own `[beam-cost]` breakdown.
 
 Two caveats apply. Beaming makes a run
@@ -813,7 +813,7 @@ for a policy gets the policy.
 With the 2.0 default, a site whose CSR replica fits by less than 2 GiB
 is treated as thin, and by default (`thin_margin_policy: separate`) the engine
 moves the radiosity replica and the GPU thermal pool onto disjoint devices
-and keeps the GPU rung, at a derived +7-10 min per A3GT-scale window. It gives up
+and keeps the GPU rung, at a derived +7-10 min per window on a multi-million-face polar site. It gives up
 the rung only below `hard_min_vram_margin_gib` (0.25), or on a rung that cannot
 be separated. That matters because the alternative is expensive: measured on
 lunar polar site B (which fit by 0.64 GiB), CPU radiosity cost 108.9 min/window against

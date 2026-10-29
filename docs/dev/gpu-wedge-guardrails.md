@@ -17,7 +17,7 @@ who asks for a policy should get the policy.
 
 ## 1. The failure
 
-Two power-offs in 24 h during the A3GT gen-2 campaign (2026-08-20 SMC `-128`,
+Two power-offs in 24 h during generation 2 of a lunar south-polar site campaign (2026-08-20 SMC `-128`,
 2026-08-21 SMC `-108`). Both died inside a GPU thermal dispatch while a
 multi-GB radiosity view-factor replica was resident on all four dies, not
 during the upload, which the surviving log proves completed. One of them had
@@ -27,8 +27,8 @@ thermal solver's working set on the same devices. A third contributing factor
 was a mitigation that had been inert for months: the run printed "Capping
 re-thermal concurrency at 1 device(s)" and then ran the re-thermal on four,
 rebuilding four OpenCL contexts every coupling iteration, which is the churn the
-mitigation existed to remove. (The full forensic write-up is an internal
-session note and is not shipped with the repository; everything the guardrails
+mitigation existed to remove. (The full forensic write-up is internal
+and is not shipped with the repository; everything the guardrails
 rest on is summarized here.)
 
 ### Wedge signature
@@ -70,7 +70,7 @@ rest on is summarized here.)
 
 *Engine, all platforms.* The radiation-coupling re-thermal builds its GPU
 thermal pool once per run instead of once per coupling iteration. Kernel
-compiles on the 12,800-face crater arm fall from 20 to 9.
+compiles on the 12,800-face crater run fall from 20 to 9.
 
 Cost: none. Concurrency is unchanged (the configured device count), because
 that is what production was already running; the old "cap to 1" message was
@@ -88,14 +88,14 @@ the rung is kept and the two pools are moved onto disjoint dies; only below the
 0.25 GiB hard floor (or on a rung that cannot be separated) is the GPU rung
 given up and radiosity run on the CPU. The reserve the fit check leaves is
 one lump shared with every other consumer of the same die, above all the GPU
-thermal pool, which allocates ~0.77 GiB/device at A3GT production settings
+thermal pool, which allocates ~0.77 GiB/device at the polar-site production settings
 (`gpu_batch_size=100000`, 23 layers, 961 steps) on the very dies holding the
 replica, and which the fit check does not count.
 
 Cost: under the default ordering a thin-band site keeps the GPU rung and pays
 the separation (~+7-10 min/window, derived). What it would cost to *lose* the
 rung instead (the `refuse` ordering, and what happens below the hard floor
-either way) is large on a big matrix. Measured on A3GT lunar polar site B
+either way) is large on a big matrix. Measured on lunar polar site B
 (1,798,135 faces, 3.5 G nnz), eight standard windows per generation:
 
 | rung | windows | mean wall | range |
@@ -159,7 +159,7 @@ common to both wedges. The decision is printed on the `[Radiosity] ACTIVE RUNG`
 line.
 
 Cost: derived, not measured. Both pools lose devices, roughly +7-10 min on
-a ~30 min A3GT window (radiosity sweeps go from N=4 to N=2, ~+2 min; the
+a ~30 min polar-site window (radiosity sweeps go from N=4 to N=2, ~+2 min; the
 thermal phases likewise, ~+5-8 min).
 
 Two deliberate refusals:
@@ -219,7 +219,7 @@ note rather than a warning.
   costs the whole attempt. The phase to watch is a very large view-factor matrix read
   from slow or cloud-backed storage. Raise `--stall-min` if that is your
   situation; the 45 min default is chosen well above every silent phase
-  measured on the A3GT windows (the longest is the ~13 min illumination pass,
+  measured on the polar-site windows (the longest is the ~13 min illumination pass,
   which is not silent at all).
 - Rotated logs move an existing `<output-dir>/logs/` to
   `logs.prev-<UTC>` at startup and write one log per attempt
@@ -242,13 +242,13 @@ mitigation for the `gpusKillClientExt` command-buffer watchdog; leave it alone.
 ## 2b. Changes for runs that worked before
 
 Every item below is new default behavior as of 2026-08-22, on macOS+AMD unless
-noted. Nothing here changes physics: the crater regression arm is byte-identical
+noted. Nothing here changes physics: the crater regression case is byte-identical
 in the default state, with the pools separated, and at one device.
 
 1. A thin-margin site keeps the GPU radiosity rung, on disjoint dies. Below
    `gpu.min_vram_margin_gib` (2.0) the engine moves the radiosity replica and
    the thermal pool onto separate devices and carries on, at about +8
-   min/window on an A3GT-scale site. The GPU rung is given up only below the
+   min/window on a multi-million-face polar site. The GPU rung is given up only below the
    0.25 GiB hard floor, or on a rung that cannot be separated at all, or if you
    set `gpu.thin_margin_policy: refuse` (which costs a measured +78 min/window
    on lunar polar site B).

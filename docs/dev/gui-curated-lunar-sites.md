@@ -28,7 +28,7 @@ radiation:
 ```
 
 Every way of getting the combination wrong produces a run that finishes.
-From this project's own A3GT campaign, all measured:
+From this project's own lunar south-polar site campaign, all measured:
 
 * a `view_factors.hmat` with zero stored nonzeros: dimensions match, the
   loader is content, and facet-to-facet radiation silently computes nothing;
@@ -174,7 +174,7 @@ Refused outright, each with its reason and both numbers where there are two:
 a row count that disagrees with the mesh; a cloud placeholder (refused on the
 `stat`, before anything reads it and blocks); a truncated or unidentifiable
 file; a radiance-pruned matrix whose receipt records a failure; and the five
-A3GT matrices that `DEFECTIVE_VIEW_FACTORS` records as defective, which are loadable, correctly
+polar-site matrices that `DEFECTIVE_VIEW_FACTORS` records as defective, which are loadable, correctly
 dimensioned, and known to be wrong.
 
 Three things the ranking deliberately does not claim:

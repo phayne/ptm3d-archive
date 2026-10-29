@@ -164,7 +164,7 @@ Split-half TV, p50 per face orientation:
 | east | 3.69e-2 | 2.61e-2 | 1.86e-2 |
 | west | 2.81e-2 | 1.89e-2 | 1.21e-2 |
 
-Cost (peak RSS was 0.62 GB in all three arms):
+Cost (peak RSS was 0.62 GB in all three cases):
 
 | n_rays | rays | wall | cache | nnz |
 |---|---|---|---|---|
@@ -248,7 +248,7 @@ against closed forms using the estimator's a-priori binomial error bar:
   Measured 1.00000 / 0.00000 / 0.50013-0.50015 against a 3-sigma bar of 0.01172.
 - finite square plane, `L = 10 m`, `h = 5 m`: the cosine-weighted nadir row sum must fall
   between the inscribed and circumscribed disk values, `0.8000 <= sum_j F <= 0.8889`. Measured
-  0.83130. A uniform-hemisphere sampler would read 0.5528, so this arm discriminates the cosine
+  0.83130. A uniform-hemisphere sampler would read 0.5528, so this case discriminates the cosine
   weighting rather than merely accommodating it.
 
 ---
@@ -361,17 +361,17 @@ treat the per-chunk files as separate products. Making the cube axis mergeable i
 
 ## 9. Validation status
 
-| gate | result |
+| check | result |
 |---|---|
 | radiosity reconstruction vs the solver's own `B` | 7.7e-17 / 9.4e-17 relative (bar 1e-12) |
 | closed forms, infinite plane | `f_sky` 1.00000 / 0.00000 / 0.50014, 3-sigma bar 0.00586 |
 | cosine weighting, analytic bracket | `sum_j F` = 0.83080 in [0.8000, 0.8889]; uniform would give 0.5528 |
 | flush limit, h = 1.0 / 0.1 / 0.01 m | `f_max` 0.1307 -> 0.9095 -> 0.9990, monotone |
-| pass unit test (3 arms, 5 negative controls) | 0 failures; nadir `terrain_ir` = 904.784902 W/m^2 at 360 K |
+| pass unit test (3 cases, 5 negative controls) | 0 failures; nadir `terrain_ir` = 904.784902 W/m^2 at 360 K |
 | Ingersoll bowl crater | PASSED, 0.492713% |
 | mesh-wide passivity, cubes ON and OFF | byte-identical to the pristine baseline engine |
 
-Passivity is the essential gate. On the 12,800-face crater80N config, 862 physics output
+Passivity is the essential check. On the 12,800-face crater80N config, 862 physics output
 files, the aggregate md5 is `cab1be996c71c52543c006822e6a9deb` for all of: the pristine engine, this
 engine with no `flux_cubes` block, this engine with `enabled: false`, and this engine with
 `enabled: true`. The probe does not perturb the simulation.
@@ -515,7 +515,7 @@ made "the same point" mean two slightly different points.
 
 ---
 
-## 13. Known limitations and disclosure (post-gate)
+## 13. Known limitations and disclosure
 
 ### Zenith terrain-IR: resolved, the cube is correct
 An earlier version of this document flagged the zenith `terrain_ir` column as not
