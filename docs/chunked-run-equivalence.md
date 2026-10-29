@@ -111,12 +111,17 @@ The merged mean improves by 320x and the max by 61x.
 
 Two mechanisms survive this change. Neither is an epoch-grid defect.
 
-The seam frame is the restored initial condition, verbatim. Frame 0 of every
-chunk after the first reports the checkpoint column as restored, rather than the
-surface re-solved at that frame's own epoch; the massless surface node makes
-row 0 a diagnostic of the epoch it was last evaluated at. The difference is up to 37.8 K in
-that one frame and 8e-4 K once averaged over 236 samples. It is the deliberately
-unfixed row-0 convention; changing it is a convention decision, not a bug fix.
+The seam frame was the restored initial condition, verbatim. In the measurement
+above, frame 0 of every chunk after the first reported the checkpoint column as
+restored, rather than the surface re-solved at that frame's own epoch; the
+massless surface node makes row 0 a diagnostic of the epoch it was last
+evaluated at. The difference was up to 37.8 K in that one frame and 8e-4 K once
+averaged over 236 samples. The CPU solvers (SIMD and scalar) have since been
+changed: a warm-started chunk's frame 0 is now re-solved at its own
+epoch, so a chunked CPU series equals the single-shot series at every frame,
+seam included (`scripts/test_chunk_seam_equivalence.py`). The GPU solver still
+reports the checkpoint's raw surface node at frame 0 and prints a warning when
+it restores.
 
 A cold chunk 0's equilibration seed depends on the length of the chunk. The
 `spinup_seed: physical` seed anchors each column on `<F_abs>`, the time mean of

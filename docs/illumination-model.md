@@ -27,7 +27,7 @@ where $S_0 = 1361\thickspace\text{W m}^{-2}$ is the total solar irradiance at 1 
 
 ### Point-Source Approximation
 
-For faces where the Sun is well above the local horizon and unobstructed, a single center ray suffices and the absorbed direct solar flux reduces to
+For faces where the Sun is well above the local horizon and unobstructed, a single center ray suffices and the incident direct solar flux reduces to
 
 $$F_{\mathrm{direct},i} = E_\odot \cos\theta_i$$
 

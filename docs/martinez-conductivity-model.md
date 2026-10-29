@@ -166,7 +166,11 @@ Two design points should be preserved:
 * The selector is carried by `thermal::Config`, never `thermal::Planet`. `Config` is
   built once in `main` and passed to every solver entry point; `Planet` is
   rebuilt from the body name at every entry point, which is why
-  `ks_override`/`kd_override` are silent no-ops on the Moon/Europa mesh+GPU path (`KNOWN_LIMITATIONS.md`). Placing it on `Config` avoids that class of bug by
+  `ks_override`/`kd_override` were once silent no-ops on the Moon/Europa
+  mesh+GPU path. That is now fixed: every solver entry point reapplies the
+  overrides (`applyConfiguredThermo()` in `ptm_thermal_sim.cpp`), and a run
+  whose override no solver applied exits before writing output. Placing the
+  selector on `Config` avoids that class of bug by
   construction, but engagement is still proven by byte-difference in a real
   run, never assumed.
 * `setMaterialParams` takes `cond_model` with no default argument. A

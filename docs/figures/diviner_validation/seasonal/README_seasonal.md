@@ -61,6 +61,14 @@ Production runs (old: 2-orbit, 40 km occluder), for reference; the biases were w
 (bias / RMSE, K)
 
 ## Findings
+
+Superseded in part: finding 2's conclusion (the floor deficit needs rim heat
+retention, and the view factors are correct) no longer holds. The Moon3D
+revision rebuilt the view factors and added sub-facet roughness, which brought
+the cold-trap summer-maximum bias to −0.80 K (median, with beaming). See
+[psr-floor-temperature-validation.md](../../../psr-floor-temperature-validation.md).
+The numbers below are kept as recorded.
+
 1. The winter warm bias was an under-equilibration artifact, now resolved. The
    2-orbit production runs leave a warm transient deep column: the regolith
    reservoir has a multi-year time constant (τ_b ∼ (b²/π)·P_diur ≈ 70 lunations at
