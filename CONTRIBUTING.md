@@ -58,7 +58,7 @@ python3 -m ptm.engine_config --regenerate
 git add src/python/ptm/engine_defaults.py
 ```
 
-Changing an existing default is the case worth spelling out, because it does not
+Changing an existing default needs particular care, because it does not
 look like a change to the configuration surface. Nothing in the YAML files
 moves, no key appears or disappears, and the engine goes on accepting every
 configuration it accepted before; it simply runs a different simulation when
