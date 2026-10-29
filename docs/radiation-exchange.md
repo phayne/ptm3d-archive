@@ -117,7 +117,7 @@ the dimensionless separation $N_s = r/\sqrt{A_{\text{eff}}}$ with $A_{\text{eff}
 
 $$F_{ij} \approx \frac{A_j}{\pi} \frac{\cos\theta_i \cos\theta_j}{r^2}$$
 
-with $\cos\theta_i = \hat{n}_i \cdot \hat{r}_{ij}$ and $\cos\theta_j = -\hat{n}_j \cdot \hat{r}_{ij}$,
+with $`\cos\theta_i = \hat{n}_i \cdot \hat{r}_{ij}`$ and $`\cos\theta_j = -\hat{n}_j \cdot \hat{r}_{ij}`$,
 $\hat{r}_{ij}$ the unit vector from centroid $i$ to centroid $j$. A single Embree ray verifies
 visibility. This follows the M1 formulation of Rezac & Zhao (2020).
 
@@ -214,15 +214,15 @@ Richardson $m = 8/16$ double-area reference on `lunar_crater_80N.ply` (60 faces,
 | $\max(3, \text{adaptive})$, shipped | $+0.729$ percent | $+7.10$ percent | 191 |
 
 The two builders still differ in where they switch from the far-field to the near-field rule
-(sparse builder: $N_s \le 5$; H-matrix: $r < 4(\sqrt{A_i} + \sqrt{A_j})$), in their grazing-angle
+(sparse builder: $N_s \le 5$; H-matrix: $`r < 4(\sqrt{A_i} + \sqrt{A_j})`$), in their grazing-angle
 culls, and in neighbor selection; arm `[H4]` of `test_vf_production` bounds what these cost.
 
 **Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
-cosine-weighted hemispherical rays and count first hits, giving $F_{ij} \approx \text{hits}_j/N$.
+cosine-weighted hemispherical rays and count first hits, giving $`F_{ij} \approx \text{hits}_j/N`$.
 The result is a sparse CSR matrix with row sums $\le 1$ by construction, and it plugs into the
 solver unchanged. This path exists for meshes beyond the practical H-matrix build limit (several
 million faces), where H-matrix build memory and the adaptive-neighbor cap both become binding.
-The default 100,000 rays per face gives roughly 10% relative error on $F_{ij} \sim 10^{-3}$.
+The default 100,000 rays per face gives roughly 10% relative error on $`F_{ij} \sim 10^{-3}`$.
 
 ### 4.3 Visibility testing
 
@@ -270,7 +270,7 @@ The solver therefore computes the row sums once with a single $F\mathbf{1}$ prod
 
 $$w_i = \frac{1}{\max(1, \sum_j F_{ij})}$$
 
-applying $w_i$ after every $F\mathbf{x}$ product. Rows already summing to $\le 1$ are untouched.
+applying $w_i$ after every $F\mathbf{x}$ product. Rows already summing to $`\le 1`$ are untouched.
 The number of renormalized rows, the maximum row sum and the mean row sum are reported at
 radiation start-up; `PTM_DUMP_VF_ROWSUMS` writes the per-face row sums for inspection.
 
@@ -393,7 +393,7 @@ visibility cull uses the average normals to skip pairs that cannot see each othe
 builds the factorization directly by greedy row/column sampling:
 
 1. Start from pivot row $i_0 = 0$.
-2. For rank $k = 0, 1, \ldots$: compute row $i$, subtract the current rank-$k$ approximation,
+2. For rank $k = 0, 1, \ldots$: compute row $i$, subtract the current rank-$`k`$ approximation,
    find the pivot column $j$ of maximum residual, stop if
    $|r_{ij}| < \tau_{\text{ACA}}\lVert F\rVert$ or $|r_{ij}| < 10^{-15}$, otherwise compute
    column $j$ and add the rank-1 update.
@@ -647,7 +647,9 @@ each coupling iteration $k = 1, 2, \ldots, k_{\max}$:
 3. **Check convergence** (§7.3).
 4. **Re-run the 1D thermal model** on the selected faces over all timesteps with
 
-   $$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
+   ```math
+   Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)
+   ```
 
    warm-started from the previous iteration's temperature profile.
 
@@ -671,7 +673,7 @@ Two selection criteria are available through `coupling_select_mode`.
 
 $$\widehat{\Delta T}_i = \frac{(1-\alpha_i)\Delta F_i}{4\varepsilon\sigma T_{\text{eff},i}^3}, \qquad T_{\text{eff},i} = \max\bigl(\max_t T_i(t), 40\ \text{K}\bigr)$$
 
-with $\Delta F_i = \max_t Q^{(k)}_{\text{indirect},i}(t) - \max_t Q^{(k-1)}_{\text{indirect},i}(t)$
+with $`\Delta F_i = \max_t Q^{(k)}_{\text{indirect},i}(t) - \max_t Q^{(k-1)}_{\text{indirect},i}(t)`$
 for $k > 0$ and $\max_t Q^{(0)}_{\text{indirect},i}(t)$ at $k = 0$. A face is re-run when
 $\widehat{\Delta T}_i$ exceeds the selection threshold, or when the temperature change it actually
 showed in the previous re-run still exceeds it. Faces that have stopped moving *and* whose flux is
@@ -1299,9 +1301,9 @@ beaming single-shot, or state the chunk decomposition with the result.
 directly and never touches `RadiationExchangeManager`, so `buildBeamPairs` / `addBeamedFlux` are
 architecturally unreachable from it. A passing result there is not evidence about beaming.
 
-**The isothermal model only.** This is the isothermal Smith-$\chi$ radiosity beaming. The
+**The isothermal model only.** This is the isothermal Smith-$`\chi`$ radiosity beaming. The
 anisothermal sub-facet model (`radiation/anisothermal_beaming.h`) is designed but deliberately
-not wired: it needs a per-$\cos\theta_{\text{sun}}$ closure table first, or it leaks ~+9% of the
+not wired: it needs a per-$`\cos\theta_{\text{sun}}`$ closure table first, or it leaks ~+9% of the
 energy at grazing incidence.
 
 ## 9. Configuration reference
@@ -1432,8 +1434,8 @@ The simulator is unchanged: it loads whatever CSR matrix it is given.
 - `--radiance-weight PATH`: the per-face $R$ source, either a prior run's statistics directory
   (`temperature_max.bin` + `direct_solar_max.bin`), or a `.npy`/`.bin` of per-face $R$ built as a
   cheap illumination proxy without a full thermal run
-  ($T_{\text{eq}} = ((1-A)\cdot\text{direct solar}_{\max}/\varepsilon\sigma)^{1/4}$,
-  $R \approx \sigma T_{\text{eq}}^4 + A_0 \cdot \text{direct solar}_{\max}$).
+  ($`T_{\text{eq}} = ((1-A)\cdot\text{direct solar}_{\max}/\varepsilon\sigma)^{1/4}`$,
+  $`R \approx \sigma T_{\text{eq}}^4 + A_0 \cdot \text{direct solar}_{\max}`$).
 - `--radiance-albedo`: visible-band albedo (default 0.12).
 
 **Configuration key and precedence.** The same threshold is exposed as
