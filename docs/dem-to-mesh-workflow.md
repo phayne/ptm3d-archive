@@ -354,8 +354,8 @@ does not assume:
   `ImportFromProj4`. That call returns 5 with an empty WKT on any host whose
   `proj.db` does not match its PROJ library, and `SetProjection('')` succeeds
   silently, which would leave the fixture projection-less and every geometric
-  check quietly measuring the unprojected fallback. The smoke arms additionally
+  check quietly measuring the unprojected fallback. The smoke tests additionally
   assert `Detected POLAR STEREOGRAPHIC projection` appears in the tool's output.
-- When a binary is absent the affected arms skip with a message naming the
+- When a binary is absent the affected tests skip with a message naming the
   missing binary and the `cmake --build` command, and the runner prints that
   they are not passes.

@@ -207,7 +207,7 @@ energy-consistent with the `*_BOND_ALBEDO` constants already in `constants.cpp`
 and cannot double-count. A body-specific measured `(p, Φ)` pair is a separate
 task; a note in the code says so.
 
-## 5. Numerical verification (`/tmp/jup_derive.py`, reproduced in the gate)
+## 5. Numerical verification (`/tmp/jup_derive.py`, reproduced in the check script)
 
 Direct evaluation of the lune integral (4) on a 4000×8000 surface grid vs the
 closed form (1)–(3):

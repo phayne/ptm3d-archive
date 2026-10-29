@@ -1000,7 +1000,7 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--lag-optical-depth` $\delta_{\mathrm{opt}}$ | 1e-5 | Albedo e-folding lag thickness [m] |
 | `--no-gardening` | off | No micrometeoroid gardening ($v_m$ = 0) and the fixed 5 cm box |
 | `--no-sputter-shield` | off | H$`_2`$O sputter ejection not barriered by the lag. With `--no-gardening` this is the model exactly |
-| `--gardening-rate` $v_m$ | 0.3 | Lag and veneer gardening rate [µm/yr] (arm 1.2) |
+| `--gardening-rate` $v_m$ | 0.3 | Lag and veneer gardening rate [µm/yr] (1.2 also tested) |
 | `--gardening-case` A\|B | B | Costello et al. 2021 secondary-crater rate for the box depth $h_g(t)$ |
 | `--gardening-box-depth` $h_{\mathrm{mm}}$ | 0.01 | Box depth at $t = 0$ [m] |
 | `--gardening-k99` $K_{99}$ | from the case | Box-deepening coefficient [m$`^2`$/yr] directly; overrides the case, $h$ and $c$ |

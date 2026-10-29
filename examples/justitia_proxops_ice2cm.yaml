@@ -47,7 +47,7 @@ thermal:
   # layers span 0->2cm at thermal_m=10). thermal_m=150 restores ~17 layers
   # up to the 2cm boundary (36 layers total to zmax~29cm) -- verified by
   # reproducing generateAdaptiveGrid() in Python against these exact
-  # ks/kd/rhos/rhod/H/cp0/period values. See session note /memory for detail.
+  # ks/kd/rhos/rhod/H/cp0/period values.
   thermal_m: 150
 thermophysical:
   constant_thermal_inertia: 0.0

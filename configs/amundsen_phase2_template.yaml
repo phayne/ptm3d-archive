@@ -66,7 +66,7 @@ radiation:
   min_neighbors: 20
   # ---- Smith (1967) beamed thermal emission ------------------------------
   # Amundsen is a lunar polar crater, and beaming is standard for lunar polar
-  # configurations (Paul, 2026-08-25). It is left OFF here pending Paul's word:
+  # configurations (project default since 2026-08-25). It is left OFF here pending a decision:
   # this template drives a campaign whose earlier lunations were run Lambertian
   # and whose radiation-on reruns are on hold. To enable, UNCOMMENT BOTH lines.
   #

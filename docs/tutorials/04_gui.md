@@ -614,7 +614,7 @@ reached the run:
    `Loaded view factors from: ...`, `Face count: ...`) and warns when a set
    value is ignored. If a setting is never mentioned, check the YAML.
 4. Compare the outputs. For anything that should change temperatures, run
-   both arms and difference them, as [tutorial 02](02_crater_radiosity.md)
+   both runs and difference them, as [tutorial 02](02_crater_radiosity.md)
    does.
 
 ---

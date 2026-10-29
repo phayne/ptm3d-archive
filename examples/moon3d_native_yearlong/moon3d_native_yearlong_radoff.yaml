@@ -1,10 +1,10 @@
 # Moon3D year-long simulation (one full year, 2030-09-01 to 2031-09-01) of the
 # 509,337-face Moon3D testbed crater mesh placed at the IM-2 landing site.
-# These are the settings of the Moon3D JGR revision's year-long runs; only
+# These are the settings of the year-long runs for the Moon3D paper; only
 # machine paths are replaced by repository-relative ones. Read
 # examples/moon3d_native_yearlong/README.md before running: the mesh and the
 # view-factor matrix are not distributed, and the run takes days.
-# Radiation-off companion arm: identical except radiation.enabled.
+# Radiation-off companion run: identical except radiation.enabled.
 
 # The validated fine-mesh illumination settings. They are opt-in (default OFF)
 # and are always used together; never set PTM_ILLUM_RISE_EPS on its own.
@@ -31,9 +31,9 @@ thermal:
   equilibration_samples_per_diurnal_cycle: 120
   thermal_m: 10
   thermal_b: 32                   # deeper than the default 15, for the annual wave
-  use_gpu: false                  # the revision runs used the CPU solver
+  use_gpu: false                  # the Moon3D paper's runs used the CPU solver
   compute_statistics: true
-  # Basal heat flow 0.022 W/m^2, the value used by the revision's production runs.
+  # Basal heat flow 0.022 W/m^2, the value used by the Moon3D paper's runs.
   # (The engine's lunar default is 0.018 W/m^2, Langseth et al. 1976.)
   geothermal_heat_flow: 0.022
 thermophysical:

@@ -1,4 +1,4 @@
-# Moon3D year-long simulation (configurations from the Moon3D revision)
+# Moon3D year-long simulation (configurations from the Moon3D paper)
 
 The two configurations here are the settings of the Moon3D paper's year-long runs (JGR Planets,
 revised version, Section 4.6): one full year (2030-09-01 to 2031-09-01, 1,484 output steps) of
@@ -22,8 +22,8 @@ Neither input is in the repository or in the Zenodo data archive.
 1. The mesh, `data/meshes/moon3d_c_cartesian_NEW_500k_clean_native.ply` (509,337 faces,
    about 23 MB). It is resolved against `$PTM_DATA_ROOT/meshes/`, then `<repo>/data/meshes/`.
    The fetchable dataset `moon3d-mesh` is the undecimated 1.7 M-face scan, not this file.
-2. The view-factor matrix. The revision's runs replaced the engine's view factors with a
-   precomputed sky-side matrix from the offline Monte Carlo referee, loaded through the
+2. The view-factor matrix. The Moon3D paper's runs replaced the engine's view factors with a
+   precomputed matrix, traced on the sky-facing side of the surface by the offline Monte Carlo referee, loaded through the
    environment variable `PTM_HMATRIX_VF_REPLACE=/path/to/matrix.csr` (see
    [docs/ENVIRONMENT.md](../../docs/ENVIRONMENT.md)). The engine refuses a matrix that does not
    match the mesh or that was traced on the other side of the surface. The config's

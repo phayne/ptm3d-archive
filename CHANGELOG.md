@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (release/r1-engine): the Moon3D revision engine
+## Unreleased: the engine for the Moon3D paper (Hayne et al., in revision)
 
 Results change for radiation-coupled runs; see "Behavior changes".
 
@@ -46,7 +46,7 @@ Results change for radiation-coupled runs; see "Behavior changes".
 ### Examples and documentation
 
 - Quickstart spin-up raised to 80 cycles; tutorial 2 uses the fine-mesh illumination settings;
-  the Moon3D year-long example carries the revision's settings, including Q_b = 0.022 W/m².
+  the Moon3D year-long example carries the paper's settings, including Q_b = 0.022 W/m².
 - Documentation rewritten for this release; `KNOWN_LIMITATIONS.md` lists only open limitations.
 
 ## Fixed in earlier development (after v1.0.3)

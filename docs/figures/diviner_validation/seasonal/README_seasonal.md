@@ -1,7 +1,7 @@
 # PTM3D vs Diviner seasonal polar temperatures
 
 > Historical analysis notes: these four-site comparisons predate the corrected view factors
-> and sub-facet roughness used in the Moon3D revision. Current results: [docs/VALIDATION.md](../../../VALIDATION.md).
+> and sub-facet roughness used for the Moon3D paper (Hayne et al., in revision). Current results: [docs/VALIDATION.md](../../../VALIDATION.md).
 
 Comparison of PTM3D against the Diviner level-4 seasonal polar temperature
 product (Williams et al. 2019, *JGR Planets* 124, 2505; data:
@@ -63,8 +63,8 @@ Production runs (old: 2-orbit, 40 km occluder), for reference; the biases were w
 ## Findings
 
 Superseded in part: finding 2's conclusion (the floor deficit needs rim heat
-retention, and the view factors are correct) no longer holds. The Moon3D
-revision rebuilt the view factors and added sub-facet roughness, which brought
+retention, and the view factors are correct) no longer holds. The runs for the
+Moon3D paper rebuilt the view factors and added sub-facet roughness, which brought
 the cold-trap summer-maximum bias to −0.80 K (median, with beaming). See
 [psr-floor-temperature-validation.md](../../../psr-floor-temperature-validation.md).
 The numbers below are kept as recorded.

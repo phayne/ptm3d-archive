@@ -281,7 +281,7 @@ the data outside the repository. The quickstart example needs only the SPICE ker
 
 ## 5. Python environment (QA, notebooks, plots)
 
-The engine and the correctness gates need no Python packages. The QA checker
+The engine and the correctness tests need no Python packages. The QA checker
 (`scripts/ptm_qa.py`), the tutorial notebooks and every plotting route do:
 
 ```bash
