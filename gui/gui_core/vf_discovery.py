@@ -21,7 +21,7 @@ matrix was built for is not recoverable from its name.
 
 **Refuse with the reason, never with a shrug.** A file whose row count
 disagrees with the mesh is REFUSED and says by how much. That is the
-wrong-mesh-same-size trap from the other side: two A3GT sites at the same DEM
+wrong-mesh-same-size trap from the other side: two polar landing sites at the same DEM
 posting produce meshes of DIFFERENT face counts, so the count catches most
 mismatches -- but two matrices that happen to agree on the count do not agree
 on the geometry, and only a ``.csr`` provenance sidecar can say which mesh a
@@ -114,7 +114,7 @@ __all__ = [
 
 #: Suffixes worth opening. THE SUFFIX SELECTS A CANDIDATE; THE MAGIC NUMBER
 #: DECIDES WHAT IT IS, and in this project those two disagree routinely.
-#: ``~/projects/a3gt/campaign/base_vf/*.hmat`` are SPARSE (``VFFM``) version-1
+#: ``<campaign dir>/base_vf/*.hmat`` are SPARSE (``VFFM``) version-1
 #: files with zero nonzeros -- measured 2026-08-31 on six of them -- while the
 #: current empty stubs, named ``.vf``, are H-matrix version 2. Anything here
 #: that trusted the extension would report both backwards.
@@ -170,7 +170,7 @@ def known_defective_view_factors():
     return dict(DEFECTIVE_VIEW_FACTORS)
 
 #: A radiance-PRUNED experimental matrix carries its own receipt, and for the
-#: A3GT polar sites those receipts record FAILURE ("Diffuse polar terrain does
+#: polar landing sites those receipts record FAILURE ("Diffuse polar terrain does
 #: NOT prune safely": PSR-floor Tmax 3.3 K mean / 22.6 K max cold).
 #:
 #: TWO artifacts can say a matrix was pruned, and neither is guaranteed:
@@ -679,10 +679,10 @@ def _same_mesh(recorded, wired):
     1. **the same file** -- same device and inode, so symlinks and two
        spellings of one path both resolve;
     2. **an identical copy elsewhere** -- same file name and same byte length.
-       This rung is not academic and was not anticipated: every real A3GT
+       This rung is not academic and was not anticipated: every real polar landing-site
        provenance sidecar records the mesh under
        ``<repo>/data/dem/a3gt_v2/``, and every production configuration loads
-       it from ``~/projects/a3gt/meshes/``. Measured 2026-08-31, those two
+       it from ``<campaign dir>/meshes/``. Measured 2026-08-31, those two
        copies of ``polar_site_A_R3km_linear.ply`` are
        byte-identical (md5 ``a256fbc7…``) -- so rung 1 alone would have
        refused every genuine match this project has.

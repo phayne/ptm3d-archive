@@ -1,10 +1,10 @@
 """A long run, broken into windows. NO Qt: this is what the card decides.
 
 WHAT PAUL ASKED FOR, in his words: "add an option to break the integration up
-into windows, as we've done previously for the Moon (the AGT runs)."
+into windows, as we've done previously for the Moon (the polar landing-site runs)."
 
-WHAT THE AGT RUNS ACTUALLY DO, because this had to be reused rather than
-reinvented. The A3GT campaign does NOT integrate one 18.6-year run. It picks a
+WHAT THE POLAR LANDING-SITE RUNS ACTUALLY DO, because this had to be reused rather than
+reinvented. The polar landing-site campaign does NOT integrate one 18.6-year run. It picks a
 handful of SHORT windows at chosen epochs across the long span and runs each one
 as a complete, independent simulation with its own spin-up:
 
@@ -21,12 +21,12 @@ as a complete, independent simulation with its own spin-up:
 
 So the machinery already exists at both ends, and what this module supplies is
 the middle: the schedule, the per-window configurations, and the exact commands.
-**Nothing here is a new runner.** The commands it emits are the ones the A3GT
+**Nothing here is a new runner.** The commands it emits are the ones the polar landing-site
 orchestrator itself issues.
 
-WHERE THIS DIFFERS FROM A3GT, stated because it is the one thing a user could
+WHERE THIS DIFFERS FROM THE POLAR LANDING-SITE CAMPAIGN, stated because it is the one thing a user could
 otherwise assume wrongly: **the epochs here are EVENLY SPACED, not chosen.**
-A3GT's are sub-solar-latitude extrema found with SPICE for the Moon; this card
+the polar landing-site campaign's windows are sub-solar-latitude extrema found with SPICE for the Moon; this card
 has no body-specific seasonal solver behind it, so it places the windows at
 equal intervals and says so in the schedule it writes
 (``epoch_rule: "even"``). An evenly spaced set samples the seasonal cycle; it
@@ -69,7 +69,7 @@ __all__ = [
 #: More windows than this is a campaign, and a campaign belongs to the
 #: orchestrator (``scripts/a3gt_v2_orchestrator.py``), which has the resume,
 #: the per-window stall watchdog and the per-site merge this card does not.
-#: A3GT's own production year set is 4 years x 2 seasons = 8 windows.
+#: The polar landing-site campaign's own production year set is 4 years x 2 seasons = 8 windows.
 MAX_WINDOWS = 64
 
 #: Rough single-window wall clock, minutes. The SAME crude number the Europa
@@ -238,7 +238,7 @@ def schedule_document(plan, body="", output_root=""):
     Deliberately the same keys (``start_time``, ``total_days``, ``windows`` of
     ``{tag, start_iso, duration_days}``), so a schedule written here can be
     read by anything that already reads that file -- and so that a reader who
-    knows the A3GT one is not learning a second format. ``epoch_rule`` and
+    knows the polar landing-site one is not learning a second format. ``epoch_rule`` and
     ``generated_by`` are ADDED, not substituted: a file that looked exactly
     like a SPICE-derived schedule while carrying evenly spaced epochs would be
     the quiet substitution this project keeps paying for.
@@ -318,7 +318,7 @@ def runner_commands(plan, output_root, config_dir=None, python="python3",
     GUI to drive.
 
     ``--total-days`` is formatted at :data:`DAYS_DIGITS` significant figures
-    and NOT at the orchestrator's ``%g``. ``%g`` is six, and the A3GT windows
+    and NOT at the orchestrator's ``%g``. ``%g`` is six, and the polar-site windows
     are whole days (30), so six is exact there -- but a diurnal window is
     29.530588 d, which ``%g`` rounds to 29.5306. The chunked runner divides
     ``--total-days`` into chunks while the configuration keeps its own

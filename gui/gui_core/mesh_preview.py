@@ -96,13 +96,13 @@ __all__ = [
 
 
 #: Faces above which the preview stops drawing a surface. Chosen from the
-#: meshes this project actually opens: the A3GT lunar polar site A 3 km core is 2,397,890
+#: meshes this project actually opens: the lunar polar site A 3 km core is 2,397,890
 #: faces and the moon3d flagship is 509,337, so the cap has to sit below both
 #: or the "big mesh" path is never exercised on a real file. 500,000 also keeps
 #: the point-cloud fallback under a second on this machine.
 PREVIEW_FACE_CAP = 500_000
 
-#: Points the fallback draws. The A3GT core has 899,154 vertices; drawing all
+#: Points the fallback draws. The polar-site core has 899,154 vertices; drawing all
 #: of them is neither necessary to see the terrain nor free.
 PREVIEW_POINT_CAP = 400_000
 

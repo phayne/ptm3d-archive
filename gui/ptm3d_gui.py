@@ -1298,7 +1298,7 @@ class PTM3DMainWindow(QMainWindow):
 
     #: Milliseconds a mesh path must hold still before it is previewed. A path
     #: field emits on every KEYSTROKE, and reading a mesh is not free -- the
-    #: A3GT production core is 77 MB and 1.8 million faces. `facet_scale`
+    #: The polar-site production core is 77 MB and 1.8 million faces. `facet_scale`
     #: already carries this lesson from the other direction (it checks the body
     #: before it decodes a single vertex).
     PREVIEW_DEBOUNCE_MS = 400

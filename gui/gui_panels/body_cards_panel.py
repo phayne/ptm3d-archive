@@ -697,9 +697,9 @@ class BodyCard(BaseConfigTab):
         group.setLayout(grid)
         return group
 
-    # -- a long run, broken into windows (the A3GT pattern) ------------------
+    # -- a long run, broken into windows (the polar-site pattern) ------------------
 
-    #: Windows a new series starts with. A3GT's own production year set is 4
+    #: Windows a new series starts with. The polar landing-site campaign's own production year set is 4
     #: years x 2 seasons; four is a set somebody would actually look at.
     DEFAULT_WINDOW_COUNT = 4
 
@@ -3102,7 +3102,7 @@ class MoonCard(BodyCard):
         self.load_flux_locations()
         self.refresh_flux_cubes()
 
-    # -- the curated A3GT lunar sites ---------------------------------------
+    # -- the curated lunar polar landing sites ---------------------------------------
 
     def _current_site(self):
         key = self.site_combo.currentData()
