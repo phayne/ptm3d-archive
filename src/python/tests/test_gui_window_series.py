@@ -206,7 +206,7 @@ def test_the_schedule_says_its_epochs_are_evenly_spaced():
     # ...and the difference from it, in the file rather than only in a docstring.
     assert document["epoch_rule"] == "even"
     assert "a3gt_v2_subsolar.py" in document["epoch_rule_detail"]
-    assert "NOT the A3GT rule" in document["epoch_rule_detail"]
+    assert "NOT the sub-solar-latitude rule" in document["epoch_rule_detail"]
 
 
 def test_the_commands_are_the_orchestrators_own():
@@ -278,7 +278,7 @@ def test_the_split_advice_fires_only_on_a_long_window():
     assert split_advice(SYNODIC * 50, SYNODIC) == ""
     advice = split_advice(SYNODIC * 200, SYNODIC)
     assert "200 diurnal cycles" in advice
-    assert "A3GT" in advice
+    assert "polar-site campaign" in advice
     # No period, no advice -- and no crash.
     assert split_advice(SYNODIC * 200, 0.0) == ""
     assert split_advice("nonsense", SYNODIC) == ""

@@ -456,9 +456,9 @@ def main():
     # --closed-form-defect-min-pct floor. The gate enforces that automatically:
     # arm A2 fails if the teeth have gone.
     ap.add_argument("--disk-nth", type=int, default=DISK_NTH,
-                    help="azimuthal divisions of the arm-A disk (default %(default)s)")
+                    help="azimuthal divisions of the case-A disk (--arm A) (default %(default)s)")
     ap.add_argument("--disk-k", type=int, default=DISK_K,
-                    help="radial rings of the arm-A disk (default %(default)s)")
+                    help="radial rings of the case-A disk (--arm A) (default %(default)s)")
     # Element area. The closed form F = a^2/(a^2+H^2) is the DIFFERENTIAL-element
     # result, so this must stay small against H^2 = 1e4 m^2: the error is
     # O((e0/H)^2), i.e. 2.3e-6 at 0.01 m^2 and 2.3e-4 at 1 m^2, both far under any
@@ -468,11 +468,11 @@ def main():
     # A0 / A_disk, and the residual falls as 1/sqrt of it. Shrinking the disk
     # without raising A0 makes the residual worse, not better.
     ap.add_argument("--disk-a0", type=float, default=DISK_A0,
-                    help="area [m^2] of the arm-A receiving element (default %(default)s)")
+                    help="area [m^2] of the case-A receiving element (--arm A) (default %(default)s)")
     ap.add_argument("--nrays-closed-form", type=int, default=200000)
     ap.add_argument("--nrays-lo", type=int, default=4000)
     ap.add_argument("--nrays-backface", type=int, default=20000,
-                    help="Ray budget for arm C. Back-face incidence is a GEOMETRIC\nproperty, not a convergence one, so this need not match the other arms.")
+                    help="Ray budget for case C (--arm C). Back-face incidence is a GEOMETRIC\nproperty, not a convergence one, so this need not match the other cases.")
     ap.add_argument("--nrays-hi", type=int, default=200000)
     # Arm A's residual is NOT a random draw: mc_ref_pp uses deterministic Halton QMC, so a
     # given binary/Embree-ISA pair reproduces it bit for bit. Measured 2026-08-19 with

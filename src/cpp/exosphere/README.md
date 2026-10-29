@@ -10,7 +10,7 @@ A coupled sublimation-ballistic transport-deposition model for Europa's tenuous 
 - **Magnetospheric sputtering** with Cassidy et al. (2013) global rates, trailing/leading hemisphere contrast, and temperature-dependent yields (Teolis et al. 2017)
 - **Ice layer model** tracking non-ice concentration within a thermally active skin depth layer
 - **Ice crystallization** via Avrami kinetics (Mitchell et al. 2017) competing with radiation-induced amorphization (Fama et al. 2010; Nordheim et al. 2022)
-- **Multi-timescale evolution** from diurnal cycles to geological timescales (~$10^3$ years) via operator splitting
+- **Multi-timescale evolution** from diurnal cycles to geological timescales (~$`10^3`$ years) via operator splitting
 - **Unstructured mesh** support (icosahedral or arbitrary triangulations) with latitude/longitude metadata
 
 ---
@@ -145,29 +145,37 @@ exosphere_output/
 
 The equilibrium vapor pressure of water ice follows the Marti & Mauersberger (1993) formulation for hexagonal ice at low temperatures:
 
-$$\log_{10}\!\bigl(P_{\mathrm{sat}}\bigr) = \frac{-2663.5}{T} + 12.537$$
+```math
+\log_{10}\!\bigl(P_{\mathrm{sat}}\bigr) = \frac{-2663.5}{T} + 12.537
+```
 
-where $P_{\mathrm{sat}}$ is the saturation vapor pressure in Pa and $T$ is the surface temperature in K. This parameterization is valid for $T = 170$-$250$ K in laboratory measurements, but is commonly extrapolated to the $80$-$150$ K range relevant to Europa's surface. At these extremely low vapor pressures, the formula provides an adequate approximation since no direct measurements exist below ~$170$ K.
+where $P_{\mathrm{sat}}$ is the saturation vapor pressure in Pa and $T$ is the surface temperature in K. This parameterization is valid for $T = 170$-$`250`$ K in laboratory measurements, but is commonly extrapolated to the $80$-$`150`$ K range relevant to Europa's surface. At these extremely low vapor pressures, the formula provides an adequate approximation since no direct measurements exist below ~$`170`$ K.
 
 The mass density of water vapor in local thermodynamic equilibrium is given by the ideal gas law:
 
-$$\rho_v = \frac{P_{\mathrm{sat}} \, M}{R \, T}$$
+```math
+\rho_v = \frac{P_{\mathrm{sat}} \, M}{R \, T}
+```
 
 where $M = 0.01802$ kg/mol is the molar mass of water and $R = 8.314$ J/(mol K) is the universal gas constant.
 
 The mean thermal velocity of molecules in a Maxwell-Boltzmann distribution is:
 
-$$\bar{v} = \sqrt{\frac{8 \, k_B \, T}{\pi \, m}}$$
+```math
+\bar{v} = \sqrt{\frac{8 \, k_B \, T}{\pi \, m}}
+```
 
-where $k_B = 1.381 \times 10^{-23}$ J/K is Boltzmann's constant and $m = 2.992 \times 10^{-26}$ kg is the molecular mass of H$_2$O.
+where $k_B = 1.381 \times 10^{-23}$ J/K is Boltzmann's constant and $m = 2.992 \times 10^{-26}$ kg is the molecular mass of H$`_2`$O.
 
 The sublimation mass flux (Hertz-Knudsen equation, assuming a sticking coefficient of unity) is:
 
-$$\Phi_{\mathrm{sub}} = \frac{\rho_v \, \bar{v}}{4}$$
+```math
+\Phi_{\mathrm{sub}} = \frac{\rho_v \, \bar{v}}{4}
+```
 
 **Vapor pressure and sublimation flux at representative temperatures:**
 
-| $T$ (K) | $P_{\mathrm{sat}}$ (Pa) | $\bar{v}$ (m/s) | $\Phi_{\mathrm{sub}}$ (kg/m$^2$/s) | $\Phi_{\mathrm{sub}}$ (molec/m$^2$/s) |
+| $T$ (K) | $P_{\mathrm{sat}}$ (Pa) | $\bar{v}$ (m/s) | $\Phi_{\mathrm{sub}}$ (kg/m$`^2`$/s) | $\Phi_{\mathrm{sub}}$ (molec/m$`^2`$/s) |
 |---------|--------------------------|------------------|-------------------------------------|----------------------------------------|
 | 80 | $1.8 \times 10^{-21}$ | 307 | $3.6 \times 10^{-24}$ | $1.2 \times 10^{2}$ |
 | 90 | $8.8 \times 10^{-18}$ | 325 | $1.7 \times 10^{-20}$ | $5.7 \times 10^{5}$ |
@@ -176,7 +184,7 @@ $$\Phi_{\mathrm{sub}} = \frac{\rho_v \, \bar{v}}{4}$$
 | 120 | $2.2 \times 10^{-10}$ | 376 | $3.7 \times 10^{-13}$ | $1.2 \times 10^{13}$ |
 | 130 | $1.1 \times 10^{-8}$ | 391 | $1.8 \times 10^{-11}$ | $6.1 \times 10^{14}$ |
 
-The sublimation flux varies by more than 12 orders of magnitude over the $80$-$130$ K temperature range typical of Europa's surface, making the thermal distribution the dominant control on mass redistribution.
+The sublimation flux varies by more than 12 orders of magnitude over the $80$-$`130`$ K temperature range typical of Europa's surface, making the thermal distribution the dominant control on mass redistribution.
 
 **Assumptions:**
 - Sticking coefficient $\alpha = 1$ (all impinging molecules stick)
@@ -187,16 +195,18 @@ The sublimation flux varies by more than 12 orders of magnitude over the $80$-$1
 
 ### Ballistic Molecular Transport
 
-Sublimated molecules follow ballistic (collisionless) trajectories in Europa's gravitational field. The exosphere is collisionless because the mean free path (~$10^6$ km at surface number densities of ~$10^4$ cm$^{-3}$) vastly exceeds the atmospheric scale height (~$35$ km).
+Sublimated molecules follow ballistic (collisionless) trajectories in Europa's gravitational field. The exosphere is collisionless because the mean free path (~$`10^6`$ km at surface number densities of ~$10^4$ cm$`^{-3}`$) vastly exceeds the atmospheric scale height (~$35$ km).
 
 The probability density for a molecule launched from one surface location to land at great-circle distance $d$ on the sphere, given a Maxwellian velocity distribution at temperature $T$, is:
 
-$$\mathcal{P}(d, T) = \frac{g^2 \, d}{4 \, \sigma^4} \, K_0(\xi)$$
+```math
+\mathcal{P}(d, T) = \frac{g^2 \, d}{4 \, \sigma^4} \, K_0(\xi)
+```
 
 where:
-- $g = 1.314$ m/s$^2$ is Europa's surface gravity
+- $g = 1.314$ m/s$`^2`$ is Europa's surface gravity
 - $\sigma^2 = k_B T / m$ is the one-dimensional velocity variance, with $k_B = 1.381 \times 10^{-23}$ J/K and $m = 2.992 \times 10^{-26}$ kg
-- $\xi = g \, d \, / \, (2\sigma^2)$ is the dimensionless distance parameter
+- $`\xi = g \, d \, / \, (2\sigma^2)`$ is the dimensionless distance parameter
 - $K_0(\xi)$ is the modified Bessel function of the second kind, order zero
 - $d$ is the great-circle distance between source and target face centers [m]
 
@@ -206,9 +216,11 @@ The $K_0$ function is evaluated using polynomial approximations (Abramowitz & St
 
 The probability is exponentially suppressed for $\xi > 10$, providing a natural cutoff for the transport matrix. The deposition flux at face $j$ from all emitting faces is:
 
-$$F_{\mathrm{dep},j} = \sum_{i} \Phi_{\mathrm{sub},i} \; A_i \; \mathcal{P}(d_{ij}, T_i) \; \frac{\Omega_j}{4\pi}$$
+```math
+F_{\mathrm{dep},j} = \sum_{i} \Phi_{\mathrm{sub},i} \; A_i \; \mathcal{P}(d_{ij}, T_i) \; \frac{\Omega_j}{4\pi}
+```
 
-where $\Phi_{\mathrm{sub},i}$ is the sublimation flux at face $i$ [kg/m$^2$/s], $A_i$ is the area of face $i$ [m$^2$], $d_{ij}$ is the great-circle distance between face centers $i$ and $j$ [m], and $\Omega_j = A_j / d_{ij}^2$ is the solid angle subtended by the target face [sr].
+where $\Phi_{\mathrm{sub},i}$ is the sublimation flux at face $i$ [kg/m$`^2`$/s], $A_i$ is the area of face $i$ [m$`^2`$], $d_{ij}$ is the great-circle distance between face centers $i$ and $j$ [m], and $\Omega_j = A_j / d_{ij}^2$ is the solid angle subtended by the target face [sr].
 
 The transport matrix is stored as a sparse Eigen matrix to exploit the sparsity enforced by the $K_0$ cutoff.
 
@@ -233,15 +245,19 @@ The characteristic distance $d_{\mathrm{char}} = 2\sigma^2 / g$ corresponds to $
 
 Molecules in the high-energy tail of the Maxwell-Boltzmann distribution can exceed the escape velocity and be lost to space. The escape fraction follows the Chamberlain (1963) approximation. The Jeans parameter is:
 
-$$\lambda_J = \frac{v_{\mathrm{esc}}^2 \, m}{2 \, k_B \, T}$$
+```math
+\lambda_J = \frac{v_{\mathrm{esc}}^2 \, m}{2 \, k_B \, T}
+```
 
-where $v_{\mathrm{esc}} = 2025$ m/s is Europa's escape velocity, $m = 2.992 \times 10^{-26}$ kg is the H$_2$O molecular mass, $k_B = 1.381 \times 10^{-23}$ J/K is Boltzmann's constant, and $T$ is the surface temperature [K].
+where $v_{\mathrm{esc}} = 2025$ m/s is Europa's escape velocity, $m = 2.992 \times 10^{-26}$ kg is the H$`_2`$O molecular mass, $k_B = 1.381 \times 10^{-23}$ J/K is Boltzmann's constant, and $T$ is the surface temperature [K].
 
 The escape fraction is:
 
-$$f_{\mathrm{esc}} = \begin{cases} 0 & \lambda_J > 50 \\[4pt] \dfrac{e^{-\lambda_J}(1 + \lambda_J)}{2\sqrt{\pi\,\lambda_J}} & 2 \le \lambda_J \le 50 \\[4pt] 0.5 & \lambda_J < 2 \end{cases}$$
+```math
+f_{\mathrm{esc}} = \begin{cases} 0 & \lambda_J > 50 \\[4pt] \dfrac{e^{-\lambda_J}(1 + \lambda_J)}{2\sqrt{\pi\,\lambda_J}} & 2 \le \lambda_J \le 50 \\[4pt] 0.5 & \lambda_J < 2 \end{cases}
+```
 
-**Jeans parameter and escape fraction for H$_2$O:**
+**Jeans parameter and escape fraction for H$`_2`$O:**
 
 | $T$ (K) | $\lambda_J$ | $f_{\mathrm{esc}}$ |
 |---------|-------------|---------------------|
@@ -252,7 +268,7 @@ $$f_{\mathrm{esc}} = \begin{cases} 0 & \lambda_J > 50 \\[4pt] \dfrac{e^{-\lambda
 | 200 | 22.2 | $\sim 10^{-10}$ |
 | 300 | 14.8 | $\sim 10^{-7}$ |
 
-Water escape from Europa is negligible at all relevant surface temperatures. The Jeans parameter $\lambda_J \gg 1$ throughout, meaning the escape velocity is many times the thermal velocity. Escape is relevant only for lighter species (H$_2$, O$_2$) or at much higher temperatures.
+Water escape from Europa is negligible at all relevant surface temperatures. The Jeans parameter $\lambda_J \gg 1$ throughout, meaning the escape velocity is many times the thermal velocity. Escape is relevant only for lighter species (H$`_2`$, O$`_2`$) or at much higher temperatures.
 
 **Assumption:** Exobase at the surface (collisionless above the surface).
 
@@ -260,70 +276,78 @@ Water escape from Europa is negligible at all relevant surface temperatures. The
 
 ### Magnetospheric Plasma Sputtering
 
-Europa is embedded in Jupiter's magnetosphere and subject to bombardment by energetic ions (primarily S$^+$, O$^+$, and H$^+$). Sputtering ejects molecules directly from the surface ice.
+Europa is embedded in Jupiter's magnetosphere and subject to bombardment by energetic ions (primarily S$`^+`$, O$`^+`$, and H$`^+`$). Sputtering ejects molecules directly from the surface ice.
 
 **Global sputtering rates** from Cassidy et al. (2013):
 
 | Species | Rate (molecules/s) | Mass rate (kg/s) |
 |---------|-------------------|-------------------|
-| H$_2$O | $2.0 \times 10^{27}$ | 59.8 |
-| O$_2$ | $1.0 \times 10^{26}$ | 5.3 |
-| H$_2$ | $2.0 \times 10^{26}$ | 0.7 |
+| H$`_2`$O | $2.0 \times 10^{27}$ | 59.8 |
+| O$`_2`$ | $1.0 \times 10^{26}$ | 5.3 |
+| H$`_2`$ | $2.0 \times 10^{26}$ | 0.7 |
 
 The spatial distribution of ion flux across the surface has two components:
 
 **Longitude dependence** (trailing hemisphere enhancement):
 
-$$f_{\mathrm{lon}} = f_{\min} + (1 - f_{\min}) \, \frac{\cos(\phi_{\mathrm{lon}} - 270°) + 1}{2}$$
+```math
+f_{\mathrm{lon}} = f_{\min} + (1 - f_{\min}) \, \frac{\cos(\phi_{\mathrm{lon}} - 270°) + 1}{2}
+```
 
-where $\phi_{\mathrm{lon}}$ is the longitude [degrees], $f_{\min} = 1/C_{\mathrm{hem}}$ is the minimum flux factor, and $C_{\mathrm{hem}} = 3.0$ is the trailing/leading hemisphere contrast ratio (default; configurable via `--sputtering-contrast`). The trailing hemisphere (centered at $270°$W) receives the highest ion flux because Jupiter's corotating plasma overtakes Europa's orbital motion.
+where $\phi_{\mathrm{lon}}$ is the longitude [degrees], $f_{\min} = 1/C_{\mathrm{hem}}$ is the minimum flux factor, and $C_{\mathrm{hem}} = 3.0$ is the trailing/leading hemisphere contrast ratio (default; configurable via `--sputtering-contrast`). The trailing hemisphere (centered at $`270°`$W) receives the highest ion flux because Jupiter's corotating plasma overtakes Europa's orbital motion.
 
 **Latitude dependence** (polar enhancement):
 
-$$f_{\mathrm{lat}} = 1 + (E_{\mathrm{pol}} - 1) \, \frac{|\phi_{\mathrm{lat}}|}{90°}$$
+```math
+f_{\mathrm{lat}} = 1 + (E_{\mathrm{pol}} - 1) \, \frac{|\phi_{\mathrm{lat}}|}{90°}
+```
 
 where $\phi_{\mathrm{lat}}$ is the latitude [degrees] and $E_{\mathrm{pol}} = 1.2$ is the polar enhancement factor (default). This is a simplified version of the full Nordheim et al. (2022) ion flux maps.
 
 **Temperature-dependent sputtering yield** (Teolis et al. 2017):
 
-$$Y(T) = Y_0 \left[1 + q_0 \, \exp\!\left(\frac{-Q}{k_B \, T}\right)\right]$$
+```math
+Y(T) = Y_0 \left[1 + q_0 \, \exp\!\left(\frac{-Q}{k_B \, T}\right)\right]
+```
 
 where $q_0 = 1000$ is a dimensionless prefactor, $Q = 0.06$ eV is the activation energy for thermally-enhanced sputtering, $k_B = 8.617 \times 10^{-5}$ eV/K is Boltzmann's constant (in eV units), and $Y_0$ is the baseline yield at $T = 0$. The yield factor relative to the reference temperature $T_{\mathrm{ref}} = 100$ K is:
 
-$$\hat{Y}(T) = \frac{Y(T)}{Y(T_{\mathrm{ref}})} = \frac{1 + q_0 \, e^{-Q/(k_B T)}}{1 + q_0 \, e^{-Q/(k_B T_{\mathrm{ref}})}}$$
+```math
+\hat{Y}(T) = \frac{Y(T)}{Y(T_{\mathrm{ref}})} = \frac{1 + q_0 \, e^{-Q/(k_B T)}}{1 + q_0 \, e^{-Q/(k_B T_{\mathrm{ref}})}}
+```
 
 Below $T = 80$ K the yield is constant (temperature-independent regime).
 
-**Current parameter set.** The gross (ice removed, H$_2$O-equivalent mass) at face $i$ is
+**Current parameter set.** The gross (ice removed, H$`_2`$O-equivalent mass) at face $i$ is
 
 $$\Phi_{\mathrm{gross},i} = m \thinspace S \thinspace \phi_i \left[ f + (1 - f) \thinspace \tau(T_i) \right], \qquad \tau(T) = \frac{1 + q_0 \exp(-E_a / k_B T)}{1 + q_0 \exp(-E_a / k_B T_{\mathrm{ref}})}$$
 
-where $\phi_i$ is the H$_2$O-equivalent molecule flux at $T_{\mathrm{ref}}$. By default $\phi_i = \dot{N}_{\mathrm{tot}} w_i / A$, with the ion-access weight $w_i$ renormalized to an area-weighted mean of 1 over the mesh area $A$, so a pure-ice surface at $T_{\mathrm{ref}}$ delivers exactly $\dot{N}_{\mathrm{tot}} = 2 \times 10^{27}$ s$^{-1}$. The geometric weight is renormalized, not the realized gross: ice availability and $\tau(T)$ then reduce or raise the realized rate (the magnetosphere sets the ion flux; the surface sets the yield). The legacy code normalized by face count over a fixed $3.09 \times 10^{13}$ m$^2$. The H$_2$O part ($f$) is temperature-independent; only the radiolytic O$_2$ + H$_2$ part follows $\tau(T)$, Cassidy et al.'s O$_2$ yield law ($q_0 = 1000$, $E_a = 0.06$ eV), which is continuous and monotonic (no cutoff; $\tau \to 0.514$ as $T \to 0$). Radiolytic O$_2$ : H$_2$ is stoichiometric. The default ion pattern (BASE) is Cassidy's trailing/leading apex ratio of 3 as a cosine in longitude, with no polar term.
+where $\phi_i$ is the H$`_2`$O-equivalent molecule flux at $`T_{\mathrm{ref}}`$. By default $`\phi_i = \dot{N}_{\mathrm{tot}} w_i / A`$, with the ion-access weight $w_i$ renormalized to an area-weighted mean of 1 over the mesh area $A$, so a pure-ice surface at $T_{\mathrm{ref}}$ delivers exactly $\dot{N}_{\mathrm{tot}} = 2 \times 10^{27}$ s$`^{-1}`$. The geometric weight is renormalized, not the realized gross: ice availability and $\tau(T)$ then reduce or raise the realized rate (the magnetosphere sets the ion flux; the surface sets the yield). The legacy code normalized by face count over a fixed $3.09 \times 10^{13}$ m$`^2`$. The H$`_2`$O part ($f$) is temperature-independent; only the radiolytic O$`_2`$ + H$`_2`$ part follows $\tau(T)$, Cassidy et al.'s O$`_2`$ yield law ($q_0 = 1000$, $E_a = 0.06$ eV), which is continuous and monotonic (no cutoff; $\tau \to 0.514$ as $T \to 0$). Radiolytic O$`_2`$ : H$`_2`$ is stoichiometric. The default ion pattern (BASE) is Cassidy's trailing/leading apex ratio of 3 as a cosine in longitude, with no polar term.
 
-The escaping share of sputtered H$_2$O and the launch temperature of the redepositing share both come from the Sigmund distribution $f(E) \propto E/(E+U)^3$: $e_{\mathrm{H_2O}} = 1 - [E_{\mathrm{esc}}/(E_{\mathrm{esc}}+U)]^2$ and $T_{\mathrm{launch}} = \langle E \rangle_{E<E_{\mathrm{esc}}} / 2k_B$, with $E_{\mathrm{esc}} = m v_{\mathrm{esc}}^2/2 = 0.3828$ eV. $U = 0.054$ eV gives 0.2320 and 677 K; `--sputter-binding-energy` changes both together. H$_2$ escapes. O$_2$ is gravitationally bound but non-condensable and is booked as atmospheric loss (ionization, dissociation, pickup), not escape. Shares of the gross at $T_{\mathrm{ref}}$: 69.12% redeposited, 22.00% escaped, 8.88% O$_2$ atmospheric loss. Per face they follow $\tau(T)$, and the multiscale path uses the diurnal-mean per-face shares.
+The escaping share of sputtered H$`_2`$O and the launch temperature of the redepositing share both come from the Sigmund distribution $f(E) \propto E/(E+U)^3$: $`e_{\mathrm{H_2O}} = 1 - [E_{\mathrm{esc}}/(E_{\mathrm{esc}}+U)]^2`$ and $T_{\mathrm{launch}} = \langle E \rangle_{E<E_{\mathrm{esc}}} / 2k_B$, with $E_{\mathrm{esc}} = m v_{\mathrm{esc}}^2/2 = 0.3828$ eV. $U = 0.054$ eV gives 0.2320 and 677 K; `--sputter-binding-energy` changes both together. H$`_2`$ escapes. O$`_2`$ is gravitationally bound but non-condensable and is booked as atmospheric loss (ionization, dissociation, pickup), not escape. Shares of the gross at $`T_{\mathrm{ref}}`$: 69.12% redeposited, 22.00% escaped, 8.88% O$`_2`$ atmospheric loss. Per face they follow $\tau(T)$, and the multiscale path uses the diurnal-mean per-face shares.
 
-Ion maps: `--sputter-ion-map FILE` replaces $w_i$ (per-face weights, renormalized as above); `--sputter-ion-map-absolute FILE` gives $\phi_i$ directly in H$_2$O-equivalent molecules cm$^{-2}$ s$^{-1}$ at $T_{\mathrm{ref}}$ and sets the total. `--sputter-o2-map-absolute FILE` (O$_2$ molecules cm$^{-2}$ s$^{-1}$) sets the radiolytic part per face: H$_2$ is stoichiometric to it, H$_2$O is the gross minus O$_2$ and H$_2$, and $\tau(T)$ is not applied, because the Addison et al. 2022 O$_2$ map already carries the same temperature law at a diurnal-mean temperature profile. All map files are a uint64 count followed by float64 per face. HIGH bracket case: both Addison 2022 absolute maps.
+Ion maps: `--sputter-ion-map FILE` replaces $`w_i`$ (per-face weights, renormalized as above); `--sputter-ion-map-absolute FILE` gives $\phi_i$ directly in H$`_2`$O-equivalent molecules cm$`^{-2}`$ s$`^{-1}`$ at $`T_{\mathrm{ref}}`$ and sets the total. `--sputter-o2-map-absolute FILE` (O$`_2`$ molecules cm$`^{-2}`$ s$`^{-1}`$) sets the radiolytic part per face: H$`_2`$ is stoichiometric to it, H$`_2`$O is the gross minus O$`_2`$ and H$`_2`$, and $\tau(T)$ is not applied, because the Addison et al. 2022 O$`_2`$ map already carries the same temperature law at a diurnal-mean temperature profile. All map files are a uint64 count followed by float64 per face. HIGH bracket case: both Addison 2022 absolute maps.
 
 **Citations** (checked 2026-09-23 against the PDFs; VERIFIED = value found at the locator, DIFFERS = the source gives another value, NOT-FOUND = the source does not contain it):
 
 | Parameter | Value used | Source and locator | Status |
 |---|---|---|---|
-| $\dot{N}_{\mathrm{tot}}$ | $2 \times 10^{27}$ H$_2$O-equivalent s$^{-1}$ | Cassidy et al. 2013, PSS 77, 64: abstract (p. 64); Table 2 (p. 70); yield counts O$_2$/H$_2$ as H$_2$O mass equivalent (p. 66) | VERIFIED |
-| $f$ | 0.90 | Cassidy p. 71: O$_2$ + H$_2$ "~10% by mass"; O$_2$ $10^{26}$ s$^{-1}$ (Table 2), H$_2$ twice that (p. 71) | VERIFIED |
+| $\dot{N}_{\mathrm{tot}}$ | $2 \times 10^{27}$ H$`_2`$O-equivalent s$`^{-1}`$ | Cassidy et al. 2013, PSS 77, 64: abstract (p. 64); Table 2 (p. 70); yield counts O$`_2`$/H$`_2`$ as H$`_2`$O mass equivalent (p. 66) | VERIFIED |
+| $f$ | 0.90 | Cassidy p. 71: O$`_2`$ + H$`_2`$ "~10% by mass"; O$`_2`$ $10^{26}$ s$`^{-1}`$ (Table 2), H$`_2`$ twice that (p. 71) | VERIFIED |
 | Trailing/leading ratio | 3 | Cassidy abstract (p. 64): leading apex "about 1/3rd of the peak"; p. 69: "about a factor of 3" | VERIFIED |
 | Cosine in longitude | | Cassidy gives a computed map (Fig. 7, p. 69), not a formula; $\cos\theta$ is the cold-ion flux only (p. 70). Fig. 7 also rises with latitude on the leading hemisphere, which the cosine omits | DIFFERS (approximation) |
 | Linear polar factor | 1 (legacy 1.2) | not in Cassidy; not in Nordheim et al. 2022, PSJ 3:5 (ion access only: polar and high latitudes get the largest flux, abstract p. 1 and p. 14) | NOT-FOUND |
-| $q_0$, $E_a$ of $\tau(T)$ | 1000, 0.06 eV | Cassidy p. 71 (O$_2$ yield, after Teolis et al. 2010); Addison et al. 2022 Eqs. 3 and 5 (p. 14). Total-yield law $q_0 = 220$: Fama et al. 2008 Sec. 3.1 (p. 158); Cassidy Eq. 2 (p. 66) | VERIFIED |
-| $T_{\mathrm{ref}}$ | 100 K | Addison et al. 2022 yield curves at 100 K (p. 14); GENTOo source | VERIFIED |
+| $q_0$, $E_a$ of $\tau(T)$ | 1000, 0.06 eV | Cassidy p. 71 (O$`_2`$ yield, after Teolis et al. 2010); Addison et al. 2022 Eqs. 3 and 5 (p. 14). Total-yield law $q_0 = 220$: Fama et al. 2008 Sec. 3.1 (p. 158); Cassidy Eq. 2 (p. 66) | VERIFIED |
+| $`T_{\mathrm{ref}}`$ | 100 K | Addison et al. 2022 yield curves at 100 K (p. 14); GENTOo source | VERIFIED |
 | $U$ | 0.054 eV | Plainaki et al. 2010, Icarus 210, 385: Table 1 and Sec. 2.2.1.3 (p. 388), after Boring et al. 1984 and Haring et al. 1984. The earlier 0.055 eV is not in Johnson and Sittler 1990 (GRL 17, 1629) | VERIFIED (0.055 NOT-FOUND) |
-| $e_{\mathrm{H_2O}}$ | 0.2320 (derived) | Plainaki abstract and p. 388: ~22% at 0.054 eV (with the $T_m$ cutoff, 100 keV S$^+$); Cassidy p. 69: ~1/3 | DIFFERS slightly (Plainaki); DIFFERS (Cassidy) |
-| $f(E) \propto E/(E+U)^3$ | | Plainaki Eq. 2 (p. 388), after Sigmund 1969 ($T_m \to \infty$ limit) | VERIFIED |
-| O$_2$ bound, H$_2$ escapes | | Cassidy p. 71 | VERIFIED |
-| O$_2$ loss channels | | Teolis et al. 2017, Icarus 284, 18, Sec. 2 (pp. 21-22) | VERIFIED |
-| JADE O$_2$ production | $12 \pm 6$ kg/s | Szalay et al. 2024, Nat. Astron.: abstract; Table 1 | VERIFIED |
-| Addison map units | cm$^{-2}$ s$^{-1}$ | Addison et al. 2022, JGR Space Phys. 127, e2021JA030136, pp. 21, 30 | VERIFIED |
-| Addison H$_2$O total | map 1.98 $\times 10^{28}$ s$^{-1}$ | paper p. 25: $\approx 5.9 \times 10^{27}$ s$^{-1}$ (draped fields), after the ×0.3 regolith sticking factor (p. 12) that the shipped GENTOo source does not apply | DIFFERS (×3.3) |
-| Addison O$_2$ total | map 2.65 $\times 10^{26}$ s$^{-1}$ = 14.1 kg/s | paper p. 32: 1.5–4.9 $\times 10^{26}$ s$^{-1}$ (thin layer, five temperature profiles) | VERIFIED (in range) |
+| $e_{\mathrm{H_2O}}$ | 0.2320 (derived) | Plainaki abstract and p. 388: ~22% at 0.054 eV (with the $T_m$ cutoff, 100 keV S$`^+`$); Cassidy p. 69: ~1/3 | DIFFERS slightly (Plainaki); DIFFERS (Cassidy) |
+| $`f(E) \propto E/(E+U)^3`$ | | Plainaki Eq. 2 (p. 388), after Sigmund 1969 ($T_m \to \infty$ limit) | VERIFIED |
+| O$`_2`$ bound, H$`_2`$ escapes | | Cassidy p. 71 | VERIFIED |
+| O$`_2`$ loss channels | | Teolis et al. 2017, Icarus 284, 18, Sec. 2 (pp. 21-22) | VERIFIED |
+| JADE O$`_2`$ production | $12 \pm 6$ kg/s | Szalay et al. 2024, Nat. Astron.: abstract; Table 1 | VERIFIED |
+| Addison map units | cm$`^{-2}`$ s$`^{-1}`$ | Addison et al. 2022, JGR Space Phys. 127, e2021JA030136, pp. 21, 30 | VERIFIED |
+| Addison H$`_2`$O total | map 1.98 $\times 10^{28}$ s$`^{-1}`$ | paper p. 25: $\approx 5.9 \times 10^{27}$ s$`^{-1}`$ (draped fields), after the ×0.3 regolith sticking factor (p. 12) that the shipped GENTOo source does not apply | DIFFERS (×3.3) |
+| Addison O$`_2`$ total | map 2.65 $\times 10^{26}$ s$`^{-1}`$ = 14.1 kg/s | paper p. 32: 1.5–4.9 $\times 10^{26}$ s$`^{-1}`$ (thin layer, five temperature profiles) | VERIFIED (in range) |
 | Addison energy quadrature | | discrete energies (p. 10); the integration rule is not stated | NOT-FOUND |
 
 `--sputter-legacy-params` restores the earlier set below (implied by `--sputter-legacy-escape-only`).
@@ -341,11 +365,13 @@ Ion maps: `--sputter-ion-map FILE` replaces $w_i$ (per-face weights, renormalize
 
 The sputtering flux at each mesh face $i$ is:
 
-$$\Phi_{\mathrm{sput},i} = \frac{\dot{N}_{\mathrm{global}} \, m}{A_{\mathrm{E}}} \; f_{\mathrm{lon},i} \; f_{\mathrm{lat},i} \; \hat{Y}(T_i) \; S$$
+```math
+\Phi_{\mathrm{sput},i} = \frac{\dot{N}_{\mathrm{global}} \, m}{A_{\mathrm{E}}} \; f_{\mathrm{lon},i} \; f_{\mathrm{lat},i} \; \hat{Y}(T_i) \; S
+```
 
-where $\dot{N}_{\mathrm{global}} = 2.0 \times 10^{27}$ molecules/s is the global H$_2$O sputtering rate (Cassidy et al. 2013), $m = 2.992 \times 10^{-26}$ kg is the H$_2$O molecular mass, $A_{\mathrm{E}} = 3.09 \times 10^{13}$ m$^2$ is Europa's surface area, and $S$ is a user-configurable rate scale factor (default $S = 1.0$; set via `--sputtering-rate`).
+where $\dot{N}_{\mathrm{global}} = 2.0 \times 10^{27}$ molecules/s is the global H$`_2`$O sputtering rate (Cassidy et al. 2013), $m = 2.992 \times 10^{-26}$ kg is the H$`_2`$O molecular mass, $`A_{\mathrm{E}} = 3.09 \times 10^{13}`$ m$`^2`$ is Europa's surface area, and $S$ is a user-configurable rate scale factor (default $S = 1.0$; set via `--sputtering-rate`).
 
-**Sputtering vs. sublimation crossover:** The mean sputtering flux is $\bar{\Phi}_{\mathrm{sput}} = \dot{N}_{\mathrm{global}} \, m / A_{\mathrm{E}} = 1.94 \times 10^{-12}$ kg/m$^2$/s. Sublimation exceeds this at $T \gtrsim 125$ K. At the subsolar point (~$130$ K), sublimation dominates by approximately an order of magnitude. At the nightside and polar regions (~$80$-$100$ K), sputtering dominates by many orders of magnitude.
+**Sputtering vs. sublimation crossover:** The mean sputtering flux is $`\bar{\Phi}_{\mathrm{sput}} = \dot{N}_{\mathrm{global}} \, m / A_{\mathrm{E}} = 1.94 \times 10^{-12}`$ kg/m$`^2`$/s. Sublimation exceeds this at $T \gtrsim 125$ K. At the subsolar point ($`\sim 130`$ K), sublimation dominates by approximately an order of magnitude. At the nightside and polar regions ($`\sim 80`$-$`100`$ K), sputtering dominates by many orders of magnitude.
 
 **Assumptions:**
 - Steady-state magnetospheric conditions (no Jovian magnetotail passages)
@@ -365,30 +391,36 @@ The key state variable is the non-ice concentration $c$ (dimensionless, $0 \le c
 
 **Ice mass per unit area:**
 
-$$m_{\mathrm{ice}} = (1 - c) \; \delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}$$
+```math
+m_{\mathrm{ice}} = (1 - c) \; \delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}
+```
 
-where $\delta_{\mathrm{th}} = 0.05$ m is the thermal skin depth (default; configurable) and $\rho_{\mathrm{ice}} = 917$ kg/m$^3$ is the water ice density.
+where $\delta_{\mathrm{th}} = 0.05$ m is the thermal skin depth (default; configurable) and $\rho_{\mathrm{ice}} = 917$ kg/m$`^3`$ is the water ice density.
 
 **Sublimation and sputtering** remove ice and increase $c$:
 
-$$\Delta c = \frac{\Delta m_{\mathrm{loss}}}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}}$$
+```math
+\Delta c = \frac{\Delta m_{\mathrm{loss}}}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}}
+```
 
-where $\Delta m_{\mathrm{loss}}$ is the ice mass removed per unit area [kg/m$^2$] over the timestep.
+where $\Delta m_{\mathrm{loss}}$ is the ice mass removed per unit area [kg/m$`^2`$] over the timestep.
 
 **Deposition** fills void space with fresh ice, decreasing $c$:
 
-$$\Delta c = -\frac{\min\!\bigl(\Delta m_{\mathrm{dep}},\; c \, \delta_{\mathrm{th}} \, \rho_{\mathrm{ice}}\bigr)}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}}$$
+```math
+\Delta c = -\frac{\min\!\bigl(\Delta m_{\mathrm{dep}},\; c \, \delta_{\mathrm{th}} \, \rho_{\mathrm{ice}}\bigr)}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}}
+```
 
-where $\Delta m_{\mathrm{dep}}$ is the deposited ice mass per unit area [kg/m$^2$]. Deposition cannot reduce $c$ below zero (cannot overfill the layer).
+where $\Delta m_{\mathrm{dep}}$ is the deposited ice mass per unit area [kg/m$`^2`$]. Deposition cannot reduce $c$ below zero (cannot overfill the layer).
 
-A dust fraction parameter $f_{\mathrm{dust}}$ (default $0.05 = 5\%$ by volume; set via `--dust-fraction`) sets the initial non-ice concentration, representing refractory contaminants embedded in Europa's ice. As ice sublimates, this dust accumulates, forming a lag deposit that can eventually armor the surface against further sublimation.
+A dust fraction parameter $f_{\mathrm{dust}}$ (default $`0.05 = 5\%`$ by volume; set via `--dust-fraction`) sets the initial non-ice concentration, representing refractory contaminants embedded in Europa's ice. As ice sublimates, this dust accumulates, forming a lag deposit that can eventually armor the surface against further sublimation.
 
 **Physical constants used in this module:**
 
 | Symbol | Value | Description |
 |--------|-------|-------------|
-| $\rho_{\mathrm{ice}}$ | 917 kg/m$^3$ | Water ice density |
-| $\rho_{\mathrm{dust}}$ | 1500 kg/m$^3$ | Refractory dust density |
+| $\rho_{\mathrm{ice}}$ | 917 kg/m$`^3`$ | Water ice density |
+| $\rho_{\mathrm{dust}}$ | 1500 kg/m$`^3`$ | Refractory dust density |
 | $\delta_{\mathrm{th}}$ | 0.05 m | Thermal skin depth (default) |
 | $c_0$ | 0.01 | Initial non-ice concentration (1%) |
 
@@ -401,15 +433,15 @@ initial composition relates to the albedo map that drove the thermal run:
 - `hapke-intimate`: invert the per-face **Bond** albedo map (`--ice-fraction-albedo-map`,
   the thermal run's own `<Body>_Albedo_res<N>.bin`) with an intimate Hapke mixture of an
   ice and a non-ice endmember. Scattering follows the engine's closed form (isotropic
-  scatterers, $H(\mu)=(1+2\mu)/(1+2\mu\gamma)$, $\gamma=\sqrt{1-w^*}$), and the Bond
-  albedo is $A_B(w^*) = 2\int_0^1 \mu\,[1-\gamma H(\mu)]\,d\mu$ (64-point Gauss-Legendre),
+  scatterers, $H(\mu)=(1+2\mu)/(1+2\mu\gamma)$, $`\gamma=\sqrt{1-w^*}`$), and the Bond
+  albedo is $`A_B(w^*) = 2\int_0^1 \mu\,[1-\gamma H(\mu)]\,d\mu`$ (64-point Gauss-Legendre),
   with $w^* = w(1-g)/(1-wg)$. Each endmember's $w$ is solved from its Bond albedo. The
   mixture weights $w$ by extinction cross section and $g$ by scattering cross section
-  ($\sigma_{\mathrm{sca}} = w\,\sigma_{\mathrm{ext}}$). Per face, $f$ (the ice share of
+  ($`\sigma_{\mathrm{sca}} = w\,\sigma_{\mathrm{ext}}`$). Per face, $f$ (the ice share of
   extinction, which equals the exposed ice area in the geometric-optics limit) is found by
   bisection and clamped at the endmembers.
   With grain-size ratio $r = D_{\mathrm{ice}}/D_{\mathrm{nonice}}$ the ice volume fraction is
-  $\phi = f r / (f r + 1 - f)$ (inverse: $f = \phi / (\phi + r(1-\phi))$), and the layer
+  $\phi = f r / (f r + 1 - f)$ (inverse: $`f = \phi / (\phi + r(1-\phi))`$), and the layer
   is seeded with $c = 1 - \phi$. **Sublimation and sputtering scale with the exposed area
   $f$, not with $1-c$**. In multi-timescale mode, $d\phi/dt = B - A f(\phi)$ is solved in
   closed form (`solveExposedAreaStep`); it reduces to the legacy exponential when $r = 1$.
@@ -424,8 +456,8 @@ initial composition relates to the albedo map that drove the thermal run:
   `--fill-ice-fraction=uniform` (the earlier behavior, which warns), get
   $f = 1 - f_{\mathrm{dust}}$. The run reports the fill faces' share of the final-state
   sublimation rate separately, with their count and area. Defaults: ice $A_B = 0.80$ (the base
-  case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (Paul,
-  2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
+  case); non-ice $A_B$ = the map's area-weighted 10th percentile over non-fill faces (default
+  since 2026-09-22; `--nonice-albedo-percentile`, or `--nonice-albedo` to set it explicitly);
   $g = 0$ for both; $r = 10$.
   Requires `--multiscale`.
 
@@ -451,7 +483,7 @@ per net ice loss $\Delta M$. Sublimation crosses the lag by Knudsen diffusion
 (Schorghofer 2008, eq. 3), $J = J_0 f(x_n) / (1 + d/\ell)$ with
 $\ell = 1.128\thinspace [\phi_{\mathrm{lag}}/(1-\phi_{\mathrm{lag}})]\thinspace r/\tau$ = 4.23 µm at the
 defaults ($r$ = 5 µm, $\phi_{\mathrm{lag}}$ = 0.6, $\tau$ = 2). **Sputtering is not
-barriered** (energetic ions reach cm depths; Paul, 2026-09-24). Deposition offsets a
+barriered** (energetic ions reach cm depths; default since 2026-09-24). Deposition offsets a
 face's net loss (the lag then tends to $d^* = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$,
 where the face stops being a net source); deposition above the free-frost loss builds an
 unbarriered frost veneer, which replaces the legacy off-book layer overflow; in between
@@ -467,19 +499,19 @@ optically neutral. Snapshots add `lag_thickness_m`, `frost_veneer_kg_m2`,
 has one row per iteration. See Appendix D.6.5.
 
 **Gardening and the sputter split.** s
-(2026-09-24): H$_2$O sputter EJECTION is shielded by the lag (ions deposit their energy
-within ~0.1 to a few µm, Plainaki et al. 2010 p. 389; ejected H$_2$O below the top grains
-sticks, Johnson et al. 2004 pp. 494, 502 and Cassidy & Johnson 2005); radiolytic O$_2$ + H$_2$
-(36/32 of the O$_2$ mass in ice) stay unshielded (O$_2$ does not stick and diffuses out,
-Johnson et al. 2004, 2019; caveat: the O$_2$ source uses Teolis thin-layer ~28 Å yields).
+(2026-09-24): H$`_2`$O sputter EJECTION is shielded by the lag (ions deposit their energy
+within ~0.1 to a few µm, Plainaki et al. 2010 p. 389; ejected H$`_2`$O below the top grains
+sticks, Johnson et al. 2004 pp. 494, 502 and Cassidy & Johnson 2005); radiolytic O$`_2`$ + H$`_2`$
+(36/32 of the O$`_2`$ mass in ice) stay unshielded (O$`_2`$ does not stick and diffuses out,
+Johnson et al. 2004, 2019; caveat: the O$`_2`$ source uses Teolis thin-layer ~28 Å yields).
 Micrometeoroid gardening at $v_m$ = 0.3 µm/yr (Johnson et al. 2004 Table 20.2, citing Cooper
 et al. 2001) mixes the lag back into the box:
-$\dot d = \beta_c[(a + p_w)/(1 + d/\ell) + p_r - B] - v_m$ for $d > 0$, $\beta_c$ from the
-CURRENT box $c$; $d = 0$ is absorbing where $\beta_c (a + p_w + p_r - B) \le v_m$ (Spencer
+$`\dot d = \beta_c[(a + p_w)/(1 + d/\ell) + p_r - B] - v_m`$ for $`d > 0`$, $`\beta_c`$ from the
+CURRENT box $c$; $d = 0$ is absorbing where $`\beta_c (a + p_w + p_r - B) \le v_m`$ (Spencer
 criterion; the box then loses ice and its $c$ rises). The veneer is gardened into the box at
 $
-ho_{\mathrm{ice}}(1 - \phi) v_m$. The box deepens as $h_g = \sqrt{h_{\mathrm{mm}}^2 + K_{99} t}$
-($h_{\mathrm{mm}}$ = 1 cm; $K_{99}$ = 3.84e-9 m$^2$/yr, Costello et al. 2021 Eq. 1 Case B, 99%;
+ho_{\mathrm{ice}}(1 - \phi) v_m$`. The box deepens as `$h_g = \sqrt{h_{\mathrm{mm}}^2 + K_{99} t}$
+($h_{\mathrm{mm}}$ = 1 cm; $K_{99}$ = 3.84e-9 m$`^2`$/yr, Costello et al. 2021 Eq. 1 Case B, 99%;
 $h$ = 0.04 and $c$ = 1 UNVERIFIED), entraining column material at the $t = 0$ composition
 (booked as an external supply in the mass audit). The box starts at 1 cm, so `ice_mass`
 at $t = 0$ differs from the legacy 5 cm layer; the composition does not. Snapshots add
@@ -492,27 +524,33 @@ Water ice on Europa exists in a competition between thermally-driven crystalliza
 
 **Crystallization rate** follows Avrami kinetics (Mitchell et al. 2017):
 
-$$k_{\mathrm{cryst}}^{1/n} = A_0^{1/n} \, \exp\!\left(\frac{-\Delta H_a}{R \, T}\right)$$
+```math
+k_{\mathrm{cryst}}^{1/n} = A_0^{1/n} \, \exp\!\left(\frac{-\Delta H_a}{R \, T}\right)
+```
 
-$$k_{\mathrm{eff}} = n \; k_{\mathrm{cryst}}^{1/n}$$
+```math
+k_{\mathrm{eff}} = n \; k_{\mathrm{cryst}}^{1/n}
+```
 
 where:
-- $A_0^{1/n} = 3.9 \times 10^{19}$ s$^{-1}$ is the pre-exponential factor (Mitchell et al. 2017, Stage 2; not configurable via CLI)
+- $A_0^{1/n} = 3.9 \times 10^{19}$ s$`^{-1}`$ is the pre-exponential factor (Mitchell et al. 2017, Stage 2; not configurable via CLI)
 - $\Delta H_a = 62{,}000$ J/mol $= 62$ kJ/mol is the activation energy (default; set via `--activation-energy`)
 - $R = 8.314$ J/(mol K) is the universal gas constant
 - $T$ is the surface temperature [K]
 - $n$ is the Avrami exponent (porosity-dependent; see below)
-- $k_{\mathrm{eff}}$ is the effective first-order crystallization rate constant [s$^{-1}$]
+- $k_{\mathrm{eff}}$ is the effective first-order crystallization rate constant [s$`^{-1}`$]
 
 The Avrami exponent varies with ice porosity $\varphi$ (Mitchell et al. 2017, Table 2):
 
-$$n(\varphi) = n_{\mathrm{low}} + (n_{\mathrm{high}} - n_{\mathrm{low}}) \, \frac{\varphi}{\varphi_{\max}}$$
+```math
+n(\varphi) = n_{\mathrm{low}} + (n_{\mathrm{high}} - n_{\mathrm{low}}) \, \frac{\varphi}{\varphi_{\max}}
+```
 
 where $n_{\mathrm{low}} = 4.0$ (compact ice, bulk nucleation + 3D growth), $n_{\mathrm{high}} = 1.5$ (porous ice, predominantly 1D growth along pore walls), and $\varphi_{\max} = 0.7$. Default porosities: equatorial $\varphi_{\mathrm{eq}} = 0.5$ (`--equatorial-porosity`), polar $\varphi_{\mathrm{pol}} = 0.2$ (`--polar-porosity`).
 
 **Crystallization timescale at representative temperatures** (compact ice, $n = 4$):
 
-| $T$ (K) | $k_{\mathrm{eff}}$ (s$^{-1}$) | Timescale |
+| $T$ (K) | $k_{\mathrm{eff}}$ (s$`^{-1}`$) | Timescale |
 |---------|-------------------------------|-----------|
 | 80 | $5.1 \times 10^{-21}$ | $> 10^{12}$ yr (frozen) |
 | 100 | $6.4 \times 10^{-13}$ | ~50,000 yr |
@@ -529,13 +567,15 @@ where $\dot{D}$ is the local radiation energy deposition rate [eV/(molecule s)] 
 
 The radiation dose rate $\dot{D}$ varies spatially following Nordheim et al. (2022):
 
-**Longitude factor** (S$^+$ ion flux, trailing hemisphere enhanced):
+**Longitude factor** (S$`^+`$ ion flux, trailing hemisphere enhanced):
 
-$$f_{\mathrm{lon}}^{(\mathrm{dose})} = \frac{1}{C_D} + \left(1 - \frac{1}{C_D}\right) \max\!\left(0,\; \frac{\cos(\phi_{\mathrm{lon}} - 270°) + 1}{2}\right)$$
+```math
+f_{\mathrm{lon}}^{(\mathrm{dose})} = \frac{1}{C_D} + \left(1 - \frac{1}{C_D}\right) \max\!\left(0,\; \frac{\cos(\phi_{\mathrm{lon}} - 270°) + 1}{2}\right)
+```
 
 where $C_D = 5.0$ is the trailing/leading hemisphere dose contrast (default; set via `--dose-hemisphere-contrast`) and $\phi_{\mathrm{lon}}$ is the longitude [degrees].
 
-**Latitude factor** (polar enhancement from O$^+$ and S$^+$ at ~1 keV):
+**Latitude factor** (polar enhancement from O$`^+`$ and S$`^+`$ at ~1 keV):
 
 $$f_{\mathrm{lat}}^{(\mathrm{dose})} = 1 + (E_D - 1) \left(\frac{|\phi_{\mathrm{lat}}|}{90°}\right)^{1.5}$$
 
@@ -543,29 +583,35 @@ where $E_D = 2.5$ is the polar dose enhancement factor (default; set via `--dose
 
 **Total dose rate:**
 
-$$\dot{D}(\phi_{\mathrm{lat}}, \phi_{\mathrm{lon}}) = \dot{D}_0 \; f_{\mathrm{lon}}^{(\mathrm{dose})} \; f_{\mathrm{lat}}^{(\mathrm{dose})}$$
+```math
+\dot{D}(\phi_{\mathrm{lat}}, \phi_{\mathrm{lon}}) = \dot{D}_0 \; f_{\mathrm{lon}}^{(\mathrm{dose})} \; f_{\mathrm{lat}}^{(\mathrm{dose})}
+```
 
 where $\dot{D}_0 = 2.3 \times 10^{-6}$ eV/(molecule s) is the base dose rate at the trailing apex (default; set via `--base-dose-rate`). This is calibrated to give an amorphization timescale of ~15 days at the trailing equator, consistent with JWST observations (Cartwright et al. 2025).
 
-At the trailing equator: $k_{\mathrm{amorph}} = \dot{D}_0 / E_{\mathrm{amorph}} = 2.3 \times 10^{-6} / 3.0 = 7.67 \times 10^{-7}$ s$^{-1}$, giving $\tau_{\mathrm{amorph}} = 1/k_{\mathrm{amorph}} = 1.30 \times 10^6$ s $= 15.1$ days.
+At the trailing equator: $`k_{\mathrm{amorph}} = \dot{D}_0 / E_{\mathrm{amorph}} = 2.3 \times 10^{-6} / 3.0 = 7.67 \times 10^{-7}`$ s$`^{-1}`$, giving $\tau_{\mathrm{amorph}} = 1/k_{\mathrm{amorph}} = 1.30 \times 10^6$ s $= 15.1$ days.
 
-> **Note — Relationship to sputtering spatial model.** The radiation dose distribution uses different parameters than the [sputtering spatial model](#magnetospheric-plasma-sputtering), despite both being driven by magnetospheric ion bombardment. Sputtering is dominated by thermal plasma ($\sim 100$ eV S$^+$ and O$^+$) with moderate spatial contrast ($C_{\mathrm{hem}} = 3.0$, $E_{\mathrm{pol}} = 1.2$, linear latitude dependence). Amorphization is driven by higher-energy ions ($\sim 1$ keV) that experience stronger magnetic focusing, producing a steeper trailing/leading contrast ($C_D = 5.0$), stronger polar enhancement ($E_D = 2.5$), and a super-linear latitude dependence (exponent $1.5$). Both models share the same cosine longitude functional form centered at $270°$W. The parameter differences follow Nordheim et al. (2022), who showed that the energetic ion flux map differs substantially from the thermal plasma distribution.
+> **Note — Relationship to sputtering spatial model.** The radiation dose distribution uses different parameters than the [sputtering spatial model](#magnetospheric-plasma-sputtering), despite both being driven by magnetospheric ion bombardment. Sputtering is dominated by thermal plasma ($\sim 100$ eV S$`^+`$ and O$`^+`$) with moderate spatial contrast ($C_{\mathrm{hem}} = 3.0$, $E_{\mathrm{pol}} = 1.2$, linear latitude dependence). Amorphization is driven by higher-energy ions ($\sim 1$ keV) that experience stronger magnetic focusing, producing a steeper trailing/leading contrast ($C_D = 5.0$), stronger polar enhancement ($E_D = 2.5$), and a super-linear latitude dependence (exponent $1.5$). Both models share the same cosine longitude functional form centered at $`270°`$W. The parameter differences follow Nordheim et al. (2022), who showed that the energetic ion flux map differs substantially from the thermal plasma distribution.
 
 **Crystallinity evolution ODE:**
 
-$$\frac{d\phi_C}{dt} = k_{\mathrm{cryst}} \, (1 - \phi_C) - k_{\mathrm{amorph}} \, \phi_C$$
+```math
+\frac{d\phi_C}{dt} = k_{\mathrm{cryst}} \, (1 - \phi_C) - k_{\mathrm{amorph}} \, \phi_C
+```
 
 This has the analytical solution:
 
-$$\phi_C(t) = \phi_{\mathrm{eq}} + \bigl[\phi_C(0) - \phi_{\mathrm{eq}}\bigr] \, \exp\!\bigl[-(k_{\mathrm{cryst}} + k_{\mathrm{amorph}}) \, t\bigr]$$
+```math
+\phi_C(t) = \phi_{\mathrm{eq}} + \bigl[\phi_C(0) - \phi_{\mathrm{eq}}\bigr] \, \exp\!\bigl[-(k_{\mathrm{cryst}} + k_{\mathrm{amorph}}) \, t\bigr]
+```
 
 where the equilibrium crystalline fraction is:
 
 $$\phi_{\mathrm{eq}} = \frac{k_{\mathrm{cryst}}}{k_{\mathrm{cryst}} + k_{\mathrm{amorph}}}$$
 
-**Equilibrium crystallinity at the trailing equator** ($k_{\mathrm{amorph}} = 7.67 \times 10^{-7}$ s$^{-1}$):
+**Equilibrium crystallinity at the trailing equator** ($k_{\mathrm{amorph}} = 7.67 \times 10^{-7}$ s$`^{-1}`$):
 
-| $T$ (K) | $k_{\mathrm{cryst}}$ (s$^{-1}$) | $k_{\mathrm{amorph}}$ (s$^{-1}$) | $\phi_{\mathrm{eq}}$ |
+| $T$ (K) | $k_{\mathrm{cryst}}$ (s$`^{-1}`$) | $k_{\mathrm{amorph}}$ (s$`^{-1}`$) | $\phi_{\mathrm{eq}}$ |
 |---------|--------------------------------|----------------------------------|----------------------|
 | 80 | $5.1 \times 10^{-21}$ | $7.67 \times 10^{-7}$ | $\sim 0$ |
 | 100 | $6.4 \times 10^{-13}$ | $7.67 \times 10^{-7}$ | $\sim 10^{-6}$ |
@@ -573,11 +619,13 @@ $$\phi_{\mathrm{eq}} = \frac{k_{\mathrm{cryst}}}{k_{\mathrm{cryst}} + k_{\mathrm
 | 120 | $1.6 \times 10^{-7}$ | $7.67 \times 10^{-7}$ | 0.17 |
 | 130 | $1.9 \times 10^{-5}$ | $7.67 \times 10^{-7}$ | 0.96 |
 
-This predicts a sharp transition from amorphous to crystalline ice between 120-130 K, consistent with the JWST detection of crystalline ice predominantly at the sub-solar point and warm latitudes (Cartwright et al. 2025).
+The model therefore has a sharp transition from amorphous to crystalline ice between 120 and 130 K.
 
 **Depositional amorphization:** Freshly deposited ice at Europa's surface temperatures is amorphous. When new ice of mass $\Delta m_{\mathrm{dep}}$ is deposited on a face with existing ice mass $m_{\mathrm{old}}$, the crystalline fraction is diluted:
 
-$$\phi_{C,\mathrm{new}} = \phi_{C,\mathrm{old}} \; \frac{m_{\mathrm{old}}}{m_{\mathrm{old}} + \Delta m_{\mathrm{dep}}}$$
+```math
+\phi_{C,\mathrm{new}} = \phi_{C,\mathrm{old}} \; \frac{m_{\mathrm{old}}}{m_{\mathrm{old}} + \Delta m_{\mathrm{dep}}}
+```
 
 **Assumptions:**
 - Spatially uniform porosity at a given latitude (no grain-scale heterogeneity)
@@ -594,29 +642,37 @@ $$\phi_{C,\mathrm{new}} = \phi_{C,\mathrm{old}} \; \frac{m_{\mathrm{old}}}{m_{\m
 
 ### Multi-Timescale Evolution
 
-The diurnal cycle of sublimation and deposition ($P_{\mathrm{diurnal}} = 3.5512$ days $= 306{,}824$ s) is much shorter than the geological timescales over which ice layer composition evolves (~$10^2$-$10^3$ years). Direct simulation of every diurnal timestep over geological time is computationally prohibitive. The model uses operator splitting to bridge these timescales.
+The diurnal cycle of sublimation and deposition ($P_{\mathrm{diurnal}} = 3.5512$ days $= 306{,}824$ s) is much shorter than the geological timescales over which ice layer composition evolves (~$`10^2`$-$`10^3`$ years). Direct simulation of every diurnal timestep over geological time is computationally prohibitive. The model uses operator splitting to bridge these timescales.
 
 **Algorithm:**
 
 1. **Diurnal cycle:** Run one complete diurnal cycle ($N_t$ timesteps) with the current surface state. Compute time-averaged fluxes at each face $i$:
 
-$$\bar{\Phi}_{\mathrm{sub},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{sub},i}(t) \;, \quad \bar{\Phi}_{\mathrm{dep},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{dep},i}(t) \;, \quad \bar{\Phi}_{\mathrm{sput},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{sput},i}(t)$$
+```math
+\bar{\Phi}_{\mathrm{sub},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{sub},i}(t) \;, \quad \bar{\Phi}_{\mathrm{dep},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{dep},i}(t) \;, \quad \bar{\Phi}_{\mathrm{sput},i} = \frac{1}{N_t} \sum_{t=1}^{N_t} \Phi_{\mathrm{sput},i}(t)
+```
 
    where $N_t$ is the number of timesteps per diurnal cycle (set via `--timesteps`).
 
 2. **Epoch extrapolation:** Apply the time-averaged fluxes over one epoch of $N_c$ diurnal cycles:
 
-$$\Delta t_{\mathrm{epoch}} = N_c \; P_{\mathrm{diurnal}}$$
+```math
+\Delta t_{\mathrm{epoch}} = N_c \; P_{\mathrm{diurnal}}
+```
 
-$$\Delta c_i = \frac{\bar{\Phi}_{\mathrm{sub},i} + \bar{\Phi}_{\mathrm{sput},i} - \bar{\Phi}_{\mathrm{dep},i}}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}} \; \Delta t_{\mathrm{epoch}}$$
+```math
+\Delta c_i = \frac{\bar{\Phi}_{\mathrm{sub},i} + \bar{\Phi}_{\mathrm{sput},i} - \bar{\Phi}_{\mathrm{dep},i}}{\delta_{\mathrm{th}} \; \rho_{\mathrm{ice}}} \; \Delta t_{\mathrm{epoch}}
+```
 
-   where $N_c = 100$ is the number of diurnal cycles per epoch (default; set via `--cycles-per-epoch`), $\delta_{\mathrm{th}} = 0.05$ m is the thermal skin depth, and $\rho_{\mathrm{ice}} = 917$ kg/m$^3$ is the ice density. Crystallinity is also evolved analytically over the epoch using the equilibrium solution from the previous section.
+   where $N_c = 100$ is the number of diurnal cycles per epoch (default; set via `--cycles-per-epoch`), $\delta_{\mathrm{th}} = 0.05$ m is the thermal skin depth, and $\rho_{\mathrm{ice}} = 917$ kg/m$`^3`$ is the ice density. Crystallinity is also evolved analytically over the epoch using the equilibrium solution from the previous section.
 
 3. **Repeat** for $N_e$ epochs (default $N_e = 1000$; set via `--epochs`).
 
 **Flux scaling for depleted regions:** As ice is removed from a face ($c \to 1$), the sublimation flux from that face decreases proportionally. The deposition flux is rescaled to conserve global mass:
 
-$$\bar{\Phi}_{\mathrm{dep}}^{(\mathrm{scaled})} = \bar{\Phi}_{\mathrm{dep}}^{(\mathrm{base})} \; \frac{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{current})}}{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{base})}}$$
+```math
+\bar{\Phi}_{\mathrm{dep}}^{(\mathrm{scaled})} = \bar{\Phi}_{\mathrm{dep}}^{(\mathrm{base})} \; \frac{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{current})}}{\sum_i \Phi_{\mathrm{em},i}^{(\mathrm{base})}}
+```
 
 where $\Phi_{\mathrm{em},i}^{(\mathrm{base})}$ is the emission flux computed with the initial (undepleted) state and $\Phi_{\mathrm{em},i}^{(\mathrm{current})}$ reflects the current ice availability.
 
@@ -624,7 +680,7 @@ where $\Phi_{\mathrm{em},i}^{(\mathrm{base})}$ is the emission flux computed wit
 
 **Diurnal-cycle cache:** The diurnal cycle is computed at the first epoch and recomputed only when `--albedo-coupling` refreshes the temperatures. There is no concentration-based or periodic refresh; `--cache-refresh N` is refused.
 
-**Albedo-coupling temperature refresh:** the exosphere does not re-solve the thermal model. It updates the thermal-run temperatures in one of two ways, chosen by `--albedo-response`. The default is `diurnal`, the diurnal-shape response described in the next paragraph. The legacy `rescale` applies the uniform $T_{\mathrm{new}} = T_{\mathrm{ref}}\,[(1-A_{\mathrm{new}})/(1-A_{\mathrm{ref}})]^{1/4}$, where $A_{\mathrm{ref}}$ is the per-face albedo the current temperature array corresponds to: the thermal run's own albedo (`--thermal-albedo` / `--thermal-albedo-map`; `hapke-intimate` defaults to its `--ice-fraction-albedo-map`) until the first refresh, and the albedo of the last refresh after that. A refresh fires when $\max_f |A_f - A_{\mathrm{ref},f}|$ exceeds `--albedo-update-threshold`, so slow drift accumulates until it fires; every face is then rescaled from its own $A_{\mathrm{ref}}$, so no sub-threshold drift is lost. If the $t=0$ composition albedo differs from the thermal albedo by more than $10^{-3}$ on any face, the run prints a WARNING and the first pass rescales those temperatures; that difference is a configuration mismatch, not feedback. Exception: `hapke-intimate` faces the forward model cannot reproduce (fill, or clamped at $f=0$ or $f=1$) are anchored at their $t=0$ composition albedo, so their thermal temperatures are kept at $t=0$ (they are reported separately at startup). With the default `--fill-ice-fraction=map-value`, an in-range fill face's $t=0$ composition albedo equals its thermal albedo, so its anchor is the thermal albedo; before fill faces were seeded at $f = 1 - f_{\mathrm{dust}}$ (bright) while their temperatures came from a dark map value, and the first refresh after they lost ice heated them by up to 35 K (a one-snapshot spike to 1,313 kg/s in the Europa albedo-map product).
+**Albedo-coupling temperature refresh:** the exosphere does not re-solve the thermal model. It updates the thermal-run temperatures in one of two ways, chosen by `--albedo-response`. The default is `diurnal`, the diurnal-shape response described in the next paragraph. The legacy `rescale` applies the uniform $`T_{\mathrm{new}} = T_{\mathrm{ref}}\,[(1-A_{\mathrm{new}})/(1-A_{\mathrm{ref}})]^{1/4}`$, where $A_{\mathrm{ref}}$ is the per-face albedo the current temperature array corresponds to: the thermal run's own albedo (`--thermal-albedo` / `--thermal-albedo-map`; `hapke-intimate` defaults to its `--ice-fraction-albedo-map`) until the first refresh, and the albedo of the last refresh after that. A refresh fires when $\max_f |A_f - A_{\mathrm{ref},f}|$ exceeds `--albedo-update-threshold`, so slow drift accumulates until it fires; every face is then rescaled from its own $A_{\mathrm{ref}}$, so no sub-threshold drift is lost. If the $t=0$ composition albedo differs from the thermal albedo by more than $10^{-3}$ on any face, the run prints a WARNING and the first pass rescales those temperatures; that difference is a configuration mismatch, not feedback. Exception: `hapke-intimate` faces the forward model cannot reproduce (fill, or clamped at $f=0$ or $f=1$) are anchored at their $t=0$ composition albedo, so their thermal temperatures are kept at $t=0$ (they are reported separately at startup). With the default `--fill-ice-fraction=map-value`, an in-range fill face's $t=0$ composition albedo equals its thermal albedo, so its anchor is the thermal albedo; before fill faces were seeded at $f = 1 - f_{\mathrm{dust}}$ (bright) while their temperatures came from a dark map value, and the first refresh after they lost ice heated them by up to 35 K (a one-snapshot spike to 1,313 kg/s in the Europa albedo-map product).
 
 **Diurnal-shape albedo response (`--albedo-response diurnal`, default).** The uniform ¼-power law is exact only without thermal inertia. With inertia, the response to an albedo change is concentrated at the daytime peak. Against true thermal re-solves on the evolved map (Europa albedo-map BASE, phase 0), the ¼-power law left darkened faces about 0.6 K too cold at peak and 0.8 K too warm at night, and undercounted Hertz-Knudsen sublimation by −14.1% time-averaged over 0–1 Myr.
 
@@ -641,9 +697,9 @@ The darkened and brightened subsets pass separately.
 
 An end-to-end check ran a diurnal-mode engine to 50 kyr and re-solved the thermal model on that run's own map. Against the re-solve, the held temperatures have a peak-T p95 error of 0.006 K; the ¼-power law on the same state gives 0.41 K.
 
-The Hertz-Knudsen proxy overstates how much the engine's sublimation changes. At 50 kyr the engine's global sublimation rose only 1.4% (84.2 → 85.4 kg/s), against about 10% predicted by the proxy, and the net loss did not change. The lag barrier and the exposed-ice throttle damp the response of the darkened faces (+5.7%). About 70% of the sublimation also comes from faces whose albedo barely moved. The two runs evolved to different states, so this comparison is indicative, not a fixed-state counterfactual.
+The Hertz-Knudsen proxy overstates how much the engine's sublimation changes: in the same 50 kyr check, the engine's global sublimation changed much less than the proxy predicted, and the net loss did not change. The lag barrier and the exposed-ice throttle damp the response of the darkened faces, and much of the sublimation comes from faces whose albedo barely moved. The two runs evolved to different states, so this comparison is indicative, not a fixed-state counterfactual.
 
-**Large r: the trust region.** The law above is an expansion about the thermal run's own state. It was validated up to |ln r| ≈ 0.4, but production reaches r ≈ 3 (|ln r| 1.1): HIGH albedo-map runs have about 9.5% of their area outside that range at 1 Myr. There the expansion runs warm. At r = 2.5–3.1 it gives +0.49 K at peak and +15% HK against true re-solves. The ¼-power law there is −6.5 K and −86%, so the darkening of such faces is real physics, which the ¼-power law was suppressing.
+**Large r: the trust region.** The law above is an expansion about the thermal run's own state. It was validated up to |ln r| ≈ 0.4, but long albedo-map runs can carry part of their area beyond that range. There the expansion runs warm. At r = 2.5–3.1 it gives +0.49 K at peak and +15% HK against true re-solves. The ¼-power law there is −6.5 K and −86%, so the darkening of such faces is real physics, which the ¼-power law was suppressing.
 
 The engine therefore treats the law as an expansion about an anchor (r_a, T_a(t), g1, g2), initially the thermal run itself. When a face's |ln(r/r_a)| exceeds `--albedo-response-trust` (default 0.35), the face is re-anchored at its current r:
 - An exact periodic Newton solve of the same column (`solveDiurnalAnchor`) finds the new base curve. The target is the thermal run's own energy-balance residual on the column, so the solve returns T0 exactly at r = 1 and the engine–column mismatch cancels.
@@ -709,9 +765,9 @@ All constants are defined in the source headers and used consistently throughout
 | Symbol | Value | Source |
 |--------|-------|--------|
 | $R_{\mathrm{E}}$ | $1.5608 \times 10^6$ m | IAU |
-| $g$ | 1.314 m/s$^2$ | $GM/R_{\mathrm{E}}^2$ |
+| $g$ | 1.314 m/s$`^2`$ | $GM/R_{\mathrm{E}}^2$ |
 | $v_{\mathrm{esc}}$ | 2025 m/s | $\sqrt{2gR_{\mathrm{E}}}$ |
-| $A_{\mathrm{E}}$ | $3.09 \times 10^{13}$ m$^2$ | $4\pi R_{\mathrm{E}}^2$ |
+| $A_{\mathrm{E}}$ | $3.09 \times 10^{13}$ m$`^2`$ | $4\pi R_{\mathrm{E}}^2$ |
 | $P_{\mathrm{diurnal}}$ | 3.5512 days ($306{,}824$ s) | Synchronous rotation |
 
 **Water ice:**
@@ -720,7 +776,7 @@ All constants are defined in the source headers and used consistently throughout
 |--------|-------|
 | $m$ | $2.992 \times 10^{-26}$ kg (molecular mass) |
 | $M$ | 0.01802 kg/mol (molar mass) |
-| $\rho_{\mathrm{ice}}$ | 917 kg/m$^3$ |
+| $\rho_{\mathrm{ice}}$ | 917 kg/m$`^3`$ |
 
 **Fundamental:**
 
@@ -728,13 +784,13 @@ All constants are defined in the source headers and used consistently throughout
 |--------|-------|
 | $k_B$ | $1.381 \times 10^{-23}$ J/K |
 | $R$ | 8.314 J/(mol K) |
-| $N_A$ | $6.022 \times 10^{23}$ mol$^{-1}$ |
+| $N_A$ | $6.022 \times 10^{23}$ mol$`^{-1}`$ |
 
 ---
 
 ## Quantitative Estimates and Validation
 
-The following estimates are computed analytically from the model equations using the constants defined in the code. They serve as sanity checks for simulation output.
+The following estimates are computed analytically from the model equations using the constants defined in the code. They serve as consistency checks for simulation output.
 
 ### Vapor Pressure
 
@@ -757,34 +813,40 @@ Europa's global mean surface temperature is approximately 100-110 K, giving a ch
 
 The mean sputtering flux (global rate divided by surface area) is:
 
-$$\bar{\Phi}_{\mathrm{sput}} = \frac{\dot{N}_{\mathrm{global}} \, m}{A_{\mathrm{E}}} = \frac{2.0 \times 10^{27} \times 2.99 \times 10^{-26}}{3.09 \times 10^{13}} = 1.94 \times 10^{-12} \;\text{kg/m}^2\text{/s}$$
+```math
+\bar{\Phi}_{\mathrm{sput}} = \frac{\dot{N}_{\mathrm{global}} \, m}{A_{\mathrm{E}}} = \frac{2.0 \times 10^{27} \times 2.99 \times 10^{-26}}{3.09 \times 10^{13}} = 1.94 \times 10^{-12} \;\text{kg/m}^2\text{/s}
+```
 
 Sublimation exceeds this mean sputtering rate at $T \gtrsim 125$ K. At the subsolar point (~130 K), sublimation dominates by approximately an order of magnitude. At the nightside and polar regions (~80-100 K), sputtering dominates by many orders of magnitude.
 
 ### Atmospheric Scale Height
 
-The barometric scale height for H$_2$O is:
+The barometric scale height for H$`_2`$O is:
 
-$$H = \frac{k_B \, T}{m \, g}$$
+```math
+H = \frac{k_B \, T}{m \, g}
+```
 
-where $k_B = 1.381 \times 10^{-23}$ J/K, $m = 2.992 \times 10^{-26}$ kg, and $g = 1.314$ m/s$^2$. This gives $H = 35$ km at 100 K, $39$ km at 110 K, and $42$ km at 120 K.
+where $k_B = 1.381 \times 10^{-23}$ J/K, $m = 2.992 \times 10^{-26}$ kg, and $g = 1.314$ m/s$`^2`$. This gives $H = 35$ km at 100 K, $39$ km at 110 K, and $42$ km at 120 K.
 
 ### Mass Conservation
 
 In steady state, global mass balance requires:
 
-$$\sum_i \Phi_{\mathrm{em},i} \, A_i = \sum_j \Phi_{\mathrm{dep},j} \, A_j + \sum_i \Phi_{\mathrm{esc},i} \, A_i$$
+```math
+\sum_i \Phi_{\mathrm{em},i} \, A_i = \sum_j \Phi_{\mathrm{dep},j} \, A_j + \sum_i \Phi_{\mathrm{esc},i} \, A_i
+```
 
-where $\Phi_{\mathrm{em}}$ includes both sublimation and sputtering, $\Phi_{\mathrm{dep}}$ is deposition, $\Phi_{\mathrm{esc}}$ is Jeans escape, and $A_i$ is the area of face $i$. Since H$_2$O escape is negligible ($\lambda_J \gg 1$), essentially all sublimated and sputtered molecules are redeposited on the surface. The simulation tracks this balance via `atmosphere/atmospheric_mass.csv`.
+where $\Phi_{\mathrm{em}}$ includes both sublimation and sputtering, $\Phi_{\mathrm{dep}}$ is deposition, $\Phi_{\mathrm{esc}}$ is Jeans escape, and $A_i$ is the area of face $i$. Since H$`_2`$O escape is negligible ($\lambda_J \gg 1$), essentially all sublimated and sputtered molecules are redeposited on the surface. The simulation tracks this balance via `atmosphere/atmospheric_mass.csv`.
 
 ### Crystallization-Amorphization Equilibrium
 
-At the trailing equator (maximum radiation dose, $k_{\mathrm{amorph}} = 7.67 \times 10^{-7}$ s$^{-1}$), the equilibrium crystalline fraction $\phi_{\mathrm{eq}} = k_{\mathrm{cryst}} / (k_{\mathrm{cryst}} + k_{\mathrm{amorph}})$ transitions sharply:
+At the trailing equator (maximum radiation dose, $k_{\mathrm{amorph}} = 7.67 \times 10^{-7}$ s$`^{-1}`$), the equilibrium crystalline fraction $\phi_{\mathrm{eq}} = k_{\mathrm{cryst}} / (k_{\mathrm{cryst}} + k_{\mathrm{amorph}})$ transitions sharply:
 - $T < 110$ K: $\phi_{\mathrm{eq}} < 0.001$ (radiation wins, ice is amorphous)
 - $T \sim 120$ K: $\phi_{\mathrm{eq}} \sim 0.17$ (competition)
 - $T > 130$ K: $\phi_{\mathrm{eq}} > 0.96$ (crystallization wins)
 
-On the leading hemisphere (dose rate ~$5\times$ lower), the transition shifts to lower temperatures. This is consistent with JWST observations showing crystalline ice at warm, leading-hemisphere locations (Cartwright et al. 2025).
+On the leading hemisphere (dose rate ~$`5\times`$ lower), the transition shifts to lower temperatures.
 
 The amorphization timescale at the trailing equator is $\tau_{\mathrm{amorph}} = 1/k_{\mathrm{amorph}} = 15.1$ days, matching the Cartwright et al. (2025) constraint.
 
@@ -820,21 +882,21 @@ exosphere_output/
 | `temperature_min_K` | K | Diurnal minimum temperature | Multiscale mode |
 | `temperature_max_K` | K | Diurnal maximum temperature | Multiscale mode |
 | `vapor_pressure_Pa` | Pa | Equilibrium vapor pressure | Always |
-| `emission_flux_kg_m2_s` | kg/m$^2$/s | Sublimation mass flux | Always |
-| `deposition_flux_kg_m2_s` | kg/m$^2$/s | Deposition mass flux | Always |
-| `net_flux_kg_m2_s` | kg/m$^2$/s | Net mass flux (emission $-$ deposition) | Always |
-| `accumulated_mass_kg_m2` | kg/m$^2$ | Cumulative net mass change | Always |
+| `emission_flux_kg_m2_s` | kg/m$`^2`$/s | Sublimation mass flux | Always |
+| `deposition_flux_kg_m2_s` | kg/m$`^2`$/s | Deposition mass flux | Always |
+| `net_flux_kg_m2_s` | kg/m$`^2`$/s | Net mass flux (emission $-$ deposition) | Always |
+| `accumulated_mass_kg_m2` | kg/m$`^2`$ | Cumulative net mass change | Always |
 | `ice_thickness_m` | m | Equivalent ice thickness change | Always |
-| `escape_flux_kg_m2_s` | kg/m$^2$/s | Jeans escape flux | Always |
-| `sputtering_flux_kg_m2_s` | kg/m$^2$/s | H$_2$O sputtering flux | `--sputtering` |
+| `escape_flux_kg_m2_s` | kg/m$`^2`$/s | Jeans escape flux | Always |
+| `sputtering_flux_kg_m2_s` | kg/m$`^2`$/s | H$`_2`$O sputtering flux | `--sputtering` |
 | `sputtering_yield` | dimensionless | Temperature-dependent yield $\hat{Y}(T)$ | `--sputtering` |
-| `sputtering_mass_loss_kg_m2_s` | kg/m$^2$/s | Total sputtering mass loss | `--sputtering` |
+| `sputtering_mass_loss_kg_m2_s` | kg/m$`^2`$/s | Total sputtering mass loss | `--sputtering` |
 | `sputtering_spatial_weight` | dimensionless | Ion flux spatial distribution $f_{\mathrm{lon}} f_{\mathrm{lat}}$ | `--sputtering` (step 0) |
 | `nonice_concentration` | dimensionless | Non-ice volume fraction $c$ | `--ice-layer` |
-| `ice_mass_kg_m2` | kg/m$^2$ | Ice mass per unit area $m_{\mathrm{ice}}$ | `--ice-layer` |
-| `cumulative_sublimated_kg_m2` | kg/m$^2$ | Total ice sublimated | `--ice-layer` |
-| `cumulative_sputtered_kg_m2` | kg/m$^2$ | Total ice sputtered | `--ice-layer` |
-| `cumulative_deposited_kg_m2` | kg/m$^2$ | Total ice deposited | `--ice-layer` |
+| `ice_mass_kg_m2` | kg/m$`^2`$ | Ice mass per unit area $m_{\mathrm{ice}}$ | `--ice-layer` |
+| `cumulative_sublimated_kg_m2` | kg/m$`^2`$ | Total ice sublimated | `--ice-layer` |
+| `cumulative_sputtered_kg_m2` | kg/m$`^2`$ | Total ice sputtered | `--ice-layer` |
+| `cumulative_deposited_kg_m2` | kg/m$`^2`$ | Total ice deposited | `--ice-layer` |
 | `crystalline_fraction` | dimensionless | Crystalline ice fraction $\phi_C$ | `--crystallization` |
 | `porosity` | dimensionless | Ice porosity $\varphi$ | `--crystallization` |
 | `radiation_dose_rate_eV_mol_s` | eV/(molecule s) | Radiation dose rate $\dot{D}$ | `--crystallization` |
@@ -850,10 +912,10 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `timestep` | index | Timestep number |
 | `time_s` | seconds | Elapsed time |
 | `time_years` | years | Elapsed time |
-| `h2o_column_mass_kg_m2` | kg/m$^2$ | Global mean H$_2$O column mass |
+| `h2o_column_mass_kg_m2` | kg/m$`^2`$ | Global mean H$`_2`$O column mass |
 | `h2o_vapor_pressure_Pa` | Pa | Global mean vapor pressure |
-| `o2_vapor_pressure_Pa` | Pa | O$_2$ partial pressure (if tracked) |
-| `h2_vapor_pressure_Pa` | Pa | H$_2$ partial pressure (if tracked) |
+| `o2_vapor_pressure_Pa` | Pa | O$`_2`$ partial pressure (if tracked) |
+| `h2_vapor_pressure_Pa` | Pa | H$`_2`$ partial pressure (if tracked) |
 
 ---
 
@@ -909,7 +971,7 @@ The file `atmosphere/atmospheric_mass.csv` contains one row per exported timeste
 | `--thermal-albedo` $A$ | (required) | Uniform Bond albedo the thermal run used; the temperature reference (`--initial-albedo` is an alias) |
 | `--thermal-albedo-map` $F$ | (required) | Per-face Bond albedo `.bin` (uint64 count + double[count]) the thermal run used |
 | `--albedo-update-threshold` $T$ | 0.01 | Refresh when any face has moved by more than $T$ since the last refresh |
-| `--albedo-ice`, `--albedo-nonice` $A$ | 0.65, 0.10 | Linear-law endmembers (not `hapke-intimate`) |
+| `--albedo-ice`, `--albedo-nonice` $`A`$ | 0.65, 0.10 | Linear-law endmembers (not `hapke-intimate`) |
 
 Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to run unless the thermal-run albedo is declared; `hapke-intimate` takes its `--ice-fraction-albedo-map` unless one of the two flags overrides it. Declaring a uniform value when the thermal run's `config_used.yaml` says `use_albedo_map: true`, or a map when it says `false`, prints a WARNING. The flags are refused without albedo coupling. For the Europa uniform-ice thermal configs, pass `--thermal-albedo 0.5`.
 
@@ -920,15 +982,15 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--multiscale` | off | Enable multi-timescale geological evolution |
 | `--epochs` $N_e$ | 1000 | Number of geological epochs |
 | `--cycles-per-epoch` $N_c$ | 100 | Diurnal cycles per epoch (~100 = 1 Earth year) |
-| `--export-interval` $N$ | 100 | Export every $N$ epochs, plus the final state (0 = the final state only; earlier builds wrote nothing for 0). Snapshot $L$ is the state after exactly $L$ epochs ($t = L\,\Delta t_{\mathrm{epoch}}$); the last is labeled `--epochs`. `time_steps.txt` lists one time per snapshot; earlier builds wrote state fields after the epoch's super-step, up to one interval past the label, and omitted the final snapshot from `time_steps.txt`) |
+| `--export-interval` $N$ | 100 | Export every $N$ epochs, plus the final state (0 = the final state only; earlier builds wrote nothing for 0). Snapshot $L$ is the state after exactly $L$ epochs ($`t = L\,\Delta t_{\mathrm{epoch}}`$); the last is labeled `--epochs`. `time_steps.txt` lists one time per snapshot; earlier builds wrote state fields after the epoch's super-step, up to one interval past the label, and omitted the final snapshot from `time_steps.txt`) |
 | `--max-superstep-epochs` $N$ | none | Cap one super-step at $N$ epochs (step-size refinement checks; the physical bound is the emission-weighted availability change) |
 | `--albedo-response` $L$ | `diurnal` | Temperature law at an albedo refresh: `diurnal` = the per-face diurnal-shape response of the thermal column (see *Diurnal-shape albedo response*); `rescale` = the legacy uniform ¼-power law (reproduces earlier products) |
-| `--albedo-response-trust` $X$ | 0.35 | Trust radius of the diurnal law in $|\ln(r/r_a)|$: beyond it a face is re-anchored by an exact periodic solve at its current $r$. 0 = never (the 65cd8c5 law, which runs +0.5 K / +15% HK warm at $r \approx 3$) |
+| `--albedo-response-trust` $X$ | 0.35 | Trust radius of the diurnal law in $\lvert \ln(r/r_a)\rvert$: beyond it a face is re-anchored by an exact periodic solve at its current $r$. 0 = never (the 65cd8c5 law, which runs +0.5 K / +15% HK warm at $r \approx 3$) |
 | `--garden-subcycle-kappa` $K$ | 0.1 | Garden mode: a frost-free face whose box entrains more than $K$ of its ice within a step is integrated in substeps of at most $K$ × its turnover time. 0 = the single call, whose equilibrium on exhausted-box faces depends on the super-step length |
 | `--albedo-refresh-global` | off | Recompute the full diurnal cycle and transport, and rescale every face, at each albedo refresh (earlier). By default the refresh is face-local in the transport: every face whose albedo moved is rescaled as before, the diurnal cycle is recomputed (cheap), and the transport is updated source by source from cached raw sums, only for the sources whose emission or temperature moved beyond the tolerance (see below). Implied by `--sputter-legacy-escape-only` |
 | `--albedo-refresh-fraction` $F$ | 0 | Face-local refresh: rescale only faces whose albedo deviation exceeds $F$ × `--albedo-update-threshold`. The default 0 rescales every face that moved, as the global refresh does; $F > 0$ is faster but re-bases faces at different times, face-scale jitter that the albedo feedback amplifies |
 | `--albedo-refresh-tolerance` $\epsilon$ | $10^{-2}$ | Face-local refresh: sources left un-updated may differ from the current source field by at most $\epsilon$ of the total emission (emission change plus emission × relative temperature change) and $\epsilon$ of the total area in relative temperature change (0 = update every source that changed; with $F = 0$ this reproduces the global refresh) |
-| `--no-sputter-operator-cache` | off | Recompute the sputtered-H$_2$O transport kernel (per-pair $K_0$, taper and spatial-index query) at every refresh, as builds up to 683f1cc did (byte-identical to them). By default the fixed-launch-temperature operator is built once per run and reused; see below) |
+| `--no-sputter-operator-cache` | off | Recompute the sputtered-H$`_2`$O transport kernel (per-pair $K_0$, taper and spatial-index query) at every refresh, as builds up to 683f1cc did (byte-identical to them). By default the fixed-launch-temperature operator is built once per run and reused; see below) |
 | `--no-albedo-step-limit` | off | Legacy step: super-steps are not ended when a face's albedo would pass `--albedo-update-threshold`, so the temperature refresh can lag by a whole step and the answer depends on the step size. Implied by `--sputter-legacy-escape-only`. By default, with `--albedo-coupling`, each super-step ends at the first epoch count whose predicted albedo deviation (from the albedo the temperatures correspond to) exceeds the threshold (bisection on the closed-form step), so every refresh fires within one epoch of being due |
 | `--no-lag-barrier` | off | Legacy well-mixed layer (lost ice becomes non-ice volume; no diffusion barrier), for comparison. Implied, with a WARNING, by `--superstep-legacy-deposition` and `--sputter-legacy-escape-only` |
 | `--lag-barrier-length` $\ell$ | Knudsen value (4.23e-6 m) | Barrier length [m] directly |
@@ -937,30 +999,30 @@ Albedo coupling (`--albedo-coupling`, `percentile`, `hapke-intimate`) refuses to
 | `--lag-tortuosity` $\tau$ | 2 | Lag tortuosity |
 | `--lag-optical-depth` $\delta_{\mathrm{opt}}$ | 1e-5 | Albedo e-folding lag thickness [m] |
 | `--no-gardening` | off | No micrometeoroid gardening ($v_m$ = 0) and the fixed 5 cm box |
-| `--no-sputter-shield` | off | H$_2$O sputter ejection not barriered by the lag. With `--no-gardening` this is the model exactly |
-| `--gardening-rate` $v_m$ | 0.3 | Lag and veneer gardening rate [µm/yr] (arm 1.2) |
+| `--no-sputter-shield` | off | H$`_2`$O sputter ejection not barriered by the lag. With `--no-gardening` this is the model exactly |
+| `--gardening-rate` $v_m$ | 0.3 | Lag and veneer gardening rate [µm/yr] (1.2 also tested) |
 | `--gardening-case` A\|B | B | Costello et al. 2021 secondary-crater rate for the box depth $h_g(t)$ |
 | `--gardening-box-depth` $h_{\mathrm{mm}}$ | 0.01 | Box depth at $t = 0$ [m] |
-| `--gardening-k99` $K_{99}$ | from the case | Box-deepening coefficient [m$^2$/yr] directly; overrides the case, $h$ and $c$ |
+| `--gardening-k99` $K_{99}$ | from the case | Box-deepening coefficient [m$`^2`$/yr] directly; overrides the case, $h$ and $c$ |
 | `--gardening-excavation-h` $h$ | 0.04 | Costello excavation depth / crater diameter (UNVERIFIED; not in Costello et al. 2021) |
-| `--gardening-overlap-c` $c$ | 1 | Costello overlap parameter (UNVERIFIED) |
+| `--gardening-overlap-c` $`c`$ | 1 | Costello overlap parameter (UNVERIFIED) |
 
-Every gardening value ($v_m$ with its citation, $h_{\mathrm{mm}}$, $K_{99}$ and its provenance, case, $h$, $c$) is echoed in the run log banner and in `evolution_summary.txt`, so a sweep over $v_m$ (or the box law) needs no code change.
+Every gardening value ($`v_m`$ with its citation, $`h_{\mathrm{mm}}`$, $`K_{99}`$ and its provenance, case, $h$, $`c`$) is echoed in the run log banner and in `evolution_summary.txt`, so a sweep over $v_m$ (or the box law) needs no code change.
 | `--lag-source-refresh-tol` $X$ | 0.02 | Refresh the transport when the emission pattern has moved by $X$ (total variation) since it was cached |
 | `--superstep-legacy-deposition` | off | Legacy step: deposition held at its start-of-step value while the sources follow the ice availability, and the trapezoid mean availability in the linear mode. Not mass-conserving; reproduces earlier products only. Implied by `--sputter-legacy-escape-only` |
 | `--no-analytical` | (refused) | Not implemented; the CLI exits with an error |
 | `--cache-refresh` $N$ | (refused) | Not implemented; the CLI exits with an error |
 
-**Deposition over a step.** Within a step, each face's emission follows its own ice availability, while deposition is the transport kernel's cached pattern times a global scale per source group (sublimation; sputtered H$_2$O). The scale is held at the value whose deposition equals what the kernel retains from the emission the step actually produced:
-$s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))$, solved by Newton on 1-2 scalars, with $\langle f_i \rangle$ the exact step-mean availability for that constant deposition. Each step then satisfies deposited $= \rho_k \times$ emitted per group ($\rho_{\mathrm{sub}} = 1 -$ Jeans/unscattered fraction; $\rho_{\mathrm{sput}}$ = the non-escaping H$_2$O share), and the run throws if a step departs from it by more than $10^{-6}$ relative. `evolution_summary.txt` reports the cumulative residual, the non-redeposited mass, deposition that overflows a pure-ice layer, and the ice inventory against the booked fluxes. Earlier builds held deposition at its start-of-step value, so a step in which availability fell deposited more than it emitted, by an amount that depended on the step size.
+**Deposition over a step.** Within a step, each face's emission follows its own ice availability, while deposition is the transport kernel's cached pattern times a global scale per source group (sublimation; sputtered H$`_2`$O). The scale is held at the value whose deposition equals what the kernel retains from the emission the step actually produced:
+$`s_k S_{k,\mathrm{base}} = \sum_i a_i E_{k,i} \langle f_i \rangle (B(s))`$, solved by Newton on 1-2 scalars, with $\langle f_i \rangle$ the exact step-mean availability for that constant deposition. Each step then satisfies deposited $= \rho_k \times$ emitted per group ($\rho_{\mathrm{sub}} = 1 -$ Jeans/unscattered fraction; $\rho_{\mathrm{sput}}$ = the non-escaping H$`_2`$O share), and the run throws if a step departs from it by more than $10^{-6}$ relative. `evolution_summary.txt` reports the cumulative residual, the non-redeposited mass, deposition that overflows a pure-ice layer, and the ice inventory against the booked fluxes. Earlier builds held deposition at its start-of-step value, so a step in which availability fell deposited more than it emitted, by an amount that depended on the step size.
 
 **Face-local albedo refresh.** The matrix-free transport is a sum of per-source terms, $R_j = \sum_i e_i K_{ij}(T_i)$ and the calibration $C_j = \sum_i a_i K_{ij}(T_i)$, followed by a row-bias correction $B_j = a_j / C_j$ and a global mass fix; both corrections depend only on $R$ and $C$. The first diurnal computation stores $R$, $C$ and the source field $(e_i, T_i)$ they represent. A later refresh updates only the sources that moved, $R \mathrel{+}= K(T^{\mathrm{new}}) e^{\mathrm{new}} - K(T^{\mathrm{old}}) e^{\mathrm{old}}$ (and $C$ likewise), then applies the same corrections, so with tolerance 0 the result equals a full call to rounding. The deposition scales of the step solve are taken relative to the totals of the represented source field, so the step audit is exact. The 683 K sputter kernel does not depend on the thermal state; only its source changes. With `--albedo-refresh-fraction` $F > 0$ temperatures are also refreshed per face (a face is rescaled only when its own albedo has moved by more than $F$ × threshold); every refresh still fires within one epoch of a face passing the threshold (the step limiter).
 
-**Sputter transport operator.** The non-escaping sputtered H$_2$O is launched from every face at the same temperature (677 K for $U = 0.054$ eV) on fixed geometry. So everything the transport derives from its kernel is fixed for the run: each source's normalization $n_i = (1 - \epsilon)/(s_i + \sum_j w_{ij})$, its self-cap weight $s_i$, and the calibration sums $C_j$ behind the row-bias correction. Only the source vector changes between refreshes. By default the run builds these once (two sweeps over all face pairs). It then replaces the per-pair evaluation of $K_0$, the taper and the spatial-index query by a lookup in a table of the same kernel on a uniform grid of $2^{18}$ angles. The neighbor set, the float cosines and the FastAcos angle are the same as in the per-call kernel. The only approximation is linear interpolation in the table, whose maximum relative error is measured at build and reported ($4.0 \times 10^{-7}$ on ico6). Each source still scatters exactly $(1 - \epsilon)$ of its emission, because $n_i$ is computed from the same tabulated weights, and the row-bias correction and global mass fix are applied to the raw sums as before. A face-local refresh becomes one application, $R \mathrel{+}= K (e^{\mathrm{new}} - e^{\mathrm{old}})$ over the updated sources, with $C$ constant. Products are summed per target face in a fixed order, so the sputter transport no longer depends on the thread count. No $N^2$ matrix is stored (ico6: 5.9 MB; the dense matrix would be 53 GB).
+**Sputter transport operator.** The non-escaping sputtered H$`_2`$O is launched from every face at the same temperature (677 K for $`U = 0.054`$ eV) on fixed geometry. So everything the transport derives from its kernel is fixed for the run: each source's normalization $`n_i = (1 - \epsilon)/(s_i + \sum_j w_{ij})`$, its self-cap weight $s_i$, and the calibration sums $C_j$ behind the row-bias correction. Only the source vector changes between refreshes. By default the run builds these once (two sweeps over all face pairs). It then replaces the per-pair evaluation of $K_0$, the taper and the spatial-index query by a lookup in a table of the same kernel on a uniform grid of $2^{18}$ angles. The neighbor set, the float cosines and the FastAcos angle are the same as in the per-call kernel. The only approximation is linear interpolation in the table, whose maximum relative error is measured at build and reported ($4.0 \times 10^{-7}$ on ico6). Each source still scatters exactly $(1 - \epsilon)$ of its emission, because $n_i$ is computed from the same tabulated weights, and the row-bias correction and global mass fix are applied to the raw sums as before. A face-local refresh becomes one application, $R \mathrel{+}= K (e^{\mathrm{new}} - e^{\mathrm{old}})$ over the updated sources, with $C$ constant. Products are summed per target face in a fixed order, so the sputter transport no longer depends on the thread count. No $N^2$ matrix is stored (ico6: 5.9 MB; the dense matrix would be 53 GB).
 
 Measured on ico6 (81,920 faces) at 4 threads, the build takes 31 s and one full application 13.8 s (the per-call kernel: 53 s). On the albedo-map Cassidy BASE phase-0 run to 100 kyr ($\ell = 5$ µm, $v_m = 0.3$ µm/yr), the sputter transport fell from about 275 s to 79 s, and the wall time from 3072 s to 2768 s (1.11×). The rest of the wall is the lag and gardening step and the sublimation transport. Against the per-call kernel:
 
-- global totals (sublimation, deposition, net loss, sputtering, O$_2$) agree to $\le 3.1 \times 10^{-10}$ relative;
+- global totals (sublimation, deposition, net loss, sputtering, O$`_2`$) agree to $\le 3.1 \times 10^{-10}$ relative;
 - every output field agrees to within one float32 ulp;
 - the face-class budget agrees exactly in counts.
 
@@ -1029,11 +1091,11 @@ The sublimation transport is not cached: its kernel depends on each source's emi
 | `test_pentagon_bias.cpp` | Icosahedral mesh bias detection in transport |
 | `test_cutoff_benchmark.cpp` | Performance benchmarks for $K_0$ cutoff distance |
 | `test_equilibrium_bias.cpp` | Equilibrium state bias analysis |
-| `test_bessel_k0_and_areas.cpp` | EXO-01/EXO-02 regression: $K_0$ values, m$^2$ areas, smoothing gate |
+| `test_bessel_k0_and_areas.cpp` | EXO-01/EXO-02 regression: $K_0$ values, m$`^2`$ areas, smoothing gate |
 | `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember; with `<mesh.ply> <map.bin>`, fill faces follow the thermal albedo |
 | `test_multiscale_snapshot_time.cpp` | snapshot $L$ is the state after $L$ epochs (== a run stopped at $L$), same-state fields, complete `time_steps.txt` |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
-| `test_lag_gardening.cpp` | box depth vs `scripts/jwst/gardening.py`, Spencer criterion ($d = 0$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the step, global mass closure with entrainment, $t = 0$ invariance |
+| `test_lag_gardening.cpp` | box depth vs reference values from a Python implementation of Costello et al. (2021) Eq. 1, Spencer criterion ($`d = 0`$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the step, global mass closure with entrainment, $t = 0$ invariance |
 | `test_lag_barrier.cpp` | Lag barrier: $d + d^2/2\ell = \beta J_0 f t$ (one step, many steps, engine), closed form vs RK4 with sputtering and deposition, veneer first then the barrier, recycling, global mass conservation, $t = 0$ bit-identity, $\ell$ and lag albedo |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 

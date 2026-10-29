@@ -1,12 +1,12 @@
 # Changelog
 
-## Unreleased (release/r1-engine): the Moon3D revision engine
+## Unreleased: the engine for the Moon3D paper (Hayne et al., in revision)
 
 Results change for radiation-coupled runs; see "Behavior changes".
 
 ### Behavior changes
 
-- **Spin-up seed for coupled runs.** `thermal.seed_indirect` defaults to `series`: in a
+- Spin-up seed for coupled runs. `thermal.seed_indirect` defaults to `series`: in a
   radiation-coupled run the spin-up starts each column from its absorbed flux plus the
   time-varying indirect flux of the first radiation solution, folded over whole diurnal cycles.
   Every face of a coupled run starts closer to its converged state (measured on the shipped
@@ -15,19 +15,19 @@ Results change for radiation-coupled runs; see "Behavior changes".
   CPU scalar solver, zero indirect flux, an output window shorter than one diurnal cycle) the run says so and uses
   the previous seed. `provenance.txt` records `seed_indirect`, where it came from, and whether it
   acted. Previous behavior: `thermal.seed_indirect: off` or `--seed-indirect off`.
-- **CPU coupling passes re-seed with the same series seed** (`PTM_CPU_RETHERMAL=seed-series` is
+- CPU coupling passes re-seed with the same series seed (`PTM_CPU_RETHERMAL=seed-series` is
   now the default). On the same crater, never-lit mean temperature moves from 1.75 K to 0.38 K
   from the 40-cycle reference. Previous behavior: `PTM_CPU_RETHERMAL=reseed`.
-- **Chunked CPU coupled runs** write the coupled end-of-window column to the checkpoint, so a
+- Chunked CPU coupled runs write the coupled end-of-window column to the checkpoint, so a
   chunked series matches the single-shot series at the seams.
-- **View-factor orientation check.** A precomputed matrix loaded with `PTM_HMATRIX_VF_REPLACE`
+- View-factor orientation check. A precomputed matrix loaded with `PTM_HMATRIX_VF_REPLACE`
   is refused (exit 3) when it was built for the other side of the surface than the run
   illuminates (`PTM_VF_ORIENT_OVERRIDE=1` proceeds with a warning). The offline referee
   `mc_ref_pp` orients faces by the same rule and refuses a mesh it would have to reverse on more
   than 1% of faces.
-- **Unknown configuration keys and command-line arguments** are reported as warnings instead
+- Unknown configuration keys and command-line arguments are reported as warnings instead
   of being ignored silently; `--validate-config` summarizes them ("ACCEPTED WITH WARNINGS").
-- **`time_steps.txt`** labels column 1 correctly: ephemeris seconds past J2000 (the values
+- `time_steps.txt` labels column 1 correctly: ephemeris seconds past J2000 (the values
   never changed).
 - Engine messages no longer carry internal tracking numbers.
 
@@ -46,7 +46,7 @@ Results change for radiation-coupled runs; see "Behavior changes".
 ### Examples and documentation
 
 - Quickstart spin-up raised to 80 cycles; tutorial 2 uses the fine-mesh illumination settings;
-  the Moon3D year-long example carries the revision's settings, including Q_b = 0.022 W/m².
+  the Moon3D year-long example carries the paper's settings, including Q_b = 0.022 W/m².
 - Documentation rewritten for this release; `KNOWN_LIMITATIONS.md` lists only open limitations.
 
 ## Fixed in earlier development (after v1.0.3)

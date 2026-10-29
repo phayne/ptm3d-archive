@@ -2,12 +2,12 @@
 
 PTM3D is used primarily through `ptm_thermal_sim` and a YAML configuration; this
 page is an orientation to the C++ types a caller linking against the libraries
-will meet. Declarations are abridged — the headers named beside each type are
+will meet. Declarations are abridged; the headers named beside each type are
 authoritative.
 
 ## Configuration
 
-### `ptm::SimulationConfig` — `tools/config_parser.h`
+### `ptm::SimulationConfig` (`tools/config_parser.h`)
 
 The parsed configuration. Its nested structs mirror the YAML sections
 one-for-one (`time`, `mesh`, `thermal`, `illumination`, `radiation`, `output`,
@@ -37,7 +37,7 @@ public:
 A YAML file that fails to parse is fatal: the loader reports `FATAL:` and the
 program exits 1 rather than falling back to built-in defaults.
 
-### `radiation::RadiationConfig` — `radiation/radiation_config.h`
+### `radiation::RadiationConfig` (`radiation/radiation_config.h`)
 
 The radiation module's own configuration, populated from
 `SimulationConfig::radiation`. Field-by-field documentation, including which
@@ -73,7 +73,7 @@ coupling loop in `ptm_thermal_sim.cpp`, not by `radiation::RadiationConfig`.
 
 ## Mesh
 
-### `ptm::Mesh`, `ptm::MeshUtils` — `mesh/mesh_utils.h`
+### `ptm::Mesh`, `ptm::MeshUtils` (`mesh/mesh_utils.h`)
 
 ```cpp
 namespace ptm {
@@ -111,7 +111,7 @@ startup and refuses to run when the inference is ambiguous. See
 
 ## Thermal solver
 
-### `thermal::Planet`, `thermal::Profile`, `thermal::Model` — `thermal/thermal_model.h`
+### `thermal::Planet`, `thermal::Profile`, `thermal::Model` (`thermal/thermal_model.h`)
 
 `Planet` holds the body's thermophysical and orbital properties; `Profile` owns
 one face's depth grid and temperature column; `Model` drives a single column
@@ -146,7 +146,7 @@ public:
 }
 ```
 
-### `thermal::PlanetaryData` — `thermal/planetary_properties.h`
+### `thermal::PlanetaryData` (`thermal/planetary_properties.h`)
 
 Built-in property sets, by enum or by name:
 
@@ -168,7 +168,7 @@ to supply the real values.
 
 ## Illumination
 
-### `IlluminationModel` — `illumination/illumination_model.h`
+### `IlluminationModel` (`illumination/illumination_model.h`)
 
 Computes direct solar flux, primary-body reflected flux and primary-body thermal
 IR per face and timestep, with Embree shadow ray tracing, finite solar-disk
@@ -181,7 +181,7 @@ std::array<double, 3>              getSunPosition(double et);
 
 ## Radiation exchange
 
-### `radiation::RadiationExchangeManager`, `radiation::RadiositySolver` — `radiation/radiation_exchange.h`
+### `radiation::RadiationExchangeManager`, `radiation::RadiositySolver` (`radiation/radiation_exchange.h`)
 
 The manager owns face classification, view-factor construction and the radiosity
 solver; the solver returns the absorbed indirect flux for every face. The
@@ -207,7 +207,7 @@ public:
 `solve()` returns $Q_{\text{indirect}}$ for **all** faces; the exchange-selection
 mask is applied afterwards by the manager.
 
-### `radiation::computeMonteCarlo` — `radiation/mc_view_factor.h`
+### `radiation::computeMonteCarlo` (`radiation/mc_view_factor.h`)
 
 ```cpp
 ViewFactorMatrix computeMonteCarlo(const std::shared_ptr<ptm::Mesh>& mesh,

@@ -1,10 +1,10 @@
 # Contributing to PTM3D
 
-Short version of the three things that are easy to get wrong.
+This page describes three conventions that are easy to get wrong.
 
 ## American English
 
-PTM3D is written in American English — documentation, tutorials, code comments,
+PTM3D is written in American English: documentation, tutorials, code comments,
 docstrings, and anything a user can see, including GUI labels and command-line
 help.
 <!-- american-english: allow-begin (this section has to quote what it forbids) -->
@@ -22,20 +22,20 @@ cell or in printed output is caught while base64 image data is never scanned.
 
 Three kinds of hit are legitimate and stay British:
 
-- **Quoted text you do not own** — a paper title in a citation, third-party
+- Quoted text you do not own: a paper title in a citation, third-party
   license text, vendored code.
 <!-- american-english: allow-begin -->
-- **External format literals** — the OGC WKT unit name is spelled `metre`, and
+- External format literals: the OGC WKT unit name is spelled `metre`, and
   GDAL parses that string.
 <!-- american-english: allow-end -->
-- **Code identifiers** — a function, attribute, config key or saved-data field
+- Code identifiers: a function, attribute, config key or saved-data field
   whose British name cannot change without breaking callers or existing runs.
 
 Record such a case in the `ALLOW` table at the top of
 `scripts/check_american_english.py`, which pairs a path with the substring that
 makes the line legitimate, or put `american-english: allow` at the end of the
-line. A run of lines — prose that has to quote the spellings it forbids, as this
-section does — goes between `american-english: allow-begin` and
+line. A run of lines (prose that has to quote the spellings it forbids, as this
+section does) goes between `american-english: allow-begin` and
 `american-english: allow-end` in a comment. Do not widen a rule to silence one
 hit.
 
@@ -50,28 +50,26 @@ and what each one defaults to (`src/cpp/tools/config_parser.cpp`, with the
 struct defaults in `config_parser.h`). The Python layer keeps a committed copy
 of that table in `src/python/ptm/engine_defaults.py`, and the two must agree.
 
-**If you add a key, remove a key, or change a default, regenerate the table and
-commit the result:**
+If you add a key, remove a key, or change a default, regenerate the table and
+commit the result:
 
 ```bash
 python3 -m ptm.engine_config --regenerate
 git add src/python/ptm/engine_defaults.py
 ```
 
-Changing an existing default is the case worth spelling out, because it does not
+Changing an existing default needs particular care, because it does not
 look like a change to the configuration surface. Nothing in the YAML files
 moves, no key appears or disappears, and the engine goes on accepting every
-configuration it accepted before — it simply runs a different simulation when
+configuration it accepted before; it simply runs a different simulation when
 the key is absent. The committed table would go on reporting the old value to
 anything that asked.
 
-Two properties of the regenerator are worth knowing:
-
-- **It reads the C++ sources, not a build.** No compiler, no CSPICE, no CMake
-  step. It works in a checkout that has never been built.
-- **It reads *your* checkout.** Regenerating on a tree that does not contain the
-  C++ change produces a table that is stale in a way that looks current. Make
-  the C++ edit first, then regenerate.
+The regenerator reads the C++ sources, not a build, so it needs no compiler,
+CSPICE or CMake step and works in a checkout that has never been built. It also
+reads only your own checkout: regenerating on a tree that does not contain the
+C++ change produces a table that is stale in a way that looks current. Make the
+C++ edit first, then regenerate.
 
 `src/python/tests/test_config_parity.py` re-derives the table from the C++
 sources on every run and fails if it no longer matches the committed one, so a
@@ -80,7 +78,7 @@ believes the old value. It also fails when the extractor stops recognizing the
 parser's shape, and when a shipped example configuration grows a key the engine
 does not read.
 
-Run it directly — it needs no pytest:
+It runs directly, without pytest:
 
 ```bash
 python3 src/python/tests/test_config_parity.py

@@ -8,15 +8,15 @@
 One lunar day (29.53 Earth days) of surface and subsurface temperatures over the whole Moon on a
 level-3 icosphere (1,280 faces, about 480 km across each):
 
-1. **Spin-up.** Each face's column is integrated for 80 diurnal cycles of the real forcing,
+1. Spin-up. Each face's column is integrated for 80 diurnal cycles of the real forcing,
    sampled 48 times per cycle, before the output window opens.
-2. **Illumination.** For each of the 240 output steps (about 3 h apart), shadow rays are traced
+2. Illumination. For each of the 240 output steps (about 3 h apart), shadow rays are traced
    from every face toward the Sun's SPICE position; Earth's reflected light and thermal
    emission are added.
-3. **Thermal solve.** A 1D conduction column under each face, with lunar regolith properties
+3. Thermal solve. A 1D conduction column under each face, with lunar regolith properties
    (density and conductivity increasing with depth, temperature-dependent conductivity and heat
    capacity).
-4. **Statistics.** Per-face minimum, mean and maximum over the output window, for temperature and
+4. Statistics. Per-face minimum, mean and maximum over the output window, for temperature and
    for each flux component.
 
 ## Check the build first (optional, seconds)
@@ -90,12 +90,10 @@ temperature_min: min=66.8  median=92.6  max=95.0 K
 temperature_avg: min=107.8  median=208.2  max=215.7 K
 ```
 
-Physical checks:
-
-- **Equatorial noon about 385 K:** radiative balance near 1 AU with a normal-incidence Bond
-  albedo of 0.12.
-- **Night about 93 K:** the lunar nighttime plateau set by the regolith's thermal inertia.
-- **Polar peak about 182 K:** grazing sunlight at the poles.
+These values have simple physical explanations. The equatorial noon maximum of about 385 K is
+the radiative balance near 1 AU with a normal-incidence Bond albedo of 0.12. The nighttime value
+of about 93 K is the lunar nighttime plateau set by the regolith's thermal inertia. The polar
+peak of about 182 K reflects grazing sunlight at the poles.
 
 Results land in `output/quickstart_moon_diurnal/` (about 10 MB). [Tutorial 3](03_outputs.md)
 explains every file.

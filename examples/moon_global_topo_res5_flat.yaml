@@ -1,6 +1,6 @@
 # PTM3D companion control: the res-5 global Moon run WITHOUT topography.
 #
-# This file is the smooth-sphere arm of a two-run comparison. It is a copy of
+# This file is the smooth-sphere run of a two-run comparison. It is a copy of
 # examples/moon_global_topo_res5.yaml with exactly TWO keys changed:
 #
 #     mesh.use_topographic : true  -> false

@@ -2171,7 +2171,7 @@ int main(int argc, char** argv)
             if (garden_param_flag.empty()) garden_param_flag = a;
             const std::string v = argv[++i];
             // K99 = u pi c^2 h^2 / (2 x 4.605) [m^2/yr], Costello et al. 2021 Eq. 1 (v = -4);
-            // u = 7.03e-12 (B) / 2.02e-12 (A) km^-2 yr^-1, h = 0.04, c = 1 (scripts/jwst/gardening.py).
+            // u = 7.03e-12 (B) / 2.02e-12 (A) km^-2 yr^-1, h = 0.04, c = 1 (as in the removed scripts/jwst/gardening.py; see git history).
             if (v == "B" || v == "A") lag_cfg.garden_case = v[0];
             else { std::cerr << "Error: --gardening-case must be A or B" << std::endl; return 1; }
         }

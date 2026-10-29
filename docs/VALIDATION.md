@@ -1,7 +1,7 @@
 # Validation
 
-The validation figures of the Moon3D paper (Hayne et al., JGR Planets, revised version), with
-captions adapted from the paper. Figure numbers match the paper. Numbers are quoted from it,
+This page reproduces the validation figures of the Moon3D paper (Hayne et al., JGR Planets,
+revised version), with captions adapted from the paper. Figure numbers match the paper. Numbers are quoted from it,
 not re-derived here.
 
 The revision's Diviner comparison (Figs. 8 and 9) and its polar results were produced with the
@@ -85,11 +85,11 @@ Modeled versus Diviner bolometric temperature for every valid 240 m cell of Fig.
 four seasonal statistics, with roughness beaming (colored density) and without it (gray
 contours), radiation coupling on in both.
 
-**Headline.** The comparison is stratified by Diviner's annual maximum temperature into cold
+The comparison is stratified by Diviner's annual maximum temperature into cold
 traps (below 110 K; n = 2,970 cells), a shadow-boundary margin (110 to 200 K; n = 2,251) and
 sunlit terrain (200 K and above; n = 7,044), and reported as the median and interquartile range
 (IQR) of model minus Diviner. On the cold-trap floor the median summer-maximum bias is
-**−0.80 K (IQR 11.19 K)** with roughness beaming and −10.30 K (IQR 10.38 K) without it; with
+−0.80 K (IQR 11.19 K) with roughness beaming and −10.30 K (IQR 10.38 K) without it; with
 beaming, the summer-mean, winter-maximum and winter-mean medians are −1.88, −0.85 and +2.81 K.
 Radiation exchange itself accounts for nearly all of the floor warmth: the per-cell median of
 the no-beaming minus radiation-disabled difference on the cold-trap floor is +40.5 K (summer

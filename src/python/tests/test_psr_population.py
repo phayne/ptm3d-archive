@@ -224,15 +224,11 @@ def test_gui_thermal_analysis_classifies_over_the_resolved_population():
     assert n_qualifying / n_resolved == pytest.approx(TRUE_COUNT_FRACTION)
 
 
-# The Europa/JWST cold-trap fraction helpers are the same defect on a
-# different body. None of their real inputs is reachable from this machine, so
-# they get a behavioral arm here instead of a before/after run: the helper is
-# lifted out of the source text and made to answer the fixture.
+# The polar cold-trap fraction helper is the same defect on a different body.
+# Its real inputs are not reachable from this machine, so it gets a behavioral
+# arm here instead of a before/after run: the helper is lifted out of the
+# source text and made to answer the fixture.
 FRACTION_HELPERS = [
-    ("scripts/jwst/cold_trap_volatile_stability.py", "fraction_below"),
-    ("scripts/jwst/plot_cold_trap_fraction_with_albedo.py", "_frac_below"),
-    ("scripts/jwst/plot_cold_trap_fraction_three_models.py", "_frac_below"),
-    ("scripts/jwst/animate_cold_trap_fraction.py", "_frac_below"),
     ("scripts/plot_polar_cold_traps.py", "_frac_below"),
 ]
 
@@ -250,30 +246,6 @@ def test_cold_trap_fraction_helpers_use_the_resolved_population(rel, name):
     assert abs(frac - UNGUARDED_COUNT_FRACTION) > 0.04
     # an all-unresolved population is not zero
     assert np.isnan(ns[name](np.full(8, np.nan), PSR_THRESH))
-
-
-def test_predict_phi_eq_fractions_use_the_resolved_population():
-    """Crystalline / amorphous face fractions are the same defect.
-
-    phi derives from T_max, so a blank temperature propagates into it; and the
-    two thresholds sit on opposite sides, so the unguarded expression is wrong
-    in BOTH directions at once -- +inf reads as crystalline, -inf as amorphous.
-    """
-    ns = _exec_functions(REPO / "scripts" / "jwst" / "predict_phi_eq.py",
-                         ["_population", "_frac", "_stat"])
-    phi = np.concatenate([np.full(40, 0.9), np.full(40, 0.05),
-                          np.full(10, np.nan), np.full(5, np.inf),
-                          np.full(5, -np.inf)])
-    resolved, n_resolved = ns["_population"](phi, "phi_eq(T_max)")
-    assert n_resolved == 80
-    assert ns["_frac"](phi > 0.5, resolved, n_resolved) == pytest.approx(0.5)
-    assert ns["_frac"](phi < 0.1, resolved, n_resolved) == pytest.approx(0.5)
-    # unguarded: +inf joins the crystalline count, -inf the amorphous one, and
-    # all 20 unresolved faces pad the denominator
-    assert float(np.mean(phi > 0.5)) == pytest.approx(0.45)
-    assert float(np.mean(phi < 0.1)) == pytest.approx(0.45)
-    assert np.isfinite(ns["_stat"](np.median, phi, resolved, n_resolved))
-    assert np.isnan(np.median(phi)), "fixture lost its teeth"
 
 
 # ---------------------------------------------------------------------------
@@ -346,18 +318,8 @@ FORBIDDEN = [
     ("scripts/yearlong_analysis/make_yearlong_figures.py", "int((tmax > 400).sum())"),
     ("gui/module_adapters/thermal_analysis.py", "psr_mask = data <= threshold"),
     ("gui/module_adapters/thermal_analysis.py", "ct_mask = data <= threshold"),
-    ("scripts/jwst/cold_trap_volatile_stability.py", "float(np.mean(T_arr < threshold))"),
-    ("scripts/jwst/plot_cold_trap_fraction_with_albedo.py",
-     "float(np.mean(T_arr < threshold))"),
-    ("scripts/jwst/plot_cold_trap_fraction_three_models.py", "float(np.mean(T_topo < Ts))"),
-    ("scripts/jwst/animate_cold_trap_fraction.py", "float(np.mean(T_max < Ts))"),
-    ("scripts/jwst/predict_co2_coldtrap.py", "int(np.sum(T_max < T_stab))"),
     ("scripts/plot_polar_cold_traps.py", "np.sum(data < T_stab) / len(data)"),
     ("scripts/plot_polar_cold_traps.py", "np.sum(T_max < T_stab) / n_faces"),
-    ("scripts/jwst/predict_phi_eq.py", "float(np.mean(phi_eq_tmax > 0.5))"),
-    ("scripts/jwst/predict_phi_eq.py", "float(np.mean(phi_eq_tmax < 0.1))"),
-    ("scripts/jwst/predict_phi_eq.py", "float(np.mean(phi_C > 0.5))"),
-    ("scripts/jwst/predict_phi_eq.py", "float(np.mean(phi_C < 0.1))"),
     # round 2: the order statistics and the figure paint that sit next to
     # these fractions must use the same population, or one bad facet turns a
     # caption number into nan, a JSON maximum into Infinity, or paints a facet

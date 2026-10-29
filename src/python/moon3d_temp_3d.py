@@ -146,7 +146,7 @@ def main() -> int:
                          "gray and exclude them from the color scale (view-factor "
                          "over-count artifacts); 0 = keep all")
     ap.add_argument("--pubclean", action="store_true",
-                    help="Publication-clean variant (Paul's no-on-figure-notes rule): "
+                    help="Publication-clean variant (no on-figure notes): "
                          "suppress the upper suptitle AND the two per-panel headers "
                          "(content identification moves to the caption instead, "
                          "manuscript v4 review round 2, 2026-07-27). Colorbars/axis "

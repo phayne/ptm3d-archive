@@ -11,16 +11,16 @@ see [../INSTALL.md](../INSTALL.md); for a first run see
 
 ## How a run works
 
-1. **Mesh:** a built-in icosphere, a global topographic icosphere, or an imported PLY/OBJ/VTK mesh.
-2. **Illumination:** for every output step (and every spin-up step) Embree traces shadow rays
+1. Mesh: a built-in icosphere, a global topographic icosphere, or an imported PLY/OBJ/VTK mesh.
+2. Illumination: for every output step (and every spin-up step) Embree traces shadow rays
    toward the Sun's SPICE position over a finite solar disk, and adds light and thermal emission
    from a primary body if there is one.
-3. **Spin-up and output window:** a 1D Crank-Nicolson column under every face is spun up for
+3. Spin-up and output window: a 1D Crank-Nicolson column under every face is spun up for
    `thermal.equilibration_orbits` diurnal cycles and then integrated through the output window.
-4. **Radiation exchange (optional):** view factors between faces feed a two-band radiosity
+4. Radiation exchange (optional): view factors between faces feed a two-band radiosity
    solve; its indirect flux is fed back to the thermal model until the largest per-face
    temperature change falls below a threshold.
-5. **Outputs:** per-face statistics, per-step frames, and optional depth maps, location series
+5. Outputs: per-face statistics, per-step frames, and optional depth maps, location series
    and ice-stability depth.
 
 The physics and numerics of each stage: [thermal-model.md](thermal-model.md),
@@ -127,16 +127,16 @@ conductivity carrying the whole change, and `kd` scaled by the same factor so
 the `kd/ks` depth contrast survives. This is the convention already used by
 `scripts/ema_campaign_driver.py`, `scripts/divval_sweep.py` and the shipped pair
 `examples/quickstart_asteroid_diurnal.yaml` /
-`examples/quickstart_asteroid_diurnal_ti200_check.yaml` — and running the first
+`examples/quickstart_asteroid_diurnal_ti200_check.yaml`; running the first
 of those with `--thermal-inertia 200` reproduces the second to 1e-4 K.
 
 `cp` is evaluated at 273 K by the body's own `cp(T)` polynomial, the same
 reference the engine's TI(273 K) property maps use (Hayne et al. 2017). On a
-body with a constant `cp` — every generic body — that is `cp0` exactly. On the
-Moon it is the only workable choice: `cp0` there is the *constant term* of the
+body with a constant `cp` (every generic body), that is `cp0` exactly. On the
+Moon it is the only workable choice: `cp0` there is the constant term of the
 polynomial and is negative (−3.6125 J/kg/K).
 
-The flag does **not** make thermal inertia constant. `cp(T)` and `chi` are left
+The flag does not make thermal inertia constant. `cp(T)` and `chi` are left
 alone, so on a body that has them the delivered TI moves with temperature about
 the requested value and the run says so. `--constant-thermal-inertia` is the
 other reading: it derives `cp = TI^2/(ks*rhos)` and forces `chi = 0`, `kd = ks`,
@@ -144,7 +144,7 @@ other reading: it derives `cp = TI^2/(ks*rhos)` and forces `chi = 0`, `kd = ks`,
 of the two-layer profile. The two are mutually exclusive and the run refuses if
 both are given.
 
-`--albedo` is out-ranked by a per-face albedo map for the absorbed-solar flux;
+`--albedo` is overridden by a per-face albedo map for the absorbed-solar flux;
 the run warns when one is configured. Set `illumination.use_albedo_map: false`
 to sweep albedo directly. With `incidence_angle_albedo: true` the Hapke angular
 model is re-anchored on the new A0 (the single-scattering albedo `w` is
@@ -226,13 +226,13 @@ output/
 └── illumination_series.csv     # Location time series (if --locations)
 ```
 
-**Binary format**: each statistics file is a 4-byte little-endian int32 face
+Binary format: each statistics file is a 4-byte little-endian int32 face
 count followed by one single-precision float per mesh face (see the tutorial
 `tutorials/03_outputs.md` for a reader snippet).
 
-**Time index**: per-step frames are labeled by output index, and index `NNNN`
+Time index: per-step frames are labeled by output index, and index `NNNN`
 means the same thing in every one of them. `temperature/temperature_NNNN.bin`
-holds the surface state **at** the epoch on line `NNNN` of `time_steps.txt`,
+holds the surface state at the epoch on line `NNNN` of `time_steps.txt`,
 which is the same epoch at which `direct_solar/direct_solar_NNNN.bin` and
 `illumination/illumination_NNNN.bin` are sampled. So index 0 is the state the
 run started from (the spin-up seed, or the checkpoint of a warm-started chunk),
@@ -243,7 +243,7 @@ equals the single-shot series at every frame
 (`scripts/test_chunk_seam_equivalence.py`). The GPU solver
 still reports the checkpoint's raw surface node there and says so in its log.
 
-**Index width**: the index is zero-padded to at least **six** digits, and to
+Index width: the index is zero-padded to at least six digits, and to
 more when a run has more frames than six digits hold, so every frame of one
 run has the same width and an alphabetical listing is in time order. Runs
 written before 2026-09-24 used four digits, which roll over to five at frame
@@ -257,9 +257,9 @@ duplicate. To confirm this on a build, run
 series, a GPU warm-start checkpoint or a `PTM_DUMP_SEED` file, because a
 uniform shift of the whole series is invisible from inside it).
 
-**VTK/PVD export**: Use `python src/python/vtk_converter.py` to create ParaView-compatible time series.
+VTK/PVD export: use `python src/python/vtk_converter.py` to create ParaView-compatible time series.
 
-**Additional exports**: NetCDF (`netcdf_converter.py`), HDF5 (`ptm_hdf5.py`), GeoTIFF (`ptm_geotiff.py`).
+Additional exports: NetCDF (`netcdf_converter.py`), HDF5 (`ptm_hdf5.py`), GeoTIFF (`ptm_geotiff.py`).
 
 ---
 
@@ -271,16 +271,16 @@ bundles additional modules:
 | Entry point | Script | Purpose |
 |-----|--------|---------|
 | **PTM3D Main** (supported) | `gui/run_gui.py` | Thermal simulation configuration, 3D visualization, results browsing |
-| **Dashboard** (optional) | `gui/run_dashboard.py` | Multi-module shell; adds the **DEM module** (GeoTIFF DTM → PLY mesh, ROI extraction) alongside the thermal app. Convenience wrapper, less tested than `run_gui.py`. |
+| **Dashboard** (optional) | `gui/run_dashboard.py` | Multi-module shell; adds the DEM module (GeoTIFF DTM to PLY mesh, ROI extraction) alongside the thermal app. Convenience wrapper, less tested than `run_gui.py`. |
 
 The standalone `exosphere_gui.py` and `viewshed_gui.py` scripts listed in
-earlier revisions of this guide **no longer exist**. Run the exosphere model
+earlier revisions of this guide no longer exist. Run the exosphere model
 through `build/bin/ptm_exosphere_main`; the viewshed capability is the
 `src/cpp/viewshed/` module, whose command-line front end is
 `build/bin/dark_horse_viewshed`.
 
 The DEM module needs one compiled binary (`dtm_to_ply_delaunay`) that
-requires GDAL to build — see
+requires GDAL to build; see
 [dem-to-mesh-workflow.md](dem-to-mesh-workflow.md) for the full walkthrough and
 [../INSTALL.md](../INSTALL.md) ("DEM / DTM tools") for the prerequisites.
 
@@ -294,11 +294,11 @@ python run_gui.py
 
 ### Features
 
-- **Tabbed configuration**: Simulation, mesh, thermal, radiation, illumination, and output settings
-- **3D visualization**: Interactive PyVista-based mesh rendering with temperature colormap
-- **2D analysis**: Histograms, latitude plots, and time series
-- **Live preview**: Real-time YAML configuration preview
-- **Console output**: Color-coded simulation progress and logging
+- Tabbed configuration: simulation, mesh, thermal, radiation, illumination, and output settings
+- 3D visualization: interactive PyVista-based mesh rendering with temperature colormap
+- 2D analysis: histograms, latitude plots, and time series
+- Live preview: real-time YAML configuration preview
+- Console output: color-coded simulation progress and logging
 
 See [../gui/README.md](../gui/README.md) for detailed GUI documentation.
 
@@ -309,7 +309,7 @@ See [../gui/README.md](../gui/README.md) for detailed GUI documentation.
 ### The `ptm` package and the `ptm` command
 
 `pip install -e .` from the repository root installs one importable package and
-one console script. Everything below is plumbing and presentation — the C++
+one console script. Everything below is infrastructure and presentation; the C++
 engine is still the model.
 
 ```bash
@@ -338,30 +338,30 @@ sweep.plot_curves(save="family.png")
 
 | Behavior | Detail |
 |---|---|
-| Execution | Serial by default. `jobs=N` runs `N` engine processes at once and **refuses to start** if any point asks for the GPU — there is one GPU, and concurrent use of it wedges the device. |
-| Resume | Each point writes `sweep_point.json` before it starts and rewrites it when it finishes. A re-run skips a point only if that file says `complete`, the config still hashes the same, **and** the outputs are on disk; every skip and every re-run prints its reason. |
+| Execution | Serial by default. `jobs=N` runs `N` engine processes at once and refuses to start if any point asks for the GPU, because there is one GPU, and concurrent use of it wedges the device. |
+| Resume | Each point writes `sweep_point.json` before it starts and rewrites it when it finishes. A re-run skips a point only if that file says `complete`, the config still hashes the same, and the outputs are on disk; every skip and every re-run prints its reason. |
 | Provenance | The swept values, the generated overrides, the argv, the engine path and md5, and the config hash are recorded next to the outputs. `ptm.sweep.load_sweep(dir)` reopens a finished sweep without retyping the grid. |
 | Generated configs | Written to each point's own output directory, never into `examples/` or `configs/`. `radiation.view_factor_file` is made absolute, because it is the one key the engine resolves against the YAML's own directory (`config_parser.cpp`). |
-| Axis names | `albedo` and `constant_thermal_inertia` go through the engine CLI flags `--albedo` / `--constant-thermal-inertia` when the binary advertises them (detected from `--help`, never assumed) and otherwise through the config keys `thermophysical.albedo_override` / `thermophysical.constant_thermal_inertia`, which the engine interprets identically (measured: byte-identical output either way). `thermal_inertia` is **flag-only** — see below. Any name containing a dot is a config key. A bare name that is neither must be declared in `label_axes=`, so it cannot become a dead key in the YAML. |
-| Collection | `values()`, `collect()`, `stat()`, `grid_of()`, `table()`, `write_table()`, `curves()`. `table()` returns a list of dicts — `pandas.DataFrame(sweep.table(...))` works, and nothing here requires pandas. |
+| Axis names | `albedo` and `constant_thermal_inertia` go through the engine CLI flags `--albedo` / `--constant-thermal-inertia` when the binary advertises them (detected from `--help`, never assumed) and otherwise through the config keys `thermophysical.albedo_override` / `thermophysical.constant_thermal_inertia`, which the engine interprets identically (measured: byte-identical output either way). `thermal_inertia` is flag-only (see below). Any name containing a dot is a config key. A bare name that is neither must be declared in `label_axes=`, so it cannot become a dead key in the YAML. |
+| Collection | `values()`, `collect()`, `stat()`, `grid_of()`, `table()`, `write_table()`, `curves()`. `table()` returns a list of dicts; `pandas.DataFrame(sweep.table(...))` works, and nothing here requires pandas. |
 | No engine needed to read one | Constructing a sweep, `--list`, `--dry-run`, `table()`, `write_table()`, `grid_of()`, the plots and `load_sweep()` all work with no compiled binary present. The engine is resolved only when something launches. |
 
-#### Thermal inertia is two parameters — say which one
+#### Two definitions of thermal inertia
 
 TI is derived here (the primaries are `ks`/`kd`/`rhos`/`rhod`/`cp0`/`chi`), so
 "set TI to 200" has two answers and the engine implements both. They are
-**different physics**, not two spellings.
+different physics, not two spellings.
 
 | Grid key | What the engine does | Route |
 |---|---|---|
-| `thermal_inertia` | `ks = TI²/(rhos·cp(273 K))`, `kd` scaled by the same factor. Densities, `cp(T)` and `chi` untouched, so the depth contrast is preserved. Resolves onto `thermophysical.{ks,kd}_override`. This is the convention already used by `ema_campaign_driver.py`, `divval_sweep.py` and the shipped `quickstart_asteroid_diurnal_ti200_check.yaml`. | `--thermal-inertia` **only** |
-| `constant_thermal_inertia` | `cp = TI²/(ks·rhos)` instead, plus `chi=0`, `kd=ks`, `rhod=rhos`, so TI is exactly constant in temperature **and** depth — and the thermal diffusivity moves along the axis where the other holds it. | `--constant-thermal-inertia`, or the config key of the same name |
+| `thermal_inertia` | `ks = TI²/(rhos·cp(273 K))`, `kd` scaled by the same factor. Densities, `cp(T)` and `chi` untouched, so the depth contrast is preserved. Resolves onto `thermophysical.{ks,kd}_override`. This is the convention already used by `ema_campaign_driver.py`, `divval_sweep.py` and the shipped `quickstart_asteroid_diurnal_ti200_check.yaml`. | `--thermal-inertia` only |
+| `constant_thermal_inertia` | `cp = TI²/(ks·rhos)` instead, plus `chi=0`, `kd=ks`, `rhod=rhos`, so TI is exactly constant in temperature and depth, and the thermal diffusivity moves along the axis where the other holds it. | `--constant-thermal-inertia`, or the config key of the same name |
 
 The two are far enough apart to change a thermal inertia you fit, so the choice
 is not a formality. How far apart is a property of the body, the mesh and the
 window, not a constant worth carrying between runs: measure it on the case you
 care about by running the same config twice, once per key, and comparing a
-statistic you state in full — the metric, the faces it covers and the window it
+statistic you state in full: the metric, the faces it covers and the window it
 covers. "Diurnal amplitude" on its own does not pin those down, and different
 choices of them disagree. A fully specified example: the median, over all
 faces, of `temperature_max - temperature_min` from `statistics/`, accumulated
@@ -370,13 +370,13 @@ does `Sweep`.
 
 `thermal_inertia` has no config-file route on purpose. Building one would mean
 this Python layer evaluating the body's `cp` polynomial at 273 K, which is
-physics the wrapper does not do — and on the Moon `cp0` is that polynomial's
-*constant term*, −3.6125 J/kg/K, so the naive `sqrt(ks·rhos·cp0)` is not a real
+physics the wrapper does not do. On the Moon, moreover, `cp0` is that polynomial's
+constant term, −3.6125 J/kg/K, so the naive `sqrt(ks·rhos·cp0)` is not a real
 number. On an engine without the flag you get an error naming
 `constant_thermal_inertia`, never a silent switch to different physics.
 
 Worked examples: [`examples/python/fit_thermal_inertia.py`](../examples/python/fit_thermal_inertia.py)
-(sweep → lookup table → fit thermal inertia to a 233 GHz brightness-temperature
+(sweep, then lookup table, then fit thermal inertia to a 233 GHz brightness-temperature
 curve, with the observable conversion supplied as a callable) and
 [`examples/python/sweep_replaces_45_configs.py`](../examples/python/sweep_replaces_45_configs.py)
 (the 40-file `configs/europa_lat*` product as one sweep, checked key-by-key

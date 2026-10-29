@@ -359,8 +359,8 @@ def find_nearest_face(target_lat, target_lon, latitudes, longitudes):
     """Index of the face nearest ``(target_lat, target_lon)``, and how far.
 
     Lifted from ``src/python/extract_timeseries.py:196``, which is the one
-    implementation of this in the tree and reached three importers, all in
-    ``scripts/jwst/``, because it sits under a 170-line argparse ``main``.
+    implementation of this in the tree and was reached by three importers (in
+    ``scripts/jwst/``, since removed), because it sits under a 170-line argparse ``main``.
 
     Returns ``(index, separation_degrees)``. The great-circle form is
     insensitive to the longitude convention -- ``sin^2(dlon/2)`` is unchanged

@@ -28,6 +28,14 @@ For percent signs and underscores, move the character outside the math span.
 For multi-row environments, put each `\\\\` at the end of its own line inside a
 `$$` block, where it survives.
 
+Two further mistakes are reported:
+
+    \\lbracec_j, \\thinspaceF     a letter-only macro glued to the next letter is
+                                one undefined control word (write `\\lbrace c_j`);
+                                checked in every math form, including ```math
+                                fences and $`...`$, which are otherwise safe
+    $|x|$ in a table row         the bare `|` ends the table cell; use \\lvert x \\rvert
+
 Usage:
     python3 scripts/check_github_math.py [PATH ...]     # default: docs/ and *.md
 
@@ -43,6 +51,10 @@ CODESPAN = re.compile(r"`[^`]*`")
 MATH_BLOCK = re.compile(r"\$\$(.+?)\$\$", re.S)
 MATH_INLINE = re.compile(r"(?<!\$)\$(?!\$)((?:[^$\n]|\\\$)+?)(?<!\$)\$(?!\$)")
 HOSTILE = re.compile(r"\\([!-/:-@\[-`{-~])")
+# Letter-only replacements glued to a following letter form an undefined control word.
+GLUED = re.compile(r"\\(thinspace|thickspace|medspace|negthinspace|negmedspace|negthickspace"
+                   r"|lbrace|rbrace|lVert|rVert|lvert|rvert)(?=[A-Za-z])")
+SAFE_MATH = re.compile(r"(?ms)^[ \t]*```math[ \t]*\n(.*?)^[ \t]*```|\$`([^`]+)`\$")
 
 SUGGESTION = {
     ",": r"\thinspace",
@@ -55,6 +67,8 @@ SUGGESTION = {
     "%": "move the percent sign outside the math span",
     "_": "move the underscore outside the math span",
     "\\": "put the row separator at the end of a line inside a $$ block",
+    "|": "\\lvert ... \\rvert (a bare | ends the table cell)",
+    "glued": "a space after the control word (\\lbrace c_j, not \\lbracec_j)",
 }
 
 
@@ -107,6 +121,19 @@ def scan(path):
             line = text.count("\n", 0, off) + 1
             findings.append((line, "\\" + m.group(1),
                              text[max(0, off - 25):off + 25].replace("\n", " ")))
+        line_start = text.rfind("\n", 0, start) + 1
+        if (text[line_start:start].lstrip().startswith("|") and "|" in masked[start:end]
+                and "\n" not in masked[start:end]):
+            findings.append((text.count("\n", 0, start) + 1, "|",
+                             text[max(0, start - 25):end + 25].replace("\n", " ")))
+    # Glued control words are wrong in every math form, the verbatim ones included.
+    regions = [(s, e) for s, e in math_spans(masked)]
+    regions += [(m.start(m.lastindex), m.end(m.lastindex)) for m in SAFE_MATH.finditer(text)]
+    for start, end in regions:
+        for m in GLUED.finditer(text[start:end]):
+            off = start + m.start()
+            findings.append((text.count("\n", 0, off) + 1, "glued",
+                             text[max(0, off - 25):off + 25].replace("\n", " ")))
     return sorted(findings)
 
 
@@ -123,13 +150,15 @@ def collect(paths):
 
 
 def main(argv):
-    paths = argv[1:] or ["docs", "README.md", "INSTALL.md", "CHANGELOG.md"]
+    paths = argv[1:] or ["docs", "README.md", "INSTALL.md", "CHANGELOG.md",
+                         "src/cpp/exosphere/README.md"]
     files = collect([p for p in paths if os.path.exists(p)])
     total = 0
     for f in files:
         for line, tok, ctx in scan(f):
             total += 1
-            print(f"{f}:{line}: {tok} -> use {SUGGESTION.get(tok[1], 'a letter-only macro')}"
+            key = tok if tok in ("|", "glued") else tok[1]
+            print(f"{f}:{line}: {tok} -> use {SUGGESTION.get(key, 'a letter-only macro')}"
                   f"   ...{ctx}...")
     if total:
         print(f"\n{total} sequence(s) GitHub's Markdown pipeline will mangle "

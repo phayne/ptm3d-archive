@@ -71,8 +71,9 @@ struct IceLayerConfig {
 /**
  * Impact-gardening depth, Costello et al. (2021, Nat. Astron. 5, 951) Eq. 1 for
  * secondary craters (v = -4):  Lambda(t)^2 = u pi c^2 h^2 t / (2 lambda),  i.e. a
- * diffusive growth Lambda^2 = K t. Ported from scripts/jwst/gardening.py (the test
- * cross-checks the two). u [km^-2 yr^-1]: Case A 2.02e-12 (Zahnle et al. 2003 Case A),
+ * diffusive growth Lambda^2 = K t. Ported from a Python reference implementation
+ * (scripts/jwst/gardening.py, removed 2026-10-29; see git history), whose printed values
+ * the test reproduces. u [km^-2 yr^-1]: Case A 2.02e-12 (Zahnle et al. 2003 Case A),
  * Case B 7.03e-12 (Case B + Levison et al. 2000). lambda = 4.605 is the 99% level.
  * h = 0.04 (excavation depth / diameter) and c = 1 are NOT in Costello et al. 2021
  * (UNVERIFIED; gardening.py attributes h to the Costello et al. 2018 lunar calibration).

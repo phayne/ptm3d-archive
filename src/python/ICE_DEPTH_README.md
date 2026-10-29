@@ -16,7 +16,7 @@ Designed to handle large-scale datasets (≥10⁷ mesh faces) via chunked proces
 
 - `--threads`: Specifies thread count for Numba-based solver and parallel face-wise accumulation of mean/max (binary & VTK). Set to your physical core / logical CPU count (e.g. 48) for maximum throughput. Defaults to 1.
 - `--progress`: Enables progress bars (requires `tqdm`) or simple status messages if `tqdm` is not installed.
-- Internally, if Numba is available and `--threads > 1`, face-wise accumulation leverages a parallel loop (`prange`). IO remains sequential to avoid excessive disk contention.
+- Internally, if Numba is available and `--threads > 1`, face-wise accumulation uses a parallel loop (`prange`). IO remains sequential to avoid excessive disk contention.
 - The solver backend (`--backend auto`) will choose Numba if installed; thread count is applied via `numba.set_num_threads()` before computation.
 
 ## Installation

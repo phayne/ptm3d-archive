@@ -1,6 +1,6 @@
 # PTM3D quickstart companion: Europa diurnal run with the GLOBAL BOND-ALBEDO MAP.
 #
-# This file is the spatial-albedo arm of a two-run comparison. It is a copy of
+# This file is the spatial-albedo run of a two-run comparison. It is a copy of
 # examples/quickstart_europa_diurnal.yaml with exactly TWO keys changed:
 #
 #     illumination.use_albedo_map : false -> true
@@ -38,7 +38,7 @@ mesh:
 thermal:
   run_thermal_mesh: true
   threads: 0                    # 0 = auto-detect
-  equilibration_orbits: 20.0    # matches the uniform-ice arm exactly
+  equilibration_orbits: 20.0    # matches the uniform-ice run exactly
   use_gpu: false
   compute_statistics: true      # write statistics/*.bin (Tmax/Tavg/Tmin, flux)
   enable_shadow_flux: false

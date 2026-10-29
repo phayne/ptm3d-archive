@@ -214,7 +214,7 @@ where:
 - `Q = 1e-3 W/m²` (internal heat flux)
 - `k = 205 W/m/K` (thermal conductivity)
 
-## Robustness Features
+## Error Handling
 
 ✓ Graceful degradation:
   - Numba missing → fallback to NumPy

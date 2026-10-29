@@ -353,7 +353,7 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("phase", help="Lambert-sphere phase-law gate")
+    p = sub.add_parser("phase", help="Lambert-sphere phase-law check")
     p.add_argument("run_dir")
     p.add_argument("--primary", default="JUPITER", choices=sorted(PRIMARY))
     p.add_argument("--tol", type=float, default=2e-3,

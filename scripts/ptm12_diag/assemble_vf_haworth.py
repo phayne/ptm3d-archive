@@ -257,7 +257,7 @@ def main():
                     help="the OLD (buggy) fractional threshold, for the before/after report")
     ap.add_argument("--radiance-prune-eps", type=float,
                     default=float(os.environ.get("PTM_RADIANCE_PRUNE_EPS", "0.0")),
-                    help="Radiance-weighted VF pruning threshold in W/m^2 (Paul's adjustable knob). "
+                    help="Radiance-weighted VF pruning threshold in W/m^2 (adjustable). "
                          "Keep partner j for face i iff F_ij * R_j >= eps (R_j = sigma*T_max,j^4 + "
                          "albedo*direct_solar_max,j). 0.0 (DEFAULT) = NO PRUNING, byte-identical. "
                          "Env PTM_RADIANCE_PRUNE_EPS sets the default (require-env compatible).")

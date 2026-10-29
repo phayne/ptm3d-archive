@@ -239,7 +239,7 @@ This is JPL small-body solution **76** for Bennu, dated 2013-02-01:
 
 It is retained, under its original name, for three reasons: it is the ephemeris
 behind every Bennu number published from this repository before 2026-08-27; it
-is the ephemeris the `asteroid_bennu_spice_cpu` validation arm was banked on
+is the ephemeris the `asteroid_bennu_spice_cpu` validation case was banked on
 until that date; and `docs/tutorials/notebooks/04_asteroid_spice.ipynb`
 furnishes this exact path in its own cells, so deleting or renaming it would
 break a shipped, executed notebook.
@@ -270,7 +270,7 @@ the kernel held fixed.
 maximum position difference 31.97 km, mean 20.91 km — relative 1.7e-7. Over the
 tutorial's own window on 2019-01-10: 13.93 km, of which 6.36 km is heliocentric
 distance, so insolation moves by 9.5e-8 and the solar direction by 5.4e-6 deg.
-On the `asteroid_bennu_spice_cpu` arm that is 7 of 16 output files changed, at
+On the `asteroid_bennu_spice_cpu` validation case that is 7 of 16 output files changed, at
 most **2.14e-4 K** in temperature and 2.44e-4 W/m² in direct solar flux — one to
 a few float32 ULP. Physically nothing; byte-identity, everything.
 

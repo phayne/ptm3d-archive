@@ -1368,7 +1368,7 @@ def main(argv=None) -> int:
     b.add_argument("--bank-dir", default="", help="copy the arms' output bytes "
                    "and inputs into this directory and mark it DO-NOT-DELETE, "
                    "so the manifest does not merely point at scratch runs that "
-                   "a cleanup will remove -- which is how the 2026-08-24 "
+                   "a cleanup will remove, which is how the 2026-08-24 "
                    "baseline was lost")
     b.set_defaults(fn=cmd_bank)
 

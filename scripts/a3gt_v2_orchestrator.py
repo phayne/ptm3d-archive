@@ -1192,7 +1192,7 @@ def main() -> int:
     p.add_argument("--roi-core-frac", type=float, default=0.05)
     p.add_argument("--roi-max-points", type=int, default=2_500_000)
     p.add_argument("--density-exp", type=float, default=1.0,
-                   help="Mesh density falloff exponent (1.0 = linear; A3GT v2 default).")
+                   help="Mesh density falloff exponent (1.0 = linear; the v2 default).")
     # Core + occluder-ring architecture (catalog mode). Requires --schedule.
     # docs/extended-occluder-architecture.md
     p.add_argument("--extended", action="store_true",
@@ -1301,8 +1301,8 @@ def main() -> int:
                         "the CSR is scratch, not a deliverable).")
     p.add_argument("--require-env", type=str, default="",
                    help="Comma-separated 'NAME' or 'NAME=value' physics-env "
-                        "manifest, checked before EVERY window launch (Phase "
-                        "R ENV-COMPLETENESS gate, ptm_run_guard). A missing "
+                        "manifest, checked before every window launch (the "
+                        "environment-completeness check, ptm_run_guard). A missing "
                         "or mismatched var fails that window (not the whole "
                         "campaign) loudly rather than running silently-wrong "
                         "physics. Radoff-mode windows should omit "

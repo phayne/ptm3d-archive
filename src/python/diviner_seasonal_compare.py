@@ -368,8 +368,7 @@ def main(argv=None):
                          "comparison window outlined) above the 4x3 grid. Single "
                          "site only; the 4x3 comparison grid is unchanged.")
     ap.add_argument("--pubclean", action="store_true",
-                    help="Publication-clean variant (Paul's no-on-figure-notes rule, "
-                         "checklist P2.8, 2026-07-22): suppress the figure suptitle, "
+                    help="Publication-clean variant (no on-figure notes): suppress the figure suptitle, "
                          "the per-column titles (Diviner/PTM3D/model-Div), and the "
                          "bias/RMSE text box. Axis labels, colorbars, and legends are "
                          "unaffected. Default OFF -- no behavior change for existing "
@@ -381,8 +380,7 @@ def main(argv=None):
                          "when the title/stat-box text is removed -- so the manuscript "
                          "can swap the two files 1:1 without a layout reflow.")
     ap.add_argument("--id-labels", action="store_true",
-                    help="Content-IDENTIFICATION labels (Paul's manuscript v5 Fig. 8 "
-                         "review, 2026-07-28) -- allowed under the no-on-figure-notes "
+                    help="Content-identification labels, allowed under the no-on-figure-notes "
                          "rule, which bars data/stat annotations, not identity. Works "
                          "WITH --pubclean (keeps the suptitle/stat-box suppressed) and "
                          "adds: small per-column headers 'Diviner'/'model'/'difference' "
