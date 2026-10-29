@@ -64,8 +64,8 @@ Eq.  9:  k_am(T)   = Ac + Bc*T^-4 + Cc*T^-3 + Dc*T^-2 + Ec*T^-1
 falls steeply with temperature, instead of being constant.
 
 Reference: Martinez, A., & Siegler, M. A. (2021), "A Global Thermal Conductivity
-Model for Lunar Regolith at Low Temperatures", *JGR Planets* **126**,
-e2021JE006829, doi:10.1029/2021JE006829. PDF in `docs/`.
+Model for Lunar Regolith at Low Temperatures", *JGR Planets* **126**(10),
+e2021JE006829, doi:[10.1029/2021JE006829](https://doi.org/10.1029/2021JE006829).
 
 ---
 
