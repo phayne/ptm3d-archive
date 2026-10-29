@@ -1141,7 +1141,7 @@ See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
 
 Seven keys are read as YAML sequences. yaml-cpp iterates a scalar as an *empty*
 sequence, so before 2026-09-06 writing one without brackets was a silent no-op:
-the value was dropped, the default stood, and nothing said so. All six now stop
+the value was dropped, the default stood, and nothing said so. All seven now stop
 the run at config load, naming the value given and the list form that fixes it.
 
 | Key | A scalar used to mean | Now |
@@ -1248,7 +1248,7 @@ configured.
 
 (Separately, and not covered by that guarantee: a `simulation.body` name other
 than `Moon`, `Mercury` or `Europa` that is *not* backed by a `generic_body:`
-block is refused at config parse, with `rc 1` and a message naming the three
+block is refused at startup, with `rc 1` and a message naming the three
 implemented bodies and the generic-body route. Until 2026-08-26 such a name fell
 through to Europa's property set and Europa's metakernel instead, and the run
 completed with `rc 0` and zero absorbed flux on every face. Use `generic_body:`
@@ -1315,5 +1315,6 @@ The full flag list is in [USER_GUIDE.md](USER_GUIDE.md) and from
 | Europa | 3.55 days | 11.86 years | 5.2 |
 
 These three have pre-defined thermophysical property sets. Any other body name
-falls back to placeholder defaults and expects a `generic_body:` block to supply
-its properties; the run says so on stderr.
+is refused at startup unless the config has a `generic_body:` block (see the
+SPICE section above). With that block, the run seeds placeholder properties,
+says so on stderr, and overwrites them from the block.
