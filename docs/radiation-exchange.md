@@ -110,10 +110,11 @@ hemisphere open to space.
 Two builders are available. The default is the deterministic pairwise builder; the Monte Carlo
 ray-gather builder is selected with `radiation.use_monte_carlo_vf: true`.
 
-**Pairwise builder.** Each retained face pair is evaluated by one of two estimators, chosen from
-the dimensionless separation $N_s = r/\sqrt{A_{\text{eff}}}$ with $A_{\text{eff}} = \sqrt{A_i A_j}$:
+**Pairwise builder.** Each retained face pair is evaluated by one of two estimators, chosen by
+the near/far switch below. The tables below also quote the dimensionless separation
+$N_s = r/\sqrt{A_{\text{eff}}}$ with $A_{\text{eff}} = \sqrt{A_i A_j}$:
 
-*M1, centroid approximation* (far field, $N_s > 5$) evaluates the integrand at the face centroids:
+*M1, centroid approximation* (far field) evaluates the integrand at the face centroids:
 
 $$F_{ij} \approx \frac{A_j}{\pi} \frac{\cos\theta_i \cos\theta_j}{r^2}$$
 
@@ -121,7 +122,7 @@ with $`\cos\theta_i = \hat{n}_i \cdot \hat{r}_{ij}`$ and $`\cos\theta_j = -\hat{
 $\hat{r}_{ij}$ the unit vector from centroid $i$ to centroid $j$. A single Embree ray verifies
 visibility. This follows the M1 formulation of Rezac & Zhao (2020).
 
-*M2, symmetric double-area quadrature* (near field, $N_s \le 5$) samples both faces at the
+*M2, symmetric double-area quadrature* (near field) samples both faces at the
 centroids of $m \times m$ equal-area sub-triangles, $m$ = `nearfield_quadrature_order` (default 3,
 so $m^2 = 9$ points per face and $m^4 = 81$ kernel evaluations per unordered pair):
 
@@ -213,9 +214,8 @@ Richardson $m = 8/16$ double-area reference on `lunar_crater_80N.ply` (60 faces,
 | fixed $m = 3$ (the sparse rule) | $+2.899$ percent | $+31.75$ percent | 81 |
 | $\max(3, \text{adaptive})$, shipped | $+0.729$ percent | $+7.10$ percent | 191 |
 
-The two builders still differ in where they switch from the far-field to the near-field rule
-(sparse builder: $N_s \le 5$; H-matrix: $`r < 4(\sqrt{A_i} + \sqrt{A_j})`$), in their grazing-angle
-culls, and in neighbor selection; arm `[H4]` of `test_vf_production` bounds what these cost.
+The two builders share the near/far switch above but still differ in their grazing-angle
+culls and in neighbor selection; arm `[H4]` of `test_vf_production` bounds what these cost.
 
 **Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
 cosine-weighted hemispherical rays and count first hits, giving $`F_{ij} \approx \text{hits}_j/N`$.
@@ -553,7 +553,7 @@ now holds the matrix and nothing on the host reads the replica again; clearing `
 keeps any mid-run CPU fallback on the fused Jacobi rather than Gauss-Seidel, because `solveTwoBand`
 selects Gauss-Seidel precisely when `F_ptr_` is non-null.
 
-### 6.6 Measured cost of the GPU radiosity solver
+### 6.7 Measured cost of the GPU radiosity solver
 
 All numbers below are measurements on this machine's four AMD Radeon PRO W6800X Duo
 dies, 2026-08-16, on two real view-factor matrices. Nothing here is derived except
@@ -1230,7 +1230,9 @@ Three things changed, and none of them changes a number:
    to 5 × 10⁻⁶ on the p05.
 
 The pair build and the Gate-2 audit are one shot per *chunk*; the per-timestep pass runs once per
-beamed timestep (1380 on the production science chunk above), so on a long run the per-timestep
+beamed timestep (1115 across both chunks of the 2026-08-25 production arms in the per-term
+table above; the first version of this section, written against the 2026-08-24 arms, gave 1380
+for one chunk), so on a long run the per-timestep
 term is what matters and on a short one the setup is.
 
 **Memory.** The pair list is `24 B/pair` (`BeamPair`: one `int`, two `float`, a `float[3]`; the
@@ -1371,7 +1373,7 @@ energy at grazing incidence.
 --rad-hmatrix-threads N           H-matrix build thread cap (0 = auto)
 --rad-exchange-selection MODE     all | shadow
 --rad-min-shadow-fraction F       Shadow-gate threshold (shadow mode only)
---rad-coupling-iter N             Maximum coupling iterations (default 10)
+--rad-coupling-iter N             Maximum coupling iterations (default 16)
 --rad-coupling-temp-tol K         Temperature convergence threshold (default 0.5)
 --rad-coupling-flux-tol W         Flux threshold, legacy selection (default 0.1)
 --rad-coupling-face-frac F        Face-fraction exit, legacy coupling mode (default 0.01)
@@ -1472,7 +1474,7 @@ simulations; enable only with a per-terrain window test and the receipt in hand.
 |---|---|---|
 | `RadiationExchangeManager` | `radiation_exchange.h` | Top-level coordinator: face classification, view factors, radiosity |
 | `RadiositySolver` | `radiation_exchange.h` | Solves the radiosity system; sparse, H-matrix and GPU backends |
-| `ViewFactorCalculator` | `view_factor.h` | Pairwise view factors with Embree; adaptive M1/M3 |
+| `ViewFactorCalculator` | `view_factor.h` | Pairwise view factors with Embree; adaptive M1/M2 |
 | `ViewFactorMatrix` | `view_factor.h` | CSR storage with `matvec`, row access and binary I/O |
 | `computeMonteCarlo` | `mc_view_factor.h` | Monte Carlo ray-gather view-factor builder |
 | `HMatrixViewFactor` | `hmatrix_view_factor.h` | Hierarchical matrix: octree partitioning, ACA/SVD compression |
