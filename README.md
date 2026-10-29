@@ -7,12 +7,44 @@ It couples ray-traced illumination (Intel Embree, NASA SPICE geometry), a 1D hea
 column under every mesh face, and face-to-face exchange of scattered sunlight and thermal
 infrared. It runs on ordinary CPUs; an OpenCL GPU is optional.
 
-![Moon3D testbed crater: mean temperature and the warming from radiation exchange](docs/figures/moon3d_testbed_tavg_coupling.png)
+<table>
+<tr>
+<td width="60%">
 
-*Moon3D testbed crater scan (509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across) placed at the IM-2 landing
-site (84.79°S): (a) time-averaged surface temperature over one synodic month with
+![Global lunar surface temperatures](docs/figures/moon_global_res9_temperature.png)
+
+</td>
+<td width="40%">
+
+*Global lunar surface temperatures on a 5.2-million-face icosphere
+(resolution 9), one snapshot from a full-lunation PTM3D run with topographic
+shadowing and SPICE solar geometry.*
+
+</td>
+</tr>
+<tr>
+<td width="60%">
+
+![Europa surface temperature animation](docs/figures/europa_res7_temperature_animation.gif)
+
+</td>
+<td width="40%">
+
+*Global Europa surface temperatures over one Europan day (3.55 Earth days),
+computed with SPICE geometry, per-face albedo, and Jupiter's reflected light
+and thermal emission included.*
+
+</td>
+</tr>
+</table>
+
+![Moon3D testbed crater, top-down view with a 20 cm scale bar: mean temperature and the warming from radiation exchange](docs/figures/moon3d_testbed_tavg_coupling_scalebar.png)
+
+*Moon3D testbed crater scan (509,337 faces, mean facet edge about 2.5 mm, domain 1.33 m on a side) placed at the IM-2 landing
+site (84.79°S), seen from directly above (east to the right, north up; the scale bar applies to both panels):
+(a) time-averaged surface temperature over one synodic month with
 face-to-face radiation exchange; (b) the warming that radiation exchange adds relative to an
-otherwise identical run without it. (Hayne et al., JGR Planets, in revision; Fig. 12).*
+otherwise identical run without it. (Same data as Fig. 12 of Hayne et al., JGR Planets, in revision, which shows an oblique view.)*
 
 ## Install
 
