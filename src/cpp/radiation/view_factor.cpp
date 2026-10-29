@@ -602,7 +602,7 @@ bool ViewFactorMatrix::readBinary(const std::string& filename) {
     if (version < SPARSE_VF_VERSION && nnz > 0) {
         // Same bytes, different physics. Say so; do not refuse.
         // An empty stub (nnz == 0) carries no near-field entries, so it is not
-        // announced -- the A3GT VF_REPLACE route deliberately loads one.
+        // announced -- the polar-site VF_REPLACE route deliberately loads one.
         std::cout << "\n  *** LOADED A v" << version << " SPARSE VIEW-FACTOR FILE: "
                   << filename << "\n      Its near-field (M2) entries were built by the "
                      "one-sided estimator retired on\n      2026-08-23, which reads about "

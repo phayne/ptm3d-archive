@@ -46,7 +46,7 @@ void makeGlobalMesh(std::vector<double>& lat, std::vector<double>& lon, double s
     }
 }
 
-// A small regional patch, the shape of an A3GT site or a moon3d crater mesh.
+// A small regional patch, the shape of a polar landing site or a moon3d crater mesh.
 void makeRegionalMesh(std::vector<double>& lat, std::vector<double>& lon,
                       double lat0, double lon0, double half_width_deg) {
     lat.clear();
@@ -164,7 +164,7 @@ int main() {
 
     // 5. A regional mesh cannot resolve the reference sites, so the check must
     //    DECLINE rather than judge off whatever face is nearest. Without this,
-    //    every A3GT polar site and every moon3d crater run would false-alarm.
+    //    every polar landing site and every moon3d crater run would false-alarm.
     {
         struct Site { double lat, lon; const char* name; };
         const Site sites[] = {

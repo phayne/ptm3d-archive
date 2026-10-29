@@ -872,7 +872,7 @@ int main(int argc, char** argv)
         // Q_prev is what set T0_prev; the batch path used to seed from it.
         // The first six reproduce the physics review's M6 table (moon3d grid, T1 = 24 K for
         // the sunrise rows -- a cold column taking a sudden flux, which is what
-        // a terminator crossing at the A3GT 1440-step cadence looks like when
+        // a terminator crossing at the polar-site 1440-step cadence looks like when
         // n_sub = 1 puts the whole crossing in one substep).
         const Trans cases_t[] = {
             {"sunrise 0 -> 30 W/m^2",       0.0,   30.0,  24.0},

@@ -5281,7 +5281,7 @@ void IlluminationModel::updatePrimaryDiskVisibility(
 
         // The probe is already paid for. A face whose budget covers the probe's
         // own worst error stops here and spends nothing further -- this is the
-        // rung that most of an A3GT mesh lands on, and it is why the census's
+        // rung that most of a polar-site mesh lands on, and it is why the census's
         // "sampled" count and its RAY count no longer move together.
         if (n_samp_face == ptm::disk::PRIMARY_DISK_PROBES) {
             const double v_probe = (probe_w_total > 0.0)

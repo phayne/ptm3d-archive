@@ -952,7 +952,7 @@ struct SimulationConfig {
         // enabled, the absorbed-solar term uses the analytic closed form
         //   A_h(mu0) = 1 - gamma * H(mu0, w),  gamma = sqrt(1-w),
         //   H(mu0,w) = (1 + 2*mu0) / (1 + 2*mu0*gamma),  mu0 = cos(incidence),
-        // replacing the constant (1 - albedo). Gated so baseline (Moon3D / A3GT /
+        // replacing the constant (1 - albedo). Gated so baseline (Moon3D / polar sites /
         // Europa) runs stay byte-identical. Opt in via `incidence_angle_albedo:
         // true` or `albedo_model: hapke` in the thermophysical section.
         bool   albedo_hapke = false;        // gate: use A_h(i) closed form
@@ -1017,7 +1017,7 @@ struct SimulationConfig {
         //              (Paul's ruling, 2026-08-22).
         //   refuse   = give up the GPU rung (radiosity on the CPU).
         // Both remove the co-residency the 2026-08 wedges died in; they differ
-        // by a lot in price on a large-matrix site. Measured on A3GT lunar polar site B,
+        // by a lot in price on a large-matrix site. Measured on lunar polar site B,
         // the CPU radiosity rung cost 108.9 min/window against 31.4 min on the
         // GPU pool (+77.5 measured), while separation costs a derived
         // +7-10 min. See docs/dev/gpu-wedge-guardrails.md.

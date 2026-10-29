@@ -80,7 +80,7 @@ inline bool isNearFieldPair(double r, double A_i, double A_j, double window_fact
 //     "a segment shorter than 0.1 m after both margins is VISIBLE"
 //
 // which is three absolute lengths in meters in a code base whose facets run
-// from 2.48 mm (the moon3d polar patch) to 80 m (A3GT rings). On a sub-meter
+// from 2.48 mm (the moon3d polar patch) to 80 m (polar-site rings). On a sub-meter
 // mesh the 0.1 m auto-pass swallows the whole segment: EVERY pair closer than
 // about 0.125 m -- fifty facet widths -- skipped the occlusion test entirely
 // and was recorded visible. See [[ptm-shadow-ray-offset-scale-bug]], and note

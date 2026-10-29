@@ -74,7 +74,7 @@ public:
     // rise dz = (P_hit - c_src)*n_src is below a facet-scaled floor h_eps = rise_keps_ * local_edge(src);
     // the FIRST hit rising >= h_eps out of the source tangent plane is a real occluder. Separates the
     // ~0.12 mm coplanar self-relief from the ~2.47 mm real rim occluder the 1 cm offset hops.
-    // Resolution-independent (h_eps scales with the facet, so A3GT m-DEM occluders are always
+    // Resolution-independent (h_eps scales with the facet, so polar-site m-DEM occluders are always
     // kept). Independent of the topological self-skip flag. Default OFF -> byte-identical. Also settable
     // via env PTM_ILLUM_RISE_EPS=1 (+ PTM_ILLUM_RISE_KEPS=<k>), read in initializeScene. CPU path only
     // (warns if GPU ray tracing is active).
