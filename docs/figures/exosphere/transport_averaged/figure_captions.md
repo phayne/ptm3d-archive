@@ -1,7 +1,7 @@
 # Ice Transport Figure Captions
 
 Figures generated from season-averaged PTM3D exosphere simulations of Europa.
-All longitude values use the **east longitude** convention (0–360°E), with the
+All longitude values use the east longitude convention (0–360°E), with the
 sub-Jovian point at 0°E, trailing hemisphere apex at 90°E, anti-Jovian point at
 180°E, and leading hemisphere apex at 270°E.
 
@@ -9,12 +9,12 @@ sub-Jovian point at 0°E, trailing hemisphere apex at 90°E, anti-Jovian point a
 
 ## Data Source
 
-**Thermal baseline**: PTM3D thermophysical model on an icosphere level-6 mesh
+Thermal baseline: PTM3D thermophysical model on an icosphere level-6 mesh
 (81,920 triangular faces). Two orbital seasons computed with diurnal stride 2
 (200 timesteps per diurnal cycle), phase-aligned and averaged to produce
 season-mean, season-min, and season-max surface temperatures.
 
-**Exosphere transport model**: Multi-timescale operator-splitting evolution over
+Exosphere transport model: Multi-timescale operator-splitting evolution over
 100,000 epochs × 100 diurnal cycles/epoch ≈ 97,230 years to steady state.
 Initial non-ice (dust/lag) concentration: 5% uniform. Bond albedo fixed at 0.5
 (no albedo–composition feedback). Ice density: 917 kg/m³.
@@ -33,7 +33,7 @@ Initial non-ice (dust/lag) concentration: 5% uniform. Bond albedo fixed at 0.5
 - Temperature-dependent yield: Y(T) = Y₀[1 + q₀ exp(−Q/kT)] normalized at
   100 K (Teolis et al. 2017)
 - Sputtered H₂O: 85% of total; O₂: 10%; H₂: 5%
-- Escape fractions: H₂O 10%, O₂ 90%, H₂ 95% → net ~22% of sputtered mass
+- Escape fractions: H₂O 10%, O₂ 90%, H₂ 95%, giving a net ~22% of sputtered mass
   lost to space per timestep
 - 90% of sputtered H₂O redeposits locally (same face; not transported
   ballistically)
@@ -55,7 +55,7 @@ deposition; red indicates net ice removal. The color scale uses a
 allowing the asymmetric positive and negative ranges to be resolved
 independently. Graticule lines at 30° intervals. Elevation angle 15°.
 
-**Data range**: −20.5 to +4.0 μm/kyr; 58% of faces show net deposition.
+Data range: −20.5 to +4.0 μm/kyr; 58% of faces show net deposition.
 
 ### `globe_sublimation___sputtering.png` / `.pdf`
 
@@ -67,7 +67,7 @@ removal due to enhanced magnetospheric ion bombardment. Per-case color scale:
 −43.6 to −6.1 μm/kyr (color scale still centered at 0 for comparison with
 the sublimation-only case, though no positive values exist).
 
-**Data range**: −43.6 to −6.1 μm/kyr; 0% positive.
+Data range: −43.6 to −6.1 μm/kyr; 0% positive.
 
 ### `globe_comparison.png` / `.pdf`
 
@@ -95,7 +95,7 @@ latitude labels at 30° intervals. The zonal banding shows equatorial
 sublimation (red, peaking at sub-solar latitudes ±15°) and polar deposition
 (blue, poleward of ±50°). Per-case `TwoSlopeNorm` color scale.
 
-**Data**: Regridded from 81,920 icosphere faces to 181 × 361 regular lat–lon
+Data: Regridded from 81,920 icosphere faces to 181 × 361 regular lat–lon
 grid via linear interpolation (nearest-neighbor gap fill at boundaries).
 
 ### `mollweide_sublimation___sputtering.png` / `.pdf`
@@ -113,7 +113,7 @@ removal (−44 μm/kyr) from combined peak sublimation and peak sputtering.
 (b) sublimation + sputtering net ice flux at steady state. Both panels share a
 common `TwoSlopeNorm` color scale (−43.6 to +4.0 μm/kyr) and a single
 horizontal colorbar. Panel labels follow (a)/(b) convention. This projection
-best reveals the longitudinal asymmetry introduced by sputtering: while
+shows most clearly the longitudinal asymmetry introduced by sputtering: while
 sublimation-only transport is nearly symmetric in longitude (slight asymmetry
 from illumination geometry), sputtering imposes a strong trailing/leading
 contrast.
@@ -159,8 +159,8 @@ classic equatorial sublimation / polar deposition pattern. Sputtering case
 shows net removal at all latitudes, with the most negative values at the
 equator.
 
-**Equatorial binning**: 72 bins of 5° width in the |lat| < 5° band.
-**Latitudinal binning**: 90 bins of 2° width, zonal average over all
+Equatorial binning: 72 bins of 5° width in the |lat| < 5° band.
+Latitudinal binning: 90 bins of 2° width, zonal average over all
 longitudes.
 
 ---
@@ -194,7 +194,7 @@ python3 scripts/plot_transport_profiles.py \
   `temperature_mean_K/`, `vapor_pressure_Pa/`, etc.) and `mesh.ply` (binary PLY
   with per-face latitude/longitude attributes)
 
-### Key script parameters
+### Script parameters
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
@@ -203,7 +203,7 @@ python3 scripts/plot_transport_profiles.py \
 | Globe elevation | 15° | Slight tilt for polar visibility |
 | Graticule | 30° spacing, color `'0.55'`, linewidth 0.2, alpha 0.35 | Subtle grid overlay |
 | Regrid resolution | 181 × 361 (0.5° lat × 1° lon) | For Mollweide projection |
-| Ice density | 917 kg/m³ | For kg/m²/s → μm/kyr conversion |
+| Ice density | 917 kg/m³ | For kg/m²/s to μm/kyr conversion |
 | Unit conversion | 1 kg/m²/s = (10⁶/917) × (1000 × 365.25 × 24 × 3600) μm/kyr | ≈ 3.44 × 10¹³ μm/kyr per kg/m²/s |
 
 ---
@@ -230,7 +230,7 @@ ratio exceeds unity (dotted horizontal line) during the nightside portion of
 the orbit (orbital phase ~60–200°), indicating that sputtering dominates the
 exosphere surface pressure when sublimation is suppressed by low temperatures.
 
-**Physics**: Sublimation pressure computed from the Marti & Mauersberger (1993)
+Physics: Sublimation pressure computed from the Marti & Mauersberger (1993)
 vapor pressure formula: log₁₀(P [Pa]) = −2663.5/T + 12.537. Sputtering
 equivalent pressure computed by equating the non-escaping sputtered flux to
 Maxwellian effusion (P = nkT where n = 4Φ/v_th). Sputtering model uses
@@ -239,7 +239,7 @@ trailing/leading hemisphere contrast and Teolis et al. (2017) temperature-
 dependent yield. Species fractions: H₂O 85%, O₂ 10%, H₂ 5%; escape fractions:
 H₂O 10%, O₂ 90%, H₂ 95%.
 
-**Data source**: 288 per-timestep temperature files from the season-averaged
+Data source: 288 per-timestep temperature files from the season-averaged
 PTM3D simulation (81,920 icosphere faces).
 
 ---
@@ -261,7 +261,7 @@ exosphere (column densities ~10¹⁴–10¹⁷ cm⁻² at the equatorial limb); 
 density falls off exponentially with altitude on the scale height H = kT/(mg).
 The thin equator and pole markers (gray crosshairs) indicate the disk geometry.
 
-**Physics**: For an exponential atmosphere with surface number density n₀ and
+Physics: For an exponential atmosphere with surface number density n₀ and
 scale height H, the tangent column density at altitude h above the surface is:
 
 N_tang(h) = n₀ √(2πRH) exp(−h/H)
@@ -272,14 +272,14 @@ for all three species. Each species has its own scale height: H_H₂O = kT/(m_H�
 H_O₂ = kT/(m_O₂ g), H_H₂ = kT/(m_H₂ g). At 100 K: H_H₂O ≈ 35 km,
 H_O₂ ≈ 20 km, H_H₂ ≈ 313 km.
 
-**Limb profile construction**: For each sub-observer longitude, limb faces are
+Limb profile construction: For each sub-observer longitude, limb faces are
 selected within ±30° of the limb circle (at observer longitude ± 90°). Surface
 density n₀ and scale height H are binned by latitude (90 bins of 2° width),
 area-weighted. For each image pixel outside the disk, the tangent altitude
 h = (r − 1)R_Europa and the apparent latitude are computed, and the column
 density is evaluated by interpolating the latitude-binned profiles.
 
-**Data source**: Diurnal-average temperature (mean of 288 timesteps) per face
+Data source: Diurnal-average temperature (mean of 288 timesteps) per face
 from the season-averaged PTM3D simulation.
 
 ---
@@ -300,7 +300,7 @@ The equator-to-pole gradient in H reflects the corresponding temperature
 gradient and controls the latitudinal structure visible in the limb profile
 figures.
 
-**Data source**: Same diurnal-average temperature as the tangent column density
+Data source: Same diurnal-average temperature as the tangent column density
 figure.
 
 ---
@@ -322,7 +322,7 @@ python3 scripts/plot_diurnal_pressure.py \
 | `--hemisphere-contrast` | 3.0 | Sputtering trailing/leading ratio |
 | `--sputtering-scale` | 1.0 | Scale factor for global sputtering rate |
 
-### Key physical constants (matching C++ code)
+### Physical constants (matching C++ code)
 
 | Constant | Value | Source |
 |----------|-------|--------|

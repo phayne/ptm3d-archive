@@ -7,8 +7,8 @@ temperature of the mesh face beneath it. It is a *sensor*, not a body:
 - it does not occlude, emit, or scatter;
 - it is not a row or a column of the view-factor matrix and never enters the radiosity solve;
 - cubes do not see each other; cube-to-cube coupling is identically zero;
-- everything reported is **incident irradiance in W/m^2** — no albedo, no emissivity, no cube
-  material is applied anywhere. Consumers bolt their own optical model on top.
+- everything reported is **incident irradiance in W/m^2**; no albedo, no emissivity, and no cube
+  material is applied anywhere. Users apply their own optical model on top.
 
 Turning cubes on must not move a single byte of the mesh temperature or flux fields.
 
@@ -16,7 +16,7 @@ Turning cubes on must not move a single byte of the mesh temperature or flux fie
 
 ## 1. Geometry: the cube is sized to the mesh, not to a fixed number of meters
 
-The cube center height and edge are **site-relative by default**:
+The cube center height and edge are site-relative by default:
 
 ```
   local_median_edge = median over CORE faces whose centroid lies inside the grid disk
@@ -27,22 +27,22 @@ The cube center height and edge are **site-relative by default**:
   edge_m   = edge_factor   * local_median_edge     (default edge_factor   = 0.1)
 ```
 
-`height_m` is a **plumb-line** height along the site vertical `U` — what a leveled lander leg
-gives — not a height along the local face normal. The two differ by `h(1 - cos slope)`, which is
-sub-millimeter at the measured 4 degree median inner slope, but they must never be mixed and
-hardware people assume the plumb line.
+`height_m` is a **plumb-line** height along the site vertical `U` (what a leveled lander leg
+gives), not a height along the local face normal. The two differ by `h(1 - cos slope)`, which is
+sub-millimeter at the measured 4 degree median inner slope, but they must not be mixed, and
+hardware engineers assume the plumb line.
 
 The definitions are not assumed: the tool measures `local_median_edge` on the actual mesh, prints
 it, and writes it into the file header, so any number in a delivered product can be re-derived.
 
-**Absolute overrides win.** `height_m` / `edge_m` given explicitly (CLI `--height-m` / `--edge-m`)
+Absolute overrides take precedence: `height_m` / `edge_m` given explicitly (CLI `--height-m` / `--edge-m`)
 override the factors, and the file header records `height_factor = 0` to say so.
 
-> **Coarse-mesh sites need the override.** The factor is a fraction of the *local facet size*, so
+> Coarse-mesh sites need the override. The factor is a fraction of the *local facet size*, so
 > it only means "just above the ground" where the mesh is fine. lunar polar site A has a dedicated
 > high-resolution SfS core (median equivalent edge 1.083 m in the grid region) and resolves to
-> **h = 0.1083 m**. lunar polar site C has only the generic 80 m/px LOLA base and an 8,746-face core; there
-> a 0.1x height is **meters above the ground**, which is a different instrument entirely. Set
+> h = 0.1083 m. lunar polar site C has only the generic 80 m/px LOLA base and an 8,746-face core; there
+> a 0.1x height is meters above the ground, which is a different instrument. Set
 > `height_m` explicitly at such sites.
 
 Measured at lunar polar site A (2,397,890-face core, 724,593 faces inside the 500 m grid disk):
@@ -59,12 +59,12 @@ Measured at lunar polar site A (2,397,890-face core, 724,593 faces inside the 50
 
 ## 2. `f_max` is an expected-mode disclosure, not a warning
 
-`f_max` is the largest single view-factor entry in a patch's row — the share of that face's
+`f_max` is the largest single view-factor entry in a patch's row, i.e., the share of that face's
 entire incident terrain flux that comes from one mesh facet. `n_faces_50pct` is how many partners
 it takes to reach half the terrain weight.
 
-At a **site-relative height of 0.1 x the local facet edge, a large `f_max` on the nadir face is
-the intended behavior, not a defect.** The whole point of putting the cube ~11 cm above a ~1.1 m
+At a site-relative height of 0.1 x the local facet edge, a large `f_max` on the nadir face is
+the intended behavior, not a defect. The purpose of putting the cube ~11 cm above a ~1.1 m
 facet is that the nadir face becomes a near-unity-view-factor sensor of the facet beneath it.
 
 Measured at lunar polar site A, `h = 0.1083 m`, 65,536 rays per patch:
@@ -78,12 +78,12 @@ Measured at lunar polar site A, `h = 0.1083 m`, 65,536 rays per patch:
 | east | 0.0814 | 0.2019 | 0.3474 | 0.4893 | 0.6465 |
 | west | 0.0837 | 0.1785 | 0.3146 | 0.4326 | 0.5046 |
 
-The nadir `n_faces_50pct` is **1** at both the median and the minimum. A threshold warning at
-`f_max > 0.25` would fire on **99.6% of nadir patches and 69.4% of all patches** — it would be
-noise, and noise is how a real warning gets ignored. So `f_max` and `n_faces_50pct` are
-**reported per cube, always**, and the height-factor path emits no warning. An absolute
-`height_m` override that lands unexpectedly close to the ground is the case worth flagging, and
-that is where the note belongs.
+The nadir `n_faces_50pct` is 1 at both the median and the minimum. A threshold warning at
+`f_max > 0.25` would fire on 99.6% of nadir patches and 69.4% of all patches. Such a warning would be
+noise, and noise causes real warnings to be ignored. We therefore always report `f_max` and
+`n_faces_50pct` per cube, and the height-factor path emits no warning. An absolute
+`height_m` override that lands unexpectedly close to the ground is the case that warrants a
+warning.
 
 ### Near-field error bound, re-derived at h = 0.1083 m
 
@@ -91,7 +91,7 @@ The design's original bound was derived at `h = 1 m`, where the nadir face avera
 At the site-relative height it must be restated, because the two heights make *different
 instruments* and the error moves in opposite directions:
 
-**The numerical error falls.** The ray-traced row integrates the true facet geometry exactly, so
+The numerical error falls. The ray-traced row integrates the true facet geometry exactly, so
 there is no error from the facet *count*; the only error is within-facet radiosity
 non-uniformity. At the measured median `f_max = 0.852`, the neighboring facets carry the
 remaining 0.148, and the measured facet-to-facet relative `B_ir` spread inside 1 m is 2.7%. So
@@ -101,24 +101,24 @@ the reported nadir irradiance deviates from the underlying facet's own radiosity
   0.148 x 2.7%  ~  0.40%
 ```
 
-which is better-posed than the h = 1 m case, not worse.
+which is better posed than the h = 1 m case, not worse.
 
-**The model sensitivity rises, and this is the part to disclose.** Because the nadir face is
-~85% one facet, it inherits that single facet's temperature error *whole*, instead of averaging
+The model sensitivity rises, and this must be disclosed. Because the nadir face is
+~85% one facet, it inherits that single facet's temperature error in full, instead of averaging
 it down across ~6 facets the way a 1 m height did. The measured facet-to-facet temperature spread
-inside 1 m is 1.51 K. So the nadir reading is a **sharper but less smoothed** instrument: it
+inside 1 m is 1.51 K. The nadir reading is therefore a sharper but less smoothed instrument: it
 measures one facet nearly exactly, and it does not average away facet-scale scatter. That is the
-correct answer for a sensor 11 cm above the ground, and it is what the product should say.
+correct behavior for a sensor 11 cm above the ground, and the product documentation states it.
 
-**Do not add a sub-facet near-field model.** That would mean inventing a temperature field the
+We do not add a sub-facet near-field model, because that would mean inventing a temperature field the
 engine does not have.
 
 ---
 
 ## 3. Sampling and the ray budget
 
-Rays are drawn **cosine-weighted** about each patch normal using a stratified Shirley-Chiu
-concentric mapping with a **per-patch Cranley-Patterson rotation**. Every ray then carries equal
+Rays are drawn cosine-weighted about each patch normal using a stratified Shirley-Chiu
+concentric mapping with a per-patch Cranley-Patterson rotation. Every ray then carries equal
 weight and
 
 ```
@@ -130,19 +130,19 @@ weight and
 so `sum_j F + f_sky + f_ring = 1` exactly, and for Lambertian emitters of radiosity `B_j` the
 irradiance on the patch is exactly `E = sum_j F[j] B_j`.
 
-The per-patch rotation is not decoration. The engine's own sampler calls `hammersley(k, N, 0, 0)`
+The per-patch rotation is necessary. The engine's own sampler calls `hammersley(k, N, 0, 0)`
 with zero offsets, so every face reuses the identical point grain, whose worst-case error sits on
 the 45/135 degree diagonal. With 7,542 patches on a regular 25 m lattice, a shared grain would
-produce a **coherent stripe across the flux map** rather than white noise. The rotation is free.
+produce a coherent stripe across the flux map rather than white noise. The rotation adds no cost.
 
 ### Accuracy metric
 
-**`closure_residual` cannot measure sampling accuracy and must never be quoted as if it did.**
+`closure_residual` cannot measure sampling accuracy and must not be quoted as if it did.
 This estimator sums to 1 by construction, so the residual is identically zero (measured: 0.000e+00
-on every patch at every budget). It is retained as a **bookkeeping** check — it catches a dropped
-or double-counted ray channel — and it is labeled as such in the file.
+on every patch at every budget). It is retained as a bookkeeping check (it catches a dropped
+or double-counted ray channel) and is labeled as such in the file.
 
-The metric that does measure accuracy is the **split-half total variation** between two
+The metric that does measure accuracy is the split-half total variation between two
 independently rotated half-rows:
 
 ```
@@ -164,7 +164,7 @@ Split-half TV, p50 per face orientation:
 | east | 3.69e-2 | 2.61e-2 | 1.86e-2 |
 | west | 2.81e-2 | 1.89e-2 | 1.21e-2 |
 
-Cost — peak RSS was 0.62 GB in **all three** arms:
+Cost (peak RSS was 0.62 GB in all three arms):
 
 | n_rays | rays | wall | cache | nnz |
 |---|---|---|---|---|
@@ -172,31 +172,31 @@ Cost — peak RSS was 0.62 GB in **all three** arms:
 | 16,384 | 123.6 M | 14 s | 16.5 MB | 2,113,257 |
 | 65,536 | 494.5 M | 46 s | 47.2 MB | 6,131,014 |
 
-**Default: `n_rays = 65536`.** The measured throughput is **11.9-20 M rays/s on eight threads**,
-about 15x the planning figure, because these rays are short and spatially coherent — all
-originating inside one 1 km patch — so the BVH stays cache-resident. That is *not* the regime the
+The default is `n_rays = 65536`. The measured throughput is 11.9-20 M rays/s on eight threads,
+about 15x the planning figure, because these rays are short and spatially coherent (all
+originating inside one 1 km patch), so the BVH stays cache-resident. That is not the regime the
 whole-body illumination throughput was measured in, and the illumination derate should not be
 reused for local hemisphere sweeps. With the whole sweep costing under a minute, the ~1.4x
-accuracy gain on the binding side-face rows is free.
+accuracy gain on the binding side-face rows costs little.
 
 ### Truncation
 
-`truncate_rel` defaults to **0 (keep every partner face)**. Truncation buys a flux error bound
-that is embarrassing to write down: dropping weight `w_res` costs `|dE| <= w_res * max_j B_j`, and
+`truncate_rel` defaults to 0 (keep every partner face). The flux error bound from truncation
+is large: dropping weight `w_res` costs `|dE| <= w_res * max_j B_j`, and
 `B_ir` reaches `sigma*(363.5 K)^4 ~ 990 W/m^2` at this site, so even `w_res = 0.002` is
-**2.0 W/m^2** — larger than the entire Earthshine budget the product is asked to resolve. When
-set above zero, the tool prints the dropped weight and the resulting bound per face orientation.
-Never silent.
+2.0 W/m^2, larger than the entire Earthshine budget the product is asked to resolve. When
+set above zero, the tool prints the dropped weight and the resulting bound per face orientation;
+truncation is never silent.
 
 ---
 
-## 4. The occluder ring carries no radiosity — and it is NOT invisible at this height
+## 4. The occluder ring carries no radiosity and is visible at this height
 
-Rays that hit the occluder ring are counted in their **own** `f_ring` channel. They are never
+Rays that hit the occluder ring are counted in their own `f_ring` channel. They are never
 folded into `f_sky`: the ring has no thermal solution, so it has no radiosity to contribute, and
 calling it "sky" would silently delete a real IR source from the budget.
 
-**The design expected `f_ring ~ 0` at a 500 m grid inside a 3 km core. Measured, it is not.**
+The design expected `f_ring ~ 0` at a 500 m grid inside a 3 km core. The measured value is not zero.
 At lunar polar site A with the 27.3 km ring:
 
 | face | median f_ring | max over all patches |
@@ -207,11 +207,11 @@ At lunar polar site A with the 27.3 km ring:
 
 The cause is the low cube height itself: a side patch's cosine lobe points at the horizon, so
 rays that clear the local terrain run ~2.5 km to the core rim and land on the ring beyond it. Up
-to ~4% of a side face's terrain-IR budget is therefore **missing** from the product. At ~100 K
-ring terrain that is order 0.1-0.2 W/m^2, which is **larger than the entire primary-body IR term**
+to ~4% of a side face's terrain-IR budget is therefore missing from the product. At ~100 K
+ring terrain that is order 0.1-0.2 W/m^2, which is larger than the entire primary-body IR term
 (measured 0.010-0.047 W/m^2 at this site) that the product exists to resolve.
 
-This is measured and printed by the geometry tool on every build, not assumed. It needs a scope
+This is measured and printed by the geometry tool on every build, not assumed. It requires a scope
 decision: either accept and document the deficit, extend the thermal core, or give the ring a
 radiosity surrogate.
 
@@ -225,28 +225,28 @@ radiosity surrogate.
       DO NOT overlap a view-factor assemble step (those peak above 300 GB RSS).
 ```
 
-The engine **loads** a `.fcg` and refuses on a key mismatch (core geometry hash, core face count,
+The engine loads a `.fcg` and refuses on a key mismatch (core geometry hash, core face count,
 ring hash, grid parameters, ray count, sampler, seed). It never rebuilds inline: a 7,542-row
-hemisphere sweep starting unannounced inside a production window is the kind of surprise that
-ends campaigns.
+hemisphere sweep starting unannounced inside a production window could disrupt a
+campaign.
 
-Refusals are hard, never skips:
+Refusals are hard errors, never skips:
 
-- a lattice point with no terrain below it aborts the build — silently dropping cubes would change
+- a lattice point with no terrain below it aborts the build, because silently dropping cubes would change
   the cube count between runs of the same configuration;
-- a lattice point landing on the occluder ring aborts — there is no `T_face` and no radiosity there;
-- a site within 0.1 degrees of the spin pole aborts — local north is undefined and the face naming
+- a lattice point landing on the occluder ring aborts, because there is no `T_face` and no radiosity there;
+- a site within 0.1 degrees of the spin pole aborts, because local north is undefined and the face naming
   would be arbitrary;
-- `--ring` given but unreadable aborts — the ring changes every sky fraction in the file.
+- `--ring` given but unreadable aborts, because the ring changes every sky fraction in the file.
 
 ### Validation
 
 `scripts/flux_cube_closed_form_check.py` builds its own analytic meshes and scores the geometry
 against closed forms using the estimator's a-priori binomial error bar:
 
-- **infinite flat plane**, `h = 0.1 m`: `f_sky` must be 1 (zenith), 0 (nadir), 1/2 (each side).
+- infinite flat plane, `h = 0.1 m`: `f_sky` must be 1 (zenith), 0 (nadir), 1/2 (each side).
   Measured 1.00000 / 0.00000 / 0.50013-0.50015 against a 3-sigma bar of 0.01172.
-- **finite square plane**, `L = 10 m`, `h = 5 m`: the cosine-weighted nadir row sum must fall
+- finite square plane, `L = 10 m`, `h = 5 m`: the cosine-weighted nadir row sum must fall
   between the inscribed and circumscribed disk values, `0.8000 <= sum_j F <= 0.8889`. Measured
   0.83130. A uniform-hemisphere sampler would read 0.5528, so this arm discriminates the cosine
   weighting rather than merely accommodating it.
@@ -255,14 +255,14 @@ against closed forms using the estimator's a-priori binomial error bar:
 
 ## 6. The engine pass
 
-Flux cubes are evaluated in a **post-solve pass**, once, after the radiation coupling loop has
+Flux cubes are evaluated in a post-solve pass, once, after the radiation coupling loop has
 converged and immediately before the location export. Not inside the loop, for three reasons: the
 sweep is the hot loop and only the converged answer is a product; inside the loop the band series
 are Picard-blended and `B_ir` carries an emission term that moves with `T` between iterations, so
 a blended `B` is not the `B` of any state; and the loop has two dispatch sites (single-timestep and
 multi-GPU pool), so evaluating there would mean two insertion points that must agree forever. After
-the loop both routes have written the same series, and that confluence is what makes the pass
-**route-blind**.
+the loop both routes have written the same series, and this common point makes the pass
+route-blind.
 
 ### Reconstruction, not readback
 
@@ -275,9 +275,9 @@ bit-identical to the CPU, the host inverts the solver's own two closing identiti
   B_vis[j] = A_src_j * Q_dir_j +      A_j    * ( Q_ind_vis[j] / (1 - A_j) )
 ```
 
-This is exact, not approximate, and it is spelled **once**, in
+This is exact, not approximate, and it is written once, in
 `src/cpp/radiation/radiosity_reconstruction.h`, called by both the pass and its test.
-Measured against the solver's own retained `B`: **7.7e-17 relative** (bar 1e-12).
+Measured against the solver's own retained `B`, the difference is 7.7e-17 relative (bar 1e-12).
 
 `A_src(t)` is not cached. `ptm106_fill` is just `applyIncidenceAlbedo()` of quantities that all
 survive to post-solve, so the pass calls that same function rather than storing
@@ -300,11 +300,11 @@ succeed quietly.
 
 ### Units
 
-⛔ `sun_positions` and `primary_positions` are in **kilometers**; the mesh is in meters for lunar
+`sun_positions` and `primary_positions` are in kilometers; the mesh is in meters for lunar
 and Europa DEMs and kilometers for asteroid shape models. `PassInputs::mesh_to_km` carries the
 conversion, set at the call site by the same magnitude test the illumination model uses. Getting
 this wrong does not raise an error: the direction to the primary points into the ground, every
-disk sample reads as occluded, and the primary-body flux comes out **exactly zero**. That happened
+disk sample reads as occluded, and the primary-body flux comes out exactly zero. That happened
 during development and was caught only by comparing against the engine's own `primary_ir`
 statistics. The pass now warns whenever the primary is in the ephemeris and no cube sees it at any
 epoch.
@@ -321,10 +321,10 @@ flux_cubes:
   shadow_probe_rays: 5      # 1 = center only; 5 = center + four rim points
 ```
 
-The block is **top level**, not nested under `output:`, so it cannot be reached by the
+The block is top level, not nested under `output:`, so it cannot be reached by the
 body-defaults machinery that makes `thermophysical:` decorative on a built-in body. A
 `warnUnreadFluxCubeKeys()` names any key the parser does not consume. The geometry keys
-(`spacing_m`, `height_factor`, `n_rays`, ...) are accepted but reported as **inert**: they live in
+(`spacing_m`, `height_factor`, `n_rays`, ...) are accepted but reported as inert: they live in
 the cache header, and honoring a YAML copy would create two sources of truth for one number.
 
 ## 8. Outputs
@@ -337,8 +337,8 @@ the cache header, and honoring a YAML copy would create two sources of truth for
 
 HDF5 is written from Python, not C++: the repo declares HDF5 off by default in-tree to avoid
 macOS/Conda link issues, and adding an HDF5 link would change the production binary's provenance
-for every remaining site run in order to serve a file format. The requirement -- CSV **and** HDF5
--- is met; only the producer moves.
+for every remaining site run in order to serve a file format. The requirement (CSV and HDF5)
+is met; only the producer differs.
 
 The packager's `--qa` mode can fail, and is meant to: `total == sum(components)`, no NaN or
 negative irradiance, closure per patch, and `nadir terrain_ir >= eps*sigma*T_face^4 * f_max`, which
@@ -348,15 +348,15 @@ would pass.
 ### Compatibility with `skip_time_series`
 
 The chunked-run orchestrator forces `output.skip_time_series = True` unconditionally
-(`scripts/run_chunked_simulation.py`). Flux cubes read the **in-memory** band series, not the
-per-step frames on disk, so the two are compatible -- but that was a claim, and it has now been
-measured rather than assumed: on the crater80N config the `.fcb` is **byte-identical**
+(`scripts/run_chunked_simulation.py`). Flux cubes read the in-memory band series, not the
+per-step frames on disk, so the two are compatible. This has been measured rather than
+assumed: on the crater80N config the `.fcb` is byte-identical
 (md5 `0133a0e073a3162ee21ce2dc38066b59`) with `skip_time_series` true and false, while the
-per-step frame count goes 118 -> 0.
+per-step frame count goes from 118 to 0.
 
-⛔ **The pass is NOT chunk-aware.** Under the chunked runner each chunk would run its own
+The pass is not chunk-aware. Under the chunked runner each chunk would run its own
 post-solve pass over its own sub-window and emit its own `flux_cubes.fcb`, and `ptm_merge_chunks`
-has no rule for merging them. Run a window that needs cubes as a **single direct engine run**, or
+has no rule for merging them. Run a window that needs cubes as a single direct engine run, or
 treat the per-chunk files as separate products. Making the cube axis mergeable is a v2 item.
 
 ## 9. Validation status
@@ -371,34 +371,34 @@ treat the per-chunk files as separate products. Making the cube axis mergeable i
 | Ingersoll bowl crater | PASSED, 0.492713% |
 | mesh-wide passivity, cubes ON and OFF | byte-identical to the pristine baseline engine |
 
-**Passivity is the load-bearing one.** On the 12,800-face crater80N config, 862 physics output
+Passivity is the essential gate. On the 12,800-face crater80N config, 862 physics output
 files, the aggregate md5 is `cab1be996c71c52543c006822e6a9deb` for all of: the pristine engine, this
 engine with no `flux_cubes` block, this engine with `enabled: false`, and this engine with
-**`enabled: true`**. The probe does not perturb the simulation.
+`enabled: true`. The probe does not perturb the simulation.
 
-⛔ **What that does NOT cover.** Moon, built-in body, CPU `SparseVFOperator` route, two-band
-radiosity, single-shot (non-chunked) run. It says nothing about Europa, generic bodies, the gray
+This passivity test covers one configuration: the Moon as a built-in body, the CPU
+`SparseVFOperator` route, two-band radiosity, and a single-shot (non-chunked) run. It says nothing about Europa, generic bodies, the gray
 path, the GPU pool route, the H-matrix route, or the chunked/warm-start path.
 
 ---
 
 ## 10. Shadow strata: "window-dark" is not "PSR"
 
-A **permanently shadowed region (PSR)** is dark in **all seasons**. A cube that receives no direct
+A **permanently shadowed region (PSR)** is dark in all seasons. A cube that receives no direct
 solar flux during one evaluated window is **window-dark**, which is a different and weaker claim:
 if the cube were truly permanently shadowed it would also have been dark in the summer window.
 
 The distinction is not pedantic, because the two answer different questions:
 
-- **window-dark** exercises the **indirect-only flux path** — direct solar identically zero,
+- window-dark exercises the indirect-only flux path: direct solar identically zero,
   terrain IR down in the tens of mW/m², the primary body's IR no longer negligible. That is the
   physics regime a PSR cube lives in, and it is what validates the dark-flux code path.
-- **PSR** is a statement about the *site*, decided by the site's `psr_mask` across all seasons, not
+- PSR is a statement about the site, decided by the site's `psr_mask` across all seasons, not
   by any single window.
 
 `scripts/flux_cube_strata.py` reports the `window_dark` stratum and refuses to call it PSR.
 
-### Whether a genuine PSR is even reachable at lunar polar site A
+### Reachability of a genuine PSR at lunar polar site A
 
 Measured directly from the campaign's own `cogs/polar_site_A/psr_mask.tif` (1 m polar-stereographic;
 the mask is 0/1 at 99.87% of valid pixels, the remaining 0.13% being the COG's linear-interpolation
@@ -406,33 +406,33 @@ boundary, so both a strict and an inclusive count are given):
 
 | quantity | value |
 |---|---|
-| PSR pixels within 500 m of the site | **441** inclusive (`>= 0.5`) / 346 strict (`== 1`) |
-| nearest PSR pixel to the site | **118.7 m** |
+| PSR pixels within 500 m of the site | 441 inclusive (`>= 0.5`) / 346 strict (`== 1`) |
+| nearest PSR pixel to the site | 118.7 m |
 | distinct PSR patches inside the grid | 7 |
-| largest patch | **195 m²**, only **15 × 15 m** across, center at site ENU E = −109.9 m, N = +62.8 m (lat −84.220932, lon 33.466089) |
-| PSR areal fraction of the grid | 441 m² / 0.785 km² ≈ **0.056%** |
-| 25 m production lattice points landing on PSR | **0 of 1257** (≈0.7 expected by area) |
+| largest patch | 195 m², only 15 × 15 m across, center at site ENU E = −109.9 m, N = +62.8 m (lat −84.220932, lon 33.466089) |
+| PSR areal fraction of the grid | 441 m² / 0.785 km² ≈ 0.056% |
+| 25 m production lattice points landing on PSR | 0 of 1257 (≈0.7 expected by area) |
 
-⚠️ The site-local ENU frame is rotated from the projection's axes by the site longitude (33.5°) —
-in a south-polar stereographic projection with `lon_0 = 0`, local north is the *radial outward*
+The site-local ENU frame is rotated from the projection's axes by the site longitude (33.5°);
+in a south-polar stereographic projection with `lon_0 = 0`, local north is the radial outward
 direction, not projected +Y. Skipping that rotation moves the patch centroid by tens of meters and
 changes which lattice points appear to be on PSR.
 
-**Consequence: the production 25 m lattice cannot sample a genuine PSR at this site.** The patches
-are far smaller than the lattice spacing. Reaching one requires a *targeted dense array*, not a
-finer global grid — see §11.
+As a result, the production 25 m lattice cannot sample a genuine PSR at this site. The patches
+are far smaller than the lattice spacing. Reaching one requires a targeted dense array, not a
+finer global grid (see §11).
 
-## 11. Targeted PSR array — CANCELED
+## 11. Targeted PSR array (canceled)
 
-**PSR flux cubes serve no engineering need**, because landed hardware
+PSR flux cubes serve no engineering need, because landed hardware
 and crew will never remain inside a permanently shadowed region long enough for the distinction to
-matter. The targeted dense array is **canceled permanently**, not deferred.
+matter. The targeted dense array is canceled permanently, not deferred.
 
-The design is retained here only so the descope is auditable and nobody rediscovers it and assumes
-it was merely never got to. It was sized against real data: spacing 1.0 m, radius 10 m on the
+The design is retained here only so that the descope is auditable and is not mistaken later for
+unfinished work. It was sized against real data: spacing 1.0 m, radius 10 m on the
 largest in-grid patch (lat −84.220932, lon 33.466089) would have placed 317 cubes with 196 (62%)
-on PSR pixels, needing no code change to `ptm_flux_cube_geom` and one extra ~40 min run. **It is
-canceled on relevance, not on cost or difficulty.**
+on PSR pixels, needing no code change to `ptm_flux_cube_geom` and one extra ~40 min run. It was
+canceled on relevance, not on cost or difficulty.
 
 The §10 site measurement stays, because "the production lattice lands on 0 of 1257 PSR pixels" is
 the evidence that this was a judgment about what is worth measuring, rather than a gap the tooling
@@ -443,7 +443,7 @@ could not close.
 ## 12. Named locations (arbitrary lat/lon cubes)
 
 Cubes can be placed at arbitrary named lat/lon points, alongside or instead of the grid. Outputs
-are keyed by name — the flux-cube analog of the engine's existing `locations:` mechanism.
+are keyed by name, the flux-cube analog of the engine's existing `locations:` mechanism.
 
 ### Building the geometry
 
@@ -463,12 +463,12 @@ pad_B,-84.2195,33.4820,2.0,1.0
 ```
 
 `height_m` and `edge_m` are optional per-entry overrides; omitted, each falls back to the
-site-relative value (§1). **`--radius <0` disables the lattice entirely**, for named locations
+site-relative value (§1). `--radius <0` disables the lattice entirely, for named locations
 only; `--radius 0` still yields the single origin cube, which is a different thing.
 
-Named cubes are appended after the lattice in **one cache**, so a single run covers both. They
+Named cubes are appended after the lattice in one cache, so a single run covers both. They
 carry a sentinel grid index (`-2147483648`) so the two kinds are distinguishable, and a names block
-is appended after the JSON in both `.fcg` and `.fcb` — a reader written against the original layout
+is appended after the JSON in both `.fcg` and `.fcb`. A reader written against the original layout
 parses everything before it at unchanged offsets and ignores the tail, so no format version bump
 was needed.
 
@@ -483,32 +483,32 @@ flux_cubes:
     - {name: pad_B, lat_deg: -84.2195, lon_deg: 33.4820, height_m: 2.0, edge_m: 1.0}
 ```
 
-⛔ **The config list does not place anything.** Placement belongs to `ptm_flux_cube_geom`, the only
-component permitted to touch geometry. What the engine does with this list is **verify** that the
-cache contains every name, and **refuse** otherwise — closing the trap the feature would otherwise
+The config list does not place anything. Placement belongs to `ptm_flux_cube_geom`, the only
+component permitted to touch geometry. What the engine does with this list is verify that the
+cache contains every name, and refuse otherwise. This closes a pitfall the feature would otherwise
 create: edit the YAML, forget to rebuild the cache, and receive a product silently describing the
 previous set of locations.
 
 Outputs: `flux_cubes/csv/cube_<name>.csv` for named locations (index-keyed for lattice cubes), with
 `name=` and `placement=named_location` in the header. `write_csv_max_cubes` caps the lattice
-fan-out but **never** drops a named location.
+fan-out but never drops a named location.
 
 ### The discriminator
 
-`scripts/flux_cube_location_check.py` requires that a cube placed **by name** at the site's own
-lat/lon reproduces the **lattice** origin cube **bit for bit** — every `CubeRecord` field beyond the
-deliberately-differing grid indices, all six `PatchRecord`s, and all view-factor columns *and*
+`scripts/flux_cube_location_check.py` requires that a cube placed by name at the site's own
+lat/lon reproduces the lattice origin cube bit for bit: every `CubeRecord` field beyond the
+deliberately-differing grid indices, all six `PatchRecord`s, and all view-factor columns and
 values. It passes.
 
-Reaching that took three fixes, and the reason they are worth recording is that they are one lesson
-in three costumes — **"the same formula" is not "the same computation"**:
+Reaching that took three fixes. We record them because they illustrate one point three times:
+"the same formula" is not "the same computation".
 
 1. `d * r_mean - org` subtracts two ~1.7e6 m vectors to reach ~0 m. Catastrophic cancellation left
-   ~2e-11 m in the recorded offset. Difference the *directions* first, then scale.
-2. The same three trig lines written at two call sites are not the same computation — the optimizer
+   ~2e-11 m in the recorded offset. Difference the directions first, then scale.
+2. The same three trig lines written at two call sites are not the same computation; the optimizer
    may contract them differently. One shared `noinline dirFromLatLon()` now serves both.
-3. Even then, the site frame normalized the direction **twice** (`U = unit(C)` where `C` was already
-   unit) while the named path normalized once. Same algebra, different *sequence*, one ulp apart.
+3. Even then, the site frame normalized the direction twice (`U = unit(C)` where `C` was already
+   unit) while the named path normalized once. Same algebra, different sequence, one ulp apart.
 
 A tolerance would have hidden all three. None was a physics error; all three would have quietly
 made "the same point" mean two slightly different points.
@@ -520,38 +520,38 @@ made "the same point" mean two slightly different points.
 ### Zenith terrain-IR: resolved, the cube is correct
 An earlier version of this document flagged the zenith `terrain_ir` column as not
 engineering-grade, on a measured 0.51× parity between the cube's ray-traced upward view-factor row
-and the model's own row for the same facet. **That flag is withdrawn.**
+and the model's own row for the same facet. That flag is withdrawn.
 
-The discrepancy was in the **reference matrix**, not the cube: the offline view-factor assembler
+The discrepancy was in the reference matrix, not the cube: the offline view-factor assembler
 divided entries by the hit count instead of by 2, inflating far-field view factors by up to exactly
 2× (fixed on `fix/vf-assembler-divisor`). Re-running the same check
-(`scripts/flux_cube_vf_parity.py`) against the re-assembled matrix, **with the cube's own rows
-unchanged**, moves the median ratio **0.513 → 0.978–0.99** over 40 level facets — a ~2% residual
+(`scripts/flux_cube_vf_parity.py`) against the re-assembled matrix, with the cube's own rows
+unchanged, moves the median ratio from 0.513 to 0.978–0.99 over 40 level facets, a ~2% residual
 inside sampling scatter. The near-field agreement, the ray-count convergence and the absent
 facet-size dependence that this branch measured were all pointing at the reference all along.
 
-⚠️ **The delivered products predate the fix.** Their absolute terrain fluxes inherit the assembler
+The delivered products predate the fix. Their absolute terrain fluxes inherit the assembler
 defect through the underlying thermal solution, in common with the rest of that campaign
 generation. The correction is not applied retroactively; a re-run against the corrected matrix
 would be needed for that.
 
 ### Sampling budget is per-patch, not per-face-orientation
 The ray budget was set from a B-free split-half total variation that converges at ~N^-0.23, where
-design §7.2 specified a **flux-referenced** metric. Against the flux, the true sampling error is
-**nadir and sides 0.01–0.04% (p50) but zenith 3.98% p50 / 18.97% p95** — the zenith is the
+design §7.2 specified a flux-referenced metric. Against the flux, the true sampling error is
+nadir and sides 0.01–0.04% (p50) but zenith 3.98% p50 / 18.97% p95; the zenith is the
 under-sampled face by two orders of magnitude, because it is nearly all sky and its small terrain
 row is what the estimator must resolve.
 
-⛔ **Owed:** emit the flux-referenced split-half and set **per-face-orientation** budgets. This
+Still needed: emit the flux-referenced split-half and set per-face-orientation budgets. This
 needs the geometry tool to retain both half-rows (the cache currently stores only their sum), so
 it is a format change, not a reporting change. Until then the single global `n_rays` is chosen for
-the *binding side faces*, and the zenith is under-sampled at that budget.
+the binding side faces, and the zenith is under-sampled at that budget.
 
 ### Shadow-probe spread is tied to DEM resolution, not hardware scale
 `edge_m` defaults to 0.1 × the local facet scale, so the spatial probe spread is set by mesh
 resolution rather than by the size of the object being modeled (the design recommended a fixed
-0.30 m avionics-box scale). At lunar polar site A that gives edge 0.108 m. Note also that the **nadir face
-therefore sits at h − edge/2 = 0.054 m above the surface**, not at h. Use the per-entry `edge_m`
+0.30 m avionics-box scale). At lunar polar site A that gives edge 0.108 m. The nadir face
+therefore sits at h − edge/2 = 0.054 m above the surface, not at h. Use the per-entry `edge_m`
 override (§12) when the hardware scale is known.
 
 ### Direct solar

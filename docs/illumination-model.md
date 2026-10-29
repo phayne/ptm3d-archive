@@ -35,7 +35,7 @@ where $\theta_i$ is the solar incidence angle, i.e., $\cos\theta_i = \hat{\mathb
 
 ### Finite Solar Disk Model
 
-When the fast-path conditions are not met --- for instance near topographic shadow boundaries, during partial eclipses, or at high solar incidence --- the Sun is modeled as a finite-extent disk. The apparent angular radius of the solar disk as seen from face $i$ is
+When the fast-path conditions are not met (for instance near topographic shadow boundaries, during partial eclipses, or at high solar incidence), the Sun is modeled as a finite-extent disk. The apparent angular radius of the solar disk as seen from face $i$ is
 
 $$\alpha_\odot = \arcsin\negthinspace\left(\frac{R_\odot}{d_\odot}\right)$$
 
@@ -84,8 +84,8 @@ where $N_\mathrm{total}$ is the number of samples that survived the unit-disk re
 
 A two-tier adaptive strategy balances computational cost and penumbral accuracy:
 
-- **Initial pass**: A minimum of $N_0 = \max(8, N_\mathrm{base})$ samples are evaluated, where $N_\mathrm{base}$ is the user-specified sample count (default 9).
-- **Penumbra upsampling**: If the initial pass detects partial terrain occlusion --- i.e., at least one sample is blocked and at least one is visible --- the face is automatically resampled with $N_\mathrm{heavy} = \max(64, 4 N_\mathrm{base})$ samples to resolve the penumbra boundary more accurately.
+- Initial pass: a minimum of $N_0 = \max(8, N_\mathrm{base})$ samples are evaluated, where $N_\mathrm{base}$ is the user-specified sample count (default 9).
+- Penumbra upsampling: if the initial pass detects partial terrain occlusion (i.e., at least one sample is blocked and at least one is visible), the face is resampled with $N_\mathrm{heavy} = \max(64, 4 N_\mathrm{base})$ samples to resolve the penumbra boundary more accurately.
 
 ### Sub-grid crater shadow flux (optional, off by default)
 
