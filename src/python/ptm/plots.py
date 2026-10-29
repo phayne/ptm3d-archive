@@ -407,7 +407,7 @@ def mesh_angular_radius(directions):
 def _require_global_mesh(run, min_angular_radius_deg=30.0):
     """Refuse to draw a globe of a mesh that covers a small patch of one.
 
-    A site mesh -- an A3GT crater, the fig-8 core+ring -- projects to a speck
+    A site mesh -- a polar-site crater, the fig-8 core+ring -- projects to a speck
     near the limb, or to nothing at all from three of the four default views.
     That is a correct rendering of the wrong request, and it looks exactly like
     a rendering failure, so it fails here instead.

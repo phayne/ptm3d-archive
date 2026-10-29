@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Breaking a long run into windows, the way the A3GT campaign does.
+"""Breaking a long run into windows, the way the polar landing-site campaign does.
 
 WHAT IS BEING HELD. `gui_core.window_series` plans N short windows across a
 long span and emits one complete configuration per window plus the schedule and
@@ -11,7 +11,7 @@ are what keep that true: ``test_the_commands_are_the_orchestrators_own`` reads
 the orchestrator's own source and compares flags.
 
 THE ONE DIFFERENCE, held explicitly by
-``test_the_schedule_says_its_epochs_are_evenly_spaced``: A3GT's window epochs
+``test_the_schedule_says_its_epochs_are_evenly_spaced``: the polar landing-site campaign's window epochs
 are subsolar-latitude extrema found with SPICE; these are evenly spaced. A
 schedule that looked like the SPICE one while carrying even spacing would be
 the silent substitution this project keeps paying for, so the difference is
@@ -197,7 +197,7 @@ def test_the_schedule_says_its_epochs_are_evenly_spaced():
     plan = plan_windows("2034-10-30T00:00:00", 6798.5, 4, 30.0,
                         synodic_days=SYNODIC)
     document = schedule_document(plan, body="Moon", output_root="/tmp/x")
-    # The A3GT schedule's own keys, so anything reading that file reads this.
+    # The polar-site schedule's own keys, so anything reading that file reads this.
     for key in ("start_time", "total_days", "windows"):
         assert key in document
     for window in document["windows"]:
@@ -233,7 +233,7 @@ def test_the_commands_are_the_orchestrators_own():
 def test_the_total_days_flag_carries_the_windows_full_precision():
     """The orchestrator's own ``%g`` is six figures; a diurnal window is not.
 
-    A3GT windows are whole days, so ``%g`` is exact there. 29.530588 d is not:
+    polar-site windows are whole days, so ``%g`` is exact there. 29.530588 d is not:
     ``%g`` gives 29.5306, and the chunked runner divides ``--total-days`` into
     chunks while the configuration keeps its own ``duration_days``. The two
     would then describe runs a second apart.

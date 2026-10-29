@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A3GT v2 — physics-horizon extended-mesh parameter derivation.
+"""Polar landing-site campaign (v2): physics-horizon extended-mesh parameter derivation.
 
 The sim must run on a mesh extended radially past the requested ROI so that
 distant massifs / crater rims cast shadows and contribute reflected/IR flux;

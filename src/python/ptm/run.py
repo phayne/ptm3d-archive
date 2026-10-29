@@ -225,7 +225,7 @@ def build_command(executable, config_file, config_dict=None):
 
 
 #: A run at or above this many simulated days is "long" for the purposes of the
-#: GPU-wedge advisory below. 30 days is one A3GT production window and the
+#: GPU-wedge advisory below. 30 days is one polar-site production window and the
 #: length at which the 2026-08 wedges occurred; shorter runs finish inside the
 #: driver's healthy window even on the affected hardware.
 LONG_RUN_DAYS = 30.0

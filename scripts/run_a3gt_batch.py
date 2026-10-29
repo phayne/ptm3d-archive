@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A3GT batch driver — runs PTM3D 18-year chunked simulations for a list of
+polar landing-site batch driver — runs PTM3D 18-year chunked simulations for a list of
 candidate sites that all share one regional DEM.
 
 For each site this driver:

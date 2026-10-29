@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A3GT v2 — coarse occluder ring/annulus builder.
+"""Polar landing-site campaign (v2): coarse occluder ring/annulus builder.
 
 Produces the `ring.ply` consumed by ptm_thermal_sim's `mesh.occluder_file`
 (see docs/extended-occluder-architecture.md). The ring is **occluder-only**

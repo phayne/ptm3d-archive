@@ -108,7 +108,7 @@ def narrow_perm(p, name):
 
     A permutation's values are indices into itself, so the bound is len(p), not the face
     count -- and len(p) here is a NONZERO count, which is not bounded by 2**31 (the
-    worst-case A3GT site, 1e7 faces, reaches ~2.4e10 nonzeros). int32 halves the array;
+    worst-case polar landing site, 1e7 faces, reaches ~2.4e10 nonzeros). int32 halves the array;
     int64 is kept, with a warning on stderr, whenever it would not be exact. Indexing
     with the narrowed permutation is value-for-value identical to indexing with the
     original, so this never changes a computed number -- only the footprint."""

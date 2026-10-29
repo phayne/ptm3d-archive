@@ -16,7 +16,7 @@ Geometry is generated here as small PLY files rather than read from the real
 meshes: the checks have to run on a machine that has none of them. The real
 meshes were measured separately and agreed with
 ``docs/radiation-exchange.md`` section 8.4 to 0.1% (``sunlit_radcore_r50``,
-236.6 m against 237 m) and 0.6% (A3GT lunar polar site A 3 km core, 3.479 m against
+236.6 m against 237 m) and 0.6% (lunar polar site A 3 km core, 3.479 m against
 3.46 m, sampled).
 
 No PyQt6 needed: ``gui_core.facet_scale`` imports no Qt.
@@ -136,7 +136,7 @@ def test_the_warn_band_requires_an_acknowledgment():
 
 
 def test_a_meter_scale_mesh_passes_cleanly():
-    """The A3GT 3 km core case: 3.46 m facets."""
+    """The polar landing-site 3 km core case: 3.46 m facets."""
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "coarse.ply"
         _write_grid_ply(path, edge_m=4.9)          # -> ~3.46 m facet scale
@@ -337,7 +337,7 @@ def test_a_multi_resolution_mesh_is_refused_on_its_FINE_end():
 
     99% of facets at 1 mm plus 1% at 1 m has a mean-area scale of 10 cm, which
     sails past a rule written to refuse millimeter facets with margin. This is
-    not contrived: scripts/a3gt_v2_extended_mesh.py builds the production A3GT
+    not contrived: scripts/a3gt_v2_extended_mesh.py builds the production polar landing-site
     v2 mesh as one PLY whose resolution falls off from the center, and the real
     lunar polar site A 3 km core measures 3.47 m mean against 0.71 m at the 5th
     percentile.

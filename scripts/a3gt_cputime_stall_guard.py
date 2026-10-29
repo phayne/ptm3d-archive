@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-time stall guard for the AGT unattended campaign (kill-on-soft-hang).
+"""CPU-time stall guard for the unattended polar landing-site campaign (kill-on-soft-hang).
 
 The June campaign stalled ~38 h with the orchestrator and its GPU sim child
 BOTH alive but not computing (a soft GPU wedge). `a3gt_rad_corering_watchdog.py`

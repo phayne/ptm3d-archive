@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Computational performance scaling for a 1-lunation PTM3D run with full
-radiation coupling, anchored on the May 2026 A3GT v2 production batch
+radiation coupling, anchored on the May 2026 polar landing-site production batch
 (lunar polar site L, a lunar polar site, 1,797,769 faces, 30-day output window, hourly
 cadence, 2-orbit equilibration).
 

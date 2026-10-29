@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A3GT v2 — SPICE-driven sub-solar-latitude schedule for the lunar 18.6-yr nodal cycle.
+"""Polar landing-site campaign (v2): SPICE-driven sub-solar-latitude schedule for the lunar 18.6-yr nodal cycle.
 
 Computes lunar sub-solar latitude vs time across the requested year window
 and identifies the day-of-year of the annual maximum ("summer") and minimum
