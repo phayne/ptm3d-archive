@@ -225,7 +225,7 @@ def plan_windows(start_iso, span_days, n_windows, window_days,
         plan.notes.append(
             f"The windows are evenly spaced: one every {stride:g} days, the "
             f"first at the start of the span and the last ending at its end. "
-            f"They are NOT placed on seasonal extremes -- the A3GT campaign "
+            f"They are NOT placed on seasonal extremes -- the polar-site campaign "
             f"chooses its epochs from a SPICE sub-solar-latitude schedule "
             f"(scripts/a3gt_v2_subsolar.py), and that is still the tool for "
             f"that job.")
@@ -247,7 +247,7 @@ def schedule_document(plan, body="", output_root=""):
         "generated_by": "PTM3D GUI, gui_core.window_series",
         "epoch_rule": plan.epoch_rule,
         "epoch_rule_detail": (
-            "Evenly spaced across the span. NOT the A3GT rule: "
+            "Evenly spaced across the span. NOT the sub-solar-latitude rule: "
             "scripts/a3gt_v2_subsolar.py places its windows on the annual "
             "sub-solar-latitude maximum and minimum of each sampled year, "
             "found with SPICE."),
@@ -432,6 +432,6 @@ def split_advice(window_days, synodic_days,
     return (f"This window is {periods:,.0f} diurnal cycles long. A run that "
             f"long is usually done as a series of shorter windows across the "
             f"span rather than one continuous integration -- that is what the "
-            f"lunar A3GT campaign does, and it is what keeps a single GPU "
+            f"lunar polar-site campaign does, and it is what keeps a single GPU "
             f"dispatch inside the envelope this machine is known to tolerate. "
             f"Tick \"Split into windows\" below to write one.")

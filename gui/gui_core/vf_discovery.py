@@ -741,8 +741,8 @@ def _judge(candidate, mesh_faces):
             "nonzeros). Loading it gives no facet-to-facet exchange at all — "
             "a shadowed crater floor is then warmed by nothing. Its purpose "
             "is to be a base the engine loads clean so it does not rebuild, "
-            "while the real matrix arrives another way (the A3GT replacement "
-            "CSR route). On its own it is radiation switched off with the "
+            "while the real matrix arrives another way (the "
+            "PTM_HMATRIX_VF_REPLACE CSR route). On its own it is radiation switched off with the "
             "switch left on.")
     return candidate
 
