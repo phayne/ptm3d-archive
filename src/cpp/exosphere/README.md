@@ -1095,7 +1095,7 @@ The sublimation transport is not cached: its kernel depends on each source's emi
 | `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember; with `<mesh.ply> <map.bin>`, fill faces follow the thermal albedo |
 | `test_multiscale_snapshot_time.cpp` | snapshot $L$ is the state after $L$ epochs (== a run stopped at $L$), same-state fields, complete `time_steps.txt` |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
-| `test_lag_gardening.cpp` | box depth vs `scripts/jwst/gardening.py`, Spencer criterion ($`d = 0`$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the step, global mass closure with entrainment, $t = 0$ invariance |
+| `test_lag_gardening.cpp` | box depth vs reference values from a Python implementation of Costello et al. (2021) Eq. 1, Spencer criterion ($`d = 0`$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the step, global mass closure with entrainment, $t = 0$ invariance |
 | `test_lag_barrier.cpp` | Lag barrier: $d + d^2/2\ell = \beta J_0 f t$ (one step, many steps, engine), closed form vs RK4 with sputtering and deposition, veneer first then the barrier, recycling, global mass conservation, $t = 0$ bit-identity, $\ell$ and lag albedo |
 | `analyze_diagnostics.py` | Python diagnostic analysis of simulation output |
 

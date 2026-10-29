@@ -149,8 +149,6 @@ ALLOW = [
      "quoted paper title"),
     ("docs/appendix-d-exosphere-model-full.md", "Murphy, D.M. & Koop",
      "quoted paper title"),
-    ("scripts/jwst/gardening.py", '"Modelling secondary impacts"',
-     "quoted section title from the source paper"),
     # Code identifiers. Renaming these breaks callers or saved data, so the
     # British spelling stays until someone does a deliberate API change.
     ("src/cpp/gpu/bvh_gpu_pool.cpp", "honourPause",

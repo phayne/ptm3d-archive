@@ -1,8 +1,9 @@
 // Unit tests for the gardened lag with the sputter split. Self-contained;
 // exit code 0 = all checks pass.
 //
-//  (1) Box depth vs scripts/jwst/gardening.py: Lambda_99(t)^2 = K99 t (Costello et al.
-//      2021 Eq. 1, Cases A and B; reference values printed by gardening.py).
+//  (1) Box depth vs the Python reference: Lambda_99(t)^2 = K99 t (Costello et al.
+//      2021 Eq. 1, Cases A and B; reference values printed by scripts/jwst/gardening.py,
+//      removed from the tree 2026-10-29, see git history).
 //  (2) Spencer criterion: at d = 0, beta (a + p_w + p_r - B) <= v_m is absorbing
 //      (no lag, the box loses ice); just above it a lag forms; a lag on a sub-critical
 //      face is gardened away and the face then stays at d = 0.
@@ -42,7 +43,7 @@ static constexpr double RHO = exo::layer_constants::ICE_DENSITY;
 static double betaOf(double c, double phi = 0.6) { return c / ((1.0 - c) * RHO * (1.0 - phi)); }
 
 static void test_box_depth_vs_python() {
-    std::printf("\n(1) box depth vs scripts/jwst/gardening.py (Lambda at lambda = 4.605)\n");
+    std::printf("\n(1) box depth vs the Python reference values (Lambda at lambda = 4.605)\n");
     // python3 -c "import gardening as g; print(repr(float(g.gardening_depth(t, lam=g.LAMBDA_SAT, case=C))))"
     struct Ref { char c; double t_yr, lambda_m; };
     const Ref refs[] = {
