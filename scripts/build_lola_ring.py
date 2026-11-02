@@ -91,9 +91,19 @@ def main():
     half = int(a.r_ext_km*1.05*1000.0/dx) + 2
     col0 = max(0, int((x0-ulx)/dx) - half)
     row0 = max(0, int((uly-y0)/dy) - half)
-    n = 2*half
-    n = min(n, ds.RasterXSize-col0, ds.RasterYSize-row0)
-    arr = band.ReadAsArray(col0, row0, n, n).astype(np.float64)
+    # Clip each axis to the raster on its own. A single square side clipped by
+    # min(x-room, y-room) let a site near ONE raster edge silently lose ring
+    # coverage on the OTHER axis too (scripts/test_build_lola_ring_window.py).
+    ncol = min(2*half, ds.RasterXSize-col0)
+    nrow = min(2*half, ds.RasterYSize-row0)
+    want0c, want0r = int((x0-ulx)/dx) - half, int((uly-y0)/dy) - half
+    if (want0c < 0 or want0r < 0 or want0c + 2*half > ds.RasterXSize
+            or want0r + 2*half > ds.RasterYSize):
+        print(f"[build_lola_ring] WARNING: the requested {a.r_ext_km} km ring "
+              f"extends past the DEM edge; ring coverage is cut there (window "
+              f"cols {col0}..{col0+ncol}, rows {row0}..{row0+nrow} of "
+              f"{ds.RasterXSize} x {ds.RasterYSize}).")
+    arr = band.ReadAsArray(col0, row0, ncol, nrow).astype(np.float64)
 
     # Apply the DEM's elevation scale/offset. LOLA polar PDS .IMG store elevation
     # as scaled integers (SCALING_FACTOR, e.g. 0.5 m/DN); GDAL's ReadAsArray
@@ -120,8 +130,8 @@ def main():
               f"(source {a.lola})")
     arr = arr * scale + offset
 
-    cols = np.arange(col0, col0+n)
-    rows = np.arange(row0, row0+n)
+    cols = np.arange(col0, col0+ncol)
+    rows = np.arange(row0, row0+nrow)
     PX = ulx + (cols+0.5)*dx
     PY = uly - (rows+0.5)*dy
     PXg, PYg = np.meshgrid(PX, PY)
